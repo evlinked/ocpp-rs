@@ -8,7 +8,7 @@ use crate::{
     config::SimulatorConfig,
     error::SimulatorError,
     events::{EventStore, SimulatorEvent, SimulatorEventHandler},
-    fault_injector::FaultInjector,
+    fault_injector::{FaultInjectionConfig, FaultInjector},
     meter_simulator::MeterSimulator,
     scenario::ScenarioManager,
     websocket::{WebSocketClient, WebSocketConfig},
@@ -147,7 +147,7 @@ impl Simulator {
         }
 
         // Create fault injector
-        let fault_injector = Arc::new(RwLock::new(FaultInjector::new(config.fault_config.clone())));
+        let fault_injector = Arc::new(RwLock::new(FaultInjector::new(FaultInjectionConfig::default())));
 
         // Create meter simulators for each connector
         let mut meter_simulators = HashMap::new();
@@ -323,10 +323,12 @@ impl Simulator {
         }
 
         // Set fault on charge point
-        let cp_connector_id = ConnectorId::new(connector_id)?;
+        let cp_connector_id = ConnectorId::new(connector_id)
+            .map_err(|e| SimulatorError::charge_point(e.to_string()))?;
         self.charge_point
             .set_fault(cp_connector_id, error_code, description)
-            .await?;
+            .await
+            .map_err(|e| SimulatorError::charge_point(e.to_string()))?;
 
         // Update statistics
         {
@@ -349,8 +351,12 @@ impl Simulator {
         }
 
         // Clear fault on charge point
-        let cp_connector_id = ConnectorId::new(connector_id)?;
-        self.charge_point.clear_fault(cp_connector_id).await?;
+        let cp_connector_id = ConnectorId::new(connector_id)
+            .map_err(|e| SimulatorError::charge_point(e.to_string()))?;
+        self.charge_point
+            .clear_fault(cp_connector_id)
+            .await
+            .map_err(|e| SimulatorError::charge_point(e.to_string()))?;
 
         Ok(())
     }

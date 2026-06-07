@@ -68,8 +68,6 @@ pub struct FaultInjector {
     config: FaultInjectionConfig,
     /// Active faults by connector ID
     active_faults: HashMap<u32, ActiveFault>,
-    /// Random number generator
-    rng: rand::rngs::ThreadRng,
 }
 
 impl FaultInjector {
@@ -78,7 +76,6 @@ impl FaultInjector {
         Self {
             config,
             active_faults: HashMap::new(),
-            rng: rand::thread_rng(),
         }
     }
 
@@ -245,12 +242,12 @@ impl FaultInjector {
     // Private helper methods
 
     fn should_inject_random_fault(&mut self) -> bool {
-        use rand::Rng;
-        self.rng.gen::<f64>() < self.config.random_probability
+        use rand::Rng as _;
+        rand::thread_rng().gen::<f64>() < self.config.random_probability
     }
 
     fn select_random_fault(&mut self) -> Option<ChargePointErrorCode> {
-        use rand::Rng;
+        use rand::Rng as _;
 
         if self.config.fault_probabilities.is_empty() {
             return None;
@@ -261,7 +258,7 @@ impl FaultInjector {
             return None;
         }
 
-        let mut random_value = self.rng.gen::<f64>() * total_weight;
+        let mut random_value = rand::thread_rng().gen::<f64>() * total_weight;
 
         for (error_code, probability) in &self.config.fault_probabilities {
             random_value -= probability;
@@ -275,9 +272,9 @@ impl FaultInjector {
     }
 
     fn generate_recovery_time(&mut self) -> u64 {
-        use rand::Rng;
+        use rand::Rng as _;
         let (min_time, max_time) = self.config.recovery_time_range;
-        self.rng.gen_range(min_time..=max_time)
+        rand::thread_rng().gen_range(min_time..=max_time)
     }
 }
 

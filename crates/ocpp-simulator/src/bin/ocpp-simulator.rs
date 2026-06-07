@@ -6,7 +6,7 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use ocpp_simulator::{
-    config::SimulatorConfig, events::EventSeverity, start_simulator, SimulatorResult,
+    config::SimulatorConfig, events::EventSeverity, start_simulator,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;

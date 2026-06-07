@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Charge point status enumeration for OCPP 1.6J
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ChargePointStatus {
     /// Available for new transaction
@@ -28,7 +28,7 @@ pub enum ChargePointStatus {
 }
 
 /// Error code enumeration for OCPP 1.6J
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ChargePointErrorCode {
     /// Connector failure
@@ -443,6 +443,22 @@ impl std::fmt::Display for ChargePointErrorCode {
             ChargePointErrorCode::ResetFailure => write!(f, "ResetFailure"),
             ChargePointErrorCode::UnderVoltage => write!(f, "UnderVoltage"),
             ChargePointErrorCode::WeakSignal => write!(f, "WeakSignal"),
+        }
+    }
+}
+
+impl std::fmt::Display for ChargePointStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ChargePointStatus::Available => write!(f, "Available"),
+            ChargePointStatus::Preparing => write!(f, "Preparing"),
+            ChargePointStatus::Charging => write!(f, "Charging"),
+            ChargePointStatus::SuspendedEV => write!(f, "SuspendedEV"),
+            ChargePointStatus::SuspendedEVSE => write!(f, "SuspendedEVSE"),
+            ChargePointStatus::Finishing => write!(f, "Finishing"),
+            ChargePointStatus::Reserved => write!(f, "Reserved"),
+            ChargePointStatus::Faulted => write!(f, "Faulted"),
+            ChargePointStatus::Unavailable => write!(f, "Unavailable"),
         }
     }
 }

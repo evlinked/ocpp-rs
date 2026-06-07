@@ -451,7 +451,7 @@ async fn plug_in_connector(
         Ok(()) => {
             let _ = state
                 .event_sender
-                .send(SimulatorEvent::ConnectorPluggedIn { connector_id: id });
+                .send(SimulatorEvent::ConnectorPluggedIn { connector_id: id, timestamp: chrono::Utc::now() });
             Ok(Json(SimulatorResponse::success_empty()))
         }
         Err(e) => {
@@ -472,7 +472,7 @@ async fn plug_out_connector(
         Ok(()) => {
             let _ = state
                 .event_sender
-                .send(SimulatorEvent::ConnectorPluggedOut { connector_id: id });
+                .send(SimulatorEvent::ConnectorPluggedOut { connector_id: id, timestamp: chrono::Utc::now() });
             Ok(Json(SimulatorResponse::success_empty()))
         }
         Err(e) => {
@@ -504,6 +504,7 @@ async fn start_transaction(
                 connector_id: id,
                 transaction_id: 0, // Would be set from actual transaction
                 id_tag,
+                timestamp: chrono::Utc::now(),
             });
             Ok(Json(SimulatorResponse::success_empty()))
         }
@@ -533,6 +534,8 @@ async fn stop_transaction(
                 connector_id: id,
                 transaction_id: 0, // Would be set from actual transaction
                 reason: "Manual".to_string(),
+                energy_delivered_wh: None,
+                timestamp: chrono::Utc::now(),
             });
             Ok(Json(SimulatorResponse::success_empty()))
         }
@@ -565,6 +568,7 @@ async fn inject_fault(
                 connector_id: id,
                 error_code: fault_req.error_code,
                 info: fault_req.info,
+                timestamp: chrono::Utc::now(),
             });
             Ok(Json(SimulatorResponse::success_empty()))
         }
@@ -586,7 +590,7 @@ async fn clear_fault(
         Ok(()) => {
             let _ = state
                 .event_sender
-                .send(SimulatorEvent::FaultCleared { connector_id: id });
+                .send(SimulatorEvent::FaultCleared { connector_id: id, timestamp: chrono::Utc::now() });
             Ok(Json(SimulatorResponse::success_empty()))
         }
         Err(e) => {
@@ -619,6 +623,7 @@ async fn set_availability(
                 .send(SimulatorEvent::AvailabilityChanged {
                     connector_id: id,
                     available,
+                    timestamp: chrono::Utc::now(),
                 });
             Ok(Json(SimulatorResponse::success_empty()))
         }
@@ -681,6 +686,7 @@ async fn execute_scenario(
     // For now, just acknowledge the request
     let _ = state.event_sender.send(SimulatorEvent::ScenarioStarted {
         scenario: name.clone(),
+        timestamp: chrono::Utc::now(),
     });
 
     Json(SimulatorResponse::success_empty())

@@ -15,9 +15,10 @@ use ocpp_messages::v16j::{
 };
 use ocpp_messages::{CallMessage, CallResultMessage, Message, OcppAction};
 use ocpp_transport::MessageHandler as TransportMessageHandler;
+use ocpp_types::common::{AvailabilityStatus, AvailabilityType, KeyValue};
 use ocpp_types::v16j::{
-    AvailabilityType, ChangeAvailabilityStatus, ChargePointErrorCode, ConfigurationStatus,
-    DataTransferStatus, RemoteStartStopStatus, ResetStatus, ResetType, UnlockStatus,
+    ChargePointErrorCode, ConfigurationStatus, DataTransferStatus, RemoteStartStopStatus,
+    ResetStatus, ResetType, UnlockStatus,
 };
 use ocpp_types::{ConnectorId, OcppResult};
 use serde_json::Value;
@@ -196,8 +197,7 @@ impl MessageHandler {
         let available = matches!(request.availability_type, AvailabilityType::Operative);
 
         // For now, always accept the change
-        // In a real implementation, this would check if connectors can be changed
-        let status = ChangeAvailabilityStatus::Accepted;
+        let status = AvailabilityStatus::Accepted;
 
         debug!(
             "Change availability: {:?} -> {} (status: {:?})",
@@ -264,7 +264,7 @@ impl MessageHandler {
 
             for key in keys {
                 if let Some(value) = config.get(&key) {
-                    config_keys.push(ocpp_messages::v16j::ConfigurationKey {
+                    config_keys.push(KeyValue {
                         key: key.clone(),
                         readonly: Some(config.is_readonly(&key)),
                         value: Some(value.clone()),
@@ -287,7 +287,7 @@ impl MessageHandler {
             let config_keys: Vec<_> = config
                 .keys()
                 .iter()
-                .map(|(key, value)| ocpp_messages::v16j::ConfigurationKey {
+                .map(|(key, value)| KeyValue {
                     key: key.clone(),
                     readonly: Some(config.is_readonly(key)),
                     value: Some(value.clone()),
@@ -758,7 +758,7 @@ mod tests {
         };
 
         let response = handler.handle_change_availability(request).await.unwrap();
-        assert_eq!(response.status, ChangeAvailabilityStatus::Accepted);
+        assert_eq!(response.status, AvailabilityStatus::Accepted);
     }
 
     #[tokio::test]

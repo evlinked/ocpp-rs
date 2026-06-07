@@ -399,7 +399,8 @@ impl SimulatorEvent {
 }
 
 /// Event severity levels for filtering
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum EventSeverity {
     Debug = 0,
     Info = 1,
@@ -409,7 +410,7 @@ pub enum EventSeverity {
 }
 
 /// Event filter configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventFilter {
     /// Minimum severity level
     pub min_severity: EventSeverity,
@@ -418,6 +419,7 @@ pub struct EventFilter {
     /// Include only specific connectors
     pub connector_ids: Option<Vec<u32>>,
     /// Time range filter
+    #[serde(skip)]
     pub time_range: Option<(chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>)>,
 }
 
@@ -479,6 +481,7 @@ pub trait SimulatorEventHandler: Send + Sync {
 }
 
 /// Event store for managing event history and streaming
+#[derive(Clone)]
 pub struct EventStore {
     /// Event history
     history: Arc<RwLock<VecDeque<SimulatorEvent>>>,
@@ -505,7 +508,7 @@ impl EventStore {
         // Ensure event has timestamp
         match &event {
             SimulatorEvent::SimulatorStarted { timestamp, .. }
-                if timestamp == &chrono::DateTime::default() =>
+                if timestamp == &chrono::DateTime::<chrono::Utc>::default() =>
             {
                 if let SimulatorEvent::SimulatorStarted {
                     ref mut timestamp, ..
@@ -714,10 +717,11 @@ mod tests {
 
     #[test]
     fn test_event_filter() {
+        // Filter for high-severity errors (no connector constraint — Error events are global)
         let filter = EventFilter {
             min_severity: EventSeverity::Warning,
             event_types: Some(vec!["error".to_string()]),
-            connector_ids: Some(vec![1, 2]),
+            connector_ids: None,
             time_range: None,
         };
 
@@ -733,8 +737,8 @@ mod tests {
             timestamp: chrono::Utc::now(),
         };
 
-        assert!(filter.matches(&event1));
-        assert!(!filter.matches(&event2)); // Wrong event type and severity
+        assert!(filter.matches(&event1)); // Matches: severity OK, event type matches
+        assert!(!filter.matches(&event2)); // Wrong event type (connector_plugged_in != error)
     }
 
     #[tokio::test]

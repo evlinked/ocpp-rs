@@ -31,6 +31,7 @@ pub struct SimulatorConfig {
     /// Enable automatic reconnection
     pub auto_reconnect: bool,
     /// Transport configuration
+    #[serde(skip)]
     pub transport_config: TransportConfig,
     /// API server configuration
     pub api_config: ApiConfig,
@@ -440,26 +441,26 @@ impl Default for LoggingConfig {
 
 impl SimulatorConfig {
     /// Load configuration from file
-    pub fn from_file(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn from_file(path: &str) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config = if path.ends_with(".toml") {
             toml::from_str(&content)?
         } else if path.ends_with(".json") {
             serde_json::from_str(&content)?
         } else {
-            return Err("Unsupported configuration file format. Use .toml or .json".into());
+            anyhow::bail!("Unsupported configuration file format. Use .toml or .json");
         };
         Ok(config)
     }
 
     /// Save configuration to file
-    pub fn to_file(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn to_file(&self, path: &str) -> anyhow::Result<()> {
         let content = if path.ends_with(".toml") {
             toml::to_string_pretty(self)?
         } else if path.ends_with(".json") {
             serde_json::to_string_pretty(self)?
         } else {
-            return Err("Unsupported configuration file format. Use .toml or .json".into());
+            anyhow::bail!("Unsupported configuration file format. Use .toml or .json");
         };
         std::fs::write(path, content)?;
         Ok(())

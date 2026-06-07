@@ -461,11 +461,12 @@ impl Transaction {
 
     /// Add detailed meter value
     pub async fn add_meter_value(&mut self, meter_value: MeterValue) -> Result<()> {
+        let energy_wh = meter_value.energy_wh;
         self.data.add_meter_value(meter_value);
 
         debug!(
             "Detailed meter value added for transaction {}: {} Wh",
-            self.data.transaction_id, meter_value.energy_wh
+            self.data.transaction_id, energy_wh
         );
 
         Ok(())

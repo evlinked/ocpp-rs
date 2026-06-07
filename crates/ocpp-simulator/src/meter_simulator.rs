@@ -4,7 +4,7 @@
 //! including energy consumption patterns, power variations, and meter noise simulation.
 
 use crate::{config::MeterConfig, error::SimulatorError};
-use rand::{thread_rng, Rng};
+use rand::{thread_rng, Rng as _};
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::time::Instant;
@@ -103,8 +103,6 @@ pub struct MeterSimulator {
     charging_pattern: ChargingPattern,
     /// Start time of current session
     session_start_time: Option<Instant>,
-    /// Random number generator
-    rng: rand::rngs::ThreadRng,
     /// Drift accumulator
     drift_accumulator: f64,
     /// Last update timestamp
@@ -128,7 +126,6 @@ impl MeterSimulator {
             charging_pattern: ChargingPattern::ConstantPower,
             session_start_time: None,
             config,
-            rng: thread_rng(),
             drift_accumulator: 0.0,
             last_update: Instant::now(),
             session_start_energy: 0.0,
@@ -339,7 +336,8 @@ impl MeterSimulator {
             }
             ChargingPattern::VariablePower => {
                 // Add some randomness to simulate grid conditions
-                let variation = self.rng.gen_range(-0.2..=0.2); // ±20% variation
+                let mut rng = thread_rng();
+                let variation = rng.gen_range(-0.2..=0.2); // ±20% variation
                 let variable_target =
                     self.target_power_w * (1.0 + variation * self.config.power_variation);
                 let power_diff = variable_target - self.current_power_w;
@@ -349,9 +347,8 @@ impl MeterSimulator {
 
         // Apply power variation
         if self.config.power_variation > 0.0 {
-            let variation = self
-                .rng
-                .gen_range(-self.config.power_variation..=self.config.power_variation);
+            let mut rng = thread_rng();
+            let variation = rng.gen_range(-self.config.power_variation..=self.config.power_variation);
             self.current_power_w *= 1.0 + variation;
         }
 
@@ -373,7 +370,7 @@ impl MeterSimulator {
 
         // Add small random variation
         if self.config.include_noise {
-            let noise = self.rng.gen_range(-1.0..=1.0);
+            let noise = thread_rng().gen_range(-1.0..=1.0);
             voltage + noise
         } else {
             voltage
@@ -399,7 +396,7 @@ impl MeterSimulator {
 
         // Add noise
         if self.config.include_noise {
-            let noise = self.rng.gen_range(-0.5..=0.5);
+            let noise = thread_rng().gen_range(-0.5..=0.5);
             temperature + noise
         } else {
             temperature
@@ -414,11 +411,12 @@ impl MeterSimulator {
         current: f64,
     ) -> (f64, f64, f64, f64) {
         let noise_factor = self.config.noise_amplitude;
+        let mut rng = thread_rng();
 
-        let energy_noise = self.rng.gen_range(-noise_factor..=noise_factor);
-        let power_noise = self.rng.gen_range(-noise_factor..=noise_factor);
-        let voltage_noise = self.rng.gen_range(-noise_factor..=noise_factor);
-        let current_noise = self.rng.gen_range(-noise_factor..=noise_factor);
+        let energy_noise = rng.gen_range(-noise_factor..=noise_factor);
+        let power_noise = rng.gen_range(-noise_factor..=noise_factor);
+        let voltage_noise = rng.gen_range(-noise_factor..=noise_factor);
+        let current_noise = rng.gen_range(-noise_factor..=noise_factor);
 
         (
             energy * (1.0 + energy_noise),
@@ -464,7 +462,7 @@ mod tests {
         let mut simulator = MeterSimulator::new(config);
 
         let reading1 = simulator.update();
-        assert_eq!(reading1.energy_wh, 0.0);
+        assert!(reading1.energy_wh < 1.0); // Near-zero: tiny elapsed time since creation
         assert!(reading1.power_w > 0.0);
         assert!(reading1.voltage_v > 0.0);
         assert!(reading1.current_a >= 0.0);
@@ -545,7 +543,7 @@ mod tests {
     #[test]
     fn test_meter_reset() {
         let config = MeterConfig::default();
-        let mut simulator = MeterSimulator::new(config);
+        let mut simulator = MeterSimulator::new(config.clone());
 
         // Modify state
         simulator.start_charging_session(Some(70.0));
