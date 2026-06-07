@@ -11,7 +11,6 @@ use futures_util::{SinkExt, StreamExt};
 use indicatif::{ProgressBar, ProgressStyle};
 use serde_json::Value;
 
-use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
@@ -140,6 +139,7 @@ struct ValidateArgs {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct SimulatorState {
     charge_point_id: String,
     connectors: u32,
@@ -152,6 +152,7 @@ struct SimulatorState {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct ConnectorStatus {
     id: u32,
     status: ConnectorState,
@@ -167,6 +168,7 @@ struct ConnectorStatus {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct ActivityLog {
     timestamp: chrono::DateTime<chrono::Utc>,
     activity_type: ActivityType,
@@ -175,6 +177,7 @@ struct ActivityLog {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 enum ActivityType {
     RemoteStart,
     RemoteStop,
@@ -185,6 +188,7 @@ enum ActivityType {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 enum ConnectorState {
     Available,
     Preparing,
@@ -492,7 +496,7 @@ async fn connect_websocket(
         .map_err(|e| anyhow::anyhow!("Failed to build WebSocket request: {}", e))?;
 
     // Perform WebSocket handshake
-    let config = WebSocketConfig::default();
+    let _config = WebSocketConfig::default();
     let (ws_stream, response) = client_async(request, stream)
         .await
         .map_err(|e| anyhow::anyhow!("WebSocket handshake failed: {}", e))?;
@@ -533,7 +537,7 @@ async fn connect_websocket(
         .map_err(|e| anyhow::anyhow!("Failed to send BootNotification: {}", e))?;
 
     // Start message sending task
-    let simulator_clone = simulator.clone();
+    let _simulator_clone = simulator.clone();
     tokio::spawn(async move {
         info!("📡 WebSocket message sender task started");
         while let Some(msg) = rx.recv().await {
@@ -933,7 +937,7 @@ async fn handle_remote_stop_transaction_call(
                 timestamp: chrono::Utc::now(),
                 activity_type: ActivityType::RemoteStop,
                 connector_id: found_connector,
-                message: format!("🛑 Remote stop transaction requested by Central System"),
+                message: "🛑 Remote stop transaction requested by Central System".to_string(),
             });
 
             // Keep only last 20 activities
@@ -945,8 +949,7 @@ async fn handle_remote_stop_transaction_call(
         (found_connector, transaction_energy, can_stop)
     };
 
-    let status = if can_stop && connector_id.is_some() {
-        let conn_id = connector_id.unwrap();
+    let status = if let (true, Some(conn_id)) = (can_stop, connector_id) {
         let actual_tx_id = transaction_id.unwrap_or_else(|| chrono::Utc::now().timestamp() as u32);
 
         // Send StopTransaction and StatusNotification messages
@@ -1283,7 +1286,7 @@ async fn show_status(
 }
 
 async fn connector_operations(
-    args: &ConnectArgs,
+    _args: &ConnectArgs,
     simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
 ) -> Result<()> {
     loop {
@@ -1785,7 +1788,7 @@ async fn send_start_transaction(
     simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
     connector_id: u32,
     id_tag: String,
-    transaction_id: u32,
+    _transaction_id: u32,
 ) -> Result<()> {
     let state = simulator.lock().await;
     let start_transaction = serde_json::json!([
@@ -1837,6 +1840,7 @@ async fn send_stop_transaction(
     Ok(())
 }
 
+#[allow(dead_code)]
 async fn send_meter_values(
     simulator: Arc<tokio::sync::Mutex<SimulatorState>>,
     connector_id: u32,

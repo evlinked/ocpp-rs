@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// CSMS configuration structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     /// Server configuration
     pub server: ServerConfig,
@@ -18,19 +18,6 @@ pub struct Config {
     pub metrics: MetricsConfig,
     /// OCPP protocol configuration
     pub ocpp: OcppConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            database: DatabaseConfig::default(),
-            auth: AuthConfig::default(),
-            logging: LoggingConfig::default(),
-            metrics: MetricsConfig::default(),
-            ocpp: OcppConfig::default(),
-        }
-    }
 }
 
 /// Server configuration

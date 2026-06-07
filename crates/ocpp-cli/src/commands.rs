@@ -5,6 +5,7 @@
 use anyhow::Result;
 
 /// Command execution trait
+#[allow(async_fn_in_trait)]
 pub trait Command {
     /// Execute the command
     async fn execute(&self) -> Result<()>;

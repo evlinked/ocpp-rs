@@ -14,8 +14,10 @@ pub struct ChargePointManager {
     /// Connected charge points
     charge_points: Arc<DashMap<String, ChargePointInfo>>,
     /// Database pool reference
+    #[allow(dead_code)]
     database: Arc<crate::database::DatabasePool>,
     /// Metrics registry reference
+    #[allow(dead_code)]
     metrics: Arc<crate::metrics::MetricsRegistry>,
 }
 

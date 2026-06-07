@@ -248,7 +248,7 @@ impl Connector {
     /// Plug in cable
     pub async fn plug_in(&mut self) -> Result<()> {
         let current_status = self.status().await;
-        let physical_state = self.physical_state().await;
+        let _physical_state = self.physical_state().await;
 
         debug!("Plugging in connector {}", self.config.connector_id);
 
@@ -536,7 +536,7 @@ impl Connector {
             self.config.connector_id, error_code, info
         );
 
-        *self.error_code.write().await = error_code.clone();
+        *self.error_code.write().await = error_code;
         *self.error_info.write().await = info.clone();
 
         // Only change to Faulted if not NoError

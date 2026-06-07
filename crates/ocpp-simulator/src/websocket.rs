@@ -327,10 +327,10 @@ pub trait WebSocketMessageHandler: Send + Sync {
     async fn on_connect(&self) {}
 
     /// Handle connection closed
-    async fn on_disconnect(&self, reason: Option<String>) {}
+    async fn on_disconnect(&self, _reason: Option<String>) {}
 
     /// Handle connection error
-    async fn on_error(&self, error: SimulatorError) {}
+    async fn on_error(&self, _error: SimulatorError) {}
 }
 
 /// Utility functions for WebSocket operations

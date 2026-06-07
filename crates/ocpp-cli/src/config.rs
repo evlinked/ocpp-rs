@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// CLI configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CliConfig {
     /// Connection settings
     pub connection: ConnectionConfig,
@@ -15,16 +15,6 @@ pub struct CliConfig {
     pub test: TestConfig,
     /// Logging settings
     pub logging: LoggingConfig,
-}
-
-impl Default for CliConfig {
-    fn default() -> Self {
-        Self {
-            connection: ConnectionConfig::default(),
-            test: TestConfig::default(),
-            logging: LoggingConfig::default(),
-        }
-    }
 }
 
 /// Connection configuration

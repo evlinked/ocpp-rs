@@ -96,7 +96,7 @@ impl DatabasePool {
     pub async fn get_stats(&self) -> DatabaseStats {
         DatabaseStats {
             active_connections: self.pool.size() as usize,
-            idle_connections: self.pool.num_idle() as usize,
+            idle_connections: self.pool.num_idle(),
             total_connections: self.config.max_connections as usize,
         }
     }

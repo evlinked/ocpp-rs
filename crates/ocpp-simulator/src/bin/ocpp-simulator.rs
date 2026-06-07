@@ -5,7 +5,7 @@
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
-use ocpp_simulator::{config::SimulatorConfig, events::EventSeverity, start_simulator};
+use ocpp_simulator::{config::SimulatorConfig, start_simulator};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tokio::signal;
@@ -201,12 +201,12 @@ async fn start_command(args: StartArgs) -> Result<()> {
 }
 
 fn config_command(args: ConfigArgs) -> Result<()> {
-    let mut config = SimulatorConfig::default();
-
-    // Apply CLI overrides
-    config.connector_count = args.connectors;
-    config.central_system_url = args.url;
-    config.charge_point_id = args.id;
+    let config = SimulatorConfig {
+        connector_count: args.connectors,
+        central_system_url: args.url,
+        charge_point_id: args.id,
+        ..SimulatorConfig::default()
+    };
 
     // Save configuration
     config.to_file(args.output.to_str().unwrap())?;

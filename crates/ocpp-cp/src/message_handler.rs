@@ -13,15 +13,14 @@ use ocpp_messages::v16j::{
     RemoteStopTransactionRequest, RemoteStopTransactionResponse, ResetRequest, ResetResponse,
     UnlockConnectorRequest, UnlockConnectorResponse,
 };
-use ocpp_messages::{CallMessage, CallResultMessage, Message, OcppAction};
+use ocpp_messages::{CallMessage, CallResultMessage, Message};
 use ocpp_transport::MessageHandler as TransportMessageHandler;
 use ocpp_types::common::{AvailabilityStatus, AvailabilityType, KeyValue};
 use ocpp_types::v16j::{
-    ChargePointErrorCode, ConfigurationStatus, DataTransferStatus, RemoteStartStopStatus,
-    ResetStatus, ResetType, UnlockStatus,
+    ConfigurationStatus, DataTransferStatus, RemoteStartStopStatus, ResetStatus, ResetType,
+    UnlockStatus,
 };
 use ocpp_types::{ConnectorId, OcppResult};
-use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -191,7 +190,7 @@ impl MessageHandler {
             // Connector 0 means all connectors
             None
         } else {
-            Some(ConnectorId::new(request.connector_id as u32)?)
+            Some(ConnectorId::new(request.connector_id)?)
         };
 
         let available = matches!(request.availability_type, AvailabilityType::Operative);
@@ -321,7 +320,7 @@ impl MessageHandler {
 
         // Check if connector is available
         let connector_id = if let Some(id) = request.connector_id {
-            ConnectorId::new(id as u32)?
+            ConnectorId::new(id)?
         } else {
             // Find an available connector
             // For simplicity, use connector 1
@@ -423,7 +422,7 @@ impl MessageHandler {
             request.connector_id
         );
 
-        let connector_id = ConnectorId::new(request.connector_id as u32)?;
+        let connector_id = ConnectorId::new(request.connector_id)?;
 
         // Check connector state
         let states = self.connector_states.read().await;

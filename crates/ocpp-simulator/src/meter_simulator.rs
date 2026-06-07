@@ -3,10 +3,10 @@
 //! This module provides realistic meter value simulation for the OCPP simulator,
 //! including energy consumption patterns, power variations, and meter noise simulation.
 
-use crate::{config::MeterConfig, error::SimulatorError};
+use crate::config::MeterConfig;
 use rand::{thread_rng, Rng as _};
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{debug, trace};
 
@@ -68,7 +68,7 @@ impl MeterReading {
 
     /// Calculate reactive power (VAR)
     pub fn reactive_power_var(&self) -> f64 {
-        let pf = self.power_factor.unwrap_or(1.0);
+        let _pf = self.power_factor.unwrap_or(1.0);
         let apparent_power = self.apparent_power_va();
         (apparent_power * apparent_power - self.power_w * self.power_w).sqrt()
     }

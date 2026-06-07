@@ -8,6 +8,14 @@
 # Transitive dep via tokio-tungstenite → rustls. No direct upgrade path
 # available without a major version bump of tungstenite.
 ignore = [
+    # RUSTSEC-2023-0071: rsa crate Marvin Attack timing side-channel
+    # No patch available upstream; rsa is a transitive dep via sqlx/openssl.
+    # Risk is low in this context (not used for key exchange on untrusted networks).
+    "RUSTSEC-2023-0071",
+    # RUSTSEC-2026-0098: rustls-webpki URI name constraints accepted incorrectly
+    # Patched in >=0.103.12; blocked on tungstenite 0.21 / tokio-tungstenite 0.21
+    # upgrade. Tracked as a follow-up dependency-upgrade issue.
+    "RUSTSEC-2026-0098",
     # RUSTSEC-2026-0099: rustls-webpki wildcard DNS name constraint
     "RUSTSEC-2026-0099",
     # RUSTSEC-2026-0104: rustls-webpki reachable panic in CRL parsing

@@ -77,14 +77,14 @@ impl MetricsRegistry {
     }
 
     /// Record message received
-    pub fn record_message_received(&self, action: &str) {
+    pub fn record_message_received(&self, _action: &str) {
         if self.config.enabled {
             self.ocpp_metrics.messages_received.inc();
         }
     }
 
     /// Record message sent
-    pub fn record_message_sent(&self, action: &str) {
+    pub fn record_message_sent(&self, _action: &str) {
         if self.config.enabled {
             self.ocpp_metrics.messages_sent.inc();
         }
@@ -98,7 +98,7 @@ impl MetricsRegistry {
     }
 
     /// Record message processing duration
-    pub fn record_message_processing_duration(&self, action: &str, duration_seconds: f64) {
+    pub fn record_message_processing_duration(&self, _action: &str, duration_seconds: f64) {
         if self.config.enabled {
             self.ocpp_metrics
                 .message_processing_duration
@@ -237,8 +237,10 @@ mod tests {
 
     #[test]
     fn test_metrics_registry_disabled() {
-        let mut config = MetricsConfig::default();
-        config.enabled = false;
+        let config = MetricsConfig {
+            enabled: false,
+            ..MetricsConfig::default()
+        };
         let registry = MetricsRegistry::new(&config).unwrap();
         let stats = registry.get_stats();
         assert!(!stats.enabled);

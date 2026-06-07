@@ -378,10 +378,11 @@ mod tests {
 
     #[test]
     fn test_fault_probabilities() {
-        let mut config = FaultInjectionConfig::default();
-        config.enable_random = true;
-        config.random_probability = 1.0; // Always inject
-
+        let config = FaultInjectionConfig {
+            enable_random: true,
+            random_probability: 1.0,
+            ..FaultInjectionConfig::default()
+        };
         let mut injector = FaultInjector::new(config);
         let connector_ids = vec![1, 2, 3];
 

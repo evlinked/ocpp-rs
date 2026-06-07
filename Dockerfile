@@ -1,5 +1,5 @@
 # Multi-stage build for ocpp-rs
-FROM rust:1.85-slim as builder
+FROM rust:1.88-slim as builder
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \

@@ -7,7 +7,6 @@ use ocpp_transport::TransportConfig;
 use ocpp_types::v16j::ChargePointVendorInfo;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::time::Duration;
 
 /// Main simulator configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]

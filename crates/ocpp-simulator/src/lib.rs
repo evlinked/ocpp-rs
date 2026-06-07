@@ -36,7 +36,7 @@ use axum::{
     routing::{get, post, put},
     Router,
 };
-use ocpp_cp::{ChargePoint, ChargePointConfig, ChargePointEvent};
+use ocpp_cp::{ChargePoint, ChargePointConfig};
 use ocpp_types::v16j::{ChargePointErrorCode, ChargePointStatus};
 use ocpp_types::ConnectorId;
 use serde::{Deserialize, Serialize};
@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
 /// Simulator statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -417,11 +417,11 @@ async fn get_connector(
 
 /// Execute connector command
 async fn execute_connector_command(
-    State(state): State<SimulatorState>,
+    State(_state): State<SimulatorState>,
     Path(id): Path<u32>,
     Json(command): Json<ConnectorCommand>,
 ) -> Result<Json<SimulatorResponse<()>>, StatusCode> {
-    let connector_id = ConnectorId::new(id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let _connector_id = ConnectorId::new(id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     match command.command.as_str() {
         "suspend_ev" => {
@@ -560,11 +560,7 @@ async fn inject_fault(
 
     match state
         .charge_point
-        .set_fault(
-            connector_id,
-            fault_req.error_code.clone(),
-            fault_req.info.clone(),
-        )
+        .set_fault(connector_id, fault_req.error_code, fault_req.info.clone())
         .await
     {
         Ok(()) => {
@@ -837,9 +833,6 @@ mod tests {
             start_time: chrono::Utc::now(),
         };
 
-        let router = create_api_router(state);
-
-        // Just test that router creation succeeds
-        assert!(true); // Router created successfully
+        let _router = create_api_router(state);
     }
 }

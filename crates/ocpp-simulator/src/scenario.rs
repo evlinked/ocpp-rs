@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Scenario execution status
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -440,7 +440,7 @@ impl ScenarioExecutor {
             _ => ChargePointErrorCode::OtherError,
         };
 
-        let info = step.parameters.get("info").and_then(|v| v.as_str());
+        let _info = step.parameters.get("info").and_then(|v| v.as_str());
 
         debug!(
             "Executing inject_fault for connector {} with error_code: {:?}",

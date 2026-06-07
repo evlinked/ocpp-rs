@@ -7,14 +7,14 @@
 use crate::{
     config::SimulatorConfig,
     error::SimulatorError,
-    events::{EventStore, SimulatorEvent, SimulatorEventHandler},
+    events::{EventStore, SimulatorEvent},
     fault_injector::{FaultInjectionConfig, FaultInjector},
     meter_simulator::MeterSimulator,
     scenario::ScenarioManager,
     websocket::{WebSocketClient, WebSocketConfig},
 };
 use anyhow::Result;
-use ocpp_cp::{ChargePoint, ChargePointConfig, ChargePointEvent};
+use ocpp_cp::{ChargePoint, ChargePointConfig};
 use ocpp_types::v16j::{ChargePointErrorCode, ChargePointStatus};
 use ocpp_types::ConnectorId;
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Simulator runtime statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +84,7 @@ pub struct Simulator {
     /// Meter simulators by connector
     meter_simulators: Arc<RwLock<HashMap<u32, MeterSimulator>>>,
     /// WebSocket client for external communication
+    #[allow(dead_code)]
     websocket_client: Arc<RwLock<Option<WebSocketClient>>>,
     /// Event sender
     event_sender: mpsc::UnboundedSender<SimulatorEvent>,
@@ -372,7 +373,7 @@ impl Simulator {
             } else {
                 return Err(SimulatorError::resource_not_found(
                     "meter_simulator",
-                    &connector_id.to_string(),
+                    connector_id.to_string().as_str(),
                 ));
             }
         };

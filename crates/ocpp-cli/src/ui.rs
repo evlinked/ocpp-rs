@@ -7,10 +7,8 @@ use anyhow::Result;
 use colored::*;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::Rng;
 use std::collections::HashMap;
 use std::time::Duration;
-use tracing::info;
 
 /// CLI theme configuration
 pub struct CliTheme {
@@ -190,6 +188,7 @@ impl Default for InteractiveMenu {
 
 /// Status display utilities
 pub struct StatusDisplay {
+    #[allow(dead_code)]
     theme: CliTheme,
 }
 
@@ -536,7 +535,7 @@ pub mod utils {
             } else if line.trim().starts_with('"') {
                 // String value
                 println!("{}", line.bright_green());
-            } else if line.trim().chars().next().map_or(false, |c| c.is_numeric()) {
+            } else if line.trim().chars().next().is_some_and(|c| c.is_numeric()) {
                 // Numeric value
                 println!("{}", line.bright_yellow());
             } else {

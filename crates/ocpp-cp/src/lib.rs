@@ -18,8 +18,8 @@ use connector::{Connector, ConnectorConfig};
 use error::ChargePointError;
 use message_handler::MessageHandler;
 use ocpp_messages::v16j::{
-    BootNotificationRequest, BootNotificationResponse, HeartbeatRequest, HeartbeatResponse,
-    RegistrationStatus, StatusNotificationRequest, StatusNotificationResponse,
+    BootNotificationRequest, BootNotificationResponse, HeartbeatRequest, RegistrationStatus,
+    StatusNotificationRequest,
 };
 use ocpp_messages::{Message, OcppAction};
 use ocpp_transport::client::WebSocketClient;
@@ -33,8 +33,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
+use tracing::{error, info, warn};
 
 /// Charge point configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
