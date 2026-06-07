@@ -147,7 +147,9 @@ impl Simulator {
         }
 
         // Create fault injector
-        let fault_injector = Arc::new(RwLock::new(FaultInjector::new(FaultInjectionConfig::default())));
+        let fault_injector = Arc::new(RwLock::new(FaultInjector::new(
+            FaultInjectionConfig::default(),
+        )));
 
         // Create meter simulators for each connector
         let mut meter_simulators = HashMap::new();

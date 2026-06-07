@@ -449,9 +449,10 @@ async fn plug_in_connector(
 
     match state.charge_point.plug_in(connector_id).await {
         Ok(()) => {
-            let _ = state
-                .event_sender
-                .send(SimulatorEvent::ConnectorPluggedIn { connector_id: id, timestamp: chrono::Utc::now() });
+            let _ = state.event_sender.send(SimulatorEvent::ConnectorPluggedIn {
+                connector_id: id,
+                timestamp: chrono::Utc::now(),
+            });
             Ok(Json(SimulatorResponse::success_empty()))
         }
         Err(e) => {
@@ -472,7 +473,10 @@ async fn plug_out_connector(
         Ok(()) => {
             let _ = state
                 .event_sender
-                .send(SimulatorEvent::ConnectorPluggedOut { connector_id: id, timestamp: chrono::Utc::now() });
+                .send(SimulatorEvent::ConnectorPluggedOut {
+                    connector_id: id,
+                    timestamp: chrono::Utc::now(),
+                });
             Ok(Json(SimulatorResponse::success_empty()))
         }
         Err(e) => {
@@ -588,9 +592,10 @@ async fn clear_fault(
 
     match state.charge_point.clear_fault(connector_id).await {
         Ok(()) => {
-            let _ = state
-                .event_sender
-                .send(SimulatorEvent::FaultCleared { connector_id: id, timestamp: chrono::Utc::now() });
+            let _ = state.event_sender.send(SimulatorEvent::FaultCleared {
+                connector_id: id,
+                timestamp: chrono::Utc::now(),
+            });
             Ok(Json(SimulatorResponse::success_empty()))
         }
         Err(e) => {

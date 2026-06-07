@@ -348,7 +348,8 @@ impl MeterSimulator {
         // Apply power variation
         if self.config.power_variation > 0.0 {
             let mut rng = thread_rng();
-            let variation = rng.gen_range(-self.config.power_variation..=self.config.power_variation);
+            let variation =
+                rng.gen_range(-self.config.power_variation..=self.config.power_variation);
             self.current_power_w *= 1.0 + variation;
         }
 
