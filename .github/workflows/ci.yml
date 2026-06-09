@@ -128,12 +128,12 @@ jobs:
         DATABASE_URL: postgres://postgres:postgres@localhost:5432/ocpp_test
 
     - name: Upload coverage reports
-      uses: codecov/codecov-action@v3
+      uses: codecov/codecov-action@v5
       with:
-        file: coverage/cobertura.xml
+        files: coverage/cobertura.xml
         flags: unittests
         name: codecov-umbrella
-        fail_ci_if_error: true
+        fail_ci_if_error: false
 
   security:
     name: Security Audit
