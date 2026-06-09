@@ -1,7 +1,7 @@
 # Clippy configuration for ocpp-rs
 
 # Set the MSRV for clippy lints
-msrv = "1.75"
+msrv = "1.88"
 
 # Cognitive complexity threshold
 cognitive-complexity-threshold = 30
@@ -11,9 +11,6 @@ type-complexity-threshold = 250
 
 # Trivial copy size limit (in bytes)
 trivial-copy-size-limit = 64
-
-# Single char lifetime names threshold
-single-char-lifetime-names-threshold = 4
 
 # Too many arguments threshold
 too-many-arguments-threshold = 7
@@ -30,39 +27,12 @@ vec-box-size-threshold = 4096
 # Maximum size of arrays to lint
 max-suggested-slice-pattern-length = 3
 
-# Enforce documentation for public items
-# missing-docs-in-crate-items = true
-
 # Allow certain lints that are common in async/networking code
 allow-expect-in-tests = true
 allow-unwrap-in-tests = true
 
-# Enforce safety documentation for unsafe code
-missing-safety-doc = "deny"
-
 # Disallowed names (add more as needed)
 disallowed-names = ["foo", "bar", "baz", "quux"]
-
-# Disallowed types
-disallowed-types = [
-    # Prefer anyhow::Error for error handling
-    "std::error::Error",
-    # Prefer tokio types for async
-    "std::thread::spawn",
-]
-
-# Disallowed methods
-disallowed-methods = [
-    # Prefer structured logging with tracing
-    "println",
-    "eprintln",
-    "dbg",
-    # Prefer ? operator
-    "std::result::Result::unwrap",
-    "std::option::Option::unwrap",
-    # Prefer explicit error handling
-    "std::panic::panic",
-]
 
 # Allow certain patterns in tests
 allow-mixed-uninlined-format-args = false

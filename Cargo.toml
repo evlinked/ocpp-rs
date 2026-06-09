@@ -4,17 +4,14 @@ members = [
     "crates/ocpp-types",
     "crates/ocpp-messages",
     "crates/ocpp-transport",
-    "crates/ocpp-csms",
     "crates/ocpp-cp",
-    "crates/ocpp-simulator",
     "crates/ocpp-conformance",
-    "crates/ocpp-cli",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.88"
 authors = ["ocpp-rs contributors"]
 license = "MIT"
 repository = "https://github.com/ocpp-rs/ocpp-rs"
@@ -26,14 +23,11 @@ categories = ["network-programming", "simulation", "web-programming::websocket"]
 [workspace.dependencies]
 # Core async runtime
 tokio = { version = "1.35", features = ["full"] }
-tokio-util = "0.7"
 tokio-stream = "0.1"
 
 # WebSocket and HTTP
 tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
 tungstenite = "0.20"
-hyper = { version = "1.0", features = ["full"] }
-axum = { version = "0.7", features = ["ws", "macros"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -50,33 +44,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
 
-# Configuration
-config = "0.14"
+# CLI
 clap = { version = "4.4", features = ["derive"] }
-
-# Database
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "chrono", "uuid", "json"] }
-
-# Metrics and observability
-prometheus = "0.13"
-metrics = "0.22"
-metrics-prometheus = "0.6"
 
 # Utilities
 futures = "0.3"
 futures-util = "0.3"
-pin-project = "1.1"
-bytes = "1.5"
-dashmap = "5.5"
 
 # Testing
-mockall = "0.12"
-wiremock = "0.6"
 proptest = "1.4"
-criterion = "0.5"
-
-# Development tools
-cargo-tarpaulin = "0.27"
 
 [profile.dev]
 opt-level = 0

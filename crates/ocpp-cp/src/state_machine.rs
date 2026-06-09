@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use tracing::{debug, info, warn};
 
 /// State machine events that can trigger state transitions
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum StateMachineEvent {
     /// Cable plugged in
     CablePluggedIn,
@@ -154,11 +154,11 @@ impl ConnectorStateMachine {
             (
                 (
                     Available,
-                    Reserved {
+                    StateMachineEvent::Reserved {
                         id_tag: String::new(),
                     },
                 ),
-                Reserved,
+                ChargePointStatus::Reserved,
             ),
             ((Available, MakeUnavailable), Unavailable),
             (
@@ -394,8 +394,8 @@ impl ConnectorStateMachine {
             (Unavailable, MakeAvailable) => Some(Available),
 
             // Reservation handling
-            (Available, Reserved { .. }) => Some(Reserved),
-            (Reserved, ReservationCancelled) => Some(Available),
+            (Available, StateMachineEvent::Reserved { .. }) => Some(ChargePointStatus::Reserved),
+            (ChargePointStatus::Reserved, ReservationCancelled) => Some(Available),
 
             // Emergency stop
             (Charging, EmergencyStop) => Some(Finishing),
@@ -480,7 +480,7 @@ impl ConnectorStateMachine {
             }
 
             // Validate reservation events
-            (Available, Reserved, Reserved { id_tag }) => {
+            (Available, ChargePointStatus::Reserved, StateMachineEvent::Reserved { id_tag }) => {
                 if id_tag.trim().is_empty() {
                     return Err(ChargePointError::validation(
                         "id_tag",
@@ -601,7 +601,7 @@ impl ConnectorStateMachine {
         match self.current_state {
             Available => vec![
                 CablePluggedIn,
-                Reserved {
+                StateMachineEvent::Reserved {
                     id_tag: "".to_string(),
                 },
                 MakeUnavailable,
