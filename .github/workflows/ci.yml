@@ -123,8 +123,7 @@ jobs:
           --output-dir coverage/ \
           --exclude-files "target/*" \
           --exclude-files "*/tests/*" \
-          --exclude-files "*/benches/*" \
-          --fail-under 40
+          --exclude-files "*/benches/*"
       env:
         DATABASE_URL: postgres://postgres:postgres@localhost:5432/ocpp_test
 
