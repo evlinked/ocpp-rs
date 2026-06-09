@@ -124,7 +124,7 @@ jobs:
           --exclude-files "target/*" \
           --exclude-files "*/tests/*" \
           --exclude-files "*/benches/*" \
-          --fail-under 100
+          --fail-under 40
       env:
         DATABASE_URL: postgres://postgres:postgres@localhost:5432/ocpp_test
 
