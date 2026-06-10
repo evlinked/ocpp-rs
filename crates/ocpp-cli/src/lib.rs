@@ -2,12 +2,12 @@
 //!
 //! A library for building OCPP CLI applications and testing tools.
 
+#![allow(ambiguous_glob_reexports)]
+
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
-use tracing::{error, info};
+use tracing::info;
 
 // Re-export core types
 pub use ocpp_messages::*;
@@ -145,6 +145,7 @@ pub struct CliRunner {
     /// CLI configuration
     config: CliConfig,
     /// Event channel for simulator events
+    #[allow(dead_code)]
     event_channel: (
         mpsc::UnboundedSender<CliEvent>,
         mpsc::UnboundedReceiver<CliEvent>,
@@ -324,8 +325,7 @@ pub mod utils {
 
     /// Print application banner
     pub fn print_banner() {
-        println!(
-            "{}",
+        print!(
             r#"
    ____   ____ ____  ____     ____ _     ___
   / __ \ / ___/ __ \|  _ \   / ___| |   |_ _|

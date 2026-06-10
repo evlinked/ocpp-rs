@@ -111,7 +111,7 @@ fn init_tracing() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn load_config(path: &str) -> Result<CsmsConfig, Box<dyn std::error::Error>> {
+fn load_config(_path: &str) -> Result<CsmsConfig, Box<dyn std::error::Error>> {
     // For now, return default config
     // TODO: Implement actual config loading from file
     Ok(CsmsConfig::default())

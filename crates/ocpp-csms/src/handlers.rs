@@ -11,6 +11,7 @@ pub struct MessageHandlerRegistry {
     /// Firmware management handlers
     firmware_handlers: FirmwareHandlers,
     /// Smart charging handlers
+    #[allow(dead_code)]
     smart_charging_handlers: SmartChargingHandlers,
 }
 
@@ -330,9 +331,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_handler_registry_creation() {
-        let registry = MessageHandlerRegistry::new();
-        // Just test that it compiles and creates
-        assert!(true);
+        let _registry = MessageHandlerRegistry::new();
     }
 
     #[tokio::test]

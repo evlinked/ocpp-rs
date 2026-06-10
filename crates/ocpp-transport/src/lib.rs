@@ -15,7 +15,6 @@ pub use error::*;
 use ocpp_messages::Message;
 use ocpp_types::OcppResult;
 use std::time::Duration;
-use tracing::{debug, info};
 use uuid::Uuid;
 
 /// Transport configuration

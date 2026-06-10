@@ -7,14 +7,14 @@
 use crate::{
     config::SimulatorConfig,
     error::SimulatorError,
-    events::{EventStore, SimulatorEvent, SimulatorEventHandler},
-    fault_injector::FaultInjector,
+    events::{EventStore, SimulatorEvent},
+    fault_injector::{FaultInjectionConfig, FaultInjector},
     meter_simulator::MeterSimulator,
     scenario::ScenarioManager,
     websocket::{WebSocketClient, WebSocketConfig},
 };
 use anyhow::Result;
-use ocpp_cp::{ChargePoint, ChargePointConfig, ChargePointEvent};
+use ocpp_cp::{ChargePoint, ChargePointConfig};
 use ocpp_types::v16j::{ChargePointErrorCode, ChargePointStatus};
 use ocpp_types::ConnectorId;
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{interval, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Simulator runtime statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +84,7 @@ pub struct Simulator {
     /// Meter simulators by connector
     meter_simulators: Arc<RwLock<HashMap<u32, MeterSimulator>>>,
     /// WebSocket client for external communication
+    #[allow(dead_code)]
     websocket_client: Arc<RwLock<Option<WebSocketClient>>>,
     /// Event sender
     event_sender: mpsc::UnboundedSender<SimulatorEvent>,
@@ -147,7 +148,9 @@ impl Simulator {
         }
 
         // Create fault injector
-        let fault_injector = Arc::new(RwLock::new(FaultInjector::new(config.fault_config.clone())));
+        let fault_injector = Arc::new(RwLock::new(FaultInjector::new(
+            FaultInjectionConfig::default(),
+        )));
 
         // Create meter simulators for each connector
         let mut meter_simulators = HashMap::new();
@@ -323,10 +326,12 @@ impl Simulator {
         }
 
         // Set fault on charge point
-        let cp_connector_id = ConnectorId::new(connector_id)?;
+        let cp_connector_id = ConnectorId::new(connector_id)
+            .map_err(|e| SimulatorError::charge_point(e.to_string()))?;
         self.charge_point
             .set_fault(cp_connector_id, error_code, description)
-            .await?;
+            .await
+            .map_err(|e| SimulatorError::charge_point(e.to_string()))?;
 
         // Update statistics
         {
@@ -349,8 +354,12 @@ impl Simulator {
         }
 
         // Clear fault on charge point
-        let cp_connector_id = ConnectorId::new(connector_id)?;
-        self.charge_point.clear_fault(cp_connector_id).await?;
+        let cp_connector_id = ConnectorId::new(connector_id)
+            .map_err(|e| SimulatorError::charge_point(e.to_string()))?;
+        self.charge_point
+            .clear_fault(cp_connector_id)
+            .await
+            .map_err(|e| SimulatorError::charge_point(e.to_string()))?;
 
         Ok(())
     }
@@ -364,7 +373,7 @@ impl Simulator {
             } else {
                 return Err(SimulatorError::resource_not_found(
                     "meter_simulator",
-                    &connector_id.to_string(),
+                    connector_id.to_string().as_str(),
                 ));
             }
         };

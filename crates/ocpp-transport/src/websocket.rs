@@ -161,7 +161,7 @@ pub mod client {
     /// Connect to WebSocket server
     pub async fn connect(
         url: &str,
-        subprotocols: &[String],
+        _subprotocols: &[String],
         config: &TransportConfig,
     ) -> TransportResult<
         WebSocketConnection<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -313,8 +313,6 @@ pub mod server {
 
 /// WebSocket frame types and utilities
 pub mod frames {
-    use super::*;
-
     /// Frame type
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum FrameType {

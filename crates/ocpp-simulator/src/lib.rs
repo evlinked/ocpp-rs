@@ -36,7 +36,7 @@ use axum::{
     routing::{get, post, put},
     Router,
 };
-use ocpp_cp::{ChargePoint, ChargePointConfig, ChargePointEvent};
+use ocpp_cp::{ChargePoint, ChargePointConfig};
 use ocpp_types::v16j::{ChargePointErrorCode, ChargePointStatus};
 use ocpp_types::ConnectorId;
 use serde::{Deserialize, Serialize};
@@ -46,7 +46,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info};
 
 /// Simulator statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -417,11 +417,11 @@ async fn get_connector(
 
 /// Execute connector command
 async fn execute_connector_command(
-    State(state): State<SimulatorState>,
+    State(_state): State<SimulatorState>,
     Path(id): Path<u32>,
     Json(command): Json<ConnectorCommand>,
 ) -> Result<Json<SimulatorResponse<()>>, StatusCode> {
-    let connector_id = ConnectorId::new(id).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let _connector_id = ConnectorId::new(id).map_err(|_| StatusCode::BAD_REQUEST)?;
 
     match command.command.as_str() {
         "suspend_ev" => {
@@ -449,9 +449,10 @@ async fn plug_in_connector(
 
     match state.charge_point.plug_in(connector_id).await {
         Ok(()) => {
-            let _ = state
-                .event_sender
-                .send(SimulatorEvent::ConnectorPluggedIn { connector_id: id });
+            let _ = state.event_sender.send(SimulatorEvent::ConnectorPluggedIn {
+                connector_id: id,
+                timestamp: chrono::Utc::now(),
+            });
             Ok(Json(SimulatorResponse::success_empty()))
         }
         Err(e) => {
@@ -472,7 +473,10 @@ async fn plug_out_connector(
         Ok(()) => {
             let _ = state
                 .event_sender
-                .send(SimulatorEvent::ConnectorPluggedOut { connector_id: id });
+                .send(SimulatorEvent::ConnectorPluggedOut {
+                    connector_id: id,
+                    timestamp: chrono::Utc::now(),
+                });
             Ok(Json(SimulatorResponse::success_empty()))
         }
         Err(e) => {
@@ -504,6 +508,7 @@ async fn start_transaction(
                 connector_id: id,
                 transaction_id: 0, // Would be set from actual transaction
                 id_tag,
+                timestamp: chrono::Utc::now(),
             });
             Ok(Json(SimulatorResponse::success_empty()))
         }
@@ -533,6 +538,8 @@ async fn stop_transaction(
                 connector_id: id,
                 transaction_id: 0, // Would be set from actual transaction
                 reason: "Manual".to_string(),
+                energy_delivered_wh: None,
+                timestamp: chrono::Utc::now(),
             });
             Ok(Json(SimulatorResponse::success_empty()))
         }
@@ -553,11 +560,7 @@ async fn inject_fault(
 
     match state
         .charge_point
-        .set_fault(
-            connector_id,
-            fault_req.error_code.clone(),
-            fault_req.info.clone(),
-        )
+        .set_fault(connector_id, fault_req.error_code, fault_req.info.clone())
         .await
     {
         Ok(()) => {
@@ -565,6 +568,7 @@ async fn inject_fault(
                 connector_id: id,
                 error_code: fault_req.error_code,
                 info: fault_req.info,
+                timestamp: chrono::Utc::now(),
             });
             Ok(Json(SimulatorResponse::success_empty()))
         }
@@ -584,9 +588,10 @@ async fn clear_fault(
 
     match state.charge_point.clear_fault(connector_id).await {
         Ok(()) => {
-            let _ = state
-                .event_sender
-                .send(SimulatorEvent::FaultCleared { connector_id: id });
+            let _ = state.event_sender.send(SimulatorEvent::FaultCleared {
+                connector_id: id,
+                timestamp: chrono::Utc::now(),
+            });
             Ok(Json(SimulatorResponse::success_empty()))
         }
         Err(e) => {
@@ -619,6 +624,7 @@ async fn set_availability(
                 .send(SimulatorEvent::AvailabilityChanged {
                     connector_id: id,
                     available,
+                    timestamp: chrono::Utc::now(),
                 });
             Ok(Json(SimulatorResponse::success_empty()))
         }
@@ -681,6 +687,7 @@ async fn execute_scenario(
     // For now, just acknowledge the request
     let _ = state.event_sender.send(SimulatorEvent::ScenarioStarted {
         scenario: name.clone(),
+        timestamp: chrono::Utc::now(),
     });
 
     Json(SimulatorResponse::success_empty())
@@ -826,9 +833,6 @@ mod tests {
             start_time: chrono::Utc::now(),
         };
 
-        let router = create_api_router(state);
-
-        // Just test that router creation succeeds
-        assert!(true); // Router created successfully
+        let _router = create_api_router(state);
     }
 }

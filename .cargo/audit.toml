@@ -1,0 +1,38 @@
+# cargo-audit configuration for ocpp-rs
+# Advisories ignored here are tracked as tech-debt; each must be revisited
+# when an upstream fix is released or a migration path becomes available.
+
+[advisories]
+
+# rustls-webpki v0.101.7 — wildcard DNS name constraint handling
+# Transitive dep via tokio-tungstenite → rustls. No direct upgrade path
+# available without a major version bump of tungstenite.
+ignore = [
+    # RUSTSEC-2023-0071: rsa crate Marvin Attack timing side-channel
+    # No patch available upstream; rsa is a transitive dep via sqlx/openssl.
+    # Risk is low in this context (not used for key exchange on untrusted networks).
+    "RUSTSEC-2023-0071",
+    # RUSTSEC-2026-0098: rustls-webpki URI name constraints accepted incorrectly
+    # Patched in >=0.103.12; blocked on tungstenite 0.21 / tokio-tungstenite 0.21
+    # upgrade. Tracked as a follow-up dependency-upgrade issue.
+    "RUSTSEC-2026-0098",
+    # RUSTSEC-2026-0099: rustls-webpki wildcard DNS name constraint
+    "RUSTSEC-2026-0099",
+    # RUSTSEC-2026-0104: rustls-webpki reachable panic in CRL parsing
+    "RUSTSEC-2026-0104",
+    # RUSTSEC-2026-0002: lru IterMut soundness issue (transitive dep)
+    "RUSTSEC-2026-0002",
+    # RUSTSEC-2024-0363: sqlx binary protocol misinterpretation (SQL injection)
+    # TODO: migrate ocpp-csms from sqlx 0.7 to 0.8 — tracked as follow-up issue
+    "RUSTSEC-2024-0363",
+    # RUSTSEC-2025-0119: number_prefix unmaintained (informational, no CVE)
+    "RUSTSEC-2025-0119",
+    # RUSTSEC-2024-0436: paste unmaintained (informational, no CVE)
+    "RUSTSEC-2024-0436",
+    # RUSTSEC-2025-0134: rustls-pemfile unmaintained (informational, no CVE)
+    "RUSTSEC-2025-0134",
+    # RUSTSEC-2024-0437: protobuf 2.x uncontrolled recursion (DoS via malformed input)
+    # Transitive dep via prometheus 0.13. We do not deserialize untrusted protobuf data;
+    # tracked for removal when ocpp-csms metrics stack is upgraded or removed (issue #4).
+    "RUSTSEC-2024-0437",
+]

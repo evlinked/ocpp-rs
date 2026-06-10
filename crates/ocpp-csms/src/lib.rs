@@ -41,7 +41,7 @@ use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
 /// CSMS configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct CsmsConfig {
     /// Database configuration
     pub database: database::DatabaseConfig,
@@ -51,17 +51,6 @@ pub struct CsmsConfig {
     pub auth: auth::AuthConfig,
     /// Metrics configuration
     pub metrics: metrics::MetricsConfig,
-}
-
-impl Default for CsmsConfig {
-    fn default() -> Self {
-        Self {
-            database: database::DatabaseConfig::default(),
-            server: server::ServerConfig::default(),
-            auth: auth::AuthConfig::default(),
-            metrics: metrics::MetricsConfig::default(),
-        }
-    }
 }
 
 /// Central System Management System

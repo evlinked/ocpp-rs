@@ -18,7 +18,7 @@ use futures::{sink::SinkExt, stream::StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use tokio::sync::broadcast;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// WebSocket message types for event streaming
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -158,14 +158,14 @@ pub async fn websocket_handler(
 }
 
 /// Handle WebSocket connection for event streaming
-async fn handle_websocket(socket: WebSocket, state: SimulatorState) {
+async fn handle_websocket(socket: WebSocket, _state: SimulatorState) {
     let (mut sender, mut receiver) = socket.split();
 
     info!("New WebSocket connection established");
 
     // Create event receiver
     let mut event_receiver = {
-        let (tx, rx) = broadcast::channel(100);
+        let (_tx, rx) = broadcast::channel(100);
         // In a real implementation, this would connect to the event store
         rx
     };
@@ -249,7 +249,7 @@ async fn handle_websocket(socket: WebSocket, state: SimulatorState) {
 async fn get_event_history(
     Query(params): Query<HashMap<String, String>>,
 ) -> Json<crate::SimulatorResponse<Vec<SimulatorEvent>>> {
-    let limit = params
+    let _limit = params
         .get("limit")
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or(100);
@@ -276,7 +276,7 @@ async fn get_event_history(
             .collect::<Option<Vec<_>>>()
     });
 
-    let filter = EventFilter {
+    let _filter = EventFilter {
         min_severity,
         event_types,
         connector_ids,

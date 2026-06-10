@@ -8,38 +8,14 @@
 //! - Status notifications to Central System
 
 use crate::error::ChargePointError;
-use crate::transaction::{Transaction, TransactionState};
+use crate::transaction::Transaction;
 use anyhow::Result;
 use ocpp_types::v16j::{ChargePointErrorCode, ChargePointStatus};
-use ocpp_types::{ConnectorId, TransactionId};
+use ocpp_types::ConnectorId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, info, warn};
-
-/// Connector identifier (internal representation)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct ConnectorId(pub u32);
-
-impl ConnectorId {
-    pub fn new(id: u32) -> Result<Self> {
-        if id == 0 {
-            Err(anyhow::anyhow!("Connector ID cannot be 0"))
-        } else {
-            Ok(ConnectorId(id))
-        }
-    }
-
-    pub fn value(&self) -> u32 {
-        self.0
-    }
-}
-
-impl std::fmt::Display for ConnectorId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
 
 /// Connector configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +37,7 @@ pub struct ConnectorConfig {
 }
 
 /// Connector physical state
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnectorPhysicalState {
     /// Cable not plugged
     Unplugged,
@@ -272,7 +248,7 @@ impl Connector {
     /// Plug in cable
     pub async fn plug_in(&mut self) -> Result<()> {
         let current_status = self.status().await;
-        let physical_state = self.physical_state().await;
+        let _physical_state = self.physical_state().await;
 
         debug!("Plugging in connector {}", self.config.connector_id);
 
@@ -404,7 +380,7 @@ impl Connector {
             ChargePointStatus::Preparing => {
                 // Create and start transaction
                 let transaction = Transaction::new(
-                    self.config.connector_id.into(),
+                    self.config.connector_id,
                     id_tag.clone(),
                     self.last_meter_reading.read().await.energy_wh as i32,
                 )?;
@@ -560,7 +536,7 @@ impl Connector {
             self.config.connector_id, error_code, info
         );
 
-        *self.error_code.write().await = error_code.clone();
+        *self.error_code.write().await = error_code;
         *self.error_info.write().await = info.clone();
 
         // Only change to Faulted if not NoError
@@ -616,12 +592,11 @@ impl Connector {
         if current_status == ChargePointStatus::Available {
             *self.reserved_for.write().await = Some(id_tag.clone());
             self.set_status(ChargePointStatus::Reserved).await?;
-            self.send_event(ConnectorEvent::Reserved { id_tag }).await;
-
             info!(
                 "Connector {} reserved for user: {}",
                 self.config.connector_id, id_tag
             );
+            self.send_event(ConnectorEvent::Reserved { id_tag }).await;
         } else {
             return Err(ChargePointError::InvalidOperation(format!(
                 "Cannot reserve connector in status: {:?}",
@@ -654,13 +629,11 @@ impl Connector {
 
     /// Update meter reading
     pub async fn update_meter_reading(&self, reading: MeterReading) -> Result<()> {
+        let energy_wh = reading.energy_wh;
         *self.last_meter_reading.write().await = reading;
 
-        // Update transaction if active
         if let Some(transaction) = self.current_transaction.write().await.as_mut() {
-            transaction
-                .update_meter_reading(reading.energy_wh as i32)
-                .await?;
+            transaction.update_meter_reading(energy_wh as i32).await?;
         }
 
         Ok(())
@@ -918,26 +891,13 @@ mod tests {
             energy_meter_serial: Some("EM001".to_string()),
         };
 
-        let mut connector = Connector::new(config).unwrap();
+        let connector = Connector::new(config).unwrap();
 
-        // Test meter reading update
-        let meter_reading = MeterValue {
-            timestamp: chrono::Utc::now(),
-            sampled_value: vec![SampledValue {
-                value: "12500".to_string(),
-                context: Some(ReadingContext::SampleClock),
-                format: Some(ValueFormat::Raw),
-                measurand: Some(Measurand::EnergyActiveImportRegister),
-                phase: None,
-                location: Some(Location::Outlet),
-                unit: Some(UnitOfMeasure::Wh),
-            }],
-        };
+        let reading = MeterReading::new(12500.0, 7360.0, 230.0, 32.0);
+        connector.update_meter_reading(reading).await.unwrap();
 
-        connector.update_meter_reading(meter_reading).await.unwrap();
-
-        // Verify the meter reading was updated
-        let status = connector.status();
-        assert!(status.last_meter_reading.is_some());
+        let last = connector.last_meter_reading().await;
+        assert_eq!(last.energy_wh, 12500.0);
+        assert_eq!(last.power_w, 7360.0);
     }
 }

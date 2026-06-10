@@ -461,11 +461,12 @@ impl Transaction {
 
     /// Add detailed meter value
     pub async fn add_meter_value(&mut self, meter_value: MeterValue) -> Result<()> {
+        let energy_wh = meter_value.energy_wh;
         self.data.add_meter_value(meter_value);
 
         debug!(
             "Detailed meter value added for transaction {}: {} Wh",
-            self.data.transaction_id, meter_value.energy_wh
+            self.data.transaction_id, energy_wh
         );
 
         Ok(())
@@ -758,7 +759,7 @@ mod tests {
         let connector_id = ConnectorId::new(1).unwrap();
 
         // Create transaction
-        let tx_id = manager
+        let _tx_id = manager
             .create_transaction(connector_id, "test_user".to_string(), 1000, None)
             .await
             .unwrap();

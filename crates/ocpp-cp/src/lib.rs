@@ -14,16 +14,18 @@ pub mod state_machine;
 pub mod transaction;
 
 use anyhow::Result;
-use connector::{Connector, ConnectorConfig, ConnectorId as CpConnectorId};
+use connector::{Connector, ConnectorConfig};
 use error::ChargePointError;
 use message_handler::MessageHandler;
 use ocpp_messages::v16j::{
-    BootNotificationRequest, BootNotificationResponse, HeartbeatRequest, HeartbeatResponse,
-    RegistrationStatus, StatusNotificationRequest, StatusNotificationResponse,
+    BootNotificationRequest, BootNotificationResponse, HeartbeatRequest, RegistrationStatus,
+    StatusNotificationRequest,
 };
 use ocpp_messages::{Message, OcppAction};
 use ocpp_transport::client::WebSocketClient;
-use ocpp_transport::{MessageHandler as TransportMessageHandler, TransportConfig, TransportEvent};
+use ocpp_transport::{
+    MessageHandler as TransportMessageHandler, Transport, TransportConfig, TransportEvent,
+};
 use ocpp_types::v16j::{ChargePointStatus, ChargePointVendorInfo};
 use ocpp_types::{ConnectorId, OcppResult};
 use serde::{Deserialize, Serialize};
@@ -31,8 +33,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
+use tracing::{error, info, warn};
 
 /// Charge point configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,7 +56,8 @@ pub struct ChargePointConfig {
     pub max_connection_retries: u32,
     /// Enable automatic reconnection
     pub auto_reconnect: bool,
-    /// Transport configuration
+    /// Transport configuration (not serialized; uses Default on deserialization)
+    #[serde(skip)]
     pub transport_config: TransportConfig,
 }
 
@@ -160,7 +162,7 @@ impl ChargePoint {
         for i in 1..=config.connector_count {
             let connector_id = ConnectorId::new(i)?;
             let connector_config = ConnectorConfig {
-                connector_id: CpConnectorId(i),
+                connector_id,
                 connector_type: "Type2".to_string(),
                 max_amperage: 32.0,
                 max_voltage: 230.0,
@@ -324,11 +326,11 @@ impl ChargePoint {
                 }
 
                 let request = HeartbeatRequest {};
-                let message = match Message::Call(ocpp_messages::CallMessage::new(
+                let message = match ocpp_messages::CallMessage::new(
                     HeartbeatRequest::ACTION_NAME.to_string(),
                     request,
-                )) {
-                    Ok(msg) => msg,
+                ) {
+                    Ok(call) => Message::Call(call),
                     Err(e) => {
                         error!("Failed to create heartbeat message: {}", e);
                         continue;
@@ -481,11 +483,11 @@ impl ChargePoint {
         info: Option<String>,
     ) -> Result<()> {
         let request = StatusNotificationRequest {
-            connector_id: connector_id.value() as i32,
+            connector_id: connector_id.value(),
             error_code,
             info,
             status,
-            timestamp: chrono::Utc::now(),
+            timestamp: Some(chrono::Utc::now()),
             vendor_error_code: None,
             vendor_id: None,
         };
@@ -569,11 +571,12 @@ mod tests {
         let cp = ChargePoint::new(config).unwrap();
         let connector_id = ConnectorId::new(1).unwrap();
 
-        // Test plug in/out
+        // Test plug in/out cycle
         cp.plug_in(connector_id).await.unwrap();
         cp.plug_out(connector_id).await.unwrap();
 
-        // Test transaction operations
+        // Test transaction operations (cable must be plugged in first)
+        cp.plug_in(connector_id).await.unwrap();
         cp.start_transaction(connector_id, "test_tag".to_string())
             .await
             .unwrap();

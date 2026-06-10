@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::{sleep, Instant};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Scenario execution status
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -168,6 +168,7 @@ impl ScenarioExecutor {
         if let Some(sender) = &self.event_sender {
             let _ = sender.send(SimulatorEvent::ScenarioStarted {
                 scenario: context.scenario.name.clone(),
+                timestamp: chrono::Utc::now(),
             });
         }
 
@@ -202,7 +203,8 @@ impl ScenarioExecutor {
             let step_duration = step_start.elapsed();
 
             let success = step_result.is_ok();
-            if !success {
+            let step_error = step_result.err().map(|e| e.to_string());
+            if step_error.is_some() {
                 overall_success = false;
             }
 
@@ -213,7 +215,7 @@ impl ScenarioExecutor {
                 success,
                 start_time: step_start_time,
                 duration: step_duration,
-                error: step_result.err().map(|e| e.to_string()),
+                error: step_error.clone(),
                 connector_id: step.connector_id,
             };
 
@@ -225,11 +227,16 @@ impl ScenarioExecutor {
                     scenario: context.scenario.name.clone(),
                     step: step.name.clone(),
                     success,
+                    timestamp: chrono::Utc::now(),
                 });
             }
 
             if !success {
-                error!("Step '{}' failed: {}", step.name, step_result.unwrap_err());
+                error!(
+                    "Step '{}' failed: {}",
+                    step.name,
+                    step_error.as_deref().unwrap_or("unknown error")
+                );
                 context.status = ScenarioStatus::Failed;
                 break;
             }
@@ -272,6 +279,7 @@ impl ScenarioExecutor {
                 scenario: context.scenario.name.clone(),
                 success: final_status == ScenarioStatus::Completed,
                 duration_seconds: duration.num_seconds() as u64,
+                timestamp: chrono::Utc::now(),
             });
         }
 
@@ -432,7 +440,7 @@ impl ScenarioExecutor {
             _ => ChargePointErrorCode::OtherError,
         };
 
-        let info = step.parameters.get("info").and_then(|v| v.as_str());
+        let _info = step.parameters.get("info").and_then(|v| v.as_str());
 
         debug!(
             "Executing inject_fault for connector {} with error_code: {:?}",

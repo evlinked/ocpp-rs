@@ -9,8 +9,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use tokio::time::sleep;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 
 /// Test suite configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,7 +197,7 @@ impl TestRunner {
                 .progress_chars("#>-"),
         );
 
-        for (_i, test_case) in self.test_cases.iter().enumerate() {
+        for test_case in &self.test_cases {
             pb.set_message(format!("Running: {}", test_case.name));
 
             let result = self.run_test_case(test_case).await;
