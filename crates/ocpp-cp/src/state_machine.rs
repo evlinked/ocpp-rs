@@ -502,14 +502,14 @@ impl ConnectorStateMachine {
             }
 
             // Validate fault events
-            (_, Faulted, FaultOccurred { error_code }) => {
-                if *error_code == ChargePointErrorCode::NoError {
-                    return Err(ChargePointError::validation(
-                        "error_code",
-                        "Cannot fault with NoError code",
-                    )
-                    .into());
-                }
+            (_, Faulted, FaultOccurred { error_code })
+                if *error_code == ChargePointErrorCode::NoError =>
+            {
+                return Err(ChargePointError::validation(
+                    "error_code",
+                    "Cannot fault with NoError code",
+                )
+                .into());
             }
 
             _ => {} // No additional validation needed
