@@ -5,11 +5,13 @@
 //! client (Charge Point) and server (Central System) sides.
 
 pub mod client;
+pub mod dispatcher;
 pub mod error;
 pub mod server;
 pub mod websocket;
 
 pub use client::WebSocketClient;
+pub use dispatcher::ActionDispatcher;
 pub use error::*;
 
 use ocpp_messages::Message;
