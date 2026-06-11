@@ -1,10 +1,8 @@
 //! WebSocket client implementation for OCPP Charge Points
 
 use crate::{
-    error::TransportResult,
-    pending::PendingCallMap,
-    websocket::client::connect,
-    ConnectionState, MessageHandler, Transport, TransportConfig, TransportEvent,
+    error::TransportResult, pending::PendingCallMap, websocket::client::connect, ConnectionState,
+    MessageHandler, Transport, TransportConfig, TransportEvent,
 };
 use ocpp_messages::Message;
 use ocpp_types::{OcppError, OcppResult};
@@ -152,14 +150,10 @@ impl WebSocketClient {
                                         Message::CallError(error_msg) => {
                                             let err = OcppError::CallError {
                                                 code: error_msg.error_code.clone(),
-                                                description: error_msg
-                                                    .error_description
-                                                    .clone(),
+                                                description: error_msg.error_description.clone(),
                                                 details: error_msg.error_details.clone(),
                                             };
-                                            if !pending_calls
-                                                .reject(&error_msg.unique_id, err)
-                                            {
+                                            if !pending_calls.reject(&error_msg.unique_id, err) {
                                                 warn!(
                                                     "CALLERROR for unknown unique_id '{}'",
                                                     error_msg.unique_id
@@ -173,8 +167,7 @@ impl WebSocketClient {
                                                 .await
                                             {
                                                 Ok(Some(response)) => {
-                                                    match serde_json::to_string(&response)
-                                                    {
+                                                    match serde_json::to_string(&response) {
                                                         Ok(response_json) => {
                                                             let mut conn =
                                                                 ws_connection.lock().await;
@@ -291,11 +284,9 @@ impl Transport for WebSocketClient {
 
         let tx = self.message_tx.read().await;
         if let Some(sender) = tx.as_ref() {
-            sender
-                .send(message)
-                .map_err(|_| OcppError::Transport {
-                    message: "Failed to send message: channel closed".to_string(),
-                })?;
+            sender.send(message).map_err(|_| OcppError::Transport {
+                message: "Failed to send message: channel closed".to_string(),
+            })?;
             Ok(())
         } else {
             Err(OcppError::Transport {
@@ -305,11 +296,9 @@ impl Transport for WebSocketClient {
     }
 
     async fn close(&self) -> OcppResult<()> {
-        self.disconnect()
-            .await
-            .map_err(|e| OcppError::Transport {
-                message: format!("Failed to close connection: {}", e),
-            })
+        self.disconnect().await.map_err(|e| OcppError::Transport {
+            message: format!("Failed to close connection: {}", e),
+        })
     }
 
     fn state(&self) -> ConnectionState {
