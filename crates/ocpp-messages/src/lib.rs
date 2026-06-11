@@ -3,10 +3,12 @@
 //! This crate provides message definitions and serialization for OCPP protocol messages.
 //! It includes all message types for OCPP 1.6J and provides a foundation for OCPP 2.0.1.
 
+pub mod dispatcher;
 pub mod serialization;
 pub mod v16j;
 pub mod validation;
 
+pub use dispatcher::ActionDispatcher;
 pub use ocpp_types::{CallErrorMessage, CallMessage, CallResultMessage, Message, MessageType};
 use ocpp_types::{OcppError, OcppResult};
 
