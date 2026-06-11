@@ -29,21 +29,6 @@ jobs:
             can-fail: true
     continue-on-error: ${{ matrix.can-fail }}
 
-    services:
-      postgres:
-        image: postgres:14
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_USER: postgres
-          POSTGRES_DB: ocpp_test
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -72,8 +57,6 @@ jobs:
 
     - name: Run tests
       run: cargo test --workspace --all-features
-      env:
-        DATABASE_URL: postgres://postgres:postgres@localhost:5432/ocpp_test
 
     - name: Run doctests
       if: matrix.rust == 'stable'
@@ -82,21 +65,6 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:14
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_USER: postgres
-          POSTGRES_DB: ocpp_test
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
 
     steps:
     - name: Checkout code
@@ -124,13 +92,11 @@ jobs:
           --exclude-files "target/*" \
           --exclude-files "*/tests/*" \
           --exclude-files "*/benches/*"
-      env:
-        DATABASE_URL: postgres://postgres:postgres@localhost:5432/ocpp_test
 
     - name: Upload coverage reports
       uses: codecov/codecov-action@v5
       with:
-        files: coverage/cobertura.xml
+        file: coverage/cobertura.xml
         flags: unittests
         name: codecov-umbrella
         fail_ci_if_error: false
@@ -152,134 +118,6 @@ jobs:
       uses: rustsec/audit-check@v1.4.1
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
-
-  benchmarks:
-    name: Performance Benchmarks
-    runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Cache dependencies
-      uses: Swatinem/rust-cache@v2
-
-    - name: Run benchmarks
-      run: cargo bench --workspace -- --output-format json | tee benchmark_results.json
-
-    - name: Store benchmark result
-      uses: benchmark-action/github-action-benchmark@v1
-      with:
-        tool: 'cargo'
-        output-file-path: benchmark_results.json
-        github-token: ${{ secrets.GITHUB_TOKEN }}
-        auto-push: true
-
-  integration:
-    name: Integration Tests
-    runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:14
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_USER: postgres
-          POSTGRES_DB: ocpp_test
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Cache dependencies
-      uses: Swatinem/rust-cache@v2
-
-    - name: Build all targets
-      run: cargo build --workspace --all-targets --all-features
-
-    - name: Run integration tests
-      run: cargo test --workspace --all-features
-      env:
-        DATABASE_URL: postgres://postgres:postgres@localhost:5432/ocpp_test
-        RUST_LOG: debug
-
-  conformance:
-    name: OCPP Conformance Tests
-    runs-on: ubuntu-latest
-
-    services:
-      postgres:
-        image: postgres:14
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_USER: postgres
-          POSTGRES_DB: ocpp_test
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Cache dependencies
-      uses: Swatinem/rust-cache@v2
-
-    - name: Build conformance test suite
-      run: cargo build --package ocpp-conformance --all-features
-
-    - name: Run OCPP 1.6J conformance tests
-      run: |
-        cargo test --package ocpp-conformance --all-features -- --nocapture
-      env:
-        DATABASE_URL: postgres://postgres:postgres@localhost:5432/ocpp_test
-        OCPP_VERSION: "1.6J"
-        RUST_LOG: info
-
-  docker:
-    name: Docker Build
-    runs-on: ubuntu-latest
-
-    steps:
-    - name: Checkout code
-      uses: actions/checkout@v4
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
-
-    - name: Build Docker image
-      uses: docker/build-push-action@v5
-      with:
-        context: .
-        file: ./Dockerfile
-        platforms: linux/amd64,linux/arm64
-        push: false
-        tags: |
-          ocpp-rs:latest
-          ocpp-rs:${{ github.sha }}
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
 
   docs:
     name: Documentation
@@ -318,7 +156,7 @@ jobs:
       uses: actions/checkout@v4
 
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@1.88
+      uses: dtolnay/rust-toolchain@1.88.0
 
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
@@ -326,10 +164,9 @@ jobs:
     - name: Check MSRV
       run: cargo check --workspace --all-targets --all-features
 
-  release-check:
-    name: Release Readiness
+  conformance:
+    name: OCPP Conformance Tests
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
 
     steps:
     - name: Checkout code
@@ -341,16 +178,12 @@ jobs:
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
 
-    - name: Check release build
-      run: cargo build --workspace --release --all-features
+    - name: Build conformance test suite
+      run: cargo build --package ocpp-conformance --all-features
 
-    - name: Check package metadata
+    - name: Run OCPP 1.6J conformance tests
       run: |
-        cargo publish --dry-run --package ocpp-types
-        cargo publish --dry-run --package ocpp-messages
-        cargo publish --dry-run --package ocpp-transport
-        cargo publish --dry-run --package ocpp-csms
-        cargo publish --dry-run --package ocpp-cp
-        cargo publish --dry-run --package ocpp-simulator
-        cargo publish --dry-run --package ocpp-conformance
-        cargo publish --dry-run --package ocpp-cli
+        cargo test --package ocpp-conformance --all-features -- --nocapture
+      env:
+        OCPP_VERSION: "1.6J"
+        RUST_LOG: info

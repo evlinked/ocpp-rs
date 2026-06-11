@@ -27,19 +27,12 @@ vec-box-size-threshold = 4096
 # Maximum size of arrays to lint
 max-suggested-slice-pattern-length = 3
 
-# Enforce documentation for public items
-# missing-docs-in-crate-items = true
-
 # Allow certain lints that are common in async/networking code
 allow-expect-in-tests = true
 allow-unwrap-in-tests = true
 
 # Disallowed names (add more as needed)
 disallowed-names = ["foo", "bar", "baz", "quux"]
-
-# Disallowed names (reserved for future use)
-# disallowed-types = []
-# disallowed-methods = []
 
 # Allow certain patterns in tests
 allow-mixed-uninlined-format-args = false
