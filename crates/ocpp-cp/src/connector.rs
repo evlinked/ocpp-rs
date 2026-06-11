@@ -37,7 +37,7 @@ pub struct ConnectorConfig {
 }
 
 /// Connector physical state
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ConnectorPhysicalState {
     /// Cable not plugged
     Unplugged,
@@ -248,6 +248,7 @@ impl Connector {
     /// Plug in cable
     pub async fn plug_in(&mut self) -> Result<()> {
         let current_status = self.status().await;
+        let _physical_state = self.physical_state().await;
 
         debug!("Plugging in connector {}", self.config.connector_id);
 
@@ -591,15 +592,11 @@ impl Connector {
         if current_status == ChargePointStatus::Available {
             *self.reserved_for.write().await = Some(id_tag.clone());
             self.set_status(ChargePointStatus::Reserved).await?;
-            self.send_event(ConnectorEvent::Reserved {
-                id_tag: id_tag.clone(),
-            })
-            .await;
-
             info!(
                 "Connector {} reserved for user: {}",
                 self.config.connector_id, id_tag
             );
+            self.send_event(ConnectorEvent::Reserved { id_tag }).await;
         } else {
             return Err(ChargePointError::InvalidOperation(format!(
                 "Cannot reserve connector in status: {:?}",
@@ -632,11 +629,11 @@ impl Connector {
 
     /// Update meter reading
     pub async fn update_meter_reading(&self, reading: MeterReading) -> Result<()> {
-        let energy_wh = reading.energy_wh as i32;
+        let energy_wh = reading.energy_wh;
         *self.last_meter_reading.write().await = reading;
 
         if let Some(transaction) = self.current_transaction.write().await.as_mut() {
-            transaction.update_meter_reading(energy_wh).await?;
+            transaction.update_meter_reading(energy_wh as i32).await?;
         }
 
         Ok(())
@@ -900,6 +897,7 @@ mod tests {
         connector.update_meter_reading(reading).await.unwrap();
 
         let last = connector.last_meter_reading().await;
-        assert!((last.energy_wh - 12500.0).abs() < f64::EPSILON);
+        assert_eq!(last.energy_wh, 12500.0);
+        assert_eq!(last.power_w, 7360.0);
     }
 }

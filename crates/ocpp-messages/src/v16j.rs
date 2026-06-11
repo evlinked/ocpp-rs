@@ -103,7 +103,7 @@ impl OcppAction for BootNotificationResponse {
 impl OcppResponse for BootNotificationResponse {}
 
 /// Registration status for BootNotification
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum RegistrationStatus {
     /// Charge point is accepted by central system
@@ -672,6 +672,285 @@ impl OcppAction for FirmwareStatusNotificationResponse {
 
 impl OcppResponse for FirmwareStatusNotificationResponse {}
 
+// =============================================================================
+// Smart Charging Profile Messages
+// =============================================================================
+
+/// SetChargingProfile request message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetChargingProfileRequest {
+    /// Connector to which the charging profile applies (0 = all connectors)
+    #[serde(rename = "connectorId")]
+    pub connector_id: i32,
+    /// Charging profile to set
+    #[serde(rename = "csChargingProfiles")]
+    pub cs_charging_profiles: ChargingProfile,
+}
+
+impl OcppAction for SetChargingProfileRequest {
+    const ACTION_NAME: &'static str = "SetChargingProfile";
+    type Response = SetChargingProfileResponse;
+}
+
+/// SetChargingProfile response message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetChargingProfileResponse {
+    /// Acceptance status of the profile
+    pub status: ChargingProfileStatus,
+}
+
+impl OcppAction for SetChargingProfileResponse {
+    const ACTION_NAME: &'static str = "SetChargingProfileResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for SetChargingProfileResponse {}
+
+/// ClearChargingProfile request message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClearChargingProfileRequest {
+    /// ID of the charging profile to clear (optional — clears all matching)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<i32>,
+    /// Connector whose profile should be cleared (optional)
+    #[serde(rename = "connectorId", skip_serializing_if = "Option::is_none")]
+    pub connector_id: Option<i32>,
+    /// Purpose of profiles to clear (optional)
+    #[serde(
+        rename = "chargingProfilePurpose",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub charging_profile_purpose: Option<ChargingProfilePurposeType>,
+    /// Stack level of profiles to clear (optional)
+    #[serde(rename = "stackLevel", skip_serializing_if = "Option::is_none")]
+    pub stack_level: Option<i32>,
+}
+
+impl OcppAction for ClearChargingProfileRequest {
+    const ACTION_NAME: &'static str = "ClearChargingProfile";
+    type Response = ClearChargingProfileResponse;
+}
+
+/// ClearChargingProfile response message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClearChargingProfileResponse {
+    /// Whether a matching profile was found and cleared
+    pub status: ClearChargingProfileStatus,
+}
+
+impl OcppAction for ClearChargingProfileResponse {
+    const ACTION_NAME: &'static str = "ClearChargingProfileResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for ClearChargingProfileResponse {}
+
+/// GetCompositeSchedule request message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetCompositeScheduleRequest {
+    /// Connector for which to calculate the schedule (0 = entire charge point)
+    #[serde(rename = "connectorId")]
+    pub connector_id: i32,
+    /// Length of the schedule in seconds
+    pub duration: i32,
+    /// Desired unit of measure in the response (optional)
+    #[serde(rename = "chargingRateUnit", skip_serializing_if = "Option::is_none")]
+    pub charging_rate_unit: Option<ChargingRateUnitType>,
+}
+
+impl OcppAction for GetCompositeScheduleRequest {
+    const ACTION_NAME: &'static str = "GetCompositeSchedule";
+    type Response = GetCompositeScheduleResponse;
+}
+
+/// GetCompositeSchedule response message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetCompositeScheduleResponse {
+    /// Whether the CSMS was able to process the request
+    pub status: GetCompositeScheduleStatus,
+    /// Connector for which the schedule is returned (optional)
+    #[serde(rename = "connectorId", skip_serializing_if = "Option::is_none")]
+    pub connector_id: Option<i32>,
+    /// Start time of the schedule (optional)
+    #[serde(rename = "scheduleStart", skip_serializing_if = "Option::is_none")]
+    pub schedule_start: Option<DateTime<Utc>>,
+    /// Composite charging schedule (optional)
+    #[serde(rename = "chargingSchedule", skip_serializing_if = "Option::is_none")]
+    pub charging_schedule: Option<ChargingSchedule>,
+}
+
+impl OcppAction for GetCompositeScheduleResponse {
+    const ACTION_NAME: &'static str = "GetCompositeScheduleResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for GetCompositeScheduleResponse {}
+
+// =============================================================================
+// Reservation Profile Messages
+// =============================================================================
+
+/// ReserveNow request message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReserveNowRequest {
+    /// Connector to reserve (0 = no specific connector)
+    #[serde(rename = "connectorId")]
+    pub connector_id: i32,
+    /// Expiry date and time of the reservation
+    #[serde(rename = "expiryDate")]
+    pub expiry_date: DateTime<Utc>,
+    /// Identifier to be used for the reservation
+    #[serde(rename = "idTag")]
+    pub id_tag: IdToken,
+    /// Unique reservation ID
+    #[serde(rename = "reservationId")]
+    pub reservation_id: i32,
+    /// Parent identifier (optional)
+    #[serde(rename = "parentIdTag", skip_serializing_if = "Option::is_none")]
+    pub parent_id_tag: Option<String>,
+}
+
+impl OcppAction for ReserveNowRequest {
+    const ACTION_NAME: &'static str = "ReserveNow";
+    type Response = ReserveNowResponse;
+}
+
+/// ReserveNow response message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReserveNowResponse {
+    /// Acceptance status of the reservation request
+    pub status: ReservationStatus,
+}
+
+impl OcppAction for ReserveNowResponse {
+    const ACTION_NAME: &'static str = "ReserveNowResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for ReserveNowResponse {}
+
+/// CancelReservation request message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelReservationRequest {
+    /// ID of the reservation to cancel
+    #[serde(rename = "reservationId")]
+    pub reservation_id: i32,
+}
+
+impl OcppAction for CancelReservationRequest {
+    const ACTION_NAME: &'static str = "CancelReservation";
+    type Response = CancelReservationResponse;
+}
+
+/// CancelReservation response message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CancelReservationResponse {
+    /// Whether the cancellation was accepted
+    pub status: CancelReservationStatus,
+}
+
+impl OcppAction for CancelReservationResponse {
+    const ACTION_NAME: &'static str = "CancelReservationResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for CancelReservationResponse {}
+
+// =============================================================================
+// Remote Trigger Profile Messages
+// =============================================================================
+
+/// TriggerMessage request message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TriggerMessageRequest {
+    /// Type of message to trigger
+    #[serde(rename = "requestedMessage")]
+    pub requested_message: MessageTrigger,
+    /// Connector for which the message should be triggered (optional)
+    #[serde(rename = "connectorId", skip_serializing_if = "Option::is_none")]
+    pub connector_id: Option<i32>,
+}
+
+impl OcppAction for TriggerMessageRequest {
+    const ACTION_NAME: &'static str = "TriggerMessage";
+    type Response = TriggerMessageResponse;
+}
+
+/// TriggerMessage response message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TriggerMessageResponse {
+    /// Whether the trigger was accepted
+    pub status: TriggerMessageStatus,
+}
+
+impl OcppAction for TriggerMessageResponse {
+    const ACTION_NAME: &'static str = "TriggerMessageResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for TriggerMessageResponse {}
+
+// =============================================================================
+// Local Authorization List Profile Messages
+// =============================================================================
+
+/// GetLocalListVersion request message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetLocalListVersionRequest {}
+
+impl OcppAction for GetLocalListVersionRequest {
+    const ACTION_NAME: &'static str = "GetLocalListVersion";
+    type Response = GetLocalListVersionResponse;
+}
+
+/// GetLocalListVersion response message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetLocalListVersionResponse {
+    /// Version number of the local authorization list
+    #[serde(rename = "listVersion")]
+    pub list_version: i32,
+}
+
+impl OcppAction for GetLocalListVersionResponse {
+    const ACTION_NAME: &'static str = "GetLocalListVersionResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for GetLocalListVersionResponse {}
+
+/// SendLocalList request message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SendLocalListRequest {
+    /// Version number of the list after this update
+    #[serde(rename = "listVersion")]
+    pub list_version: i32,
+    /// Whether to apply a full or differential update
+    #[serde(rename = "updateType")]
+    pub update_type: UpdateType,
+    /// Authorization list entries (empty for Full update means clear the list)
+    #[serde(rename = "localAuthorizationList", default)]
+    pub local_authorization_list: Vec<AuthorizationData>,
+}
+
+impl OcppAction for SendLocalListRequest {
+    const ACTION_NAME: &'static str = "SendLocalList";
+    type Response = SendLocalListResponse;
+}
+
+/// SendLocalList response message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SendLocalListResponse {
+    /// Acceptance status of the update
+    pub status: UpdateStatus,
+}
+
+impl OcppAction for SendLocalListResponse {
+    const ACTION_NAME: &'static str = "SendLocalListResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for SendLocalListResponse {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -806,5 +1085,282 @@ mod tests {
         let json = serde_json::to_string(&response).unwrap();
         let deserialized: HeartbeatResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(response, deserialized);
+    }
+
+    #[test]
+    fn test_set_charging_profile_request() {
+        let request = SetChargingProfileRequest {
+            connector_id: 1,
+            cs_charging_profiles: ChargingProfile {
+                charging_profile_id: 42,
+                transaction_id: None,
+                stack_level: 0,
+                charging_profile_purpose: ChargingProfilePurposeType::TxDefaultProfile,
+                charging_profile_kind: ChargingProfileKindType::Absolute,
+                recurrency_kind: None,
+                valid_from: None,
+                valid_to: None,
+                charging_schedule: ChargingSchedule {
+                    duration: Some(3600),
+                    start_schedule: None,
+                    charging_rate_unit: ChargingRateUnitType::A,
+                    charging_schedule_period: vec![ChargingSchedulePeriod {
+                        start_period: 0,
+                        limit: 16.0,
+                        number_phases: Some(3),
+                    }],
+                    min_charging_rate: None,
+                },
+            },
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("connectorId"));
+        assert!(json.contains("csChargingProfiles"));
+        let deserialized: SetChargingProfileRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, deserialized);
+
+        let response = SetChargingProfileResponse {
+            status: ChargingProfileStatus::Accepted,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("Accepted"));
+        let deserialized: SetChargingProfileResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(response, deserialized);
+    }
+
+    #[test]
+    fn test_clear_charging_profile_request() {
+        let request = ClearChargingProfileRequest {
+            id: Some(42),
+            connector_id: None,
+            charging_profile_purpose: Some(ChargingProfilePurposeType::TxDefaultProfile),
+            stack_level: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(!json.contains("connectorId"));
+        assert!(!json.contains("stackLevel"));
+        let deserialized: ClearChargingProfileRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, deserialized);
+
+        let all_none = ClearChargingProfileRequest {
+            id: None,
+            connector_id: None,
+            charging_profile_purpose: None,
+            stack_level: None,
+        };
+        let json = serde_json::to_string(&all_none).unwrap();
+        assert_eq!(json, "{}");
+
+        let response = ClearChargingProfileResponse {
+            status: ClearChargingProfileStatus::Accepted,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let deserialized: ClearChargingProfileResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(response, deserialized);
+    }
+
+    #[test]
+    fn test_get_composite_schedule_request() {
+        let request = GetCompositeScheduleRequest {
+            connector_id: 1,
+            duration: 86400,
+            charging_rate_unit: Some(ChargingRateUnitType::W),
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("chargingRateUnit"));
+        let deserialized: GetCompositeScheduleRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, deserialized);
+
+        let response = GetCompositeScheduleResponse {
+            status: GetCompositeScheduleStatus::Accepted,
+            connector_id: Some(1),
+            schedule_start: Some(DateTime::from_timestamp(1640995200, 0).unwrap()),
+            charging_schedule: None,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(!json.contains("chargingSchedule"));
+        let deserialized: GetCompositeScheduleResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(response, deserialized);
+
+        let rejected = GetCompositeScheduleResponse {
+            status: GetCompositeScheduleStatus::Rejected,
+            connector_id: None,
+            schedule_start: None,
+            charging_schedule: None,
+        };
+        let json = serde_json::to_string(&rejected).unwrap();
+        assert_eq!(json, r#"{"status":"Rejected"}"#);
+    }
+
+    #[test]
+    fn test_reserve_now_request() {
+        let request = ReserveNowRequest {
+            connector_id: 1,
+            expiry_date: DateTime::from_timestamp(1640995200, 0).unwrap(),
+            id_tag: "RFID001".to_string(),
+            reservation_id: 99,
+            parent_id_tag: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("connectorId"));
+        assert!(json.contains("expiryDate"));
+        assert!(json.contains("reservationId"));
+        assert!(!json.contains("parentIdTag"));
+        let deserialized: ReserveNowRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, deserialized);
+
+        let with_parent = ReserveNowRequest {
+            connector_id: 1,
+            expiry_date: DateTime::from_timestamp(1640995200, 0).unwrap(),
+            id_tag: "RFID001".to_string(),
+            reservation_id: 100,
+            parent_id_tag: Some("GROUP01".to_string()),
+        };
+        let json = serde_json::to_string(&with_parent).unwrap();
+        assert!(json.contains("parentIdTag"));
+        let deserialized: ReserveNowRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(with_parent, deserialized);
+
+        let response = ReserveNowResponse {
+            status: ReservationStatus::Accepted,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let deserialized: ReserveNowResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(response, deserialized);
+    }
+
+    #[test]
+    fn test_cancel_reservation_request() {
+        let request = CancelReservationRequest { reservation_id: 42 };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("reservationId"));
+        let deserialized: CancelReservationRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, deserialized);
+
+        let response = CancelReservationResponse {
+            status: CancelReservationStatus::Accepted,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let deserialized: CancelReservationResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(response, deserialized);
+
+        let rejected = CancelReservationResponse {
+            status: CancelReservationStatus::Rejected,
+        };
+        let json = serde_json::to_string(&rejected).unwrap();
+        assert_eq!(json, r#"{"status":"Rejected"}"#);
+    }
+
+    #[test]
+    fn test_trigger_message_request() {
+        let request = TriggerMessageRequest {
+            requested_message: MessageTrigger::Heartbeat,
+            connector_id: None,
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("requestedMessage"));
+        assert!(!json.contains("connectorId"));
+        let deserialized: TriggerMessageRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, deserialized);
+
+        let with_connector = TriggerMessageRequest {
+            requested_message: MessageTrigger::StatusNotification,
+            connector_id: Some(2),
+        };
+        let json = serde_json::to_string(&with_connector).unwrap();
+        assert!(json.contains("connectorId"));
+        let deserialized: TriggerMessageRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(with_connector, deserialized);
+
+        let response = TriggerMessageResponse {
+            status: TriggerMessageStatus::Accepted,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let deserialized: TriggerMessageResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(response, deserialized);
+    }
+
+    #[test]
+    fn test_get_local_list_version() {
+        let request = GetLocalListVersionRequest {};
+        let json = serde_json::to_string(&request).unwrap();
+        assert_eq!(json, "{}");
+        let deserialized: GetLocalListVersionRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, deserialized);
+
+        let response = GetLocalListVersionResponse { list_version: 5 };
+        let json = serde_json::to_string(&response).unwrap();
+        assert!(json.contains("listVersion"));
+        assert!(json.contains('5'));
+        let deserialized: GetLocalListVersionResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(response, deserialized);
+    }
+
+    #[test]
+    fn test_send_local_list_request() {
+        use ocpp_types::common::{AuthorizationStatus, IdTagInfo};
+
+        let request = SendLocalListRequest {
+            list_version: 3,
+            update_type: UpdateType::Full,
+            local_authorization_list: vec![
+                AuthorizationData {
+                    id_tag: "RFID001".to_string(),
+                    id_tag_info: Some(IdTagInfo {
+                        status: AuthorizationStatus::Accepted,
+                        parent_id_tag: None,
+                        expiry_date: None,
+                    }),
+                },
+                AuthorizationData {
+                    id_tag: "RFID002".to_string(),
+                    id_tag_info: None,
+                },
+            ],
+        };
+        let json = serde_json::to_string(&request).unwrap();
+        assert!(json.contains("listVersion"));
+        assert!(json.contains("updateType"));
+        assert!(json.contains("localAuthorizationList"));
+        assert!(json.contains("RFID001"));
+        let deserialized: SendLocalListRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(request, deserialized);
+
+        let empty_full = SendLocalListRequest {
+            list_version: 1,
+            update_type: UpdateType::Full,
+            local_authorization_list: vec![],
+        };
+        let json = serde_json::to_string(&empty_full).unwrap();
+        let deserialized: SendLocalListRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(empty_full, deserialized);
+
+        let response = SendLocalListResponse {
+            status: UpdateStatus::Accepted,
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let deserialized: SendLocalListResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(response, deserialized);
+    }
+
+    #[test]
+    fn test_new_action_names() {
+        assert_eq!(SetChargingProfileRequest::ACTION_NAME, "SetChargingProfile");
+        assert_eq!(
+            ClearChargingProfileRequest::ACTION_NAME,
+            "ClearChargingProfile"
+        );
+        assert_eq!(
+            GetCompositeScheduleRequest::ACTION_NAME,
+            "GetCompositeSchedule"
+        );
+        assert_eq!(ReserveNowRequest::ACTION_NAME, "ReserveNow");
+        assert_eq!(CancelReservationRequest::ACTION_NAME, "CancelReservation");
+        assert_eq!(TriggerMessageRequest::ACTION_NAME, "TriggerMessage");
+        assert_eq!(
+            GetLocalListVersionRequest::ACTION_NAME,
+            "GetLocalListVersion"
+        );
+        assert_eq!(SendLocalListRequest::ACTION_NAME, "SendLocalList");
     }
 }

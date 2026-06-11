@@ -148,7 +148,7 @@ impl ConnectorStateMachine {
         use ChargePointStatus::*;
         use StateMachineEvent::*;
 
-        let transitions = vec![
+        let transitions: Vec<((ChargePointStatus, StateMachineEvent), ChargePointStatus)> = vec![
             // From Available
             ((Available, CablePluggedIn), Preparing),
             (
@@ -158,7 +158,7 @@ impl ConnectorStateMachine {
                         id_tag: String::new(),
                     },
                 ),
-                ChargePointStatus::Reserved,
+                Reserved,
             ),
             ((Available, MakeUnavailable), Unavailable),
             (
@@ -395,7 +395,7 @@ impl ConnectorStateMachine {
 
             // Reservation handling
             (Available, StateMachineEvent::Reserved { .. }) => Some(ChargePointStatus::Reserved),
-            (ChargePointStatus::Reserved, ReservationCancelled) => Some(Available),
+            (Reserved, ReservationCancelled) => Some(Available),
 
             // Emergency stop
             (Charging, EmergencyStop) => Some(Finishing),

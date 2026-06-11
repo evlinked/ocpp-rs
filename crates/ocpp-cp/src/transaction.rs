@@ -759,7 +759,7 @@ mod tests {
         let connector_id = ConnectorId::new(1).unwrap();
 
         // Create transaction
-        manager
+        let _tx_id = manager
             .create_transaction(connector_id, "test_user".to_string(), 1000, None)
             .await
             .unwrap();

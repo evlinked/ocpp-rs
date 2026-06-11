@@ -482,7 +482,7 @@ mod tests {
     fn test_message_size_validation() {
         let rules = SerializationRules {
             max_message_size: 10, // Very small limit for testing
-            ..Default::default()
+            ..SerializationRules::default()
         };
 
         let mut serializer = MessageSerializer::new();

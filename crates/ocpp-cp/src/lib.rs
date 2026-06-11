@@ -56,7 +56,7 @@ pub struct ChargePointConfig {
     pub max_connection_retries: u32,
     /// Enable automatic reconnection
     pub auto_reconnect: bool,
-    /// Transport configuration
+    /// Transport configuration (not serialized; uses Default on deserialization)
     #[serde(skip)]
     pub transport_config: TransportConfig,
 }
@@ -162,7 +162,7 @@ impl ChargePoint {
         for i in 1..=config.connector_count {
             let connector_id = ConnectorId::new(i)?;
             let connector_config = ConnectorConfig {
-                connector_id: ConnectorId(i),
+                connector_id,
                 connector_type: "Type2".to_string(),
                 max_amperage: 32.0,
                 max_voltage: 230.0,
@@ -571,11 +571,11 @@ mod tests {
         let cp = ChargePoint::new(config).unwrap();
         let connector_id = ConnectorId::new(1).unwrap();
 
-        // Test plug in/out
+        // Test plug in/out cycle
         cp.plug_in(connector_id).await.unwrap();
         cp.plug_out(connector_id).await.unwrap();
 
-        // Test transaction operations: must plug in before starting
+        // Test transaction operations (cable must be plugged in first)
         cp.plug_in(connector_id).await.unwrap();
         cp.start_transaction(connector_id, "test_tag".to_string())
             .await

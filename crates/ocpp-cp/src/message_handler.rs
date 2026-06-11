@@ -196,7 +196,6 @@ impl MessageHandler {
         let available = matches!(request.availability_type, AvailabilityType::Operative);
 
         // For now, always accept the change
-        // In a real implementation, this would check if connectors can be changed
         let status = AvailabilityStatus::Accepted;
 
         debug!(

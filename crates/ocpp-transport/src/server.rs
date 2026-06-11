@@ -123,6 +123,7 @@ impl OcppServer {
         Ok(failed_connections)
     }
 
+    /// Handle new WebSocket connection
     #[allow(dead_code)]
     async fn handle_new_connection(&self, connection_info: ConnectionInfo) -> TransportResult<()> {
         info!(
@@ -146,6 +147,7 @@ impl OcppServer {
         Ok(())
     }
 
+    /// Handle connection closure
     #[allow(dead_code)]
     async fn handle_connection_closed(
         &self,
@@ -169,6 +171,7 @@ impl OcppServer {
         Ok(())
     }
 
+    /// Handle incoming message from connection
     #[allow(dead_code)]
     async fn handle_message(&self, connection_id: Uuid, message: Message) -> TransportResult<()> {
         debug!(
@@ -260,8 +263,10 @@ pub struct ServerStats {
 
 /// Connection manager for handling individual WebSocket connections
 pub struct ConnectionManager {
+    /// Connection ID
     #[allow(dead_code)]
     connection_id: Uuid,
+    /// Connection info
     #[allow(dead_code)]
     connection_info: ConnectionInfo,
     /// Message handler
