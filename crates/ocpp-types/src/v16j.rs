@@ -1,5 +1,6 @@
 //! OCPP 1.6J specific types and enums
 
+use crate::common::IdTagInfo;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -424,6 +425,31 @@ pub enum TriggerMessageStatus {
     NotImplemented,
 }
 
+/// Local authorization list update status
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum UpdateStatus {
+    /// Update accepted
+    Accepted,
+    /// Update failed
+    Failed,
+    /// Local list management not supported
+    NotSupported,
+    /// List version mismatch
+    VersionMismatch,
+}
+
+/// Entry in a local authorization list update
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthorizationData {
+    /// The identifier to which this authorization applies
+    #[serde(rename = "idTag")]
+    pub id_tag: String,
+    /// Authorization status info; absent in a differential update means deauthorize
+    #[serde(rename = "idTagInfo", skip_serializing_if = "Option::is_none")]
+    pub id_tag_info: Option<IdTagInfo>,
+}
+
 impl std::fmt::Display for ChargePointErrorCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -602,5 +628,49 @@ mod tests {
 
         let deserialized: MessageTrigger = serde_json::from_str(&json).unwrap();
         assert_eq!(trigger, deserialized);
+    }
+
+    #[test]
+    fn test_update_status_serialization() {
+        let cases = [
+            (UpdateStatus::Accepted, "\"Accepted\""),
+            (UpdateStatus::Failed, "\"Failed\""),
+            (UpdateStatus::NotSupported, "\"NotSupported\""),
+            (UpdateStatus::VersionMismatch, "\"VersionMismatch\""),
+        ];
+        for (status, expected) in &cases {
+            let json = serde_json::to_string(status).unwrap();
+            assert_eq!(&json, expected);
+            let deserialized: UpdateStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(status, &deserialized);
+        }
+    }
+
+    #[test]
+    fn test_authorization_data_serialization() {
+        use crate::common::{AuthorizationStatus, IdTagInfo};
+
+        let with_info = AuthorizationData {
+            id_tag: "RFID001".to_string(),
+            id_tag_info: Some(IdTagInfo {
+                status: AuthorizationStatus::Accepted,
+                parent_id_tag: None,
+                expiry_date: None,
+            }),
+        };
+        let json = serde_json::to_string(&with_info).unwrap();
+        assert!(json.contains("idTag"));
+        assert!(json.contains("idTagInfo"));
+        let deserialized: AuthorizationData = serde_json::from_str(&json).unwrap();
+        assert_eq!(with_info, deserialized);
+
+        let without_info = AuthorizationData {
+            id_tag: "RFID002".to_string(),
+            id_tag_info: None,
+        };
+        let json = serde_json::to_string(&without_info).unwrap();
+        assert!(!json.contains("idTagInfo"));
+        let deserialized: AuthorizationData = serde_json::from_str(&json).unwrap();
+        assert_eq!(without_info, deserialized);
     }
 }
