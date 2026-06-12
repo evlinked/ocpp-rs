@@ -893,7 +893,9 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-test",
+ "tokio-tungstenite 0.20.1",
  "tracing",
+ "tungstenite 0.20.1",
  "uuid",
 ]
 

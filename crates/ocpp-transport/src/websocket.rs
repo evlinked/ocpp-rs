@@ -150,6 +150,13 @@ where
     pub fn update_activity(&mut self) {
         self.connection_info.update_activity();
     }
+
+    /// Consume the connection, returning the inner `WebSocketStream` and `TransportConfig`.
+    ///
+    /// Use this to split send and receive into independent tasks without a shared mutex.
+    pub fn into_stream(self) -> (WebSocketStream<S>, TransportConfig) {
+        (self.stream, self.config)
+    }
 }
 
 /// WebSocket client utilities

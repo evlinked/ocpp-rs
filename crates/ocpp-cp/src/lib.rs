@@ -20,13 +20,13 @@ use dispatching_handler::DispatchingHandler;
 use error::ChargePointError;
 use message_handler::ConfigurationStore;
 use ocpp_messages::v16j::{
-    BootNotificationRequest, BootNotificationResponse, ChangeAvailabilityRequest,
-    ChangeAvailabilityResponse, ChangeConfigurationRequest, ChangeConfigurationResponse,
-    ClearCacheRequest, ClearCacheResponse, DataTransferRequest, DataTransferResponse,
-    GetConfigurationRequest, GetConfigurationResponse, HeartbeatRequest, RegistrationStatus,
-    RemoteStartTransactionRequest, RemoteStartTransactionResponse, RemoteStopTransactionRequest,
-    RemoteStopTransactionResponse, ResetRequest, ResetResponse, StatusNotificationRequest,
-    UnlockConnectorRequest, UnlockConnectorResponse,
+    BootNotificationRequest, ChangeAvailabilityRequest, ChangeAvailabilityResponse,
+    ChangeConfigurationRequest, ChangeConfigurationResponse, ClearCacheRequest, ClearCacheResponse,
+    DataTransferRequest, DataTransferResponse, GetConfigurationRequest, GetConfigurationResponse,
+    HeartbeatRequest, RegistrationStatus, RemoteStartTransactionRequest,
+    RemoteStartTransactionResponse, RemoteStopTransactionRequest, RemoteStopTransactionResponse,
+    ResetRequest, ResetResponse, StatusNotificationRequest, UnlockConnectorRequest,
+    UnlockConnectorResponse,
 };
 use ocpp_messages::{ActionDispatcher, CallMessage, Message, MessageType, OcppAction};
 use ocpp_transport::client::WebSocketClient;
@@ -72,6 +72,11 @@ pub struct ChargePointConfig {
     /// Timeout for individual OCPP CALL/CALLRESULT round-trips in seconds.
     /// Matches the Python reference default of 30 s (charge_point.py).
     pub call_timeout: u64,
+    /// Maximum number of BootNotification attempts before giving up.
+    /// On each Rejected or Pending response the CP waits the server-supplied
+    /// `interval` before retrying.  Matches the Python reference behaviour in
+    /// `charge_point.py`.  Default: 3.
+    pub max_boot_retries: u32,
     /// Transport configuration (not serialized; uses Default on deserialization)
     #[serde(skip)]
     pub transport_config: TransportConfig,
@@ -100,6 +105,7 @@ impl Default for ChargePointConfig {
             max_connection_retries: 10,
             auto_reconnect: true,
             call_timeout: 30,
+            max_boot_retries: 3,
             transport_config: TransportConfig::default(),
         }
     }
@@ -182,6 +188,58 @@ pub struct ChargePoint {
     registration_status: Arc<RwLock<RegistrationStatus>>,
     is_connected: Arc<RwLock<bool>>,
     heartbeat_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+}
+
+/// Send a typed OCPP CALL and await the matching CALLRESULT.
+///
+/// Free-function version of `ChargePoint::call()` that can be called from
+/// spawned tasks (which cannot hold a reference to `ChargePoint`).  Extracted
+/// so both `ChargePoint::call()` and the heartbeat task share the same logic.
+async fn call_action<Req: OcppAction>(
+    client: &Arc<RwLock<Option<WebSocketClient>>>,
+    call_timeout: u64,
+    request: Req,
+) -> OcppResult<Req::Response> {
+    let unique_id = Uuid::new_v4().to_string();
+
+    let rx = {
+        let guard = client.read().await;
+        let c = guard.as_ref().ok_or_else(|| OcppError::Transport {
+            message: "Not connected to central system".to_string(),
+        })?;
+        c.pending_calls().register(unique_id.clone())
+    };
+
+    let call_msg = CallMessage {
+        message_type: MessageType::Call,
+        unique_id: unique_id.clone(),
+        action: Req::ACTION_NAME.to_string(),
+        payload: serde_json::to_value(&request).map_err(OcppError::from)?,
+    };
+
+    {
+        let guard = client.read().await;
+        match guard.as_ref() {
+            Some(c) => c.send_message(Message::Call(call_msg)).await?,
+            None => {
+                return Err(OcppError::Transport {
+                    message: "Not connected to central system".to_string(),
+                })
+            }
+        }
+    }
+
+    let timeout = Duration::from_secs(call_timeout);
+    let raw_result = tokio::time::timeout(timeout, rx)
+        .await
+        .map_err(|_| OcppError::Timeout {
+            operation: format!("{} call", Req::ACTION_NAME),
+        })?
+        .map_err(|_| OcppError::Transport {
+            message: "Connection closed while waiting for CALLRESULT".to_string(),
+        })?;
+
+    serde_json::from_value::<Req::Response>(raw_result?).map_err(OcppError::from)
 }
 
 impl ChargePoint {
@@ -318,7 +376,7 @@ impl ChargePoint {
         *self.client.write().await = Some(client);
         *self.is_connected.write().await = true;
         let _ = self.event_sender.send(ChargePointEvent::Connected);
-        self.send_boot_notification().await?;
+        self.perform_boot_sequence().await?;
         Ok(())
     }
 
@@ -349,52 +407,17 @@ impl ChargePoint {
     /// Port of `ChargePoint.call()` from the Python reference
     /// (`ocpp/charge_point.py`).
     pub async fn call<Req: OcppAction>(&self, request: Req) -> OcppResult<Req::Response> {
-        let unique_id = Uuid::new_v4().to_string();
-
-        let rx = {
-            let client_guard = self.client.read().await;
-            let client = client_guard.as_ref().ok_or_else(|| OcppError::Transport {
-                message: "Not connected to central system".to_string(),
-            })?;
-            client.pending_calls().register(unique_id.clone())
-        };
-
-        let call_msg = CallMessage {
-            message_type: MessageType::Call,
-            unique_id: unique_id.clone(),
-            action: Req::ACTION_NAME.to_string(),
-            payload: serde_json::to_value(&request).map_err(OcppError::from)?,
-        };
-
-        {
-            let client_guard = self.client.read().await;
-            match client_guard.as_ref() {
-                Some(client) => client.send_message(Message::Call(call_msg)).await?,
-                None => {
-                    return Err(OcppError::Transport {
-                        message: "Not connected to central system".to_string(),
-                    })
-                }
-            }
-        }
-
-        let timeout = Duration::from_secs(self.config.call_timeout);
-        let raw_result = tokio::time::timeout(timeout, rx)
-            .await
-            .map_err(|_| OcppError::Timeout {
-                operation: format!("{} call", Req::ACTION_NAME),
-            })?
-            .map_err(|_| OcppError::Transport {
-                message: "Connection closed while waiting for CALLRESULT".to_string(),
-            })?;
-
-        let payload = raw_result?;
-        serde_json::from_value::<Req::Response>(payload).map_err(OcppError::from)
+        call_action::<Req>(&self.client, self.config.call_timeout, request).await
     }
 
-    /// Send boot notification (fire-and-forget; response is handled by the
-    /// pending-call map once issue #20 wires up the boot sequence properly).
-    async fn send_boot_notification(&self) -> Result<()> {
+    /// Port of `ChargePoint.start()` boot sequence from the Python reference
+    /// (`ocpp/charge_point.py`).
+    ///
+    /// Sends `BootNotificationRequest` via `call()` and handles each response:
+    /// - `Accepted` → emit event, start heartbeat at server-supplied interval.
+    /// - `Pending` / `Rejected` → wait `interval` seconds, retry.
+    ///   After `max_boot_retries` failed attempts returns an error.
+    async fn perform_boot_sequence(&self) -> Result<()> {
         let request = BootNotificationRequest {
             charge_point_vendor: self.config.vendor_info.charge_point_vendor.clone(),
             charge_point_model: self.config.vendor_info.charge_point_model.clone(),
@@ -407,78 +430,87 @@ impl ChargePoint {
             meter_serial_number: self.config.vendor_info.meter_serial_number.clone(),
         };
 
-        let message = Message::Call(ocpp_messages::CallMessage::new(
-            BootNotificationRequest::ACTION_NAME.to_string(),
-            request,
-        )?);
+        let max_retries = self.config.max_boot_retries;
 
-        if let Some(client) = self.client.read().await.as_ref() {
-            client.send_message(message).await?;
+        for attempt in 1..=max_retries {
+            info!(
+                "Sending BootNotification (attempt {}/{})",
+                attempt, max_retries
+            );
+
+            let response = self
+                .call(request.clone())
+                .await
+                .map_err(|e| anyhow::anyhow!("BootNotification call failed: {}", e))?;
+
+            let interval_secs = response.interval.max(1) as u64;
+            *self.registration_status.write().await = response.status;
+
+            match response.status {
+                RegistrationStatus::Accepted => {
+                    info!(
+                        "BootNotification accepted; heartbeat every {}s",
+                        interval_secs
+                    );
+                    let _ = self
+                        .event_sender
+                        .send(ChargePointEvent::BootNotificationAccepted {
+                            current_time: response.current_time,
+                            interval: response.interval,
+                        });
+                    self.start_heartbeat(interval_secs).await;
+                    return Ok(());
+                }
+                RegistrationStatus::Pending | RegistrationStatus::Rejected => {
+                    if attempt < max_retries {
+                        warn!(
+                            "BootNotification {:?} (attempt {}/{}), retrying in {}s",
+                            response.status, attempt, max_retries, interval_secs
+                        );
+                        tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+                    }
+                }
+            }
         }
-        Ok(())
+
+        Err(anyhow::anyhow!(
+            "BootNotification not accepted after {} attempts",
+            max_retries
+        ))
     }
 
-    /// Spawn the heartbeat task using the server-supplied interval.
-    async fn start_heartbeat(&self) {
-        let interval = Duration::from_secs(self.config.heartbeat_interval);
+    /// Spawn the heartbeat task using the server-supplied `interval_secs`.
+    ///
+    /// Uses `call_action()` so each `HeartbeatRequest` is correlated via
+    /// `PendingCallMap` — the same semantics as `ChargePoint::call()`.
+    /// Heartbeat errors are logged but do not abort the session.
+    async fn start_heartbeat(&self, interval_secs: u64) {
+        let interval = Duration::from_secs(interval_secs.max(1));
         let client = self.client.clone();
+        let call_timeout = self.config.call_timeout;
         let is_connected = self.is_connected.clone();
 
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
+            // Skip the immediate first tick so the heartbeat starts after one interval.
+            ticker.tick().await;
             loop {
                 ticker.tick().await;
                 if !*is_connected.read().await {
-                    continue;
+                    break;
                 }
-                let message = match ocpp_messages::CallMessage::new(
-                    HeartbeatRequest::ACTION_NAME.to_string(),
-                    HeartbeatRequest {},
-                ) {
-                    Ok(call) => Message::Call(call),
-                    Err(e) => {
-                        error!("Failed to create heartbeat message: {}", e);
-                        continue;
-                    }
-                };
-                if let Some(client) = client.read().await.as_ref() {
-                    if let Err(e) = client.send_message(message).await {
-                        error!("Failed to send heartbeat: {}", e);
-                    }
+                match call_action::<HeartbeatRequest>(&client, call_timeout, HeartbeatRequest {})
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(OcppError::Timeout { .. }) => warn!("Heartbeat timed out"),
+                    Err(OcppError::Transport { .. }) => break,
+                    Err(e) => error!("Heartbeat error: {}", e),
                 }
             }
         });
 
         *self.heartbeat_handle.write().await = Some(handle);
-    }
-
-    /// Handle a boot notification response (called after `call()` resolves).
-    pub async fn handle_boot_notification_response(
-        &self,
-        response: BootNotificationResponse,
-    ) -> Result<()> {
-        info!("Boot notification response: {:?}", response.status);
-        *self.registration_status.write().await = response.status;
-
-        match response.status {
-            RegistrationStatus::Accepted => {
-                let _ = self
-                    .event_sender
-                    .send(ChargePointEvent::BootNotificationAccepted {
-                        current_time: response.current_time,
-                        interval: response.interval,
-                    });
-                self.start_heartbeat().await;
-            }
-            RegistrationStatus::Pending => {
-                warn!("Boot notification pending, will retry");
-            }
-            RegistrationStatus::Rejected => {
-                error!("Boot notification rejected");
-                return Err(anyhow::anyhow!("Boot notification rejected"));
-            }
-        }
-        Ok(())
     }
 
     /// Get connector by ID.
@@ -1128,5 +1160,225 @@ mod tests {
             .await
             .unwrap();
         assert!(result.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Boot-sequence tests — in-process mock CSMS
+    // -----------------------------------------------------------------------
+    //
+    // The mock CSMS binds on a random port and responds to each incoming CALL
+    // frame with the next pre-loaded JSON payload.  All OCPP framing is done
+    // manually so there is no dependency on `OcppServer`.
+
+    struct MockCsms {
+        addr: std::net::SocketAddr,
+        received_rx: mpsc::UnboundedReceiver<serde_json::Value>,
+        _handle: tokio::task::JoinHandle<()>,
+    }
+
+    impl MockCsms {
+        /// Start a mock CSMS.  `responses` is consumed in order: each CALL
+        /// receives the next response payload (wrapped as `[3, unique_id, payload]`).
+        /// CALLs beyond the pre-loaded responses are recorded but not replied to.
+        async fn start(responses: Vec<serde_json::Value>) -> Self {
+            use futures::{SinkExt, StreamExt};
+            use tokio::net::TcpListener;
+            use tokio_tungstenite::{accept_async, tungstenite::Message as WsMsg};
+
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let (received_tx, received_rx) = mpsc::unbounded_channel();
+
+            let handle = tokio::spawn(async move {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let ws = accept_async(stream).await.unwrap();
+                let (mut sink, mut source) = ws.split();
+                let mut responses = responses.into_iter();
+
+                while let Some(Ok(WsMsg::Text(text))) = source.next().await {
+                    let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                    let _ = received_tx.send(frame.clone());
+
+                    // Wire format: {"0": "CALL", "1": "<uid>", "2": "Action", "3": {payload}}
+                    // MessageType serializes as UPPERCASE string ("CALL"/"CALLRESULT"/"CALLERROR")
+                    let unique_id = frame["1"].as_str().unwrap().to_string();
+                    if let Some(payload) = responses.next() {
+                        let reply =
+                            serde_json::json!({"0": "CALLRESULT", "1": unique_id, "2": payload})
+                                .to_string();
+                        let _ = sink.send(WsMsg::Text(reply)).await;
+                    }
+                }
+            });
+
+            MockCsms {
+                addr,
+                received_rx,
+                _handle: handle,
+            }
+        }
+
+        /// Wait up to 5 s for the next CALL received by the mock server.
+        async fn next_call(&mut self) -> serde_json::Value {
+            tokio::time::timeout(std::time::Duration::from_secs(5), self.received_rx.recv())
+                .await
+                .expect("call arrived within 5s")
+                .expect("channel open")
+        }
+
+        fn ws_base_url(&self) -> String {
+            format!("ws://127.0.0.1:{}", self.addr.port())
+        }
+
+        /// Build a `ChargePointConfig` pointing at this mock server.
+        fn cp_config(&self, max_boot_retries: u32, call_timeout: u64) -> ChargePointConfig {
+            ChargePointConfig {
+                central_system_url: self.ws_base_url(),
+                call_timeout,
+                max_boot_retries,
+                ..Default::default()
+            }
+        }
+    }
+
+    fn boot_accepted_payload(interval: i32) -> serde_json::Value {
+        serde_json::json!({
+            "status": "Accepted",
+            "currentTime": "2026-06-12T00:00:00Z",
+            "interval": interval
+        })
+    }
+
+    fn boot_rejected_payload(interval: i32) -> serde_json::Value {
+        serde_json::json!({
+            "status": "Rejected",
+            "currentTime": "2026-06-12T00:00:00Z",
+            "interval": interval
+        })
+    }
+
+    fn boot_pending_payload(interval: i32) -> serde_json::Value {
+        serde_json::json!({
+            "status": "Pending",
+            "currentTime": "2026-06-12T00:00:00Z",
+            "interval": interval
+        })
+    }
+
+    fn heartbeat_payload() -> serde_json::Value {
+        serde_json::json!({ "currentTime": "2026-06-12T00:00:00Z" })
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_sends_boot_notification_first() {
+        // Mock server accepts immediately, no retries needed.
+        let mut mock = MockCsms::start(vec![boot_accepted_payload(300)]).await;
+
+        let config = mock.cp_config(3, 5);
+        let cp = ChargePoint::new(config).unwrap();
+
+        // connect() runs perform_boot_sequence() which sends BootNotification.
+        cp.connect().await.unwrap();
+
+        // First frame the mock received must be a BootNotification CALL.
+        let first = mock.next_call().await;
+        assert_eq!(first["0"], "CALL", "first frame should be a CALL");
+        assert_eq!(first["2"], "BootNotification");
+        assert!(
+            cp.is_connected().await,
+            "charge point should be connected after successful boot"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_retries_on_rejected_then_fails() {
+        // Three Rejected responses with interval=1s → should fail after 3 attempts.
+        let responses = vec![
+            boot_rejected_payload(1),
+            boot_rejected_payload(1),
+            boot_rejected_payload(1),
+        ];
+        let mut mock = MockCsms::start(responses).await;
+
+        let config = mock.cp_config(3, 5);
+        let cp = ChargePoint::new(config).unwrap();
+
+        let result = cp.connect().await;
+        assert!(
+            result.is_err(),
+            "expected error after all retries exhausted"
+        );
+
+        // The mock should have received exactly 3 BootNotification CALLs.
+        let mut boot_count = 0u32;
+        for _ in 0..3 {
+            let call = mock.next_call().await;
+            if call["2"] == "BootNotification" {
+                boot_count += 1;
+            }
+        }
+        assert_eq!(boot_count, 3, "expected 3 BootNotification attempts");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_accepted_starts_heartbeat() {
+        // BootNotification accepted with interval=1s; pre-load heartbeat responses.
+        let responses = vec![
+            boot_accepted_payload(1),
+            heartbeat_payload(),
+            heartbeat_payload(),
+            heartbeat_payload(),
+        ];
+        let mut mock = MockCsms::start(responses).await;
+
+        let config = mock.cp_config(3, 5);
+        let cp = ChargePoint::new(config).unwrap();
+
+        cp.connect().await.unwrap();
+
+        // First received frame: BootNotification.
+        let boot = mock.next_call().await;
+        assert_eq!(boot["2"], "BootNotification");
+
+        // Wait slightly more than one heartbeat interval.
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+
+        // At least one Heartbeat should have arrived.
+        let hb = mock.next_call().await;
+        assert_eq!(
+            hb["2"], "Heartbeat",
+            "expected a Heartbeat CALL after interval"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_pending_then_accepted_on_retry() {
+        // First response: Pending (interval=1s). Second: Accepted.
+        let responses = vec![boot_pending_payload(1), boot_accepted_payload(300)];
+        let mut mock = MockCsms::start(responses).await;
+
+        let config = mock.cp_config(3, 5);
+        let cp = ChargePoint::new(config).unwrap();
+
+        // Should succeed after the retry.
+        cp.connect().await.unwrap();
+
+        let first = mock.next_call().await;
+        assert_eq!(first["2"], "BootNotification");
+
+        let second = mock.next_call().await;
+        assert_eq!(
+            second["2"], "BootNotification",
+            "second attempt should also be BootNotification"
+        );
+
+        assert_eq!(cp.registration_status().await, RegistrationStatus::Accepted);
+    }
+
+    #[test]
+    fn boot_retries_default_is_3() {
+        assert_eq!(ChargePointConfig::default().max_boot_retries, 3);
     }
 }
