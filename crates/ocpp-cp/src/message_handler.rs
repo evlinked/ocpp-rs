@@ -3,6 +3,7 @@
 //! This module provides message handling capabilities for processing incoming
 //! OCPP messages from the Central System and generating appropriate responses.
 
+use crate::auth_cache::AuthCache;
 use crate::error::ChargePointError;
 use anyhow::Result;
 use ocpp_messages::v16j::{
@@ -23,6 +24,7 @@ use ocpp_types::v16j::{
 use ocpp_types::{ConnectorId, OcppResult};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{debug, error, info, warn};
 
@@ -134,17 +136,37 @@ pub struct MessageHandler {
     connector_states: Arc<RwLock<HashMap<ConnectorId, ocpp_types::v16j::ChargePointStatus>>>,
     /// Active transactions
     active_transactions: Arc<RwLock<HashMap<ConnectorId, i32>>>,
+    /// Authorization cache — cleared by `ClearCache` CSMS command
+    auth_cache: Arc<AuthCache>,
 }
 
 impl MessageHandler {
-    /// Create a new message handler
+    /// Create a new message handler with a default 24-hour authorization cache TTL.
     pub fn new(event_sender: mpsc::UnboundedSender<ChargePointEvent>) -> Self {
+        Self::with_auth_cache(
+            event_sender,
+            Arc::new(AuthCache::new(Duration::from_secs(24 * 3600))),
+        )
+    }
+
+    /// Create a message handler sharing the given authorization cache.
+    /// Use this when `ChargePoint` needs to query the same cache instance.
+    pub fn with_auth_cache(
+        event_sender: mpsc::UnboundedSender<ChargePointEvent>,
+        auth_cache: Arc<AuthCache>,
+    ) -> Self {
         Self {
             event_sender,
             config_store: Arc::new(RwLock::new(ConfigurationStore::new())),
             connector_states: Arc::new(RwLock::new(HashMap::new())),
             active_transactions: Arc::new(RwLock::new(HashMap::new())),
+            auth_cache,
         }
+    }
+
+    /// Return a clone of the authorization cache handle.
+    pub fn auth_cache(&self) -> Arc<AuthCache> {
+        Arc::clone(&self.auth_cache)
     }
 
     /// Handle BootNotificationResponse
@@ -450,12 +472,9 @@ impl MessageHandler {
     /// Handle ClearCache request
     async fn handle_clear_cache(&self, _request: ClearCacheRequest) -> Result<ClearCacheResponse> {
         info!("Clear cache request");
-
-        // For now, always accept
+        self.auth_cache.clear().await;
         let status = ocpp_types::v16j::ClearCacheStatus::Accepted;
-
         debug!("Clear cache result: {:?}", status);
-
         Ok(ClearCacheResponse { status })
     }
 
@@ -789,5 +808,39 @@ mod tests {
 
         let response = handler.handle_reset(request).await.unwrap();
         assert_eq!(response.status, ResetStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn test_clear_cache_empties_auth_cache() {
+        use crate::auth_cache::AuthCache;
+        use ocpp_types::common::{AuthorizationStatus, IdTagInfo};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let (sender, _receiver) = mpsc::unbounded_channel();
+        let cache = Arc::new(AuthCache::new(Duration::from_secs(86400)));
+        let handler = MessageHandler::with_auth_cache(sender, Arc::clone(&cache));
+
+        cache
+            .insert(
+                "TAG_TO_CLEAR",
+                IdTagInfo {
+                    status: AuthorizationStatus::Accepted,
+                    parent_id_tag: None,
+                    expiry_date: None,
+                },
+            )
+            .await;
+        assert!(cache.get("TAG_TO_CLEAR").await.is_some());
+
+        let response = handler
+            .handle_clear_cache(ClearCacheRequest {})
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status,
+            ocpp_types::v16j::ClearCacheStatus::Accepted
+        );
+        assert!(cache.get("TAG_TO_CLEAR").await.is_none());
     }
 }
