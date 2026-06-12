@@ -20,14 +20,15 @@ use connector::{Connector, ConnectorConfig};
 use error::ChargePointError;
 use message_handler::MessageHandler;
 use ocpp_messages::v16j::{
-    BootNotificationRequest, BootNotificationResponse, HeartbeatRequest, RegistrationStatus,
-    StatusNotificationRequest,
+    AuthorizeRequest, BootNotificationRequest, BootNotificationResponse, HeartbeatRequest,
+    RegistrationStatus, StatusNotificationRequest,
 };
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
 use ocpp_transport::client::WebSocketClient;
 use ocpp_transport::{
     MessageHandler as TransportMessageHandler, Transport, TransportConfig, TransportEvent,
 };
+use ocpp_types::common::AuthorizationStatus;
 use ocpp_types::common::IdTagInfo;
 use ocpp_types::v16j::{ChargePointStatus, ChargePointVendorInfo};
 use ocpp_types::{ConnectorId, OcppError, OcppResult};
@@ -528,8 +529,6 @@ impl ChargePoint {
     /// Look up an id-tag in the local authorization cache without sending an OCPP CALL.
     ///
     /// Returns `Some(IdTagInfo)` on a live cache hit, `None` on miss or expiry.
-    /// The full `authorize()` method (which sends `AuthorizeRequest` via `call()` on
-    /// cache miss) is implemented in a follow-up once PR #13 merges into main.
     pub async fn local_auth_lookup(&self, id_tag: &str) -> Option<IdTagInfo> {
         self.auth_cache.get(id_tag).await
     }
@@ -544,6 +543,56 @@ impl ChargePoint {
         } else {
             None
         }
+    }
+
+    /// Authorize an ID tag via local cache or CSMS.
+    ///
+    /// Ports the local-auth-list + `_send_authorize()` pattern from
+    /// `ocpp/charge_point.py`:
+    ///
+    /// 1. **Cache hit** (live entry) → return immediately, no CALL sent.
+    /// 2. **Cache miss** → send `AuthorizeRequest` via `call()`, cache the result.
+    /// 3. **Timeout** with `offline_auth_stale_ok = true` → return stale cached entry.
+    /// 4. **Timeout** with `offline_auth_stale_ok = false` → return `Invalid`.
+    pub async fn authorize(&self, id_tag: &str) -> OcppResult<IdTagInfo> {
+        if let Some(info) = self.auth_cache.get(id_tag).await {
+            return Ok(info);
+        }
+
+        let response = match self
+            .call(AuthorizeRequest {
+                id_tag: id_tag.to_string(),
+            })
+            .await
+        {
+            Ok(r) => r,
+            Err(OcppError::Timeout { .. }) => {
+                if self.config.offline_auth_stale_ok {
+                    if let Some(stale) = self.auth_cache.get_stale(id_tag).await {
+                        warn!(
+                            "authorize: CSMS unreachable, using stale cache for {}",
+                            id_tag
+                        );
+                        return Ok(stale);
+                    }
+                }
+                warn!(
+                    "authorize: CSMS unreachable, no cache, returning Invalid for {}",
+                    id_tag
+                );
+                return Ok(IdTagInfo {
+                    status: AuthorizationStatus::Invalid,
+                    parent_id_tag: None,
+                    expiry_date: None,
+                });
+            }
+            Err(e) => return Err(e),
+        };
+
+        self.auth_cache
+            .insert(id_tag, response.id_tag_info.clone())
+            .await;
+        Ok(response.id_tag_info)
     }
 
     /// Get event receiver
@@ -826,5 +875,90 @@ mod tests {
 
         let result = cp.local_auth_lookup_stale("STALE_TAG2").await;
         assert!(result.is_some());
+    }
+
+    // --- authorize() tests ---
+
+    #[tokio::test]
+    async fn authorize_cache_hit_returns_accepted_without_ocpp_call() {
+        // Pre-populate cache; authorize() must return from cache without touching
+        // the WS client (which is None / not connected).
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        cp.auth_cache
+            .insert(
+                "KNOWN_TAG",
+                IdTagInfo {
+                    status: AuthorizationStatus::Accepted,
+                    parent_id_tag: None,
+                    expiry_date: None,
+                },
+            )
+            .await;
+
+        let result = cp.authorize("KNOWN_TAG").await;
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        assert_eq!(result.unwrap().status, AuthorizationStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn authorize_cache_miss_attempts_ocpp_call() {
+        // No cache entry, no WS connection → authorize() must attempt ChargePoint::call()
+        // which returns OcppError::Transport (not an AuthorizationError or Ok).
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+
+        let result = cp.authorize("UNCACHED_TAG").await;
+        match result {
+            Err(OcppError::Transport { .. }) => {} // expected: call() tried, WS not connected
+            other => panic!("expected Transport error on cache miss, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn authorize_expired_cache_entry_triggers_fresh_call() {
+        // An expired entry must be evicted and a fresh CALL attempted.
+        use chrono::Duration as CD;
+
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        cp.auth_cache
+            .insert(
+                "EXPIRED_TAG",
+                IdTagInfo {
+                    status: AuthorizationStatus::Accepted,
+                    parent_id_tag: None,
+                    expiry_date: Some(chrono::Utc::now() - CD::seconds(1)),
+                },
+            )
+            .await;
+
+        // authorize() must NOT return the cached (expired) Accepted — it must
+        // attempt a fresh CALL and fail with Transport (no WS connection).
+        let result = cp.authorize("EXPIRED_TAG").await;
+        match result {
+            Err(OcppError::Transport { .. }) => {} // stale entry evicted, fresh call attempted
+            Ok(info) if info.status == AuthorizationStatus::Accepted => {
+                panic!("authorize() returned expired cached Accepted — should have evicted it")
+            }
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn authorize_blocked_cache_hit_returned_without_call() {
+        // A cached Blocked status is returned immediately (no CALL needed to re-check).
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        cp.auth_cache
+            .insert(
+                "BLOCKED_TAG",
+                IdTagInfo {
+                    status: AuthorizationStatus::Blocked,
+                    parent_id_tag: None,
+                    expiry_date: None,
+                },
+            )
+            .await;
+
+        let result = cp.authorize("BLOCKED_TAG").await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().status, AuthorizationStatus::Blocked);
     }
 }
