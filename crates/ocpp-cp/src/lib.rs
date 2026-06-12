@@ -7,6 +7,7 @@
 //! - WebSocket connection to Central System
 //! - Real-world charging scenarios simulation
 
+pub mod auth_cache;
 pub mod connector;
 pub mod error;
 pub mod message_handler;
@@ -14,6 +15,7 @@ pub mod state_machine;
 pub mod transaction;
 
 use anyhow::Result;
+use auth_cache::AuthCache;
 use connector::{Connector, ConnectorConfig};
 use error::ChargePointError;
 use message_handler::MessageHandler;
@@ -26,6 +28,7 @@ use ocpp_transport::client::WebSocketClient;
 use ocpp_transport::{
     MessageHandler as TransportMessageHandler, Transport, TransportConfig, TransportEvent,
 };
+use ocpp_types::common::IdTagInfo;
 use ocpp_types::v16j::{ChargePointStatus, ChargePointVendorInfo};
 use ocpp_types::{ConnectorId, OcppError, OcppResult};
 use serde::{Deserialize, Serialize};
@@ -60,6 +63,12 @@ pub struct ChargePointConfig {
     /// Timeout for individual OCPP CALL/CALLRESULT round-trips in seconds.
     /// Matches the Python reference default of 30 s (charge_point.py).
     pub call_timeout: u64,
+    /// Authorization cache TTL in seconds (default 86400 = 24 h).
+    /// Used when `IdTagInfo.expiry_date` is absent.
+    pub auth_cache_ttl: u64,
+    /// If true, return a stale (expired) cached auth result when the CSMS
+    /// is unreachable and the `authorize` CALL times out.
+    pub offline_auth_stale_ok: bool,
     /// Transport configuration (not serialized; uses Default on deserialization)
     #[serde(skip)]
     pub transport_config: TransportConfig,
@@ -87,7 +96,9 @@ impl Default for ChargePointConfig {
             connection_retry_interval: 30, // 30 seconds
             max_connection_retries: 10,
             auto_reconnect: true,
-            call_timeout: 30, // 30 seconds, matches Python reference default
+            call_timeout: 30,
+            auth_cache_ttl: 86400,
+            offline_auth_stale_ok: false,
             transport_config: TransportConfig::default(),
         }
     }
@@ -146,6 +157,8 @@ pub struct ChargePoint {
     client: Arc<RwLock<Option<WebSocketClient>>>,
     /// Message handler
     message_handler: Arc<MessageHandler>,
+    /// Authorization cache (shared with MessageHandler for ClearCache wiring)
+    auth_cache: Arc<AuthCache>,
     /// Event sender
     event_sender: mpsc::UnboundedSender<ChargePointEvent>,
     /// Event receiver
@@ -178,13 +191,18 @@ impl ChargePoint {
             connectors.insert(connector_id, Connector::new(connector_config)?);
         }
 
-        let message_handler = Arc::new(MessageHandler::new(event_sender.clone()));
+        let auth_cache = Arc::new(AuthCache::new(Duration::from_secs(config.auth_cache_ttl)));
+        let message_handler = Arc::new(MessageHandler::with_auth_cache(
+            event_sender.clone(),
+            Arc::clone(&auth_cache),
+        ));
 
         Ok(Self {
             config,
             connectors: Arc::new(RwLock::new(connectors)),
             client: Arc::new(RwLock::new(None)),
             message_handler,
+            auth_cache,
             event_sender,
             event_receiver: Arc::new(RwLock::new(Some(event_receiver))),
             registration_status: Arc::new(RwLock::new(RegistrationStatus::Rejected)),
@@ -507,6 +525,27 @@ impl ChargePoint {
         Ok(())
     }
 
+    /// Look up an id-tag in the local authorization cache without sending an OCPP CALL.
+    ///
+    /// Returns `Some(IdTagInfo)` on a live cache hit, `None` on miss or expiry.
+    /// The full `authorize()` method (which sends `AuthorizeRequest` via `call()` on
+    /// cache miss) is implemented in a follow-up once PR #13 merges into main.
+    pub async fn local_auth_lookup(&self, id_tag: &str) -> Option<IdTagInfo> {
+        self.auth_cache.get(id_tag).await
+    }
+
+    /// Look up an id-tag including expired entries (offline-fallback path).
+    ///
+    /// Only used when `ChargePointConfig::offline_auth_stale_ok` is true and
+    /// a fresh `AuthorizeRequest` CALL has timed out.
+    pub async fn local_auth_lookup_stale(&self, id_tag: &str) -> Option<IdTagInfo> {
+        if self.config.offline_auth_stale_ok {
+            self.auth_cache.get_stale(id_tag).await
+        } else {
+            None
+        }
+    }
+
     /// Get event receiver
     pub async fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<ChargePointEvent>> {
         self.event_receiver.write().await.take()
@@ -680,6 +719,18 @@ mod tests {
         assert_eq!(config.call_timeout, 30);
     }
 
+    #[test]
+    fn auth_cache_ttl_default_is_24h() {
+        let config = ChargePointConfig::default();
+        assert_eq!(config.auth_cache_ttl, 86400);
+    }
+
+    #[test]
+    fn offline_auth_stale_ok_default_is_false() {
+        let config = ChargePointConfig::default();
+        assert!(!config.offline_auth_stale_ok);
+    }
+
     #[tokio::test]
     async fn call_returns_transport_error_when_disconnected() {
         let config = ChargePointConfig::default();
@@ -697,5 +748,83 @@ mod tests {
             }
             other => panic!("expected Transport error, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn local_auth_lookup_returns_none_on_empty_cache() {
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        assert!(cp.local_auth_lookup("UNKNOWN_TAG").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_auth_lookup_returns_cached_result() {
+        use ocpp_types::common::{AuthorizationStatus, IdTagInfo};
+
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        cp.auth_cache
+            .insert(
+                "TAG_CACHED",
+                IdTagInfo {
+                    status: AuthorizationStatus::Accepted,
+                    parent_id_tag: None,
+                    expiry_date: None,
+                },
+            )
+            .await;
+
+        let result = cp.local_auth_lookup("TAG_CACHED").await;
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().status, AuthorizationStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn local_auth_lookup_stale_off_returns_none_when_disabled() {
+        use chrono::Duration as CD;
+        use ocpp_types::common::{AuthorizationStatus, IdTagInfo};
+
+        let cp = ChargePoint::new(ChargePointConfig {
+            offline_auth_stale_ok: false,
+            ..Default::default()
+        })
+        .unwrap();
+
+        cp.auth_cache
+            .insert(
+                "STALE_TAG",
+                IdTagInfo {
+                    status: AuthorizationStatus::Accepted,
+                    parent_id_tag: None,
+                    expiry_date: Some(chrono::Utc::now() - CD::seconds(1)),
+                },
+            )
+            .await;
+
+        assert!(cp.local_auth_lookup_stale("STALE_TAG").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_auth_lookup_stale_on_returns_expired_entry() {
+        use chrono::Duration as CD;
+        use ocpp_types::common::{AuthorizationStatus, IdTagInfo};
+
+        let cp = ChargePoint::new(ChargePointConfig {
+            offline_auth_stale_ok: true,
+            ..Default::default()
+        })
+        .unwrap();
+
+        cp.auth_cache
+            .insert(
+                "STALE_TAG2",
+                IdTagInfo {
+                    status: AuthorizationStatus::Accepted,
+                    parent_id_tag: None,
+                    expiry_date: Some(chrono::Utc::now() - CD::seconds(1)),
+                },
+            )
+            .await;
+
+        let result = cp.local_auth_lookup_stale("STALE_TAG2").await;
+        assert!(result.is_some());
     }
 }
