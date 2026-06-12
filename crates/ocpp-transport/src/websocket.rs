@@ -146,6 +146,11 @@ where
         &self.connection_info
     }
 
+    /// Consume the connection and return its parts for independent send/recv use.
+    pub fn into_parts(self) -> (WebSocketStream<S>, ConnectionInfo, TransportConfig) {
+        (self.stream, self.connection_info, self.config)
+    }
+
     /// Update connection activity
     pub fn update_activity(&mut self) {
         self.connection_info.update_activity();
