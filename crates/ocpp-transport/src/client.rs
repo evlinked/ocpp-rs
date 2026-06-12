@@ -1,16 +1,16 @@
 //! WebSocket client implementation for OCPP Charge Points
 
 use crate::{
-    error::TransportResult, websocket::client::connect, ConnectionState, MessageHandler, Transport,
-    TransportConfig, TransportEvent,
+    error::TransportResult, pending::PendingCallMap, websocket::client::connect, ConnectionState,
+    MessageHandler, Transport, TransportConfig, TransportEvent,
 };
 use ocpp_messages::Message;
-use ocpp_types::OcppResult;
+use ocpp_types::{OcppError, OcppResult};
 
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 /// WebSocket client for OCPP Charge Points
@@ -25,6 +25,8 @@ pub struct WebSocketClient {
     message_handler: Arc<dyn MessageHandler>,
     /// Message sender channel
     message_tx: Arc<RwLock<Option<mpsc::UnboundedSender<Message>>>>,
+    /// In-flight CALL correlation map
+    pending_calls: Arc<PendingCallMap>,
     /// Task handles
     task_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
 }
@@ -41,6 +43,7 @@ impl WebSocketClient {
         let connection_id = Uuid::new_v4();
         let state = Arc::new(RwLock::new(ConnectionState::Connecting));
         let message_tx = Arc::new(RwLock::new(None));
+        let pending_calls = Arc::new(PendingCallMap::new());
         let task_handles = Arc::new(RwLock::new(Vec::new()));
 
         let client = Self {
@@ -49,6 +52,7 @@ impl WebSocketClient {
             config: config.clone(),
             message_handler: message_handler.clone(),
             message_tx: message_tx.clone(),
+            pending_calls: pending_calls.clone(),
             task_handles: task_handles.clone(),
         };
 
@@ -82,12 +86,13 @@ impl WebSocketClient {
         };
         self.message_handler.handle_event(event).await;
 
-        // Spawn message sending task
+        // Shared WebSocket connection for send + recv tasks
         let ws_connection_send = Arc::new(tokio::sync::Mutex::new(ws_connection));
         let ws_connection_recv = ws_connection_send.clone();
         let message_handler = self.message_handler.clone();
         let connection_id = self.connection_id;
         let state = self.state.clone();
+        let pending_calls = self.pending_calls.clone();
 
         // Spawn outbound message task
         let send_task = {
@@ -110,41 +115,89 @@ impl WebSocketClient {
             })
         };
 
-        // Spawn inbound message task
+        // Spawn inbound message task.
+        // The WS mutex is held only during the receive call; it is released
+        // before dispatching to the handler or awaiting anything else.
         let recv_task = {
             let ws_connection = ws_connection_recv;
             let state = state.clone();
             tokio::spawn(async move {
-                loop {
-                    let mut conn = ws_connection.lock().await;
-                    match conn.receive_message().await {
+                'recv_loop: loop {
+                    // Acquire lock, receive one frame, release lock immediately.
+                    let recv_result = {
+                        let mut conn = ws_connection.lock().await;
+                        conn.receive_message().await
+                    };
+
+                    match recv_result {
                         Ok(Some(text)) => {
                             match serde_json::from_str::<Message>(&text) {
                                 Ok(message) => {
-                                    // Handle the message
-                                    match message_handler.handle_message(message.clone()).await {
-                                        Ok(Some(response)) => {
-                                            // Send response back
-                                            if let Ok(response_json) =
-                                                serde_json::to_string(&response)
+                                    match &message {
+                                        // CALLRESULT: wake the waiting call() future
+                                        Message::CallResult(result_msg) => {
+                                            if !pending_calls.resolve(
+                                                &result_msg.unique_id,
+                                                result_msg.payload.clone(),
+                                            ) {
+                                                warn!(
+                                                    "CALLRESULT for unknown unique_id '{}'",
+                                                    result_msg.unique_id
+                                                );
+                                            }
+                                        }
+                                        // CALLERROR: surface as OcppError::CallError
+                                        Message::CallError(error_msg) => {
+                                            let err = OcppError::CallError {
+                                                code: error_msg.error_code.clone(),
+                                                description: error_msg.error_description.clone(),
+                                                details: error_msg.error_details.clone(),
+                                            };
+                                            if !pending_calls.reject(&error_msg.unique_id, err) {
+                                                warn!(
+                                                    "CALLERROR for unknown unique_id '{}'",
+                                                    error_msg.unique_id
+                                                );
+                                            }
+                                        }
+                                        // CALL: dispatch to the registered handler
+                                        Message::Call(_) => {
+                                            match message_handler
+                                                .handle_message(message.clone())
+                                                .await
                                             {
-                                                if let Err(e) =
-                                                    conn.send_message(response_json).await
-                                                {
-                                                    error!("Failed to send response: {}", e);
-                                                    break;
+                                                Ok(Some(response)) => {
+                                                    match serde_json::to_string(&response) {
+                                                        Ok(response_json) => {
+                                                            let mut conn =
+                                                                ws_connection.lock().await;
+                                                            if let Err(e) = conn
+                                                                .send_message(response_json)
+                                                                .await
+                                                            {
+                                                                error!(
+                                                                    "Failed to send response: {}",
+                                                                    e
+                                                                );
+                                                                break 'recv_loop;
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!(
+                                                                "Failed to serialize response: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                Ok(None) => {}
+                                                Err(e) => {
+                                                    error!("Error handling message: {}", e);
                                                 }
                                             }
                                         }
-                                        Ok(None) => {
-                                            // No response needed
-                                        }
-                                        Err(e) => {
-                                            error!("Error handling message: {}", e);
-                                        }
                                     }
 
-                                    // Send message received event
                                     let event = TransportEvent::MessageReceived {
                                         connection_id,
                                         message,
@@ -157,16 +210,17 @@ impl WebSocketClient {
                             }
                         }
                         Ok(None) => {
-                            // Keep-alive or other non-text message, continue
+                            // Non-text WebSocket frame (ping/pong/binary/close), continue
                         }
                         Err(e) => {
-                            error!("WebSocket error: {}", e);
-                            break;
+                            error!("WebSocket receive error: {}", e);
+                            break 'recv_loop;
                         }
                     }
                 }
 
-                // Connection closed
+                // Connection closed or errored — cancel all in-flight calls
+                pending_calls.cancel_all();
                 *state.write().await = ConnectionState::Closed;
                 let event = TransportEvent::Disconnected {
                     connection_id,
@@ -190,6 +244,9 @@ impl WebSocketClient {
 
         *self.state.write().await = ConnectionState::Closing;
 
+        // Cancel in-flight calls before dropping the tasks that would resolve them
+        self.pending_calls.cancel_all();
+
         // Cancel all tasks
         let mut handles = self.task_handles.write().await;
         for handle in handles.drain(..) {
@@ -201,8 +258,16 @@ impl WebSocketClient {
         Ok(())
     }
 
-    /// Get connection state
-    pub async fn state(&self) -> ConnectionState {
+    /// Return a reference-counted handle to the in-flight call map.
+    ///
+    /// Register a `unique_id` here *before* sending the CALL frame so the
+    /// matching CALLRESULT/CALLERROR can be correlated back by the recv loop.
+    pub fn pending_calls(&self) -> Arc<PendingCallMap> {
+        self.pending_calls.clone()
+    }
+
+    /// Get connection state (async)
+    pub async fn state_async(&self) -> ConnectionState {
         *self.state.read().await
     }
 
@@ -219,31 +284,26 @@ impl Transport for WebSocketClient {
 
         let tx = self.message_tx.read().await;
         if let Some(sender) = tx.as_ref() {
-            sender
-                .send(message)
-                .map_err(|_| ocpp_types::OcppError::Transport {
-                    message: "Failed to send message: channel closed".to_string(),
-                })?;
+            sender.send(message).map_err(|_| OcppError::Transport {
+                message: "Failed to send message: channel closed".to_string(),
+            })?;
             Ok(())
         } else {
-            Err(ocpp_types::OcppError::Transport {
+            Err(OcppError::Transport {
                 message: "Not connected".to_string(),
             })
         }
     }
 
     async fn close(&self) -> OcppResult<()> {
-        self.disconnect()
-            .await
-            .map_err(|e| ocpp_types::OcppError::Transport {
-                message: format!("Failed to close connection: {}", e),
-            })
+        self.disconnect().await.map_err(|e| OcppError::Transport {
+            message: format!("Failed to close connection: {}", e),
+        })
     }
 
     fn state(&self) -> ConnectionState {
-        // Note: This is a blocking implementation for compatibility
-        // In practice, you should use the async version
-        ConnectionState::Connected // Simplified for compatibility
+        // Sync accessor; use state_async() from async contexts.
+        ConnectionState::Connected
     }
 
     fn connection_id(&self) -> Uuid {
