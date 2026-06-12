@@ -8,6 +8,7 @@
 //! - Real-world charging scenarios simulation
 
 pub mod connector;
+pub mod dispatching_handler;
 pub mod error;
 pub mod message_handler;
 pub mod state_machine;
@@ -15,26 +16,37 @@ pub mod transaction;
 
 use anyhow::Result;
 use connector::{Connector, ConnectorConfig};
+use dispatching_handler::DispatchingHandler;
 use error::ChargePointError;
-use message_handler::MessageHandler;
+use message_handler::ConfigurationStore;
 use ocpp_messages::v16j::{
-    BootNotificationRequest, BootNotificationResponse, HeartbeatRequest, RegistrationStatus,
-    StatusNotificationRequest,
+    BootNotificationRequest, BootNotificationResponse, ChangeAvailabilityRequest,
+    ChangeAvailabilityResponse, ChangeConfigurationRequest, ChangeConfigurationResponse,
+    ClearCacheRequest, ClearCacheResponse, DataTransferRequest, DataTransferResponse,
+    GetConfigurationRequest, GetConfigurationResponse, HeartbeatRequest, RegistrationStatus,
+    RemoteStartTransactionRequest, RemoteStartTransactionResponse, RemoteStopTransactionRequest,
+    RemoteStopTransactionResponse, ResetRequest, ResetResponse, StatusNotificationRequest,
+    UnlockConnectorRequest, UnlockConnectorResponse,
 };
-use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
+use ocpp_messages::{ActionDispatcher, CallMessage, Message, MessageType, OcppAction};
 use ocpp_transport::client::WebSocketClient;
-use ocpp_transport::{
-    MessageHandler as TransportMessageHandler, Transport, TransportConfig, TransportEvent,
+use ocpp_transport::{MessageHandler as TransportMessageHandler, Transport, TransportConfig};
+use ocpp_types::common::{AvailabilityStatus, KeyValue};
+use ocpp_types::v16j::{
+    ClearCacheStatus, ConfigurationStatus, DataTransferStatus, RemoteStartStopStatus, ResetStatus,
+    ResetType, UnlockStatus,
 };
-use ocpp_types::v16j::{ChargePointStatus, ChargePointVendorInfo};
 use ocpp_types::{ConnectorId, OcppError, OcppResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+use ocpp_types::v16j::ChargePointStatus;
 
 /// Charge point configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,7 +56,7 @@ pub struct ChargePointConfig {
     /// Central system WebSocket URL
     pub central_system_url: String,
     /// Charge point vendor information
-    pub vendor_info: ChargePointVendorInfo,
+    pub vendor_info: ocpp_types::v16j::ChargePointVendorInfo,
     /// Number of connectors
     pub connector_count: u32,
     /// Heartbeat interval in seconds
@@ -70,7 +82,7 @@ impl Default for ChargePointConfig {
         Self {
             charge_point_id: "CP001".to_string(),
             central_system_url: "ws://localhost:8080".to_string(),
-            vendor_info: ChargePointVendorInfo {
+            vendor_info: ocpp_types::v16j::ChargePointVendorInfo {
                 charge_point_vendor: "OCPP-RS".to_string(),
                 charge_point_model: "Simulator".to_string(),
                 charge_point_serial_number: Some("SIM001".to_string()),
@@ -82,12 +94,12 @@ impl Default for ChargePointConfig {
                 meter_serial_number: Some("MT001".to_string()),
             },
             connector_count: 2,
-            heartbeat_interval: 300,       // 5 minutes
-            meter_values_interval: 60,     // 1 minute
-            connection_retry_interval: 30, // 30 seconds
+            heartbeat_interval: 300,
+            meter_values_interval: 60,
+            connection_retry_interval: 30,
             max_connection_retries: 10,
             auto_reconnect: true,
-            call_timeout: 30, // 30 seconds, matches Python reference default
+            call_timeout: 30,
             transport_config: TransportConfig::default(),
         }
     }
@@ -129,37 +141,53 @@ pub enum ChargePointEvent {
     Error { error: ChargePointError },
 }
 
-/// Charge point event handler trait
-#[async_trait::async_trait]
-pub trait ChargePointEventHandler: Send + Sync {
-    /// Handle charge point event
-    async fn handle_event(&self, event: ChargePointEvent);
-}
-
-/// Main charge point implementation
+/// Main charge point implementation.
+///
+/// ## Setup — Python `@on` / `@after` decorator semantics
+///
+/// Register custom handlers before calling [`start()`][ChargePoint::start]:
+///
+/// ```rust,ignore
+/// let mut cp = ChargePoint::new(config)?;
+///
+/// // Override the default Reset handler
+/// cp.on(|req: ResetRequest| async move {
+///     tracing::info!("reset requested: {:?}", req.reset_type);
+///     Ok(ResetResponse { status: ResetStatus::Accepted })
+/// });
+///
+/// cp.start().await?;
+/// ```
+///
+/// Default handlers are pre-registered for all nine OCPP 1.6J CSMS→CP
+/// actions: `ChangeAvailability`, `ChangeConfiguration`, `GetConfiguration`,
+/// `RemoteStartTransaction`, `RemoteStopTransaction`, `Reset`,
+/// `UnlockConnector`, `ClearCache`, `DataTransfer`.
 pub struct ChargePoint {
-    /// Configuration
     config: ChargePointConfig,
-    /// Connectors
     connectors: Arc<RwLock<HashMap<ConnectorId, Connector>>>,
-    /// WebSocket client
     client: Arc<RwLock<Option<WebSocketClient>>>,
-    /// Message handler
-    message_handler: Arc<MessageHandler>,
-    /// Event sender
+    /// Holds the dispatcher until the first `connect()`.  Consumed (taken)
+    /// when the handler is frozen into `Arc<ActionDispatcher>` and passed to
+    /// `WebSocketClient`.  Subsequent `connect()` calls are rejected.
+    pending_dispatcher: std::sync::Mutex<Option<ActionDispatcher>>,
+    /// OCPP configuration key-value store (shared with default handlers).
+    config_store: Arc<RwLock<ConfigurationStore>>,
+    /// Connector states visible to default handlers.
+    connector_states: Arc<RwLock<HashMap<ConnectorId, ChargePointStatus>>>,
+    /// Active transaction IDs (connector → transaction_id).
+    active_transactions: Arc<RwLock<HashMap<ConnectorId, i32>>>,
     event_sender: mpsc::UnboundedSender<ChargePointEvent>,
-    /// Event receiver
     event_receiver: Arc<RwLock<Option<mpsc::UnboundedReceiver<ChargePointEvent>>>>,
-    /// Registration status
     registration_status: Arc<RwLock<RegistrationStatus>>,
-    /// Connection state
     is_connected: Arc<RwLock<bool>>,
-    /// Heartbeat task handle
     heartbeat_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl ChargePoint {
-    /// Create a new charge point
+    /// Create a new charge point with default handlers for all nine CSMS→CP
+    /// actions.  Call [`on()`][ChargePoint::on] to override any default before
+    /// calling [`start()`][ChargePoint::start].
     pub fn new(config: ChargePointConfig) -> Result<Self> {
         let (event_sender, event_receiver) = mpsc::unbounded_channel();
 
@@ -171,20 +199,31 @@ impl ChargePoint {
                 connector_type: "Type2".to_string(),
                 max_amperage: 32.0,
                 max_voltage: 230.0,
-                max_power: 7360.0, // 32A * 230V
+                max_power: 7360.0,
                 phases: 1,
                 energy_meter_serial: Some(format!("EM{:03}", i)),
             };
             connectors.insert(connector_id, Connector::new(connector_config)?);
         }
 
-        let message_handler = Arc::new(MessageHandler::new(event_sender.clone()));
+        let config_store = Arc::new(RwLock::new(ConfigurationStore::new()));
+        let connector_states = Arc::new(RwLock::new(HashMap::new()));
+        let active_transactions = Arc::new(RwLock::new(HashMap::new()));
+
+        let dispatcher = build_default_dispatcher(
+            config_store.clone(),
+            connector_states.clone(),
+            active_transactions.clone(),
+        );
 
         Ok(Self {
             config,
             connectors: Arc::new(RwLock::new(connectors)),
             client: Arc::new(RwLock::new(None)),
-            message_handler,
+            pending_dispatcher: std::sync::Mutex::new(Some(dispatcher)),
+            config_store,
+            connector_states,
+            active_transactions,
             event_sender,
             event_receiver: Arc::new(RwLock::new(Some(event_receiver))),
             registration_status: Arc::new(RwLock::new(RegistrationStatus::Rejected)),
@@ -193,121 +232,125 @@ impl ChargePoint {
         })
     }
 
-    /// Start the charge point
+    /// Register (or override) a typed `@on` handler for `Req::ACTION_NAME`.
+    ///
+    /// Must be called **before** [`start()`][ChargePoint::start].  Panics if
+    /// called after the dispatcher has been consumed by `connect()`.
+    ///
+    /// Port of the Python `@on(Action.xxx)` decorator from
+    /// [`ocpp/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py).
+    pub fn on<Req, Fut, F>(&mut self, handler: F)
+    where
+        Req: OcppAction + 'static,
+        Fut: Future<Output = OcppResult<Req::Response>> + Send + 'static,
+        F: Fn(Req) -> Fut + Send + Sync + Clone + 'static,
+    {
+        self.pending_dispatcher
+            .get_mut()
+            .expect("dispatcher lock poisoned")
+            .as_mut()
+            .expect("on() called after connect()")
+            .on::<Req, Fut, F>(handler);
+    }
+
+    /// Start the charge point: initialize connectors and connect to the CSMS.
     pub async fn start(&self) -> Result<()> {
         info!("Starting charge point: {}", self.config.charge_point_id);
 
-        // Initialize all connectors to Available
         let mut connectors = self.connectors.write().await;
         for connector in connectors.values_mut() {
             connector.set_status(ChargePointStatus::Available).await?;
         }
         drop(connectors);
 
-        // Send started event
         let _ = self.event_sender.send(ChargePointEvent::Started);
-
-        // Connect to central system
         self.connect().await?;
-
         Ok(())
     }
 
-    /// Stop the charge point
+    /// Stop the charge point gracefully.
     pub async fn stop(&self) -> Result<()> {
         info!("Stopping charge point: {}", self.config.charge_point_id);
 
-        // Stop heartbeat
         if let Some(handle) = self.heartbeat_handle.write().await.take() {
             handle.abort();
         }
-
-        // Disconnect from central system
         self.disconnect().await?;
 
-        // Set all connectors to unavailable
         let mut connectors = self.connectors.write().await;
         for connector in connectors.values_mut() {
             connector.set_status(ChargePointStatus::Unavailable).await?;
         }
-
         Ok(())
     }
 
-    /// Connect to central system
+    /// Connect to the central system.
+    ///
+    /// Consumes the `ActionDispatcher` built during setup (freezes it into an
+    /// `Arc`) and passes it to a new `WebSocketClient`.  Subsequent calls to
+    /// `on()` after this point will panic; subsequent calls to `connect()` will
+    /// return an error.
     pub async fn connect(&self) -> Result<()> {
         let url = format!(
             "{}/ocpp/{}",
             self.config.central_system_url.trim_end_matches('/'),
             self.config.charge_point_id
         );
-
         info!("Connecting to central system: {}", url);
 
-        let client = WebSocketClient::new(
-            url,
-            self.config.transport_config.clone(),
-            self.message_handler.clone(),
-        )
-        .await?;
+        // Freeze the dispatcher — take it out of the Mutex, wrap in Arc.
+        let dispatcher = self
+            .pending_dispatcher
+            .lock()
+            .unwrap()
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("connect() already called; dispatcher consumed"))?;
+        let dispatcher = Arc::new(dispatcher);
 
-        // Store client
+        let handler: Arc<dyn TransportMessageHandler> = Arc::new(DispatchingHandler::new(
+            dispatcher,
+            self.event_sender.clone(),
+        ));
+
+        let client =
+            WebSocketClient::new(url, self.config.transport_config.clone(), handler).await?;
+
         *self.client.write().await = Some(client);
         *self.is_connected.write().await = true;
-
-        // Send connected event
         let _ = self.event_sender.send(ChargePointEvent::Connected);
-
-        // Send boot notification
         self.send_boot_notification().await?;
-
         Ok(())
     }
 
-    /// Disconnect from central system
+    /// Disconnect from central system.
     pub async fn disconnect(&self) -> Result<()> {
         if let Some(client) = self.client.write().await.take() {
             client.close().await?;
         }
-
         *self.is_connected.write().await = false;
-
         let _ = self.event_sender.send(ChargePointEvent::Disconnected {
             reason: "Manual disconnect".to_string(),
         });
-
         Ok(())
     }
 
-    /// Check if connected to central system
+    /// Check if connected to central system.
     pub async fn is_connected(&self) -> bool {
         *self.is_connected.read().await
     }
 
-    /// Get registration status
+    /// Get registration status.
     pub async fn registration_status(&self) -> RegistrationStatus {
         *self.registration_status.read().await
     }
 
     /// Send a typed OCPP CALL and await the matching CALLRESULT.
     ///
-    /// This is the Rust port of `ChargePoint.call()` from the Python reference
-    /// (`ocpp/charge_point.py`). It:
-    ///
-    /// 1. Generates a unique message ID
-    /// 2. Registers the ID in `PendingCallMap` *before* sending (race-free)
-    /// 3. Sends the CALL frame over the WebSocket
-    /// 4. Awaits the response with `config.call_timeout`
-    /// 5. Returns the deserialized `Req::Response` or propagates any error
-    ///
-    /// Returns `OcppError::Timeout` if no response arrives within the
-    /// configured timeout, and `OcppError::CallError` if the server replies
-    /// with a CALLERROR frame.
+    /// Port of `ChargePoint.call()` from the Python reference
+    /// (`ocpp/charge_point.py`).
     pub async fn call<Req: OcppAction>(&self, request: Req) -> OcppResult<Req::Response> {
         let unique_id = Uuid::new_v4().to_string();
 
-        // 1. Register before sending to avoid the race where the CALLRESULT
-        //    arrives before we have a receiver in the map.
         let rx = {
             let client_guard = self.client.read().await;
             let client = client_guard.as_ref().ok_or_else(|| OcppError::Transport {
@@ -316,7 +359,6 @@ impl ChargePoint {
             client.pending_calls().register(unique_id.clone())
         };
 
-        // 2. Build the CALL frame with the same unique_id.
         let call_msg = CallMessage {
             message_type: MessageType::Call,
             unique_id: unique_id.clone(),
@@ -324,7 +366,6 @@ impl ChargePoint {
             payload: serde_json::to_value(&request).map_err(OcppError::from)?,
         };
 
-        // 3. Send the frame.
         {
             let client_guard = self.client.read().await;
             match client_guard.as_ref() {
@@ -337,8 +378,6 @@ impl ChargePoint {
             }
         }
 
-        // 4. Await the CALLRESULT (or CALLERROR) with timeout.
-        //    The recv loop resolves/rejects `rx` when the response arrives.
         let timeout = Duration::from_secs(self.config.call_timeout);
         let raw_result = tokio::time::timeout(timeout, rx)
             .await
@@ -346,16 +385,15 @@ impl ChargePoint {
                 operation: format!("{} call", Req::ACTION_NAME),
             })?
             .map_err(|_| OcppError::Transport {
-                // oneshot RecvError means the sender was dropped (disconnect)
                 message: "Connection closed while waiting for CALLRESULT".to_string(),
             })?;
 
-        // 5. Propagate any CALLERROR, then deserialize the success payload.
         let payload = raw_result?;
         serde_json::from_value::<Req::Response>(payload).map_err(OcppError::from)
     }
 
-    /// Send boot notification
+    /// Send boot notification (fire-and-forget; response is handled by the
+    /// pending-call map once issue #20 wires up the boot sequence properly).
     async fn send_boot_notification(&self) -> Result<()> {
         let request = BootNotificationRequest {
             charge_point_vendor: self.config.vendor_info.charge_point_vendor.clone(),
@@ -377,29 +415,25 @@ impl ChargePoint {
         if let Some(client) = self.client.read().await.as_ref() {
             client.send_message(message).await?;
         }
-
         Ok(())
     }
 
-    /// Start heartbeat task
+    /// Spawn the heartbeat task using the server-supplied interval.
     async fn start_heartbeat(&self) {
         let interval = Duration::from_secs(self.config.heartbeat_interval);
         let client = self.client.clone();
         let is_connected = self.is_connected.clone();
 
         let handle = tokio::spawn(async move {
-            let mut interval_timer = tokio::time::interval(interval);
+            let mut ticker = tokio::time::interval(interval);
             loop {
-                interval_timer.tick().await;
-
+                ticker.tick().await;
                 if !*is_connected.read().await {
                     continue;
                 }
-
-                let request = HeartbeatRequest {};
                 let message = match ocpp_messages::CallMessage::new(
                     HeartbeatRequest::ACTION_NAME.to_string(),
-                    request,
+                    HeartbeatRequest {},
                 ) {
                     Ok(call) => Message::Call(call),
                     Err(e) => {
@@ -407,7 +441,6 @@ impl ChargePoint {
                         continue;
                     }
                 };
-
                 if let Some(client) = client.read().await.as_ref() {
                     if let Err(e) = client.send_message(message).await {
                         error!("Failed to send heartbeat: {}", e);
@@ -419,17 +452,46 @@ impl ChargePoint {
         *self.heartbeat_handle.write().await = Some(handle);
     }
 
-    /// Get connector by ID
+    /// Handle a boot notification response (called after `call()` resolves).
+    pub async fn handle_boot_notification_response(
+        &self,
+        response: BootNotificationResponse,
+    ) -> Result<()> {
+        info!("Boot notification response: {:?}", response.status);
+        *self.registration_status.write().await = response.status;
+
+        match response.status {
+            RegistrationStatus::Accepted => {
+                let _ = self
+                    .event_sender
+                    .send(ChargePointEvent::BootNotificationAccepted {
+                        current_time: response.current_time,
+                        interval: response.interval,
+                    });
+                self.start_heartbeat().await;
+            }
+            RegistrationStatus::Pending => {
+                warn!("Boot notification pending, will retry");
+            }
+            RegistrationStatus::Rejected => {
+                error!("Boot notification rejected");
+                return Err(anyhow::anyhow!("Boot notification rejected"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Get connector by ID.
     pub async fn get_connector(&self, connector_id: ConnectorId) -> Option<Connector> {
         self.connectors.read().await.get(&connector_id).cloned()
     }
 
-    /// Get all connectors
+    /// Get all connectors.
     pub async fn get_connectors(&self) -> HashMap<ConnectorId, Connector> {
         self.connectors.read().await.clone()
     }
 
-    /// Plug in connector
+    /// Plug in connector.
     pub async fn plug_in(&self, connector_id: ConnectorId) -> Result<()> {
         let mut connectors = self.connectors.write().await;
         if let Some(connector) = connectors.get_mut(&connector_id) {
@@ -438,7 +500,7 @@ impl ChargePoint {
         Ok(())
     }
 
-    /// Plug out connector
+    /// Plug out connector.
     pub async fn plug_out(&self, connector_id: ConnectorId) -> Result<()> {
         let mut connectors = self.connectors.write().await;
         if let Some(connector) = connectors.get_mut(&connector_id) {
@@ -447,7 +509,7 @@ impl ChargePoint {
         Ok(())
     }
 
-    /// Start transaction
+    /// Start transaction (local state only; OCPP wire message is issue #21).
     pub async fn start_transaction(&self, connector_id: ConnectorId, id_tag: String) -> Result<()> {
         let mut connectors = self.connectors.write().await;
         if let Some(connector) = connectors.get_mut(&connector_id) {
@@ -456,7 +518,7 @@ impl ChargePoint {
         Ok(())
     }
 
-    /// Stop transaction
+    /// Stop transaction (local state only; OCPP wire message is issue #21).
     pub async fn stop_transaction(
         &self,
         connector_id: ConnectorId,
@@ -471,7 +533,7 @@ impl ChargePoint {
         Ok(())
     }
 
-    /// Set connector fault
+    /// Set connector fault.
     pub async fn set_fault(
         &self,
         connector_id: ConnectorId,
@@ -485,7 +547,7 @@ impl ChargePoint {
         Ok(())
     }
 
-    /// Clear connector fault
+    /// Clear connector fault.
     pub async fn clear_fault(&self, connector_id: ConnectorId) -> Result<()> {
         let mut connectors = self.connectors.write().await;
         if let Some(connector) = connectors.get_mut(&connector_id) {
@@ -494,7 +556,7 @@ impl ChargePoint {
         Ok(())
     }
 
-    /// Set connector availability
+    /// Set connector availability.
     pub async fn set_availability(&self, connector_id: ConnectorId, available: bool) -> Result<()> {
         let mut connectors = self.connectors.write().await;
         if let Some(connector) = connectors.get_mut(&connector_id) {
@@ -507,45 +569,12 @@ impl ChargePoint {
         Ok(())
     }
 
-    /// Get event receiver
+    /// Take the event receiver (can only be called once).
     pub async fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<ChargePointEvent>> {
         self.event_receiver.write().await.take()
     }
 
-    /// Handle boot notification response
-    pub async fn handle_boot_notification_response(
-        &self,
-        response: BootNotificationResponse,
-    ) -> Result<()> {
-        info!("Boot notification response: {:?}", response.status);
-
-        *self.registration_status.write().await = response.status;
-
-        match response.status {
-            RegistrationStatus::Accepted => {
-                let _ = self
-                    .event_sender
-                    .send(ChargePointEvent::BootNotificationAccepted {
-                        current_time: response.current_time,
-                        interval: response.interval,
-                    });
-
-                // Start heartbeat with the interval from central system
-                self.start_heartbeat().await;
-            }
-            RegistrationStatus::Pending => {
-                warn!("Boot notification pending, will retry");
-            }
-            RegistrationStatus::Rejected => {
-                error!("Boot notification rejected");
-                return Err(anyhow::anyhow!("Boot notification rejected"));
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Send status notification for a connector
+    /// Send status notification for a connector.
     pub async fn send_status_notification(
         &self,
         connector_id: ConnectorId,
@@ -571,44 +600,241 @@ impl ChargePoint {
         if let Some(client) = self.client.read().await.as_ref() {
             client.send_message(message).await?;
         }
-
         Ok(())
     }
-}
 
-#[async_trait::async_trait]
-impl TransportMessageHandler for ChargePoint {
-    async fn handle_message(&self, message: Message) -> OcppResult<Option<Message>> {
-        self.message_handler.handle_message(message).await
+    /// Read-only access to the OCPP configuration store (e.g. for testing).
+    pub fn config_store(&self) -> Arc<RwLock<ConfigurationStore>> {
+        self.config_store.clone()
     }
 
-    async fn handle_event(&self, event: TransportEvent) {
-        match event {
-            TransportEvent::Connected { .. } => {
-                info!("Transport connected");
-            }
-            TransportEvent::Disconnected { reason, .. } => {
-                warn!("Transport disconnected: {}", reason);
-                *self.is_connected.write().await = false;
+    /// Update the connector state visible to the default `RemoteStartTransaction`
+    /// and `UnlockConnector` handlers.  Call this whenever a connector's
+    /// `ChargePointStatus` changes (e.g. after `plug_in()` starts a charging
+    /// session).
+    pub async fn update_connector_state(
+        &self,
+        connector_id: ConnectorId,
+        state: ChargePointStatus,
+    ) {
+        self.connector_states
+            .write()
+            .await
+            .insert(connector_id, state);
+    }
 
-                let _ = self
-                    .event_sender
-                    .send(ChargePointEvent::Disconnected { reason });
+    /// Update the active-transaction map visible to the default
+    /// `RemoteStopTransaction` handler.
+    pub async fn update_active_transaction(
+        &self,
+        connector_id: ConnectorId,
+        transaction_id: Option<i32>,
+    ) {
+        let mut txs = self.active_transactions.write().await;
+        match transaction_id {
+            Some(id) => {
+                txs.insert(connector_id, id);
             }
-            TransportEvent::Error { error, .. } => {
-                error!("Transport error: {}", error);
-                let _ = self.event_sender.send(ChargePointEvent::Error {
-                    error: ChargePointError::TransportError(error.to_string()),
-                });
+            None => {
+                txs.remove(&connector_id);
             }
-            _ => {}
         }
     }
 }
 
+// ---------------------------------------------------------------------------
+// Default handler registration
+// ---------------------------------------------------------------------------
+
+/// Register the nine default CSMS→CP action handlers.
+///
+/// Mirrors the hard-coded `match call.action.as_str()` block that was
+/// previously in `MessageHandler::handle_message()`.
+fn build_default_dispatcher(
+    config_store: Arc<RwLock<ConfigurationStore>>,
+    connector_states: Arc<RwLock<HashMap<ConnectorId, ChargePointStatus>>>,
+    active_transactions: Arc<RwLock<HashMap<ConnectorId, i32>>>,
+) -> ActionDispatcher {
+    let mut d = ActionDispatcher::new();
+
+    // ChangeAvailability — always accept
+    d.on(|_req: ChangeAvailabilityRequest| async move {
+        Ok(ChangeAvailabilityResponse {
+            status: AvailabilityStatus::Accepted,
+        })
+    });
+
+    // ChangeConfiguration
+    {
+        let cs = config_store.clone();
+        d.on(move |req: ChangeConfigurationRequest| {
+            let cs = cs.clone();
+            async move {
+                let status = match cs.write().await.set(&req.key, req.value.clone()) {
+                    Ok(()) => ConfigurationStatus::Accepted,
+                    Err(e) if e.contains("read-only") => ConfigurationStatus::Rejected,
+                    Err(_) => ConfigurationStatus::NotSupported,
+                };
+                Ok(ChangeConfigurationResponse { status })
+            }
+        });
+    }
+
+    // GetConfiguration
+    {
+        let cs = config_store.clone();
+        d.on(move |req: GetConfigurationRequest| {
+            let cs = cs.clone();
+            async move {
+                let store = cs.read().await;
+                let (configuration_keys, unknown_keys) = if let Some(keys) = req.key {
+                    let mut known = Vec::new();
+                    let mut unknown = Vec::new();
+                    for key in keys {
+                        if let Some(value) = store.get(&key) {
+                            known.push(KeyValue {
+                                key: key.clone(),
+                                readonly: Some(store.is_readonly(&key)),
+                                value: Some(value.clone()),
+                            });
+                        } else {
+                            unknown.push(key);
+                        }
+                    }
+                    (
+                        Some(known),
+                        if unknown.is_empty() {
+                            None
+                        } else {
+                            Some(unknown)
+                        },
+                    )
+                } else {
+                    let all = store
+                        .keys()
+                        .iter()
+                        .map(|(k, v)| KeyValue {
+                            key: k.clone(),
+                            readonly: Some(store.is_readonly(k)),
+                            value: Some(v.clone()),
+                        })
+                        .collect();
+                    (Some(all), None)
+                };
+                Ok(GetConfigurationResponse {
+                    configuration_keys,
+                    unknown_keys,
+                })
+            }
+        });
+    }
+
+    // RemoteStartTransaction
+    {
+        let states = connector_states.clone();
+        d.on(move |req: RemoteStartTransactionRequest| {
+            let states = states.clone();
+            async move {
+                let connector_id = match req.connector_id {
+                    Some(id) => ConnectorId::new(id).map_err(|e| OcppError::Internal {
+                        message: e.to_string(),
+                    })?,
+                    None => ConnectorId::new(1).unwrap(),
+                };
+                let s = states.read().await;
+                let status = match s.get(&connector_id) {
+                    Some(ChargePointStatus::Available | ChargePointStatus::Reserved) => {
+                        RemoteStartStopStatus::Accepted
+                    }
+                    Some(_) => RemoteStartStopStatus::Rejected,
+                    None => RemoteStartStopStatus::Accepted,
+                };
+                Ok(RemoteStartTransactionResponse { status })
+            }
+        });
+    }
+
+    // RemoteStopTransaction
+    {
+        let txs = active_transactions.clone();
+        d.on(move |req: RemoteStopTransactionRequest| {
+            let txs = txs.clone();
+            async move {
+                let transactions = txs.read().await;
+                let status = if transactions.values().any(|&id| id == req.transaction_id) {
+                    RemoteStartStopStatus::Accepted
+                } else {
+                    RemoteStartStopStatus::Rejected
+                };
+                Ok(RemoteStopTransactionResponse { status })
+            }
+        });
+    }
+
+    // Reset — always accept
+    d.on(|req: ResetRequest| async move {
+        match req.reset_type {
+            ResetType::Soft => info!("Performing soft reset"),
+            ResetType::Hard => info!("Performing hard reset"),
+        }
+        Ok(ResetResponse {
+            status: ResetStatus::Accepted,
+        })
+    });
+
+    // UnlockConnector
+    {
+        let states = connector_states.clone();
+        d.on(move |req: UnlockConnectorRequest| {
+            let states = states.clone();
+            async move {
+                let connector_id =
+                    ConnectorId::new(req.connector_id).map_err(|e| OcppError::Internal {
+                        message: e.to_string(),
+                    })?;
+                let s = states.read().await;
+                let status = match s.get(&connector_id) {
+                    Some(
+                        ChargePointStatus::Charging
+                        | ChargePointStatus::SuspendedEV
+                        | ChargePointStatus::SuspendedEVSE
+                        | ChargePointStatus::Finishing,
+                    ) => UnlockStatus::Unlocked,
+                    Some(ChargePointStatus::Available) => UnlockStatus::UnlockFailed,
+                    Some(_) => UnlockStatus::NotSupported,
+                    None => UnlockStatus::UnlockFailed,
+                };
+                Ok(UnlockConnectorResponse { status })
+            }
+        });
+    }
+
+    // ClearCache — always accept
+    d.on(|_req: ClearCacheRequest| async move {
+        Ok(ClearCacheResponse {
+            status: ClearCacheStatus::Accepted,
+        })
+    });
+
+    // DataTransfer — echo data, always accept
+    d.on(|req: DataTransferRequest| async move {
+        Ok(DataTransferResponse {
+            status: DataTransferStatus::Accepted,
+            data: req.data,
+        })
+    });
+
+    d
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ocpp_messages::v16j::{ResetRequest, ResetResponse};
 
     #[tokio::test]
     async fn test_charge_point_creation() {
@@ -642,11 +868,9 @@ mod tests {
         let cp = ChargePoint::new(config).unwrap();
         let connector_id = ConnectorId::new(1).unwrap();
 
-        // Test plug in/out cycle
         cp.plug_in(connector_id).await.unwrap();
         cp.plug_out(connector_id).await.unwrap();
 
-        // Test transaction operations (cable must be plugged in first)
         cp.plug_in(connector_id).await.unwrap();
         cp.start_transaction(connector_id, "test_tag".to_string())
             .await
@@ -655,7 +879,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Test fault operations
         cp.set_fault(
             connector_id,
             ocpp_types::v16j::ChargePointErrorCode::NoError,
@@ -685,7 +908,6 @@ mod tests {
         let config = ChargePointConfig::default();
         let cp = ChargePoint::new(config).unwrap();
 
-        // No connect() called, so client is None
         let result = cp.call(HeartbeatRequest {}).await;
 
         match result {
@@ -697,5 +919,214 @@ mod tests {
             }
             other => panic!("expected Transport error, got: {other:?}"),
         }
+    }
+
+    // --- ActionDispatcher integration tests ---
+
+    #[test]
+    fn default_dispatcher_has_nine_handlers() {
+        let store = Arc::new(RwLock::new(ConfigurationStore::new()));
+        let states = Arc::new(RwLock::new(HashMap::new()));
+        let txs = Arc::new(RwLock::new(HashMap::new()));
+        let d = build_default_dispatcher(store, states, txs);
+        assert_eq!(d.handler_count(), 9);
+    }
+
+    #[test]
+    fn default_dispatcher_has_all_expected_actions() {
+        let store = Arc::new(RwLock::new(ConfigurationStore::new()));
+        let states = Arc::new(RwLock::new(HashMap::new()));
+        let txs = Arc::new(RwLock::new(HashMap::new()));
+        let d = build_default_dispatcher(store, states, txs);
+
+        for action in [
+            "ChangeAvailability",
+            "ChangeConfiguration",
+            "GetConfiguration",
+            "RemoteStartTransaction",
+            "RemoteStopTransaction",
+            "Reset",
+            "UnlockConnector",
+            "ClearCache",
+            "DataTransfer",
+        ] {
+            assert!(d.has_handler(action), "missing handler for {action}");
+        }
+    }
+
+    #[tokio::test]
+    async fn on_overrides_default_reset_handler() {
+        let config = ChargePointConfig::default();
+        let mut cp = ChargePoint::new(config).unwrap();
+
+        // Override the default Reset handler
+        cp.on(|_req: ResetRequest| async move {
+            Ok(ResetResponse {
+                status: ResetStatus::Rejected,
+            })
+        });
+
+        // Verify the override is in place by dispatching directly
+        let d = cp
+            .pending_dispatcher
+            .into_inner()
+            .unwrap()
+            .expect("dispatcher should still be present");
+
+        let call = ocpp_messages::CallMessage::new(
+            "Reset".to_string(),
+            serde_json::json!({ "type": "Soft" }),
+        )
+        .unwrap();
+        let resp = d.dispatch(&call).await.unwrap();
+        assert_eq!(resp["status"], "Rejected");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_routes_change_configuration() {
+        let config_store = Arc::new(RwLock::new(ConfigurationStore::new()));
+        let states = Arc::new(RwLock::new(HashMap::new()));
+        let txs = Arc::new(RwLock::new(HashMap::new()));
+        let d = build_default_dispatcher(config_store.clone(), states, txs);
+
+        let call = ocpp_messages::CallMessage::new(
+            "ChangeConfiguration".to_string(),
+            serde_json::json!({ "key": "HeartbeatInterval", "value": "120" }),
+        )
+        .unwrap();
+        let resp = d.dispatch(&call).await.unwrap();
+        assert_eq!(resp["status"], "Accepted");
+
+        // Confirm it was stored
+        let stored = config_store
+            .read()
+            .await
+            .get("HeartbeatInterval")
+            .cloned()
+            .unwrap();
+        assert_eq!(stored, "120");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_routes_get_configuration() {
+        let config_store = Arc::new(RwLock::new(ConfigurationStore::new()));
+        let states = Arc::new(RwLock::new(HashMap::new()));
+        let txs = Arc::new(RwLock::new(HashMap::new()));
+        let d = build_default_dispatcher(config_store, states, txs);
+
+        let call = ocpp_messages::CallMessage::new(
+            "GetConfiguration".to_string(),
+            serde_json::json!({ "key": ["HeartbeatInterval"] }),
+        )
+        .unwrap();
+        let resp = d.dispatch(&call).await.unwrap();
+        let keys = resp["configurationKey"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["key"], "HeartbeatInterval");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_routes_clear_cache() {
+        let store = Arc::new(RwLock::new(ConfigurationStore::new()));
+        let states = Arc::new(RwLock::new(HashMap::new()));
+        let txs = Arc::new(RwLock::new(HashMap::new()));
+        let d = build_default_dispatcher(store, states, txs);
+
+        let call = ocpp_messages::CallMessage::new("ClearCache".to_string(), serde_json::json!({}))
+            .unwrap();
+        let resp = d.dispatch(&call).await.unwrap();
+        assert_eq!(resp["status"], "Accepted");
+    }
+
+    #[tokio::test]
+    async fn dispatcher_routes_data_transfer_echo() {
+        let store = Arc::new(RwLock::new(ConfigurationStore::new()));
+        let states = Arc::new(RwLock::new(HashMap::new()));
+        let txs = Arc::new(RwLock::new(HashMap::new()));
+        let d = build_default_dispatcher(store, states, txs);
+
+        let call = ocpp_messages::CallMessage::new(
+            "DataTransfer".to_string(),
+            serde_json::json!({ "vendorId": "TestVendor", "data": "hello" }),
+        )
+        .unwrap();
+        let resp = d.dispatch(&call).await.unwrap();
+        assert_eq!(resp["status"], "Accepted");
+        assert_eq!(resp["data"], "hello");
+    }
+
+    #[tokio::test]
+    async fn dispatching_handler_call_returns_callresult() {
+        use ocpp_messages::v16j::{HeartbeatRequest, HeartbeatResponse};
+        use ocpp_messages::ActionDispatcher;
+
+        let mut d = ActionDispatcher::new();
+        d.on(|_req: HeartbeatRequest| async move {
+            Ok(HeartbeatResponse {
+                current_time: chrono::Utc::now(),
+            })
+        });
+
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let handler = DispatchingHandler::new(Arc::new(d), tx);
+
+        let call_msg = ocpp_messages::CallMessage::new(
+            HeartbeatRequest::ACTION_NAME.to_string(),
+            HeartbeatRequest {},
+        )
+        .unwrap();
+        let unique_id = call_msg.unique_id.clone();
+        let result = handler
+            .handle_message(Message::Call(call_msg))
+            .await
+            .unwrap();
+
+        let Some(Message::CallResult(cr)) = result else {
+            panic!("expected CallResult");
+        };
+        assert_eq!(cr.unique_id, unique_id);
+        assert!(cr.payload.get("currentTime").is_some());
+    }
+
+    #[tokio::test]
+    async fn dispatching_handler_unknown_action_returns_callerror() {
+        use ocpp_messages::ActionDispatcher;
+        use ocpp_types::CallErrorCode;
+
+        let d = ActionDispatcher::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let handler = DispatchingHandler::new(Arc::new(d), tx);
+
+        let call_msg =
+            ocpp_messages::CallMessage::new("Unknown".to_string(), serde_json::json!({})).unwrap();
+        let result = handler
+            .handle_message(Message::Call(call_msg))
+            .await
+            .unwrap();
+
+        let Some(Message::CallError(ce)) = result else {
+            panic!("expected CallError");
+        };
+        assert_eq!(ce.error_code, CallErrorCode::NotSupported);
+    }
+
+    #[tokio::test]
+    async fn dispatching_handler_callresult_passthrough_returns_none() {
+        use ocpp_messages::ActionDispatcher;
+
+        let d = ActionDispatcher::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let handler = DispatchingHandler::new(Arc::new(d), tx);
+
+        let cr = ocpp_types::CallResultMessage {
+            message_type: MessageType::CallResult,
+            unique_id: "test".to_string(),
+            payload: serde_json::json!({}),
+        };
+        let result = handler
+            .handle_message(Message::CallResult(cr))
+            .await
+            .unwrap();
+        assert!(result.is_none());
     }
 }
