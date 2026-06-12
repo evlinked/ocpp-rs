@@ -141,6 +141,14 @@ where
         Ok(())
     }
 
+    /// Consume this wrapper and return the inner `WebSocketStream`.
+    ///
+    /// Intended for callers that need to split the stream into independent
+    /// read and write halves (e.g. to avoid the shared-mutex deadlock).
+    pub fn into_inner(self) -> WebSocketStream<S> {
+        self.stream
+    }
+
     /// Get connection info
     pub fn connection_info(&self) -> &ConnectionInfo {
         &self.connection_info

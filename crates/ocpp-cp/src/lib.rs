@@ -18,20 +18,21 @@ use connector::{Connector, ConnectorConfig};
 use error::ChargePointError;
 use message_handler::ConfigurationStore;
 use ocpp_messages::v16j::{
-    BootNotificationRequest, BootNotificationResponse, ChangeAvailabilityRequest,
+    AuthorizeRequest, BootNotificationRequest, BootNotificationResponse, ChangeAvailabilityRequest,
     ChangeAvailabilityResponse, ChangeConfigurationRequest, ChangeConfigurationResponse,
     ClearCacheRequest, ClearCacheResponse, DataTransferRequest, DataTransferResponse,
     GetConfigurationRequest, GetConfigurationResponse, HeartbeatRequest, RegistrationStatus,
     RemoteStartTransactionRequest, RemoteStartTransactionResponse, RemoteStopTransactionRequest,
-    RemoteStopTransactionResponse, ResetRequest, ResetResponse, StatusNotificationRequest,
-    UnlockConnectorRequest, UnlockConnectorResponse,
+    RemoteStopTransactionResponse, ResetRequest, ResetResponse, StartTransactionRequest,
+    StatusNotificationRequest, StopTransactionRequest, UnlockConnectorRequest,
+    UnlockConnectorResponse,
 };
 use ocpp_messages::{ActionDispatcher, CallMessage, Message, MessageType, OcppAction};
 use ocpp_transport::client::WebSocketClient;
 use ocpp_transport::{
     MessageHandler as TransportMessageHandler, Transport, TransportConfig, TransportEvent,
 };
-use ocpp_types::common::{AvailabilityStatus, KeyValue};
+use ocpp_types::common::{AuthorizationStatus, AvailabilityStatus, IdTagInfo, KeyValue, Reason};
 use ocpp_types::v16j::{
     ChargePointStatus, ChargePointVendorInfo, ClearCacheStatus, ConfigurationStatus,
     DataTransferStatus, RemoteStartStopStatus, ResetStatus, ResetType, UnlockStatus,
@@ -711,7 +712,11 @@ impl ChargePoint {
         let is_connected = self.is_connected.clone();
 
         let handle = tokio::spawn(async move {
-            let mut interval_timer = tokio::time::interval(interval);
+            // Delay the first tick so it fires *after* the interval, not immediately.
+            // tokio::time::interval() fires at t=0 which would send a Heartbeat right
+            // after boot — before any caller can send their own CALL on the connection.
+            let start = tokio::time::Instant::now() + interval;
+            let mut interval_timer = tokio::time::interval_at(start, interval);
             loop {
                 interval_timer.tick().await;
 
@@ -770,27 +775,122 @@ impl ChargePoint {
         Ok(())
     }
 
-    /// Start transaction
-    pub async fn start_transaction(&self, connector_id: ConnectorId, id_tag: String) -> Result<()> {
-        let mut connectors = self.connectors.write().await;
-        if let Some(connector) = connectors.get_mut(&connector_id) {
-            connector.start_transaction(id_tag).await?;
-        }
-        Ok(())
+    /// Port of `ChargePoint._send_authorize()` from the Python reference.
+    /// Sends `AuthorizeRequest` via `call()` and returns the `IdTagInfo` from the CSMS.
+    ///
+    /// Python reference: [`ocpp/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py)
+    pub async fn authorize(&self, id_tag: &str) -> OcppResult<IdTagInfo> {
+        let response = self
+            .call(AuthorizeRequest {
+                id_tag: id_tag.to_string(),
+            })
+            .await?;
+        Ok(response.id_tag_info)
     }
 
-    /// Stop transaction
-    pub async fn stop_transaction(
+    /// Port of `send_start_transaction()` from the Python reference.
+    /// Sends `StartTransactionRequest` via `call()`, uses the CSMS-assigned `transactionId`,
+    /// and transitions the connector to `Charging`. Returns the CSMS-assigned transaction ID.
+    ///
+    /// Returns `OcppError::Authorization` if the CSMS blocks the id-tag.
+    ///
+    /// Python reference: [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py)
+    pub async fn start_transaction(
         &self,
         connector_id: ConnectorId,
-        reason: Option<String>,
-    ) -> Result<()> {
+        id_tag: &str,
+        meter_start: i32,
+    ) -> OcppResult<i32> {
+        let response = self
+            .call(StartTransactionRequest {
+                connector_id: connector_id.value(),
+                id_tag: id_tag.to_string(),
+                meter_start,
+                timestamp: chrono::Utc::now(),
+                reservation_id: None,
+            })
+            .await?;
+
+        if response.id_tag_info.status != AuthorizationStatus::Accepted {
+            return Err(OcppError::Authorization {
+                reason: format!(
+                    "id-tag '{}' rejected by CSMS: {:?}",
+                    id_tag, response.id_tag_info.status
+                ),
+            });
+        }
+
+        let csms_tx_id = response.transaction_id;
+        let tx_id = ocpp_types::TransactionId::new(csms_tx_id);
+
         let mut connectors = self.connectors.write().await;
         if let Some(connector) = connectors.get_mut(&connector_id) {
             connector
-                .stop_transaction(reason.unwrap_or_else(|| "Local".to_string()))
-                .await?;
+                .start_transaction_with_id(id_tag.to_string(), tx_id, meter_start)
+                .await
+                .map_err(|e| OcppError::Internal {
+                    message: e.to_string(),
+                })?;
         }
+
+        Ok(csms_tx_id)
+    }
+
+    /// Port of `send_stop_transaction()` from the Python reference.
+    /// Finds the connector owning `transaction_id`, sends `StopTransactionRequest`
+    /// via `call()`, then transitions the connector back to `Available`/`Finishing`.
+    ///
+    /// Python reference: [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py)
+    pub async fn stop_transaction(
+        &self,
+        transaction_id: i32,
+        meter_stop: i32,
+        reason: Option<Reason>,
+    ) -> OcppResult<()> {
+        // Find which connector owns this transaction (read lock only, dropped before call()).
+        let connector_id = {
+            let connectors = self.connectors.read().await;
+            let mut found: Option<ConnectorId> = None;
+            for (&cid, connector) in connectors.iter() {
+                if let Some(tx) = connector.current_transaction().await {
+                    if tx.id().value() == transaction_id {
+                        found = Some(cid);
+                        break;
+                    }
+                }
+            }
+            found
+        };
+
+        let connector_id = connector_id.ok_or_else(|| OcppError::NotFound {
+            resource: format!("active transaction {transaction_id}"),
+        })?;
+
+        self.call(StopTransactionRequest {
+            transaction_id,
+            meter_stop,
+            timestamp: chrono::Utc::now(),
+            id_tag: None,
+            reason: reason.clone(),
+            transaction_data: None,
+        })
+        .await?;
+
+        let reason_str = reason
+            .as_ref()
+            .map(|r| format!("{r:?}"))
+            .unwrap_or_else(|| "Local".to_string());
+
+        let mut connectors = self.connectors.write().await;
+        if let Some(connector) = connectors.get_mut(&connector_id) {
+            connector
+                .stop_transaction(reason_str)
+                .await
+                .map_err(|e| OcppError::Internal {
+                    message: e.to_string(),
+                })?;
+        }
+
         Ok(())
     }
 
@@ -1025,14 +1125,8 @@ mod tests {
         cp.plug_in(connector_id).await.unwrap();
         cp.plug_out(connector_id).await.unwrap();
 
-        // Test transaction operations (cable must be plugged in first)
-        cp.plug_in(connector_id).await.unwrap();
-        cp.start_transaction(connector_id, "test_tag".to_string())
-            .await
-            .unwrap();
-        cp.stop_transaction(connector_id, Some("Test stop".to_string()))
-            .await
-            .unwrap();
+        // start_transaction / stop_transaction now send OCPP messages and require a
+        // connected CSMS; those flows are covered by the OCPP round-trip tests below.
 
         // Test fault operations
         cp.set_fault(
@@ -1476,5 +1570,177 @@ mod tests {
         // The heartbeat task handle should be set after a successful boot.
         let has_heartbeat = cp.heartbeat_handle.read().await.is_some();
         assert!(has_heartbeat, "heartbeat task should be running after boot");
+    }
+
+    // --- authorize / start_transaction / stop_transaction OCPP round-trip tests ---
+    //
+    // Each test uses `spawn_mock_csms` with pre-queued CALLRESULT payloads in
+    // FIFO order. The first response always handles the BootNotification from
+    // `connect()`. Subsequent responses serve the action under test.
+    //
+    // Python reference: ocpp/charge_point.py, examples/v16/charge_point.py
+
+    fn authorize_response(status: &str) -> serde_json::Value {
+        serde_json::json!({ "idTagInfo": { "status": status } })
+    }
+
+    fn start_tx_response(transaction_id: i32, status: &str) -> serde_json::Value {
+        serde_json::json!({
+            "transactionId": transaction_id,
+            "idTagInfo": { "status": status }
+        })
+    }
+
+    fn stop_tx_response() -> serde_json::Value {
+        serde_json::json!({})
+    }
+
+    /// `ChargePoint::authorize()` — port of `_send_authorize()` from charge_point.py.
+    /// Accepted id-tag returns `IdTagInfo { status: Accepted }`.
+    #[tokio::test]
+    async fn authorize_accepted_returns_id_tag_info() {
+        let addr = spawn_mock_csms(vec![
+            boot_response("Accepted", 60),
+            authorize_response("Accepted"),
+        ])
+        .await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..Default::default()
+        })
+        .unwrap();
+
+        cp.connect().await.unwrap();
+
+        let info = cp.authorize("TAG123").await.unwrap();
+        assert_eq!(info.status, AuthorizationStatus::Accepted);
+    }
+
+    /// Blocked id-tag returns `IdTagInfo { status: Blocked }` (no error, CSMS says so).
+    #[tokio::test]
+    async fn authorize_blocked_returns_blocked_status() {
+        let addr = spawn_mock_csms(vec![
+            boot_response("Accepted", 60),
+            authorize_response("Blocked"),
+        ])
+        .await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..Default::default()
+        })
+        .unwrap();
+
+        cp.connect().await.unwrap();
+
+        let info = cp.authorize("BLOCKED").await.unwrap();
+        assert_eq!(info.status, AuthorizationStatus::Blocked);
+    }
+
+    /// `ChargePoint::start_transaction()` — port of `send_start_transaction()`.
+    /// Sends `StartTransactionRequest`, stores CSMS-assigned `transactionId`, returns it.
+    #[tokio::test]
+    async fn start_transaction_sends_call_and_returns_csms_id() {
+        const CSMS_TX_ID: i32 = 42;
+        let addr = spawn_mock_csms(vec![
+            boot_response("Accepted", 60),
+            start_tx_response(CSMS_TX_ID, "Accepted"),
+        ])
+        .await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..Default::default()
+        })
+        .unwrap();
+
+        cp.connect().await.unwrap();
+
+        let connector_id = ConnectorId::new(1).unwrap();
+        cp.plug_in(connector_id).await.unwrap();
+
+        let tx_id = cp
+            .start_transaction(connector_id, "TAG123", 0)
+            .await
+            .unwrap();
+        assert_eq!(tx_id, CSMS_TX_ID, "returned CSMS-assigned transaction ID");
+
+        // Connector should now be in Charging state.
+        let connector = cp.get_connector(connector_id).await.unwrap();
+        assert_eq!(connector.status().await, ChargePointStatus::Charging);
+
+        // CSMS-assigned ID is stored in the connector's transaction.
+        let stored_tx_id = connector.current_transaction().await.unwrap().id().value();
+        assert_eq!(stored_tx_id, CSMS_TX_ID);
+    }
+
+    /// Blocked id-tag during `start_transaction` returns `OcppError::Authorization`.
+    #[tokio::test]
+    async fn start_transaction_blocked_id_tag_returns_error() {
+        let addr = spawn_mock_csms(vec![
+            boot_response("Accepted", 60),
+            start_tx_response(0, "Blocked"),
+        ])
+        .await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..Default::default()
+        })
+        .unwrap();
+
+        cp.connect().await.unwrap();
+
+        let connector_id = ConnectorId::new(1).unwrap();
+        cp.plug_in(connector_id).await.unwrap();
+
+        let err = cp
+            .start_transaction(connector_id, "BLOCKED_TAG", 0)
+            .await
+            .unwrap_err();
+        match err {
+            OcppError::Authorization { reason } => {
+                assert!(
+                    reason.contains("BLOCKED_TAG"),
+                    "error should mention the id-tag: {reason}"
+                );
+            }
+            other => panic!("expected Authorization error, got {other:?}"),
+        }
+    }
+
+    /// `ChargePoint::stop_transaction()` — port of `send_stop_transaction()`.
+    /// Sends `StopTransactionRequest` with the correct `transactionId`.
+    #[tokio::test]
+    async fn stop_transaction_sends_call_and_clears_connector() {
+        const CSMS_TX_ID: i32 = 99;
+        let addr = spawn_mock_csms(vec![
+            boot_response("Accepted", 60),
+            start_tx_response(CSMS_TX_ID, "Accepted"),
+            stop_tx_response(),
+        ])
+        .await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..Default::default()
+        })
+        .unwrap();
+
+        cp.connect().await.unwrap();
+
+        let connector_id = ConnectorId::new(1).unwrap();
+        cp.plug_in(connector_id).await.unwrap();
+
+        let tx_id = cp
+            .start_transaction(connector_id, "TAG456", 0)
+            .await
+            .unwrap();
+        assert_eq!(tx_id, CSMS_TX_ID);
+
+        cp.stop_transaction(tx_id, 1000, None).await.unwrap();
+
+        // No active transaction after stop.
+        let connector = cp.get_connector(connector_id).await.unwrap();
+        assert!(
+            !connector.has_active_transaction().await,
+            "transaction should be cleared after stop"
+        );
     }
 }

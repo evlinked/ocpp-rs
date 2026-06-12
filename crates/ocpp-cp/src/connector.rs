@@ -11,7 +11,7 @@ use crate::error::ChargePointError;
 use crate::transaction::Transaction;
 use anyhow::Result;
 use ocpp_types::v16j::{ChargePointErrorCode, ChargePointStatus};
-use ocpp_types::ConnectorId;
+use ocpp_types::{ConnectorId, TransactionId};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -414,6 +414,68 @@ impl Connector {
                     ),
                 })
                 .await;
+                return Err(ChargePointError::InvalidOperation(format!(
+                    "Cannot start transaction in status: {:?}",
+                    current_status
+                ))
+                .into());
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Start transaction using a CSMS-assigned transaction ID.
+    ///
+    /// Called by `ChargePoint::start_transaction()` after `StartTransactionResponse` arrives.
+    /// Identical precondition checks as `start_transaction` but uses `Transaction::with_id()`
+    /// so the CSMS-supplied `transaction_id` is stored instead of a locally-generated one.
+    pub async fn start_transaction_with_id(
+        &mut self,
+        id_tag: String,
+        transaction_id: TransactionId,
+        meter_start: i32,
+    ) -> Result<()> {
+        let current_status = self.status().await;
+        let physical_state = self.physical_state().await;
+
+        if physical_state == ConnectorPhysicalState::Unplugged {
+            return Err(ChargePointError::InvalidOperation(
+                "Cannot start transaction: cable not plugged".to_string(),
+            )
+            .into());
+        }
+
+        if self.has_active_transaction().await {
+            return Err(ChargePointError::InvalidOperation(
+                "Cannot start transaction: another transaction is active".to_string(),
+            )
+            .into());
+        }
+
+        match current_status {
+            ChargePointStatus::Preparing => {
+                let transaction = Transaction::with_id(
+                    transaction_id,
+                    self.config.connector_id,
+                    id_tag.clone(),
+                    meter_start,
+                );
+
+                *self.current_transaction.write().await = Some(transaction.clone());
+                *self.physical_state.write().await = ConnectorPhysicalState::PluggedAndLocked;
+                self.set_status(ChargePointStatus::Charging).await?;
+                self.send_event(ConnectorEvent::Authorized { id_tag }).await;
+                self.send_event(ConnectorEvent::ChargingStarted).await;
+                *self.reserved_for.write().await = None;
+
+                info!(
+                    "Transaction {} started on connector {} (CSMS-assigned ID)",
+                    transaction.id(),
+                    self.config.connector_id,
+                );
+            }
+            _ => {
                 return Err(ChargePointError::InvalidOperation(format!(
                     "Cannot start transaction in status: {:?}",
                     current_status
