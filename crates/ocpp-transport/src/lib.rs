@@ -130,6 +130,8 @@ pub struct ConnectionInfo {
     pub last_activity: chrono::DateTime<chrono::Utc>,
     /// Sub-protocol used
     pub sub_protocol: Option<String>,
+    /// OCPP charge point ID (extracted from WS path on server side)
+    pub charge_point_id: Option<String>,
 }
 
 impl ConnectionInfo {
@@ -143,6 +145,7 @@ impl ConnectionInfo {
             connected_at: now,
             last_activity: now,
             sub_protocol: None,
+            charge_point_id: None,
         }
     }
 
