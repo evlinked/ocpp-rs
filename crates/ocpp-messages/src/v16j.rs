@@ -951,6 +951,339 @@ impl OcppAction for SendLocalListResponse {
 
 impl OcppResponse for SendLocalListResponse {}
 
+// =============================================================================
+// Security Extension Messages (OCPP 1.6J Security Annex)
+// =============================================================================
+
+/// CertificateSigned request — CSMS sends a signed certificate to the Charge Point
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CertificateSignedRequest {
+    /// The signed PEM encoded X.509 certificate (chain) (max 10 000 chars)
+    #[serde(rename = "certificateChain")]
+    pub certificate_chain: String,
+}
+
+impl OcppAction for CertificateSignedRequest {
+    const ACTION_NAME: &'static str = "CertificateSigned";
+    type Response = CertificateSignedResponse;
+}
+
+/// CertificateSigned response
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CertificateSignedResponse {
+    /// Whether the certificate was accepted
+    pub status: CertificateSignedStatus,
+}
+
+impl OcppAction for CertificateSignedResponse {
+    const ACTION_NAME: &'static str = "CertificateSignedResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for CertificateSignedResponse {}
+
+/// DeleteCertificate request — CSMS instructs the Charge Point to delete an installed certificate
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeleteCertificateRequest {
+    /// Hash data identifying the certificate to delete
+    #[serde(rename = "certificateHashData")]
+    pub certificate_hash_data: CertificateHashData,
+}
+
+impl OcppAction for DeleteCertificateRequest {
+    const ACTION_NAME: &'static str = "DeleteCertificate";
+    type Response = DeleteCertificateResponse;
+}
+
+/// DeleteCertificate response
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeleteCertificateResponse {
+    /// Outcome of the deletion request
+    pub status: DeleteCertificateStatus,
+}
+
+impl OcppAction for DeleteCertificateResponse {
+    const ACTION_NAME: &'static str = "DeleteCertificateResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for DeleteCertificateResponse {}
+
+/// ExtendedTriggerMessage request — CSMS requests the Charge Point to send a specific message
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtendedTriggerMessageRequest {
+    /// The type of message to be triggered
+    #[serde(rename = "requestedMessage")]
+    pub requested_message: MessageTrigger,
+    /// Connector for which the message should be triggered (optional)
+    #[serde(rename = "connectorId", skip_serializing_if = "Option::is_none")]
+    pub connector_id: Option<i32>,
+}
+
+impl OcppAction for ExtendedTriggerMessageRequest {
+    const ACTION_NAME: &'static str = "ExtendedTriggerMessage";
+    type Response = ExtendedTriggerMessageResponse;
+}
+
+/// ExtendedTriggerMessage response
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExtendedTriggerMessageResponse {
+    /// Whether the trigger request was accepted
+    pub status: TriggerMessageStatus,
+}
+
+impl OcppAction for ExtendedTriggerMessageResponse {
+    const ACTION_NAME: &'static str = "ExtendedTriggerMessageResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for ExtendedTriggerMessageResponse {}
+
+/// GetInstalledCertificateIds request — CSMS queries the certificates installed on the Charge Point
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetInstalledCertificateIdsRequest {
+    /// Which certificate type to retrieve
+    #[serde(rename = "certificateType")]
+    pub certificate_type: CertificateUse,
+}
+
+impl OcppAction for GetInstalledCertificateIdsRequest {
+    const ACTION_NAME: &'static str = "GetInstalledCertificateIds";
+    type Response = GetInstalledCertificateIdsResponse;
+}
+
+/// GetInstalledCertificateIds response
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetInstalledCertificateIdsResponse {
+    /// Whether one or more certificates were found
+    pub status: GetInstalledCertificatesStatus,
+    /// Hash data of each installed certificate (absent when status is NotFound)
+    #[serde(
+        rename = "certificateHashDataChain",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub certificate_hash_data_chain: Option<Vec<CertificateHashData>>,
+}
+
+impl OcppAction for GetInstalledCertificateIdsResponse {
+    const ACTION_NAME: &'static str = "GetInstalledCertificateIdsResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for GetInstalledCertificateIdsResponse {}
+
+/// GetLog request — CSMS requests the Charge Point to upload a log file
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetLogRequest {
+    /// Type of log file to upload
+    #[serde(rename = "logType")]
+    pub log_type: LogType,
+    /// Request ID used to correlate the LogStatusNotification
+    #[serde(rename = "requestId")]
+    pub request_id: i32,
+    /// Parameters describing the log file
+    pub log: LogParameters,
+    /// Number of upload retries (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retries: Option<i32>,
+    /// Interval in seconds between retries (optional)
+    #[serde(rename = "retryInterval", skip_serializing_if = "Option::is_none")]
+    pub retry_interval: Option<i32>,
+}
+
+impl OcppAction for GetLogRequest {
+    const ACTION_NAME: &'static str = "GetLog";
+    type Response = GetLogResponse;
+}
+
+/// GetLog response
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetLogResponse {
+    /// Upload status
+    pub status: UploadLogStatus,
+    /// Filename of the log (optional)
+    #[serde(rename = "filename", skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+}
+
+impl OcppAction for GetLogResponse {
+    const ACTION_NAME: &'static str = "GetLogResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for GetLogResponse {}
+
+/// InstallCertificate request — CSMS instructs the Charge Point to install a CA certificate
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstallCertificateRequest {
+    /// Type of certificate to install
+    #[serde(rename = "certificateType")]
+    pub certificate_type: CertificateUse,
+    /// PEM encoded X.509 certificate
+    pub certificate: String,
+}
+
+impl OcppAction for InstallCertificateRequest {
+    const ACTION_NAME: &'static str = "InstallCertificate";
+    type Response = InstallCertificateResponse;
+}
+
+/// InstallCertificate response
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InstallCertificateResponse {
+    /// Outcome of the installation request
+    pub status: InstallCertificateStatus,
+}
+
+impl OcppAction for InstallCertificateResponse {
+    const ACTION_NAME: &'static str = "InstallCertificateResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for InstallCertificateResponse {}
+
+/// LogStatusNotification request — Charge Point reports the status of a log upload
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LogStatusNotificationRequest {
+    /// Current upload status
+    pub status: UploadLogStatus,
+    /// The request ID from the original GetLog request
+    #[serde(rename = "requestId")]
+    pub request_id: i32,
+}
+
+impl OcppAction for LogStatusNotificationRequest {
+    const ACTION_NAME: &'static str = "LogStatusNotification";
+    type Response = LogStatusNotificationResponse;
+}
+
+/// LogStatusNotification response
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LogStatusNotificationResponse {}
+
+impl OcppAction for LogStatusNotificationResponse {
+    const ACTION_NAME: &'static str = "LogStatusNotificationResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for LogStatusNotificationResponse {}
+
+/// SecurityEventNotification request — Charge Point reports a security event
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SecurityEventNotificationRequest {
+    /// The security event type string
+    #[serde(rename = "type")]
+    pub event_type: String,
+    /// Timestamp of the security event
+    pub timestamp: DateTime<Utc>,
+    /// Additional technical information (optional)
+    #[serde(rename = "techInfo", skip_serializing_if = "Option::is_none")]
+    pub tech_info: Option<String>,
+}
+
+impl OcppAction for SecurityEventNotificationRequest {
+    const ACTION_NAME: &'static str = "SecurityEventNotification";
+    type Response = SecurityEventNotificationResponse;
+}
+
+/// SecurityEventNotification response
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SecurityEventNotificationResponse {}
+
+impl OcppAction for SecurityEventNotificationResponse {
+    const ACTION_NAME: &'static str = "SecurityEventNotificationResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for SecurityEventNotificationResponse {}
+
+/// SignCertificate request — Charge Point sends a CSR for the CSMS to sign
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignCertificateRequest {
+    /// PEM encoded Certificate Signing Request (CSR)
+    pub csr: String,
+}
+
+impl OcppAction for SignCertificateRequest {
+    const ACTION_NAME: &'static str = "SignCertificate";
+    type Response = SignCertificateResponse;
+}
+
+/// SignCertificate response
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignCertificateResponse {
+    /// Whether the CSR was accepted
+    pub status: GenericStatus,
+}
+
+impl OcppAction for SignCertificateResponse {
+    const ACTION_NAME: &'static str = "SignCertificateResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for SignCertificateResponse {}
+
+/// SignedFirmwareStatusNotification request — Charge Point reports status of a signed firmware update
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedFirmwareStatusNotificationRequest {
+    /// Current firmware update status (including security-extension variants)
+    pub status: FirmwareStatus,
+    /// The request ID from the original SignedUpdateFirmware request
+    #[serde(rename = "requestId")]
+    pub request_id: i32,
+}
+
+impl OcppAction for SignedFirmwareStatusNotificationRequest {
+    const ACTION_NAME: &'static str = "SignedFirmwareStatusNotification";
+    type Response = SignedFirmwareStatusNotificationResponse;
+}
+
+/// SignedFirmwareStatusNotification response
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedFirmwareStatusNotificationResponse {}
+
+impl OcppAction for SignedFirmwareStatusNotificationResponse {
+    const ACTION_NAME: &'static str = "SignedFirmwareStatusNotificationResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for SignedFirmwareStatusNotificationResponse {}
+
+/// SignedUpdateFirmware request — CSMS initiates a signed firmware update on the Charge Point
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedUpdateFirmwareRequest {
+    /// Identifies this request; referenced in SignedFirmwareStatusNotification
+    #[serde(rename = "requestId")]
+    pub request_id: i32,
+    /// Firmware image to install
+    pub firmware: FirmwareType,
+    /// Number of download/install retries (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retries: Option<i32>,
+    /// Interval in seconds between retries (optional)
+    #[serde(rename = "retryInterval", skip_serializing_if = "Option::is_none")]
+    pub retry_interval: Option<i32>,
+}
+
+impl OcppAction for SignedUpdateFirmwareRequest {
+    const ACTION_NAME: &'static str = "SignedUpdateFirmware";
+    type Response = SignedUpdateFirmwareResponse;
+}
+
+/// SignedUpdateFirmware response
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedUpdateFirmwareResponse {
+    /// Whether the request was accepted
+    pub status: UpdateFirmwareStatus,
+}
+
+impl OcppAction for SignedUpdateFirmwareResponse {
+    const ACTION_NAME: &'static str = "SignedUpdateFirmwareResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for SignedUpdateFirmwareResponse {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1362,5 +1695,316 @@ mod tests {
             "GetLocalListVersion"
         );
         assert_eq!(SendLocalListRequest::ACTION_NAME, "SendLocalList");
+    }
+
+    // ----- Security Extension Tests -----
+
+    #[test]
+    fn test_certificate_signed() {
+        let req = CertificateSignedRequest {
+            certificate_chain:
+                "-----BEGIN CERTIFICATE-----\nMIIBIjAN...\n-----END CERTIFICATE-----".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("certificateChain"));
+        let d: CertificateSignedRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, d);
+
+        let resp = CertificateSignedResponse {
+            status: CertificateSignedStatus::Accepted,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, r#"{"status":"Accepted"}"#);
+        let d: CertificateSignedResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, d);
+    }
+
+    #[test]
+    fn test_delete_certificate() {
+        let req = DeleteCertificateRequest {
+            certificate_hash_data: CertificateHashData {
+                hash_algorithm: HashAlgorithmType::Sha256,
+                issuer_name_hash: "aabb".to_string(),
+                issuer_key_hash: "ccdd".to_string(),
+                serial_number: "0001".to_string(),
+            },
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("certificateHashData"));
+        let d: DeleteCertificateRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, d);
+
+        let resp = DeleteCertificateResponse {
+            status: DeleteCertificateStatus::Accepted,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let d: DeleteCertificateResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, d);
+    }
+
+    #[test]
+    fn test_extended_trigger_message() {
+        let req = ExtendedTriggerMessageRequest {
+            requested_message: MessageTrigger::Heartbeat,
+            connector_id: Some(1),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("requestedMessage"));
+        assert!(json.contains("connectorId"));
+        let d: ExtendedTriggerMessageRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, d);
+
+        let no_connector = ExtendedTriggerMessageRequest {
+            requested_message: MessageTrigger::BootNotification,
+            connector_id: None,
+        };
+        let json = serde_json::to_string(&no_connector).unwrap();
+        assert!(!json.contains("connectorId"));
+
+        let resp = ExtendedTriggerMessageResponse {
+            status: TriggerMessageStatus::Accepted,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let d: ExtendedTriggerMessageResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, d);
+    }
+
+    #[test]
+    fn test_get_installed_certificate_ids() {
+        let req = GetInstalledCertificateIdsRequest {
+            certificate_type: CertificateUse::CentralSystemRootCertificate,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("certificateType"));
+        assert!(json.contains("CentralSystemRootCertificate"));
+        let d: GetInstalledCertificateIdsRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, d);
+
+        let resp_with_chain = GetInstalledCertificateIdsResponse {
+            status: GetInstalledCertificatesStatus::Accepted,
+            certificate_hash_data_chain: Some(vec![CertificateHashData {
+                hash_algorithm: HashAlgorithmType::Sha256,
+                issuer_name_hash: "h1".to_string(),
+                issuer_key_hash: "h2".to_string(),
+                serial_number: "01".to_string(),
+            }]),
+        };
+        let json = serde_json::to_string(&resp_with_chain).unwrap();
+        assert!(json.contains("certificateHashDataChain"));
+        let d: GetInstalledCertificateIdsResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp_with_chain, d);
+
+        let resp_not_found = GetInstalledCertificateIdsResponse {
+            status: GetInstalledCertificatesStatus::NotFound,
+            certificate_hash_data_chain: None,
+        };
+        let json = serde_json::to_string(&resp_not_found).unwrap();
+        assert!(!json.contains("certificateHashDataChain"));
+        let d: GetInstalledCertificateIdsResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp_not_found, d);
+    }
+
+    #[test]
+    fn test_get_log() {
+        let req = GetLogRequest {
+            log_type: LogType::SecurityLog,
+            request_id: 42,
+            log: LogParameters {
+                remote_location: "ftp://logs.example.com/".to_string(),
+                oldest_timestamp: None,
+                latest_timestamp: None,
+            },
+            retries: Some(3),
+            retry_interval: Some(60),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("logType"));
+        assert!(json.contains("requestId"));
+        assert!(json.contains("retries"));
+        assert!(json.contains("retryInterval"));
+        let d: GetLogRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, d);
+
+        let resp = GetLogResponse {
+            status: UploadLogStatus::Uploading,
+            filename: Some("security.log".to_string()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("filename"));
+        let d: GetLogResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, d);
+
+        let resp_no_file = GetLogResponse {
+            status: UploadLogStatus::Idle,
+            filename: None,
+        };
+        let json = serde_json::to_string(&resp_no_file).unwrap();
+        assert!(!json.contains("filename"));
+    }
+
+    #[test]
+    fn test_install_certificate() {
+        let req = InstallCertificateRequest {
+            certificate_type: CertificateUse::ManufacturerRootCertificate,
+            certificate: "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----".to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("certificateType"));
+        assert!(json.contains("ManufacturerRootCertificate"));
+        let d: InstallCertificateRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, d);
+
+        let resp = InstallCertificateResponse {
+            status: InstallCertificateStatus::Accepted,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let d: InstallCertificateResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, d);
+    }
+
+    #[test]
+    fn test_log_status_notification() {
+        let req = LogStatusNotificationRequest {
+            status: UploadLogStatus::Uploaded,
+            request_id: 7,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("requestId"));
+        let d: LogStatusNotificationRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, d);
+
+        let resp = LogStatusNotificationResponse {};
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, "{}");
+    }
+
+    #[test]
+    fn test_security_event_notification() {
+        let req = SecurityEventNotificationRequest {
+            event_type: "TamperingDetected".to_string(),
+            timestamp: DateTime::from_timestamp(1640995200, 0).unwrap(),
+            tech_info: Some("Connector 1 tamper switch triggered".to_string()),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"type\""));
+        assert!(json.contains("techInfo"));
+        let d: SecurityEventNotificationRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, d);
+
+        let no_info = SecurityEventNotificationRequest {
+            event_type: "InvalidFirmwareSignature".to_string(),
+            timestamp: DateTime::from_timestamp(1640995200, 0).unwrap(),
+            tech_info: None,
+        };
+        let json = serde_json::to_string(&no_info).unwrap();
+        assert!(!json.contains("techInfo"));
+
+        let resp = SecurityEventNotificationResponse {};
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, "{}");
+    }
+
+    #[test]
+    fn test_sign_certificate() {
+        let req = SignCertificateRequest {
+            csr: "-----BEGIN CERTIFICATE REQUEST-----\n...\n-----END CERTIFICATE REQUEST-----"
+                .to_string(),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("csr"));
+        let d: SignCertificateRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, d);
+
+        let resp = SignCertificateResponse {
+            status: GenericStatus::Accepted,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, r#"{"status":"Accepted"}"#);
+        let d: SignCertificateResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, d);
+    }
+
+    #[test]
+    fn test_signed_firmware_status_notification() {
+        let req = SignedFirmwareStatusNotificationRequest {
+            status: FirmwareStatus::SignatureError,
+            request_id: 99,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("SignatureError"));
+        assert!(json.contains("requestId"));
+        let d: SignedFirmwareStatusNotificationRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, d);
+
+        let resp = SignedFirmwareStatusNotificationResponse {};
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, "{}");
+    }
+
+    #[test]
+    fn test_signed_update_firmware() {
+        let req = SignedUpdateFirmwareRequest {
+            request_id: 1,
+            firmware: FirmwareType {
+                location: "https://fw.example.com/v2.bin".to_string(),
+                retrieve_date_time: DateTime::from_timestamp(1640995200, 0).unwrap(),
+                signing_certificate: "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
+                    .to_string(),
+                install_date_time: None,
+                signature: Some("base64sig==".to_string()),
+            },
+            retries: None,
+            retry_interval: None,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("requestId"));
+        assert!(json.contains("firmware"));
+        assert!(json.contains("retrieveDateTime"));
+        assert!(json.contains("signingCertificate"));
+        assert!(!json.contains("retries"));
+        assert!(!json.contains("retryInterval"));
+        let d: SignedUpdateFirmwareRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(req, d);
+
+        let resp = SignedUpdateFirmwareResponse {
+            status: UpdateFirmwareStatus::Accepted,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert_eq!(json, r#"{"status":"Accepted"}"#);
+        let d: SignedUpdateFirmwareResponse = serde_json::from_str(&json).unwrap();
+        assert_eq!(resp, d);
+    }
+
+    #[test]
+    fn test_security_action_names() {
+        assert_eq!(CertificateSignedRequest::ACTION_NAME, "CertificateSigned");
+        assert_eq!(DeleteCertificateRequest::ACTION_NAME, "DeleteCertificate");
+        assert_eq!(
+            ExtendedTriggerMessageRequest::ACTION_NAME,
+            "ExtendedTriggerMessage"
+        );
+        assert_eq!(
+            GetInstalledCertificateIdsRequest::ACTION_NAME,
+            "GetInstalledCertificateIds"
+        );
+        assert_eq!(GetLogRequest::ACTION_NAME, "GetLog");
+        assert_eq!(InstallCertificateRequest::ACTION_NAME, "InstallCertificate");
+        assert_eq!(
+            LogStatusNotificationRequest::ACTION_NAME,
+            "LogStatusNotification"
+        );
+        assert_eq!(
+            SecurityEventNotificationRequest::ACTION_NAME,
+            "SecurityEventNotification"
+        );
+        assert_eq!(SignCertificateRequest::ACTION_NAME, "SignCertificate");
+        assert_eq!(
+            SignedFirmwareStatusNotificationRequest::ACTION_NAME,
+            "SignedFirmwareStatusNotification"
+        );
+        assert_eq!(
+            SignedUpdateFirmwareRequest::ACTION_NAME,
+            "SignedUpdateFirmware"
+        );
     }
 }
