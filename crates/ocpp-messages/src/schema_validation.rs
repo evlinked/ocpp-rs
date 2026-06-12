@@ -368,7 +368,7 @@ impl SchemaValidator {
 
     /// Validate a CALLRESULT payload against the `{action}Response` schema.
     ///
-    /// Same error semantics as [`validate_call`].
+    /// Same error semantics as [`Self::validate_call`].
     pub fn validate_call_result(&self, action: &str, payload: &Value) -> OcppResult<()> {
         let key = format!("{}Response", action);
         let schema = self.get_schema(&key)?;
