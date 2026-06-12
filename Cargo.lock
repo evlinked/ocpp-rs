@@ -885,6 +885,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "futures-util",
  "ocpp-messages",
  "ocpp-transport",
  "ocpp-types",
@@ -893,6 +894,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-test",
+ "tokio-tungstenite 0.20.1",
  "tracing",
  "uuid",
 ]
