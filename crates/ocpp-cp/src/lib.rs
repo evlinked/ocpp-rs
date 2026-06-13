@@ -21,19 +21,20 @@ use ocpp_messages::v16j::{
     BootNotificationRequest, BootNotificationResponse, HeartbeatRequest, RegistrationStatus,
     StatusNotificationRequest,
 };
-use ocpp_messages::{Message, OcppAction};
+use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
 use ocpp_transport::client::WebSocketClient;
 use ocpp_transport::{
     MessageHandler as TransportMessageHandler, Transport, TransportConfig, TransportEvent,
 };
 use ocpp_types::v16j::{ChargePointStatus, ChargePointVendorInfo};
-use ocpp_types::{ConnectorId, OcppResult};
+use ocpp_types::{ConnectorId, OcppError, OcppResult};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 /// Charge point configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +57,9 @@ pub struct ChargePointConfig {
     pub max_connection_retries: u32,
     /// Enable automatic reconnection
     pub auto_reconnect: bool,
+    /// Timeout for individual OCPP CALL/CALLRESULT round-trips in seconds.
+    /// Matches the Python reference default of 30 s (charge_point.py).
+    pub call_timeout: u64,
     /// Transport configuration (not serialized; uses Default on deserialization)
     #[serde(skip)]
     pub transport_config: TransportConfig,
@@ -83,6 +87,7 @@ impl Default for ChargePointConfig {
             connection_retry_interval: 30, // 30 seconds
             max_connection_retries: 10,
             auto_reconnect: true,
+            call_timeout: 30, // 30 seconds, matches Python reference default
             transport_config: TransportConfig::default(),
         }
     }
@@ -282,6 +287,72 @@ impl ChargePoint {
     /// Get registration status
     pub async fn registration_status(&self) -> RegistrationStatus {
         *self.registration_status.read().await
+    }
+
+    /// Send a typed OCPP CALL and await the matching CALLRESULT.
+    ///
+    /// This is the Rust port of `ChargePoint.call()` from the Python reference
+    /// (`ocpp/charge_point.py`). It:
+    ///
+    /// 1. Generates a unique message ID
+    /// 2. Registers the ID in `PendingCallMap` *before* sending (race-free)
+    /// 3. Sends the CALL frame over the WebSocket
+    /// 4. Awaits the response with `config.call_timeout`
+    /// 5. Returns the deserialized `Req::Response` or propagates any error
+    ///
+    /// Returns `OcppError::Timeout` if no response arrives within the
+    /// configured timeout, and `OcppError::CallError` if the server replies
+    /// with a CALLERROR frame.
+    pub async fn call<Req: OcppAction>(&self, request: Req) -> OcppResult<Req::Response> {
+        let unique_id = Uuid::new_v4().to_string();
+
+        // 1. Register before sending to avoid the race where the CALLRESULT
+        //    arrives before we have a receiver in the map.
+        let rx = {
+            let client_guard = self.client.read().await;
+            let client = client_guard.as_ref().ok_or_else(|| OcppError::Transport {
+                message: "Not connected to central system".to_string(),
+            })?;
+            client.pending_calls().register(unique_id.clone())
+        };
+
+        // 2. Build the CALL frame with the same unique_id.
+        let call_msg = CallMessage {
+            message_type: MessageType::Call,
+            unique_id: unique_id.clone(),
+            action: Req::ACTION_NAME.to_string(),
+            payload: serde_json::to_value(&request).map_err(OcppError::from)?,
+        };
+
+        // 3. Send the frame.
+        {
+            let client_guard = self.client.read().await;
+            match client_guard.as_ref() {
+                Some(client) => client.send_message(Message::Call(call_msg)).await?,
+                None => {
+                    return Err(OcppError::Transport {
+                        message: "Not connected to central system".to_string(),
+                    })
+                }
+            }
+        }
+
+        // 4. Await the CALLRESULT (or CALLERROR) with timeout.
+        //    The recv loop resolves/rejects `rx` when the response arrives.
+        let timeout = Duration::from_secs(self.config.call_timeout);
+        let raw_result = tokio::time::timeout(timeout, rx)
+            .await
+            .map_err(|_| OcppError::Timeout {
+                operation: format!("{} call", Req::ACTION_NAME),
+            })?
+            .map_err(|_| OcppError::Transport {
+                // oneshot RecvError means the sender was dropped (disconnect)
+                message: "Connection closed while waiting for CALLRESULT".to_string(),
+            })?;
+
+        // 5. Propagate any CALLERROR, then deserialize the success payload.
+        let payload = raw_result?;
+        serde_json::from_value::<Req::Response>(payload).map_err(OcppError::from)
     }
 
     /// Send boot notification
@@ -601,5 +672,30 @@ mod tests {
         assert_eq!(config.charge_point_id, "CP001");
         assert_eq!(config.connector_count, 2);
         assert_eq!(config.heartbeat_interval, 300);
+    }
+
+    #[test]
+    fn call_timeout_default_is_30s() {
+        let config = ChargePointConfig::default();
+        assert_eq!(config.call_timeout, 30);
+    }
+
+    #[tokio::test]
+    async fn call_returns_transport_error_when_disconnected() {
+        let config = ChargePointConfig::default();
+        let cp = ChargePoint::new(config).unwrap();
+
+        // No connect() called, so client is None
+        let result = cp.call(HeartbeatRequest {}).await;
+
+        match result {
+            Err(OcppError::Transport { ref message }) => {
+                assert!(
+                    message.contains("Not connected"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("expected Transport error, got: {other:?}"),
+        }
     }
 }
