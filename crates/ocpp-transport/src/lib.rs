@@ -6,11 +6,13 @@
 
 pub mod client;
 pub mod error;
+pub mod pending;
 pub mod server;
 pub mod websocket;
 
 pub use client::WebSocketClient;
 pub use error::*;
+pub use pending::PendingCallMap;
 
 use ocpp_messages::Message;
 use ocpp_types::OcppResult;

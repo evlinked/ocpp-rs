@@ -118,7 +118,7 @@ pub enum DiagnosticsStatus {
     Uploading,
 }
 
-/// Firmware status enumeration
+/// Firmware status enumeration (core + security extension variants)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum FirmwareStatus {
@@ -136,6 +136,21 @@ pub enum FirmwareStatus {
     Installing,
     /// Firmware installed
     Installed,
+    // --- Security Extension variants (OCPP 1.6J Security Annex) ---
+    /// Signature verification failed
+    SignatureError,
+    /// Signing certificate has expired
+    CertificateExpired,
+    /// Signing certificate has been revoked
+    CertificateRevoked,
+    /// Installed firmware failed verification
+    InstallVerificationFailed,
+    /// Signature is invalid
+    InvalidSignature,
+    /// Certificate not yet valid
+    NotYetValid,
+    /// Signature was revoked
+    RevokedSignatureError,
 }
 
 /// Remote start/stop status
@@ -450,6 +465,183 @@ pub struct AuthorizationData {
     pub id_tag_info: Option<IdTagInfo>,
 }
 
+// =============================================================================
+// Security Extension Types (OCPP 1.6J Security Annex)
+// =============================================================================
+
+/// Hash algorithm used to generate the CertificateHashData fields
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HashAlgorithmType {
+    /// SHA-256
+    #[serde(rename = "SHA256")]
+    Sha256,
+    /// SHA-384
+    #[serde(rename = "SHA384")]
+    Sha384,
+    /// SHA-512
+    #[serde(rename = "SHA512")]
+    Sha512,
+}
+
+/// Which certificate(s) the CSMS is referring to
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum CertificateUse {
+    /// Central System root certificate
+    CentralSystemRootCertificate,
+    /// Manufacturer root certificate
+    ManufacturerRootCertificate,
+}
+
+/// Status returned in response to a CertificateSigned request
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum CertificateSignedStatus {
+    /// Certificate is valid and accepted
+    Accepted,
+    /// Certificate is invalid or rejected
+    Rejected,
+}
+
+/// Status returned in response to a DeleteCertificate request
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum DeleteCertificateStatus {
+    /// Certificate deleted successfully
+    Accepted,
+    /// Failed to delete certificate
+    Failed,
+    /// Certificate not found
+    NotFound,
+}
+
+/// Status returned in response to a GetInstalledCertificateIds request
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum GetInstalledCertificatesStatus {
+    /// One or more certificates found
+    Accepted,
+    /// No matching certificate found
+    NotFound,
+}
+
+/// Status returned in response to an InstallCertificate request
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum InstallCertificateStatus {
+    /// Certificate installed successfully
+    Accepted,
+    /// Certificate rejected
+    Rejected,
+    /// Failed to install certificate
+    Failed,
+}
+
+/// Generic two-value status used where only Accepted/Rejected is needed
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum GenericStatus {
+    /// Accepted
+    Accepted,
+    /// Rejected
+    Rejected,
+}
+
+/// Type of log file requested by the CSMS
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum LogType {
+    /// Diagnostics log
+    DiagnosticsLog,
+    /// Security log
+    SecurityLog,
+}
+
+/// Upload status reported by LogStatusNotification
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UploadLogStatus {
+    /// A badly formatted packet or other protocol incompatibility
+    BadMessage,
+    /// The Charge Point is not uploading a log file; idle
+    Idle,
+    /// The server does not support the operation
+    NotSupportedOperation,
+    /// Insufficient permissions to perform the operation
+    PermissionDenied,
+    /// File uploaded successfully
+    Uploaded,
+    /// File upload failed
+    UploadFailure,
+    /// Uploading
+    Uploading,
+}
+
+/// Status returned in response to a SignedUpdateFirmware request
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum UpdateFirmwareStatus {
+    /// Accepted; firmware update will be attempted
+    Accepted,
+    /// Rejected
+    Rejected,
+    /// Accepted but the update has been cancelled
+    AcceptedCanceled,
+    /// Certificate is invalid
+    InvalidCertificate,
+    /// Certificate has been revoked
+    RevokedCertificate,
+}
+
+/// Hash data of an X.509 certificate for identification
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CertificateHashData {
+    /// Hash algorithm used to generate the hash values
+    #[serde(rename = "hashAlgorithm")]
+    pub hash_algorithm: HashAlgorithmType,
+    /// Hash of the issuer's Distinguished Name (DN)
+    #[serde(rename = "issuerNameHash")]
+    pub issuer_name_hash: String,
+    /// Hash of the DER encoding of the issuer's public key
+    #[serde(rename = "issuerKeyHash")]
+    pub issuer_key_hash: String,
+    /// Serial number of the certificate
+    #[serde(rename = "serialNumber")]
+    pub serial_number: String,
+}
+
+/// Parameters that describe the log file to be uploaded
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LogParameters {
+    /// URL of the location at which to store the log file
+    #[serde(rename = "remoteLocation")]
+    pub remote_location: String,
+    /// Lower bound of the timestamp range; no lower bound if absent
+    #[serde(rename = "oldestTimestamp", skip_serializing_if = "Option::is_none")]
+    pub oldest_timestamp: Option<DateTime<Utc>>,
+    /// Upper bound of the timestamp range; no upper bound if absent
+    #[serde(rename = "latestTimestamp", skip_serializing_if = "Option::is_none")]
+    pub latest_timestamp: Option<DateTime<Utc>>,
+}
+
+/// Firmware image information for a signed firmware update
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FirmwareType {
+    /// URI pointing to the location of the firmware
+    pub location: String,
+    /// Date and time at which the Charge Point must retrieve the firmware
+    #[serde(rename = "retrieveDateTime")]
+    pub retrieve_date_time: DateTime<Utc>,
+    /// Certificate with which the firmware was signed
+    #[serde(rename = "signingCertificate")]
+    pub signing_certificate: String,
+    /// Date and time at which the Charge Point must install the firmware (optional)
+    #[serde(rename = "installDateTime", skip_serializing_if = "Option::is_none")]
+    pub install_date_time: Option<DateTime<Utc>>,
+    /// Base64-encoded firmware signature (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
 impl std::fmt::Display for ChargePointErrorCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -672,5 +864,142 @@ mod tests {
         assert!(!json.contains("idTagInfo"));
         let deserialized: AuthorizationData = serde_json::from_str(&json).unwrap();
         assert_eq!(without_info, deserialized);
+    }
+
+    #[test]
+    fn test_firmware_status_security_variants() {
+        let cases = [
+            (FirmwareStatus::SignatureError, "\"SignatureError\""),
+            (FirmwareStatus::CertificateExpired, "\"CertificateExpired\""),
+            (FirmwareStatus::CertificateRevoked, "\"CertificateRevoked\""),
+            (
+                FirmwareStatus::InstallVerificationFailed,
+                "\"InstallVerificationFailed\"",
+            ),
+            (FirmwareStatus::InvalidSignature, "\"InvalidSignature\""),
+            (FirmwareStatus::NotYetValid, "\"NotYetValid\""),
+            (
+                FirmwareStatus::RevokedSignatureError,
+                "\"RevokedSignatureError\"",
+            ),
+        ];
+        for (status, expected) in &cases {
+            let json = serde_json::to_string(status).unwrap();
+            assert_eq!(&json, expected);
+            let deserialized: FirmwareStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(status, &deserialized);
+        }
+    }
+
+    #[test]
+    fn test_certificate_hash_data() {
+        let data = CertificateHashData {
+            hash_algorithm: HashAlgorithmType::Sha256,
+            issuer_name_hash: "abc123".to_string(),
+            issuer_key_hash: "def456".to_string(),
+            serial_number: "0001".to_string(),
+        };
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(json.contains("hashAlgorithm"));
+        assert!(json.contains("SHA256"));
+        assert!(json.contains("issuerNameHash"));
+        assert!(json.contains("issuerKeyHash"));
+        assert!(json.contains("serialNumber"));
+        let deserialized: CertificateHashData = serde_json::from_str(&json).unwrap();
+        assert_eq!(data, deserialized);
+    }
+
+    #[test]
+    fn test_log_parameters() {
+        let params = LogParameters {
+            remote_location: "ftp://example.com/logs/".to_string(),
+            oldest_timestamp: Some(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
+            latest_timestamp: None,
+        };
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains("remoteLocation"));
+        assert!(json.contains("oldestTimestamp"));
+        assert!(!json.contains("latestTimestamp"));
+        let deserialized: LogParameters = serde_json::from_str(&json).unwrap();
+        assert_eq!(params, deserialized);
+
+        let minimal = LogParameters {
+            remote_location: "ftp://example.com/".to_string(),
+            oldest_timestamp: None,
+            latest_timestamp: None,
+        };
+        let json = serde_json::to_string(&minimal).unwrap();
+        assert!(!json.contains("oldestTimestamp"));
+        assert!(!json.contains("latestTimestamp"));
+        let deserialized: LogParameters = serde_json::from_str(&json).unwrap();
+        assert_eq!(minimal, deserialized);
+    }
+
+    #[test]
+    fn test_firmware_type() {
+        let firmware = FirmwareType {
+            location: "https://example.com/firmware.bin".to_string(),
+            retrieve_date_time: Utc.with_ymd_and_hms(2024, 6, 1, 12, 0, 0).unwrap(),
+            signing_certificate: "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
+                .to_string(),
+            install_date_time: Some(Utc.with_ymd_and_hms(2024, 6, 1, 14, 0, 0).unwrap()),
+            signature: Some("base64signature==".to_string()),
+        };
+        let json = serde_json::to_string(&firmware).unwrap();
+        assert!(json.contains("retrieveDateTime"));
+        assert!(json.contains("signingCertificate"));
+        assert!(json.contains("installDateTime"));
+        assert!(json.contains("signature"));
+        let deserialized: FirmwareType = serde_json::from_str(&json).unwrap();
+        assert_eq!(firmware, deserialized);
+
+        let minimal = FirmwareType {
+            location: "https://example.com/fw.bin".to_string(),
+            retrieve_date_time: Utc.with_ymd_and_hms(2024, 6, 1, 12, 0, 0).unwrap(),
+            signing_certificate: "CERT".to_string(),
+            install_date_time: None,
+            signature: None,
+        };
+        let json = serde_json::to_string(&minimal).unwrap();
+        assert!(!json.contains("installDateTime"));
+        assert!(!json.contains("signature"));
+        let deserialized: FirmwareType = serde_json::from_str(&json).unwrap();
+        assert_eq!(minimal, deserialized);
+    }
+
+    #[test]
+    fn test_security_enums() {
+        assert_eq!(
+            serde_json::to_string(&CertificateUse::CentralSystemRootCertificate).unwrap(),
+            "\"CentralSystemRootCertificate\""
+        );
+        assert_eq!(
+            serde_json::to_string(&CertificateSignedStatus::Accepted).unwrap(),
+            "\"Accepted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&DeleteCertificateStatus::NotFound).unwrap(),
+            "\"NotFound\""
+        );
+        assert_eq!(
+            serde_json::to_string(&GetInstalledCertificatesStatus::NotFound).unwrap(),
+            "\"NotFound\""
+        );
+        assert_eq!(
+            serde_json::to_string(&InstallCertificateStatus::Failed).unwrap(),
+            "\"Failed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&GenericStatus::Accepted).unwrap(),
+            "\"Accepted\""
+        );
+        assert_eq!(
+            serde_json::to_string(&LogType::SecurityLog).unwrap(),
+            "\"SecurityLog\""
+        );
+        assert_eq!(
+            serde_json::to_string(&UpdateFirmwareStatus::RevokedCertificate).unwrap(),
+            "\"RevokedCertificate\""
+        );
     }
 }

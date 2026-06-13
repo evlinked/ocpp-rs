@@ -4,6 +4,7 @@
 //! It includes all message types for OCPP 1.6J and provides a foundation for OCPP 2.0.1.
 
 pub mod dispatcher;
+pub mod schema_validation;
 pub mod serialization;
 pub mod v16j;
 pub mod validation;
