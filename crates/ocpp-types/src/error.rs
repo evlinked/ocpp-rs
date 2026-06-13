@@ -72,6 +72,20 @@ pub enum OcppError {
     /// Database error
     #[error("Database error: {message}")]
     Database { message: String },
+
+    /// A CALL received a CALLERROR response from the remote endpoint.
+    /// Carries the structured error code, human-readable description, and
+    /// optional detail payload from the CALLERROR frame.
+    #[error("CALLERROR [{code}]: {description}")]
+    CallError {
+        code: CallErrorCode,
+        description: String,
+        details: serde_json::Value,
+    },
+
+    /// BootNotification rejected by the CSMS after all retry attempts exhausted.
+    #[error("Boot rejected by central system after {attempts} attempt(s)")]
+    BootRejected { attempts: u32 },
 }
 
 impl From<serde_json::Error> for OcppError {
@@ -222,5 +236,27 @@ mod tests {
         };
         let cloned = error.clone();
         assert_eq!(error, cloned);
+    }
+
+    #[test]
+    fn call_error_variant_display() {
+        let err = OcppError::CallError {
+            code: CallErrorCode::NotImplemented,
+            description: "Action not implemented".to_string(),
+            details: serde_json::Value::Null,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("NotImplemented") || msg.contains("Not implemented"));
+        assert!(msg.contains("Action not implemented"));
+    }
+
+    #[test]
+    fn call_error_variant_clone_and_eq() {
+        let err = OcppError::CallError {
+            code: CallErrorCode::InternalError,
+            description: "boom".to_string(),
+            details: serde_json::json!({"hint": "see logs"}),
+        };
+        assert_eq!(err.clone(), err);
     }
 }

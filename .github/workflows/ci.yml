@@ -6,13 +6,42 @@ on:
   pull_request:
     branches: [ main, develop ]
 
+# Cancel in-progress runs for the same branch/PR when a new commit is pushed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
+  # Fast gate: fmt + clippy run once (stable only) before spinning up the
+  # full 3-toolchain matrix, coverage, docs, msrv, and conformance jobs.
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+
+    - name: Cache dependencies
+      uses: Swatinem/rust-cache@v2
+
+    - name: Check formatting
+      run: cargo fmt --all -- --check
+
+    - name: Run clippy
+      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
   test:
-    name: Test Suite
+    name: Test Suite (${{ matrix.rust }})
+    needs: lint
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -37,23 +66,11 @@ jobs:
       uses: dtolnay/rust-toolchain@master
       with:
         toolchain: ${{ matrix.rust }}
-        components: rustfmt, clippy
 
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
       with:
         key: ${{ matrix.rust }}
-
-    - name: Check formatting
-      if: matrix.rust == 'stable'
-      run: cargo fmt --all -- --check
-
-    - name: Run clippy
-      if: matrix.rust == 'stable'
-      run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-
-    - name: Build
-      run: cargo build --workspace --all-targets --all-features
 
     - name: Run tests
       run: cargo test --workspace --all-features
@@ -64,6 +81,7 @@ jobs:
 
   coverage:
     name: Code Coverage
+    needs: lint
     runs-on: ubuntu-latest
 
     steps:
@@ -121,6 +139,7 @@ jobs:
 
   docs:
     name: Documentation
+    needs: lint
     runs-on: ubuntu-latest
 
     steps:
@@ -149,12 +168,14 @@ jobs:
 
   msrv:
     name: Minimum Supported Rust Version
+    needs: lint
     runs-on: ubuntu-latest
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    # Keep in sync with rust-version in Cargo.toml [workspace.package].
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@1.88.0
 
@@ -166,6 +187,7 @@ jobs:
 
   conformance:
     name: OCPP Conformance Tests
+    needs: lint
     runs-on: ubuntu-latest
 
     steps:
@@ -178,12 +200,8 @@ jobs:
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
 
-    - name: Build conformance test suite
-      run: cargo build --package ocpp-conformance --all-features
-
     - name: Run OCPP 1.6J conformance tests
-      run: |
-        cargo test --package ocpp-conformance --all-features -- --nocapture
+      run: cargo test --package ocpp-conformance --all-features -- --nocapture
       env:
         OCPP_VERSION: "1.6J"
         RUST_LOG: info
