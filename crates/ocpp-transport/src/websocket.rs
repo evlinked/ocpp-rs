@@ -143,7 +143,7 @@ where
 
     /// Consume this wrapper and return the inner [`WebSocketStream`].
     ///
-    /// Used by [`WebSocketClient`] to split the stream into independent
+    /// Used by [`crate::client::WebSocketClient`] to split the stream into independent
     /// sink and stream halves so that send and receive can proceed
     /// concurrently without a shared mutex.
     pub fn into_inner(self) -> WebSocketStream<S> {
