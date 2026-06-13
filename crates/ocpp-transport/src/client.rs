@@ -4,8 +4,10 @@ use crate::{
     error::TransportResult, pending::PendingCallMap, websocket::client::connect, ConnectionState,
     MessageHandler, Transport, TransportConfig, TransportEvent,
 };
+use futures_util::{SinkExt, StreamExt};
 use ocpp_messages::Message;
 use ocpp_types::{OcppError, OcppResult};
+use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -86,154 +88,145 @@ impl WebSocketClient {
         };
         self.message_handler.handle_event(event).await;
 
-        // Shared WebSocket connection for send + recv tasks
-        let ws_connection_send = Arc::new(tokio::sync::Mutex::new(ws_connection));
-        let ws_connection_recv = ws_connection_send.clone();
+        // Split the WebSocket into independent sink and stream halves.
+        // This is the key architectural fix: the old design shared a single
+        // Mutex<WebSocketConnection> between a send task and a recv task.
+        // Holding the mutex across `receive_message().await` blocked the send
+        // task, causing all post-boot-sequence outgoing CALLs to time out.
+        // With a split design, a single task uses `tokio::select!` to
+        // interleave sends and receives without any shared mutex.
+        let (mut ws_sink, mut ws_stream) = ws_connection.into_inner().split();
+
         let message_handler = self.message_handler.clone();
         let connection_id = self.connection_id;
         let state = self.state.clone();
         let pending_calls = self.pending_calls.clone();
 
-        // Spawn outbound message task
-        let send_task = {
-            let ws_connection = ws_connection_send.clone();
-            tokio::spawn(async move {
-                while let Some(message) = rx.recv().await {
-                    let mut conn = ws_connection.lock().await;
-                    match serde_json::to_string(&message) {
-                        Ok(json_str) => {
-                            if let Err(e) = conn.send_message(json_str).await {
-                                error!("Failed to send message: {}", e);
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            error!("Failed to serialize message: {}", e);
-                        }
-                    }
-                }
-            })
-        };
-
-        // Spawn inbound message task.
-        // The WS mutex is held only during the receive call; it is released
-        // before dispatching to the handler or awaiting anything else.
-        let recv_task = {
-            let ws_connection = ws_connection_recv;
-            let state = state.clone();
-            tokio::spawn(async move {
-                'recv_loop: loop {
-                    // Acquire lock, receive one frame, release lock immediately.
-                    let recv_result = {
-                        let mut conn = ws_connection.lock().await;
-                        conn.receive_message().await
-                    };
-
-                    match recv_result {
-                        Ok(Some(text)) => {
-                            match serde_json::from_str::<Message>(&text) {
-                                Ok(message) => {
-                                    match &message {
-                                        // CALLRESULT: wake the waiting call() future
-                                        Message::CallResult(result_msg) => {
-                                            if !pending_calls.resolve(
-                                                &result_msg.unique_id,
-                                                result_msg.payload.clone(),
-                                            ) {
-                                                warn!(
-                                                    "CALLRESULT for unknown unique_id '{}'",
-                                                    result_msg.unique_id
-                                                );
-                                            }
-                                        }
-                                        // CALLERROR: surface as OcppError::CallError
-                                        Message::CallError(error_msg) => {
-                                            let err = OcppError::CallError {
-                                                code: error_msg.error_code.clone(),
-                                                description: error_msg.error_description.clone(),
-                                                details: error_msg.error_details.clone(),
-                                            };
-                                            if !pending_calls.reject(&error_msg.unique_id, err) {
-                                                warn!(
-                                                    "CALLERROR for unknown unique_id '{}'",
-                                                    error_msg.unique_id
-                                                );
-                                            }
-                                        }
-                                        // CALL: dispatch to the registered handler
-                                        Message::Call(_) => {
-                                            match message_handler
-                                                .handle_message(message.clone())
-                                                .await
-                                            {
-                                                Ok(Some(response)) => {
-                                                    match serde_json::to_string(&response) {
-                                                        Ok(response_json) => {
-                                                            let mut conn =
-                                                                ws_connection.lock().await;
-                                                            if let Err(e) = conn
-                                                                .send_message(response_json)
-                                                                .await
-                                                            {
-                                                                error!(
-                                                                    "Failed to send response: {}",
-                                                                    e
-                                                                );
-                                                                break 'recv_loop;
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            error!(
-                                                                "Failed to serialize response: {}",
-                                                                e
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                                Ok(None) => {}
-                                                Err(e) => {
-                                                    error!("Error handling message: {}", e);
-                                                }
-                                            }
+        // Single combined task: interleaves outbound sends (from the mpsc
+        // channel) and inbound receives (from the WebSocket stream) via
+        // `tokio::select!`.  No shared mutex is needed because only this task
+        // touches the sink or the stream.
+        let combined_task = tokio::spawn(async move {
+            'run: loop {
+                tokio::select! {
+                    // ── Outbound branch ──────────────────────────────────
+                    msg = rx.recv() => {
+                        match msg {
+                            Some(message) => {
+                                match serde_json::to_string(&message) {
+                                    Ok(json) => {
+                                        if let Err(e) = ws_sink.send(WsMessage::Text(json)).await {
+                                            error!("Failed to send WS frame: {}", e);
+                                            break 'run;
                                         }
                                     }
-
-                                    let event = TransportEvent::MessageReceived {
-                                        connection_id,
-                                        message,
-                                    };
-                                    message_handler.handle_event(event).await;
-                                }
-                                Err(e) => {
-                                    error!("Failed to parse message: {}", e);
+                                    Err(e) => error!("Failed to serialize OCPP message: {}", e),
                                 }
                             }
+                            None => break 'run, // channel closed → disconnect
                         }
-                        Ok(None) => {
-                            // Non-text WebSocket frame (ping/pong/binary/close), continue
-                        }
-                        Err(e) => {
-                            error!("WebSocket receive error: {}", e);
-                            break 'recv_loop;
+                    }
+                    // ── Inbound branch ───────────────────────────────────
+                    frame = ws_stream.next() => {
+                        match frame {
+                            Some(Ok(WsMessage::Text(text))) => {
+                                match serde_json::from_str::<Message>(&text) {
+                                    Ok(message) => {
+                                        match &message {
+                                            Message::CallResult(r) => {
+                                                if !pending_calls.resolve(
+                                                    &r.unique_id,
+                                                    r.payload.clone(),
+                                                ) {
+                                                    warn!(
+                                                        "CALLRESULT for unknown unique_id '{}'",
+                                                        r.unique_id
+                                                    );
+                                                }
+                                            }
+                                            Message::CallError(e) => {
+                                                let err = OcppError::CallError {
+                                                    code: e.error_code.clone(),
+                                                    description: e.error_description.clone(),
+                                                    details: e.error_details.clone(),
+                                                };
+                                                if !pending_calls.reject(&e.unique_id, err) {
+                                                    warn!(
+                                                        "CALLERROR for unknown unique_id '{}'",
+                                                        e.unique_id
+                                                    );
+                                                }
+                                            }
+                                            Message::Call(_) => {
+                                                match message_handler
+                                                    .handle_message(message.clone())
+                                                    .await
+                                                {
+                                                    Ok(Some(response)) => {
+                                                        match serde_json::to_string(&response) {
+                                                            Ok(resp_json) => {
+                                                                if let Err(e) = ws_sink
+                                                                    .send(WsMessage::Text(resp_json))
+                                                                    .await
+                                                                {
+                                                                    error!(
+                                                                        "Failed to send CALL response: {}",
+                                                                        e
+                                                                    );
+                                                                    break 'run;
+                                                                }
+                                                            }
+                                                            Err(e) => error!(
+                                                                "Failed to serialize response: {}",
+                                                                e
+                                                            ),
+                                                        }
+                                                    }
+                                                    Ok(None) => {}
+                                                    Err(e) => error!("Handler error: {}", e),
+                                                }
+                                            }
+                                        }
+                                        message_handler
+                                            .handle_event(TransportEvent::MessageReceived {
+                                                connection_id,
+                                                message,
+                                            })
+                                            .await;
+                                    }
+                                    Err(e) => error!("Failed to parse WS text frame: {}", e),
+                                }
+                            }
+                            Some(Ok(WsMessage::Ping(data))) => {
+                                if let Err(e) = ws_sink.send(WsMessage::Pong(data)).await {
+                                    error!("Failed to send Pong: {}", e);
+                                    break 'run;
+                                }
+                            }
+                            Some(Ok(WsMessage::Close(_))) | None => break 'run,
+                            Some(Ok(_)) => {} // binary, pong, etc. — ignore
+                            Some(Err(e)) => {
+                                error!("WebSocket error: {}", e);
+                                break 'run;
+                            }
                         }
                     }
                 }
+            }
 
-                // Connection closed or errored — cancel all in-flight calls
-                pending_calls.cancel_all();
-                *state.write().await = ConnectionState::Closed;
-                let event = TransportEvent::Disconnected {
+            // Clean up on exit
+            pending_calls.cancel_all();
+            *state.write().await = ConnectionState::Closed;
+            message_handler
+                .handle_event(TransportEvent::Disconnected {
                     connection_id,
                     reason: "Connection closed".to_string(),
-                };
-                message_handler.handle_event(event).await;
-            })
-        };
+                })
+                .await;
+        });
 
-        // Store task handles
         let mut handles = self.task_handles.write().await;
-        handles.push(send_task);
-        handles.push(recv_task);
+        handles.push(combined_task);
 
         Ok(())
     }
