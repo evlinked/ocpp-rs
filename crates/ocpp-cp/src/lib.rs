@@ -18,20 +18,21 @@ use connector::{Connector, ConnectorConfig};
 use error::ChargePointError;
 use message_handler::ConfigurationStore;
 use ocpp_messages::v16j::{
-    BootNotificationRequest, BootNotificationResponse, ChangeAvailabilityRequest,
+    AuthorizeRequest, BootNotificationRequest, BootNotificationResponse, ChangeAvailabilityRequest,
     ChangeAvailabilityResponse, ChangeConfigurationRequest, ChangeConfigurationResponse,
     ClearCacheRequest, ClearCacheResponse, DataTransferRequest, DataTransferResponse,
     GetConfigurationRequest, GetConfigurationResponse, HeartbeatRequest, RegistrationStatus,
     RemoteStartTransactionRequest, RemoteStartTransactionResponse, RemoteStopTransactionRequest,
-    RemoteStopTransactionResponse, ResetRequest, ResetResponse, StatusNotificationRequest,
-    UnlockConnectorRequest, UnlockConnectorResponse,
+    RemoteStopTransactionResponse, ResetRequest, ResetResponse, StartTransactionRequest,
+    StatusNotificationRequest, StopTransactionRequest, UnlockConnectorRequest,
+    UnlockConnectorResponse,
 };
 use ocpp_messages::{ActionDispatcher, CallMessage, Message, MessageType, OcppAction};
 use ocpp_transport::client::WebSocketClient;
 use ocpp_transport::{
     MessageHandler as TransportMessageHandler, Transport, TransportConfig, TransportEvent,
 };
-use ocpp_types::common::{AvailabilityStatus, KeyValue};
+use ocpp_types::common::{AuthorizationStatus, AvailabilityStatus, IdTagInfo, KeyValue, Reason};
 use ocpp_types::v16j::{
     ChargePointStatus, ChargePointVendorInfo, ClearCacheStatus, ConfigurationStatus,
     DataTransferStatus, RemoteStartStopStatus, ResetStatus, ResetType, UnlockStatus,
@@ -725,27 +726,114 @@ impl ChargePoint {
         Ok(())
     }
 
-    /// Start transaction
-    pub async fn start_transaction(&self, connector_id: ConnectorId, id_tag: String) -> Result<()> {
-        let mut connectors = self.connectors.write().await;
-        if let Some(connector) = connectors.get_mut(&connector_id) {
-            connector.start_transaction(id_tag).await?;
-        }
-        Ok(())
+    /// Send an `AuthorizeRequest` CALL and return the `IdTagInfo` from the response.
+    ///
+    /// Ports `_send_authorize()` / `_handle_call_result()` from
+    /// [`ocpp/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py).
+    pub async fn authorize(&self, id_tag: &str) -> OcppResult<IdTagInfo> {
+        let response = self
+            .call(AuthorizeRequest {
+                id_tag: id_tag.to_string(),
+            })
+            .await?;
+        Ok(response.id_tag_info)
     }
 
-    /// Stop transaction
-    pub async fn stop_transaction(
+    /// Send a `StartTransactionRequest` CALL, store the CSMS-assigned `transactionId`
+    /// in the local connector state, and transition the connector to `Charging`.
+    ///
+    /// Returns the CSMS-assigned `transactionId` on success.
+    /// Returns `OcppError::Authorization` when the CSMS rejects the id-tag.
+    ///
+    /// Ports `send_start_transaction()` from
+    /// [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py).
+    pub async fn start_transaction(
         &self,
         connector_id: ConnectorId,
-        reason: Option<String>,
-    ) -> Result<()> {
-        let mut connectors = self.connectors.write().await;
-        if let Some(connector) = connectors.get_mut(&connector_id) {
-            connector
-                .stop_transaction(reason.unwrap_or_else(|| "Local".to_string()))
-                .await?;
+        id_tag: &str,
+        meter_start: i32,
+    ) -> OcppResult<i32> {
+        let response = self
+            .call(StartTransactionRequest {
+                connector_id: connector_id.value(),
+                id_tag: id_tag.to_string(),
+                meter_start,
+                timestamp: chrono::Utc::now(),
+                reservation_id: None,
+            })
+            .await?;
+
+        if response.id_tag_info.status != AuthorizationStatus::Accepted {
+            return Err(OcppError::Authorization {
+                reason: format!(
+                    "StartTransaction rejected — idTag status: {:?}",
+                    response.id_tag_info.status
+                ),
+            });
         }
+
+        let csms_id = response.transaction_id;
+        {
+            let mut connectors = self.connectors.write().await;
+            if let Some(connector) = connectors.get_mut(&connector_id) {
+                connector
+                    .start_transaction_with_csms_id(id_tag.to_string(), csms_id, meter_start)
+                    .await
+                    .map_err(|e| OcppError::Internal {
+                        message: e.to_string(),
+                    })?;
+            }
+        }
+
+        info!(
+            "Transaction {} started on connector {}",
+            csms_id, connector_id
+        );
+        Ok(csms_id)
+    }
+
+    /// Send a `StopTransactionRequest` CALL and clear local connector state.
+    ///
+    /// `transaction_id` must be the CSMS-assigned ID returned by `start_transaction()`.
+    /// `meter_stop` is the final meter reading in Wh.
+    ///
+    /// Ports `send_stop_transaction()` from
+    /// [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py).
+    pub async fn stop_transaction(
+        &self,
+        transaction_id: i32,
+        meter_stop: i32,
+        reason: Option<Reason>,
+    ) -> OcppResult<()> {
+        let _response = self
+            .call(StopTransactionRequest {
+                id_tag: None,
+                meter_stop,
+                timestamp: chrono::Utc::now(),
+                transaction_id,
+                reason,
+                transaction_data: None,
+            })
+            .await?;
+
+        // Clear local connector state for the matching transaction.
+        let mut connectors = self.connectors.write().await;
+        for connector in connectors.values_mut() {
+            if connector
+                .has_active_transaction_with_id(transaction_id)
+                .await
+            {
+                connector
+                    .stop_transaction("Local".to_string())
+                    .await
+                    .map_err(|e| OcppError::Internal {
+                        message: e.to_string(),
+                    })?;
+                break;
+            }
+        }
+
+        info!("Transaction {} stopped", transaction_id);
         Ok(())
     }
 
@@ -975,20 +1063,11 @@ mod tests {
         let cp = ChargePoint::new(config).unwrap();
         let connector_id = ConnectorId::new(1).unwrap();
 
-        // Test plug in/out cycle
+        // Plug in/out — local state only, no OCPP call needed
         cp.plug_in(connector_id).await.unwrap();
         cp.plug_out(connector_id).await.unwrap();
 
-        // Test transaction operations (cable must be plugged in first)
-        cp.plug_in(connector_id).await.unwrap();
-        cp.start_transaction(connector_id, "test_tag".to_string())
-            .await
-            .unwrap();
-        cp.stop_transaction(connector_id, Some("Test stop".to_string()))
-            .await
-            .unwrap();
-
-        // Test fault operations
+        // Fault lifecycle — local state only
         cp.set_fault(
             connector_id,
             ocpp_types::v16j::ChargePointErrorCode::NoError,
@@ -997,6 +1076,8 @@ mod tests {
         .await
         .unwrap();
         cp.clear_fault(connector_id).await.unwrap();
+        // start_transaction / stop_transaction now send OCPP messages and require
+        // a live WebSocket connection — see the mock-CSMS tests below.
     }
 
     #[test]
@@ -1277,5 +1358,319 @@ mod tests {
             .await
             .unwrap();
         assert!(res.is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // Mock-CSMS helpers for testing outgoing CALL flows
+    // -------------------------------------------------------------------------
+
+    /// Spawn a minimal raw WebSocket server on a random port.
+    ///
+    /// `handler` receives the raw OCPP JSON text frames and returns the response
+    /// frames. Stops after processing `max_messages` frames.
+    async fn spawn_mock_csms(
+        handler: impl Fn(String) -> Option<String> + Send + Sync + 'static,
+        max_messages: usize,
+    ) -> std::net::SocketAddr {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+        use tokio_tungstenite::{accept_async, tungstenite::Message as WsMsg};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let mut ws = accept_async(stream).await.unwrap();
+                // Consume the BootNotification first (sent by connect())
+                let mut processed = 0usize;
+                while processed < max_messages {
+                    match ws.next().await {
+                        Some(Ok(WsMsg::Text(text))) => {
+                            if let Some(reply) = handler(text) {
+                                let _ = ws.send(WsMsg::Text(reply)).await;
+                            }
+                            processed += 1;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        });
+
+        addr
+    }
+
+    /// Build a JSON CALLRESULT frame: `[3, "<uid>", <payload>]`
+    fn callresult(unique_id: &str, payload: serde_json::Value) -> String {
+        serde_json::json!([3, unique_id, payload]).to_string()
+    }
+
+    /// Extract the unique_id and action from a CALL frame: `[2, uid, action, payload]`
+    fn parse_call(text: &str) -> Option<(String, String, serde_json::Value)> {
+        let v: serde_json::Value = serde_json::from_str(text).ok()?;
+        let arr = v.as_array()?;
+        if arr.len() < 4 {
+            return None;
+        }
+        Some((
+            arr[1].as_str()?.to_string(),
+            arr[2].as_str()?.to_string(),
+            arr[3].clone(),
+        ))
+    }
+
+    /// Connect a ChargePoint to a mock server, bypassing the BootNotification
+    /// handshake by answering it automatically.
+    async fn connect_cp_to_mock(addr: std::net::SocketAddr) -> ChargePoint {
+        let config = ChargePointConfig {
+            central_system_url: format!("ws://{}", addr),
+            call_timeout: 5,
+            ..Default::default()
+        };
+        let cp = ChargePoint::new(config).unwrap();
+        cp.connect().await.unwrap();
+        cp
+    }
+
+    // -------------------------------------------------------------------------
+    // authorize() tests
+    // -------------------------------------------------------------------------
+
+    // The transport layer's recv task holds the WS mutex across the receive
+    // await, blocking the send task.  Multi-thread tests side-step this by
+    // letting both tasks truly run in parallel.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authorize_accepted_returns_id_tag_info() {
+        use ocpp_types::common::AuthorizationStatus;
+
+        // Server: answer BootNotification then Authorize
+        let addr = spawn_mock_csms(
+            |text| {
+                let (uid, action, _payload) = parse_call(&text)?;
+                match action.as_str() {
+                    "BootNotification" => Some(callresult(
+                        &uid,
+                        serde_json::json!({
+                            "status": "Accepted",
+                            "currentTime": "2026-06-13T00:00:00Z",
+                            "interval": 300
+                        }),
+                    )),
+                    "Authorize" => Some(callresult(
+                        &uid,
+                        serde_json::json!({ "idTagInfo": { "status": "Accepted" } }),
+                    )),
+                    _ => None,
+                }
+            },
+            2,
+        )
+        .await;
+
+        let cp = connect_cp_to_mock(addr).await;
+
+        let id_tag_info = cp.authorize("VALID_TAG").await.unwrap();
+        assert_eq!(id_tag_info.status, AuthorizationStatus::Accepted);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authorize_rejected_returns_blocked_status() {
+        use ocpp_types::common::AuthorizationStatus;
+
+        let addr = spawn_mock_csms(
+            |text| {
+                let (uid, action, _) = parse_call(&text)?;
+                match action.as_str() {
+                    "BootNotification" => Some(callresult(
+                        &uid,
+                        serde_json::json!({
+                            "status": "Accepted",
+                            "currentTime": "2026-06-13T00:00:00Z",
+                            "interval": 300
+                        }),
+                    )),
+                    "Authorize" => Some(callresult(
+                        &uid,
+                        serde_json::json!({ "idTagInfo": { "status": "Blocked" } }),
+                    )),
+                    _ => None,
+                }
+            },
+            2,
+        )
+        .await;
+
+        let cp = connect_cp_to_mock(addr).await;
+
+        let id_tag_info = cp.authorize("BLOCKED_TAG").await.unwrap();
+        assert_eq!(id_tag_info.status, AuthorizationStatus::Blocked);
+    }
+
+    // -------------------------------------------------------------------------
+    // start_transaction() tests
+    // -------------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_transaction_sends_request_and_stores_csms_id() {
+        // Mock server: handle Boot + StartTransaction
+        let addr = spawn_mock_csms(
+            |text| {
+                let (uid, action, _) = parse_call(&text)?;
+                match action.as_str() {
+                    "BootNotification" => Some(callresult(
+                        &uid,
+                        serde_json::json!({
+                            "status": "Accepted",
+                            "currentTime": "2026-06-13T00:00:00Z",
+                            "interval": 300
+                        }),
+                    )),
+                    "StartTransaction" => Some(callresult(
+                        &uid,
+                        serde_json::json!({
+                            "transactionId": 42,
+                            "idTagInfo": { "status": "Accepted" }
+                        }),
+                    )),
+                    _ => None,
+                }
+            },
+            2,
+        )
+        .await;
+
+        let cp = connect_cp_to_mock(addr).await;
+        let connector_id = ConnectorId::new(1).unwrap();
+
+        // Plug in so connector is in Preparing state
+        cp.plug_in(connector_id).await.unwrap();
+
+        let txn_id = cp
+            .start_transaction(connector_id, "TAG_001", 0)
+            .await
+            .unwrap();
+
+        assert_eq!(txn_id, 42, "should return CSMS-assigned transaction ID");
+
+        // Connector should now be in Charging state
+        let connectors = cp.get_connectors().await;
+        let connector = connectors.get(&connector_id).unwrap();
+        assert_eq!(
+            connector.status().await,
+            ChargePointStatus::Charging,
+            "connector must transition to Charging after accepted StartTransaction"
+        );
+        assert!(
+            connector.has_active_transaction_with_id(42).await,
+            "connector must hold transaction with CSMS-assigned ID 42"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_transaction_rejected_id_tag_returns_authorization_error() {
+        let addr = spawn_mock_csms(
+            |text| {
+                let (uid, action, _) = parse_call(&text)?;
+                match action.as_str() {
+                    "BootNotification" => Some(callresult(
+                        &uid,
+                        serde_json::json!({
+                            "status": "Accepted",
+                            "currentTime": "2026-06-13T00:00:00Z",
+                            "interval": 300
+                        }),
+                    )),
+                    "StartTransaction" => Some(callresult(
+                        &uid,
+                        serde_json::json!({
+                            "transactionId": 0,
+                            "idTagInfo": { "status": "Blocked" }
+                        }),
+                    )),
+                    _ => None,
+                }
+            },
+            2,
+        )
+        .await;
+
+        let cp = connect_cp_to_mock(addr).await;
+        let connector_id = ConnectorId::new(1).unwrap();
+        cp.plug_in(connector_id).await.unwrap();
+
+        let result = cp.start_transaction(connector_id, "BLOCKED_TAG", 0).await;
+
+        match result {
+            Err(OcppError::Authorization { reason }) => {
+                assert!(
+                    reason.contains("Blocked"),
+                    "error reason should mention Blocked, got: {reason}"
+                );
+            }
+            other => panic!("expected Authorization error, got: {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // stop_transaction() tests
+    // -------------------------------------------------------------------------
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_transaction_sends_request_with_correct_id() {
+        let addr = spawn_mock_csms(
+            |text| {
+                let (uid, action, payload) = parse_call(&text)?;
+                match action.as_str() {
+                    "BootNotification" => Some(callresult(
+                        &uid,
+                        serde_json::json!({
+                            "status": "Accepted",
+                            "currentTime": "2026-06-13T00:00:00Z",
+                            "interval": 300
+                        }),
+                    )),
+                    "StartTransaction" => Some(callresult(
+                        &uid,
+                        serde_json::json!({
+                            "transactionId": 99,
+                            "idTagInfo": { "status": "Accepted" }
+                        }),
+                    )),
+                    "StopTransaction" => {
+                        // Verify the correct transactionId was sent
+                        assert_eq!(
+                            payload["transactionId"].as_i64(),
+                            Some(99),
+                            "StopTransaction must carry the CSMS-assigned transactionId"
+                        );
+                        Some(callresult(&uid, serde_json::json!({})))
+                    }
+                    _ => None,
+                }
+            },
+            3,
+        )
+        .await;
+
+        let cp = connect_cp_to_mock(addr).await;
+        let connector_id = ConnectorId::new(1).unwrap();
+        cp.plug_in(connector_id).await.unwrap();
+
+        let txn_id = cp
+            .start_transaction(connector_id, "TAG_999", 0)
+            .await
+            .unwrap();
+        assert_eq!(txn_id, 99);
+
+        cp.stop_transaction(txn_id, 1000, None).await.unwrap();
+
+        // Connector should no longer have an active transaction
+        let connectors = cp.get_connectors().await;
+        let connector = connectors.get(&connector_id).unwrap();
+        assert!(
+            !connector.has_active_transaction_with_id(99).await,
+            "transaction should be cleared after stop"
+        );
     }
 }

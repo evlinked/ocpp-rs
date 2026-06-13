@@ -240,6 +240,15 @@ impl Connector {
         self.current_transaction.read().await.is_some()
     }
 
+    /// Check if connector has an active transaction with the given CSMS-assigned ID.
+    pub async fn has_active_transaction_with_id(&self, transaction_id: i32) -> bool {
+        if let Some(txn) = self.current_transaction.read().await.as_ref() {
+            txn.id().0 == transaction_id
+        } else {
+            false
+        }
+    }
+
     /// Get current transaction
     pub async fn current_transaction(&self) -> Option<Transaction> {
         self.current_transaction.read().await.clone()
@@ -422,6 +431,49 @@ impl Connector {
             }
         }
 
+        Ok(())
+    }
+
+    /// Transition connector to Charging using a CSMS-assigned transaction ID.
+    ///
+    /// Called by `ChargePoint::start_transaction()` after the CSMS has responded
+    /// with a `StartTransactionResponse` containing the server-assigned `transactionId`.
+    /// Skips the local-ID generation in `Transaction::new()` and uses
+    /// `Transaction::with_id()` instead, so the transaction ID tracked locally
+    /// always matches the one the CSMS knows about.
+    pub async fn start_transaction_with_csms_id(
+        &mut self,
+        id_tag: String,
+        csms_id: i32,
+        meter_start: i32,
+    ) -> Result<()> {
+        use ocpp_types::TransactionId;
+
+        if self.has_active_transaction().await {
+            return Err(ChargePointError::InvalidOperation(
+                "Cannot start transaction: another transaction is active".to_string(),
+            )
+            .into());
+        }
+
+        let transaction = Transaction::with_id(
+            TransactionId::new(csms_id),
+            self.config.connector_id,
+            id_tag.clone(),
+            meter_start,
+        );
+        *self.current_transaction.write().await = Some(transaction);
+        *self.physical_state.write().await = ConnectorPhysicalState::PluggedAndLocked;
+        self.set_status(ChargePointStatus::Charging).await?;
+        *self.reserved_for.write().await = None;
+
+        self.send_event(ConnectorEvent::Authorized { id_tag }).await;
+        self.send_event(ConnectorEvent::ChargingStarted).await;
+
+        info!(
+            "Transaction {} (CSMS-assigned) started on connector {}",
+            csms_id, self.config.connector_id
+        );
         Ok(())
     }
 

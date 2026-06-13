@@ -141,6 +141,23 @@ where
         Ok(())
     }
 
+    /// Consume this connection and return independent split sink and stream halves
+    /// together with the transport config.
+    ///
+    /// The returned halves use a `BiLock` that releases while awaiting I/O, so
+    /// a send task and a receive task can run concurrently without deadlocking
+    /// (unlike sharing a `tokio::sync::Mutex` across an `.await`).
+    pub fn into_split(
+        self,
+    ) -> (
+        futures_util::stream::SplitSink<WebSocketStream<S>, Message>,
+        futures_util::stream::SplitStream<WebSocketStream<S>>,
+        TransportConfig,
+    ) {
+        let (sink, stream) = self.stream.split();
+        (sink, stream, self.config)
+    }
+
     /// Get connection info
     pub fn connection_info(&self) -> &ConnectionInfo {
         &self.connection_info

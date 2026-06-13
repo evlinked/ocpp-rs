@@ -5,7 +5,7 @@ use crate::{
     MessageHandler, Transport, TransportConfig, TransportEvent,
 };
 use ocpp_messages::Message;
-use ocpp_types::{OcppError, OcppResult};
+use ocpp_types::{OcppError, OcppResult, RawMessage};
 
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -66,17 +66,30 @@ impl WebSocketClient {
     async fn connect_internal(&self, url: String) -> TransportResult<()> {
         info!("Connecting to WebSocket server: {}", url);
 
-        // Update state to connecting
         *self.state.write().await = ConnectionState::Connecting;
 
-        // Connect to the WebSocket server
         let ws_connection = connect(&url, &self.config.sub_protocols, &self.config).await?;
 
-        // Update state to connected
         *self.state.write().await = ConnectionState::Connected;
 
-        // Create message channel
-        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        // Split into independent send/receive halves.
+        //
+        // The old approach shared an `Arc<tokio::sync::Mutex<WebSocketConnection>>`.
+        // That caused a deadlock: the recv task held the mutex guard across
+        // `receive_message().await` (waiting for TCP data), so the send task
+        // could never acquire the mutex to write frames — even on a multi-thread
+        // runtime, because tokio's async mutex is task-scoped, not thread-scoped.
+        //
+        // `StreamExt::split()` returns halves backed by a `BiLock` that releases
+        // while the underlying poll returns `Pending`, so send and receive can
+        // proceed concurrently without contention.
+        let (ws_sink, ws_stream, conn_config) = ws_connection.into_split();
+        let max_size = conn_config.max_message_size;
+
+        // Outbound channel: Transport::send_message() writes here; send task drains it.
+        // The recv task also writes here when it needs to reply to an inbound CALL.
+        let (tx, rx) = mpsc::unbounded_channel::<Message>();
+        let reply_tx = tx.clone();
         *self.message_tx.write().await = Some(tx);
 
         // Send connection event
@@ -86,23 +99,32 @@ impl WebSocketClient {
         };
         self.message_handler.handle_event(event).await;
 
-        // Shared WebSocket connection for send + recv tasks
-        let ws_connection_send = Arc::new(tokio::sync::Mutex::new(ws_connection));
-        let ws_connection_recv = ws_connection_send.clone();
         let message_handler = self.message_handler.clone();
         let connection_id = self.connection_id;
         let state = self.state.clone();
         let pending_calls = self.pending_calls.clone();
 
-        // Spawn outbound message task
+        // ── Send task ────────────────────────────────────────────────────────
+        // Owns `ws_sink` exclusively; serialises OCPP `Message` values from
+        // the channel and writes them as WebSocket Text frames.
         let send_task = {
-            let ws_connection = ws_connection_send.clone();
+            let mut sink = ws_sink;
+            let mut rx = rx;
             tokio::spawn(async move {
+                use futures_util::SinkExt as _;
+                use tokio_tungstenite::tungstenite::Message as WsMsg;
                 while let Some(message) = rx.recv().await {
-                    let mut conn = ws_connection.lock().await;
-                    match serde_json::to_string(&message) {
+                    let raw: RawMessage = message.into();
+                    match serde_json::to_string(&raw) {
                         Ok(json_str) => {
-                            if let Err(e) = conn.send_message(json_str).await {
+                            if json_str.len() > max_size {
+                                error!(
+                                    "Outbound message too large ({} bytes), dropping",
+                                    json_str.len()
+                                );
+                                continue;
+                            }
+                            if let Err(e) = sink.send(WsMsg::Text(json_str)).await {
                                 error!("Failed to send message: {}", e);
                                 break;
                             }
@@ -115,23 +137,29 @@ impl WebSocketClient {
             })
         };
 
-        // Spawn inbound message task.
-        // The WS mutex is held only during the receive call; it is released
-        // before dispatching to the handler or awaiting anything else.
+        // ── Recv task ────────────────────────────────────────────────────────
+        // Owns `ws_stream` exclusively; no shared lock, runs fully concurrently
+        // with the send task.  CALL replies are routed through `reply_tx` so
+        // they are sent by the send task (which owns the sink).
         let recv_task = {
-            let ws_connection = ws_connection_recv;
-            let state = state.clone();
+            let mut stream = ws_stream;
             tokio::spawn(async move {
+                use futures_util::StreamExt as _;
+                use tokio_tungstenite::tungstenite::Message as WsMsg;
                 'recv_loop: loop {
-                    // Acquire lock, receive one frame, release lock immediately.
-                    let recv_result = {
-                        let mut conn = ws_connection.lock().await;
-                        conn.receive_message().await
-                    };
-
-                    match recv_result {
-                        Ok(Some(text)) => {
-                            match serde_json::from_str::<Message>(&text) {
+                    match stream.next().await {
+                        Some(Ok(WsMsg::Text(text))) => {
+                            if text.len() > max_size {
+                                error!(
+                                    "Inbound message too large ({} bytes), dropping",
+                                    text.len()
+                                );
+                                continue;
+                            }
+                            let parse_result = serde_json::from_str::<RawMessage>(&text)
+                                .map_err(|e| e.to_string())
+                                .and_then(|raw| raw.into_message().map_err(|e| e.to_string()));
+                            match parse_result {
                                 Ok(message) => {
                                     match &message {
                                         // CALLRESULT: wake the waiting call() future
@@ -160,39 +188,22 @@ impl WebSocketClient {
                                                 );
                                             }
                                         }
-                                        // CALL: dispatch to the registered handler
+                                        // CALL: dispatch to the registered handler; reply via
+                                        // send task (which owns the sink)
                                         Message::Call(_) => {
                                             match message_handler
                                                 .handle_message(message.clone())
                                                 .await
                                             {
                                                 Ok(Some(response)) => {
-                                                    match serde_json::to_string(&response) {
-                                                        Ok(response_json) => {
-                                                            let mut conn =
-                                                                ws_connection.lock().await;
-                                                            if let Err(e) = conn
-                                                                .send_message(response_json)
-                                                                .await
-                                                            {
-                                                                error!(
-                                                                    "Failed to send response: {}",
-                                                                    e
-                                                                );
-                                                                break 'recv_loop;
-                                                            }
-                                                        }
-                                                        Err(e) => {
-                                                            error!(
-                                                                "Failed to serialize response: {}",
-                                                                e
-                                                            );
-                                                        }
+                                                    if reply_tx.send(response).is_err() {
+                                                        error!("Send channel closed; cannot deliver CALL reply");
+                                                        break 'recv_loop;
                                                     }
                                                 }
                                                 Ok(None) => {}
                                                 Err(e) => {
-                                                    error!("Error handling message: {}", e);
+                                                    error!("Error handling inbound CALL: {}", e);
                                                 }
                                             }
                                         }
@@ -209,10 +220,17 @@ impl WebSocketClient {
                                 }
                             }
                         }
-                        Ok(None) => {
-                            // Non-text WebSocket frame (ping/pong/binary/close), continue
+                        Some(Ok(WsMsg::Ping(_))) => {
+                            // tungstenite queues a Pong internally; it will be flushed
+                            // on the next sink write.
+                            debug!("Received WebSocket Ping");
                         }
-                        Err(e) => {
+                        Some(Ok(WsMsg::Pong(_))) | Some(Ok(WsMsg::Binary(_))) => {}
+                        Some(Ok(WsMsg::Close(_))) | None => {
+                            break 'recv_loop;
+                        }
+                        Some(Ok(_)) => {}
+                        Some(Err(e)) => {
                             error!("WebSocket receive error: {}", e);
                             break 'recv_loop;
                         }
