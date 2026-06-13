@@ -22,6 +22,9 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true, features = ["rt", "sync"] }
 async-trait = "0.1"
+# JSON Schema Draft-4 validator — same role as Python's `jsonschema.Draft4Validator`
+# used in mobilityhouse/ocpp ocpp/messages.py `_validate_payload()`
+jsonschema = { version = "0.17", default-features = false }
 
 [dev-dependencies]
 proptest = { workspace = true }
