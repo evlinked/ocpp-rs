@@ -82,6 +82,10 @@ pub enum OcppError {
         description: String,
         details: serde_json::Value,
     },
+
+    /// BootNotification rejected by the CSMS after all retry attempts exhausted.
+    #[error("Boot rejected by central system after {attempts} attempt(s)")]
+    BootRejected { attempts: u32 },
 }
 
 impl From<serde_json::Error> for OcppError {

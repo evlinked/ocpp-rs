@@ -20,6 +20,7 @@ uuid = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true, features = ["rt", "sync"] }
 async-trait = "0.1"
 
 [dev-dependencies]
