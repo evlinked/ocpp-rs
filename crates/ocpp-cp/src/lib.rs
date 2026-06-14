@@ -10,6 +10,7 @@
 pub mod connector;
 pub mod error;
 pub mod message_handler;
+pub mod meter_sampler;
 pub mod state_machine;
 pub mod transaction;
 
@@ -21,18 +22,20 @@ use ocpp_messages::v16j::{
     AuthorizeRequest, BootNotificationRequest, BootNotificationResponse, ChangeAvailabilityRequest,
     ChangeAvailabilityResponse, ChangeConfigurationRequest, ChangeConfigurationResponse,
     ClearCacheRequest, ClearCacheResponse, DataTransferRequest, DataTransferResponse,
-    GetConfigurationRequest, GetConfigurationResponse, HeartbeatRequest, RegistrationStatus,
-    RemoteStartTransactionRequest, RemoteStartTransactionResponse, RemoteStopTransactionRequest,
-    RemoteStopTransactionResponse, ResetRequest, ResetResponse, StartTransactionRequest,
-    StatusNotificationRequest, StopTransactionRequest, UnlockConnectorRequest,
-    UnlockConnectorResponse,
+    GetConfigurationRequest, GetConfigurationResponse, HeartbeatRequest, MeterValuesRequest,
+    RegistrationStatus, RemoteStartTransactionRequest, RemoteStartTransactionResponse,
+    RemoteStopTransactionRequest, RemoteStopTransactionResponse, ResetRequest, ResetResponse,
+    StartTransactionRequest, StatusNotificationRequest, StopTransactionRequest,
+    UnlockConnectorRequest, UnlockConnectorResponse,
 };
 use ocpp_messages::{ActionDispatcher, CallMessage, Message, MessageType, OcppAction};
 use ocpp_transport::client::WebSocketClient;
 use ocpp_transport::{
     MessageHandler as TransportMessageHandler, Transport, TransportConfig, TransportEvent,
 };
-use ocpp_types::common::{AuthorizationStatus, AvailabilityStatus, IdTagInfo, KeyValue, Reason};
+use ocpp_types::common::{
+    AuthorizationStatus, AvailabilityStatus, IdTagInfo, KeyValue, Measurand, ReadingContext, Reason,
+};
 use ocpp_types::v16j::{
     ChargePointStatus, ChargePointVendorInfo, ClearCacheStatus, ConfigurationStatus,
     DataTransferStatus, RemoteStartStopStatus, ResetStatus, ResetType, UnlockStatus,
@@ -64,6 +67,10 @@ pub struct ChargePointConfig {
     pub heartbeat_interval: u64,
     /// Meter values sample interval in seconds
     pub meter_values_interval: u64,
+    /// Measurands sampled in each periodic `MeterValues` frame during a
+    /// transaction. Defaults to `[Energy.Active.Import.Register]`, matching the
+    /// OCPP default for the `MeterValuesSampledData` configuration key.
+    pub meter_value_measurands: Vec<Measurand>,
     /// Connection retry interval in seconds
     pub connection_retry_interval: u64,
     /// Maximum connection retry attempts
@@ -98,8 +105,9 @@ impl Default for ChargePointConfig {
                 meter_serial_number: Some("MT001".to_string()),
             },
             connector_count: 2,
-            heartbeat_interval: 300,       // 5 minutes
-            meter_values_interval: 60,     // 1 minute
+            heartbeat_interval: 300,   // 5 minutes
+            meter_values_interval: 60, // 1 minute
+            meter_value_measurands: vec![Measurand::EnergyActiveImportRegister],
             connection_retry_interval: 30, // 30 seconds
             max_connection_retries: 10,
             auto_reconnect: true,
@@ -265,6 +273,10 @@ pub struct ChargePoint {
     heartbeat_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Maps CSMS-assigned transaction ID → connector ID for stop_transaction lookup.
     active_transactions: Arc<RwLock<HashMap<i32, ConnectorId>>>,
+    /// Per-transaction periodic `MeterValues` sampler tasks, keyed by the
+    /// CSMS-assigned transaction ID. Each active transaction has its own task
+    /// (connectors charge concurrently); cancelled on `stop_transaction`/`stop`.
+    meter_sampler_handles: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
 }
 
 impl ChargePoint {
@@ -309,6 +321,7 @@ impl ChargePoint {
             is_connected: Arc::new(RwLock::new(false)),
             heartbeat_handle: Arc::new(RwLock::new(None)),
             active_transactions: Arc::new(RwLock::new(HashMap::new())),
+            meter_sampler_handles: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -502,6 +515,11 @@ impl ChargePoint {
 
         // Stop heartbeat
         if let Some(handle) = self.heartbeat_handle.write().await.take() {
+            handle.abort();
+        }
+
+        // Stop all periodic MeterValues samplers
+        for (_txn_id, handle) in self.meter_sampler_handles.write().await.drain() {
             handle.abort();
         }
 
@@ -746,6 +764,117 @@ impl ChargePoint {
         *self.heartbeat_handle.write().await = Some(handle);
     }
 
+    /// Start the periodic `MeterValues` sampler for an active transaction.
+    ///
+    /// Ports the periodic background-task pattern from the Python reference
+    /// (`ocpp/charge_point.py`), which spawns meter sampling alongside the
+    /// heartbeat. The task fires an immediate `Transaction.Begin` snapshot and
+    /// then a `Sample.Periodic` frame every `config.meter_values_interval`
+    /// seconds, reading the connector's latest meter value each tick.
+    ///
+    /// Frames are sent fire-and-forget via `send_message` (like the heartbeat):
+    /// a periodic emitter must not block on the empty `MeterValuesResponse`, and
+    /// a send failure is logged without aborting the transaction.
+    async fn start_meter_sampler(&self, connector_id: ConnectorId, transaction_id: i32) {
+        let interval = Duration::from_secs(self.config.meter_values_interval.max(1));
+        let measurands = self.config.meter_value_measurands.clone();
+        let client = self.client.clone();
+        let is_connected = self.is_connected.clone();
+        let connectors = self.connectors.clone();
+
+        let handle = tokio::spawn(async move {
+            let mut timer = tokio::time::interval(interval);
+            // The first tick of `interval` fires immediately, so the
+            // `Transaction.Begin` snapshot is sent at t=0 and `Sample.Periodic`
+            // frames follow at each subsequent interval.
+            let mut sent_begin = false;
+            loop {
+                timer.tick().await;
+
+                // Skip ticks while offline; don't consume the begin snapshot.
+                if !*is_connected.read().await {
+                    continue;
+                }
+
+                let context = if sent_begin {
+                    ReadingContext::SamplePeriodic
+                } else {
+                    ReadingContext::TransactionBegin
+                };
+
+                // Read the connector's latest meter value, releasing the lock
+                // before building/sending so we never hold it across the send.
+                let reading = {
+                    let connectors = connectors.read().await;
+                    match connectors.get(&connector_id) {
+                        Some(connector) => connector.last_meter_reading().await,
+                        None => continue,
+                    }
+                };
+
+                let request = meter_sampler::build_meter_values_request(
+                    connector_id,
+                    Some(transaction_id),
+                    &reading,
+                    &measurands,
+                    context,
+                );
+                if !meter_sampler::has_samples(&request) {
+                    // Nothing to report (e.g. no supported measurands); the
+                    // OCPP schema forbids an empty sampledValue list.
+                    continue;
+                }
+
+                let message = match ocpp_messages::CallMessage::new(
+                    MeterValuesRequest::ACTION_NAME.to_string(),
+                    request,
+                ) {
+                    Ok(call) => Message::Call(call),
+                    Err(e) => {
+                        error!("Failed to create MeterValues message: {}", e);
+                        continue;
+                    }
+                };
+
+                if let Some(client) = client.read().await.as_ref() {
+                    if let Err(e) = client.send_message(message).await {
+                        warn!(
+                            "Failed to send MeterValues for transaction {}: {}",
+                            transaction_id, e
+                        );
+                    }
+                }
+
+                sent_begin = true;
+            }
+        });
+
+        // Replace any existing sampler for this id, aborting the stale task so
+        // it can't outlive its transaction (defensive against a reused id).
+        if let Some(previous) = self
+            .meter_sampler_handles
+            .write()
+            .await
+            .insert(transaction_id, handle)
+        {
+            previous.abort();
+        }
+    }
+
+    /// Stop and remove the periodic `MeterValues` sampler for a transaction.
+    ///
+    /// Idempotent: a no-op if no sampler is running for `transaction_id`.
+    async fn stop_meter_sampler(&self, transaction_id: i32) {
+        if let Some(handle) = self
+            .meter_sampler_handles
+            .write()
+            .await
+            .remove(&transaction_id)
+        {
+            handle.abort();
+        }
+    }
+
     /// Get connector by ID
     pub async fn get_connector(&self, connector_id: ConnectorId) -> Option<Connector> {
         self.connectors.read().await.get(&connector_id).cloned()
@@ -844,6 +973,9 @@ impl ChargePoint {
             }
         }
 
+        // Begin periodic MeterValues sampling for this transaction.
+        self.start_meter_sampler(connector_id, transaction_id).await;
+
         info!(
             "Transaction {} started on connector {}",
             transaction_id,
@@ -886,6 +1018,9 @@ impl ChargePoint {
             transaction_data: None,
         })
         .await?;
+
+        // Stop periodic MeterValues sampling for this transaction.
+        self.stop_meter_sampler(transaction_id).await;
 
         // Remove mapping now that CSMS has acknowledged the stop
         self.active_transactions
@@ -1801,5 +1936,197 @@ mod tests {
         // The heartbeat task handle should be set after a successful boot.
         let has_heartbeat = cp.heartbeat_handle.read().await.is_some();
         assert!(has_heartbeat, "heartbeat task should be running after boot");
+    }
+
+    // --- MeterValues periodic sampling tests (Issue #22) ---
+    // Python ref: ocpp/charge_point.py periodic-task pattern; ocpp/v16/call.py MeterValues
+
+    /// Spawn a mock CSMS that records every received CALL over a channel (so a
+    /// test can observe periodic `MeterValues` frames) while still answering the
+    /// configured actions so the charge point can reach the `Charging` state.
+    async fn spawn_recording_csms(
+        routes: std::collections::HashMap<String, serde_json::Value>,
+    ) -> (std::net::SocketAddr, mpsc::UnboundedReceiver<CallMessage>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::net::TcpListener;
+
+        let (tx, rx) = mpsc::unbounded_channel::<CallMessage>();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(frame)) = ws.next().await {
+                    if let tokio_tungstenite::tungstenite::Message::Text(text) = frame {
+                        if let Ok(Message::Call(call)) = serde_json::from_str::<Message>(&text) {
+                            // Record the call for the test to observe, then reply.
+                            let _ = tx.send(call.clone());
+                            if let Some(payload) = routes.get(&call.action) {
+                                let result = Message::CallResult(CallResultMessage {
+                                    message_type: MessageType::CallResult,
+                                    unique_id: call.unique_id,
+                                    payload: payload.clone(),
+                                });
+                                let json = serde_json::to_string(&result).unwrap();
+                                let _ = ws
+                                    .send(tokio_tungstenite::tungstenite::Message::Text(json))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        (addr, rx)
+    }
+
+    /// Receive from a recording CSMS channel until a CALL with `action` arrives,
+    /// skipping unrelated frames (BootNotification, StartTransaction, …). Fails
+    /// the test rather than hanging if the frame never arrives.
+    async fn recv_until_action(
+        rx: &mut mpsc::UnboundedReceiver<CallMessage>,
+        action: &str,
+    ) -> CallMessage {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(call) if call.action == action => return call,
+                    Some(_) => continue,
+                    None => panic!("recording CSMS channel closed before a {action} frame"),
+                }
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for a {action} frame"))
+    }
+
+    fn start_routes() -> std::collections::HashMap<String, serde_json::Value> {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert(
+            "StartTransaction".to_string(),
+            serde_json::json!({"idTagInfo": {"status": "Accepted"}, "transactionId": 77}),
+        );
+        routes
+    }
+
+    #[tokio::test]
+    async fn start_transaction_spawns_meter_sampler() {
+        let addr = spawn_mock_csms_routing(start_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..Default::default()
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let txn_id = cp
+            .start_transaction(ConnectorId::new(1).unwrap(), "TAG001", 0)
+            .await
+            .unwrap();
+
+        assert!(
+            cp.meter_sampler_handles.read().await.contains_key(&txn_id),
+            "a MeterValues sampler should be registered for the active transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_transaction_aborts_meter_sampler() {
+        use ocpp_types::common::Reason;
+
+        let mut routes = start_routes();
+        routes.insert(
+            "StopTransaction".to_string(),
+            serde_json::json!({"idTagInfo": {"status": "Accepted"}}),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..Default::default()
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let txn_id = cp
+            .start_transaction(ConnectorId::new(1).unwrap(), "TAG001", 0)
+            .await
+            .unwrap();
+        assert!(cp.meter_sampler_handles.read().await.contains_key(&txn_id));
+
+        cp.stop_transaction(txn_id, 1000, Reason::Local)
+            .await
+            .unwrap();
+
+        assert!(
+            !cp.meter_sampler_handles.read().await.contains_key(&txn_id),
+            "the sampler should be cancelled and removed after stop_transaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn meter_values_begin_snapshot_has_transaction_begin_context_and_measurand() {
+        // A long interval so only the immediate Transaction.Begin snapshot fires.
+        let (addr, mut rx) = spawn_recording_csms(start_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            meter_values_interval: 60,
+            ..Default::default()
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+        cp.start_transaction(ConnectorId::new(1).unwrap(), "TAG001", 0)
+            .await
+            .unwrap();
+
+        let mv = recv_until_action(&mut rx, "MeterValues").await;
+        let sampled = &mv.payload["meterValue"][0]["sampledValue"][0];
+        assert_eq!(mv.payload["connectorId"], 1);
+        assert_eq!(mv.payload["transactionId"], 77);
+        assert_eq!(
+            sampled["context"].as_str(),
+            Some("Transaction.Begin"),
+            "first snapshot must use the Transaction.Begin context"
+        );
+        assert_eq!(
+            sampled["measurand"].as_str(),
+            Some("Energy.Active.Import.Register"),
+            "default measurand should be the active-import energy register"
+        );
+        assert_eq!(sampled["unit"].as_str(), Some("Wh"));
+    }
+
+    #[tokio::test]
+    async fn meter_values_sent_periodically_with_sample_periodic_context() {
+        // 1-second interval: Transaction.Begin at t=0, then Sample.Periodic at t=1.
+        let (addr, mut rx) = spawn_recording_csms(start_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            meter_values_interval: 1,
+            ..Default::default()
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+        cp.start_transaction(ConnectorId::new(1).unwrap(), "TAG001", 0)
+            .await
+            .unwrap();
+
+        let begin = recv_until_action(&mut rx, "MeterValues").await;
+        assert_eq!(
+            begin.payload["meterValue"][0]["sampledValue"][0]["context"].as_str(),
+            Some("Transaction.Begin")
+        );
+
+        let periodic = recv_until_action(&mut rx, "MeterValues").await;
+        assert_eq!(
+            periodic.payload["meterValue"][0]["sampledValue"][0]["context"].as_str(),
+            Some("Sample.Periodic"),
+            "subsequent frames at the configured interval must use Sample.Periodic"
+        );
     }
 }
