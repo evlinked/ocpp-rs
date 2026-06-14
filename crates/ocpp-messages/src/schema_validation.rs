@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use jsonschema::error::ValidationErrorKind;
 use ocpp_types::{OcppError, OcppResult};
 use serde_json::Value;
 
@@ -402,13 +403,101 @@ impl SchemaValidator {
             })?;
 
         if let Err(errors) = compiled.validate(payload) {
-            let messages: Vec<String> = errors.map(|e| e.to_string()).collect();
-            return Err(OcppError::ValidationError {
-                message: messages.join("; "),
-            });
+            // Drop `multipleOf` errors that are pure f64 representation
+            // artifacts (e.g. `21.4` against `multipleOf: 0.1`). Every other
+            // keyword violation is kept. This is the Rust equivalent of the
+            // `decimal.Decimal` re-parse in `ocpp/messages.py::_validate_payload`.
+            let messages: Vec<String> = errors
+                .filter(|e| !is_multiple_of_precision_artifact(e))
+                .map(|e| e.to_string())
+                .collect();
+            if !messages.is_empty() {
+                return Err(OcppError::ValidationError {
+                    message: messages.join("; "),
+                });
+            }
         }
         Ok(())
     }
+}
+
+/// Returns `true` when `error` is a `multipleOf` violation that only fails
+/// because of f64 representation error — i.e. the value really *is* an exact
+/// multiple of the divisor when judged as a base-10 decimal.
+///
+/// `jsonschema` 0.17's `MultipleOfFloatValidator` operates on raw f64 bit
+/// values, so `21.4` (stored as `21.39999999999999857…`) is rejected against
+/// `multipleOf: 0.1` even though `21.4` is a valid one-decimal value. The
+/// Python reference dodges this by re-parsing both schema and payload with
+/// `decimal.Decimal` ([`ocpp/messages.py::_validate_payload`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/messages.py));
+/// we reach the same verdict by comparing the *shortest decimal
+/// representations* of the two numbers exactly.
+///
+/// Only `multipleOf` errors are ever forgiven; `type`, `required`,
+/// `additionalProperties`, `enum`, `minimum`, … are untouched. Anything we
+/// cannot prove is an exact multiple stays a genuine violation (fail-safe).
+fn is_multiple_of_precision_artifact(error: &jsonschema::ValidationError) -> bool {
+    if let ValidationErrorKind::MultipleOf { multiple_of } = &error.kind {
+        if let Some(value) = error.instance.as_f64() {
+            return is_exact_decimal_multiple(value, *multiple_of);
+        }
+    }
+    false
+}
+
+/// Exact "is `value` an integer multiple of `divisor`?", decided on the
+/// shortest round-tripping decimal representation of each f64 (the digits a
+/// human actually wrote in the JSON) via integer mantissa/scale arithmetic.
+/// Mirrors `decimal.Decimal` semantics from the Python reference.
+///
+/// Returns `false` if either number can't be expressed as an exact
+/// `mantissa × 10⁻ˢᶜᵃˡᵉ` (exponent-form output, `i128` overflow, or a zero
+/// divisor) so callers never accept a payload that cannot be proven valid.
+fn is_exact_decimal_multiple(value: f64, divisor: f64) -> bool {
+    let (vm, vs) = match decimal_mantissa_scale(value) {
+        Some(t) => t,
+        None => return false,
+    };
+    let (dm, ds) = match decimal_mantissa_scale(divisor) {
+        Some(t) => t,
+        None => return false,
+    };
+    if dm == 0 {
+        return false;
+    }
+    // value / divisor = (vm / 10^vs) / (dm / 10^ds)
+    //                 = (vm * 10^ds) / (dm * 10^vs)
+    // which is an integer iff numerator % denominator == 0.
+    let num = match 10i128.checked_pow(ds).and_then(|p| vm.checked_mul(p)) {
+        Some(n) => n,
+        None => return false,
+    };
+    let den = match 10i128.checked_pow(vs).and_then(|p| dm.checked_mul(p)) {
+        Some(d) => d,
+        None => return false,
+    };
+    den != 0 && num % den == 0
+}
+
+/// Decompose an f64 into `(mantissa, scale)` such that the value equals
+/// `mantissa as f64 / 10_f64.powi(scale as i32)`, using the shortest decimal
+/// representation produced by `f64::to_string` (ryū). Returns `None` for
+/// exponent-form output or magnitudes that don't fit in `i128`.
+fn decimal_mantissa_scale(x: f64) -> Option<(i128, u32)> {
+    if !x.is_finite() {
+        return None;
+    }
+    let s = x.to_string();
+    // ryū uses plain decimal notation across the magnitudes OCPP limit fields
+    // use; if it ever emits exponent form, bail rather than mis-parse.
+    if s.contains(['e', 'E']) {
+        return None;
+    }
+    let (digits, scale) = match s.split_once('.') {
+        Some((int_part, frac_part)) => (format!("{int_part}{frac_part}"), frac_part.len() as u32),
+        None => (s, 0),
+    };
+    digits.parse::<i128>().ok().map(|m| (m, scale))
 }
 
 #[cfg(test)]
@@ -526,21 +615,15 @@ mod tests {
         assert!(v.validate_call("Reset", &payload).is_ok());
     }
 
-    /// Port of test_validate_set_charging_profile_payload (Python reference).
+    /// Port of `test_validate_set_charging_profile_payload`
+    /// ([`tests/test_messages.py`](https://github.com/mobilityhouse/ocpp/blob/master/tests/test_messages.py)).
     ///
-    /// The Python reference's version uses `21.4` and relies on
-    /// `Decimal`-based JSON parsing to avoid float precision issues with
-    /// the schema's `"multipleOf": 0.1` constraint.  In Rust, `serde_json`
-    /// represents numbers as `f64`, which means `21.4_f64 / 0.1_f64`
-    /// produces `213.999…` rather than `214.0`.  `jsonschema` 0.17 uses
-    /// the `fraction` crate for exact rational arithmetic in `multipleOf`,
-    /// so it correctly rejects the imprecise value.
-    ///
-    /// This test uses `21.0` (exactly representable) to verify the happy
-    /// path.  Handling values like `21.4` requires pre-processing payloads
-    /// with arbitrary-precision decimal parsing — tracked as a known gap.
+    /// Uses the reference value `21.4`. As f64 that is `21.39999999999999857…`,
+    /// so `jsonschema` 0.17's `multipleOf: 0.1` check rejects it outright;
+    /// `is_multiple_of_precision_artifact` forgives the false positive, the way
+    /// the Python reference re-parses with `decimal.Decimal`.
     #[test]
-    fn validate_set_charging_profile_with_integer_limit_passes() {
+    fn validate_set_charging_profile_with_decimal_limit_passes() {
         let v = SchemaValidator::v16j();
         let payload = json!({
             "connectorId": 1,
@@ -551,7 +634,7 @@ mod tests {
                 "chargingProfileKind": "Relative",
                 "chargingSchedule": {
                     "chargingRateUnit": "A",
-                    "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 21.0}]
+                    "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 21.4}]
                 },
                 "transactionId": 123456789
             }
@@ -559,11 +642,11 @@ mod tests {
         assert!(v.validate_call("SetChargingProfile", &payload).is_ok());
     }
 
-    /// Port of test_validate_get_composite_profile_payload (Python reference).
-    /// Same `multipleOf` precision note as `validate_set_charging_profile_…`.
-    /// Uses `15.0` instead of `15.2` to stay within f64 exact representation.
+    /// Port of `test_validate_get_composite_profile_payload`
+    /// ([`tests/test_messages.py`](https://github.com/mobilityhouse/ocpp/blob/master/tests/test_messages.py)),
+    /// using the reference value `15.2` (f64 `15.19999999999999857…`).
     #[test]
-    fn validate_get_composite_schedule_response_with_integer_limit_passes() {
+    fn validate_get_composite_schedule_response_with_decimal_limit_passes() {
         let v = SchemaValidator::v16j();
         let payload = json!({
             "status": "Accepted",
@@ -572,12 +655,90 @@ mod tests {
             "chargingSchedule": {
                 "duration": 60,
                 "chargingRateUnit": "A",
-                "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 15.0}]
+                "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 15.2}]
             }
         });
         assert!(v
             .validate_call_result("GetCompositeSchedule", &payload)
             .is_ok());
+    }
+
+    /// `RemoteStartTransaction` is the third schema carrying `multipleOf: 0.1`
+    /// (on `chargingProfile.chargingSchedule.chargingSchedulePeriod[*].limit`);
+    /// the Python reference lists it next to `SetChargingProfile` in
+    /// `_validate_payload`. A one-decimal limit must validate here too.
+    #[test]
+    fn validate_remote_start_transaction_with_decimal_limit_passes() {
+        let v = SchemaValidator::v16j();
+        let payload = json!({
+            "connectorId": 1,
+            "idTag": "ABC123",
+            "chargingProfile": {
+                "chargingProfileId": 1,
+                "stackLevel": 0,
+                "chargingProfilePurpose": "TxProfile",
+                "chargingProfileKind": "Relative",
+                "chargingSchedule": {
+                    "chargingRateUnit": "A",
+                    "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 21.4}]
+                }
+            }
+        });
+        assert!(v.validate_call("RemoteStartTransaction", &payload).is_ok());
+    }
+
+    /// A genuine `multipleOf: 0.1` violation (more than one decimal) must STILL
+    /// be rejected — the precision filter only forgives exact decimals. `4.11`
+    /// is the Python reference's canonical invalid value.
+    #[test]
+    fn validate_set_charging_profile_rejects_two_decimal_limit() {
+        let v = SchemaValidator::v16j();
+        let payload = json!({
+            "connectorId": 1,
+            "csChargingProfiles": {
+                "chargingProfileId": 1,
+                "stackLevel": 0,
+                "chargingProfilePurpose": "TxProfile",
+                "chargingProfileKind": "Relative",
+                "chargingSchedule": {
+                    "chargingRateUnit": "A",
+                    "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 4.11}]
+                },
+                "transactionId": 123456789
+            }
+        });
+        let err = v.validate_call("SetChargingProfile", &payload).unwrap_err();
+        assert!(
+            matches!(err, OcppError::ValidationError { .. }),
+            "expected ValidationError for 4.11, got {err:?}"
+        );
+    }
+
+    /// The precision filter must not swallow *other* errors in the same
+    /// payload: a forgivable `21.4` limit next to a genuine type violation
+    /// (`connectorId` as a string) still fails validation.
+    #[test]
+    fn precision_filter_does_not_mask_sibling_errors() {
+        let v = SchemaValidator::v16j();
+        let payload = json!({
+            "connectorId": "not-an-integer",
+            "csChargingProfiles": {
+                "chargingProfileId": 1,
+                "stackLevel": 0,
+                "chargingProfilePurpose": "TxProfile",
+                "chargingProfileKind": "Relative",
+                "chargingSchedule": {
+                    "chargingRateUnit": "A",
+                    "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 21.4}]
+                },
+                "transactionId": 123456789
+            }
+        });
+        let err = v.validate_call("SetChargingProfile", &payload).unwrap_err();
+        assert!(
+            matches!(err, OcppError::ValidationError { .. }),
+            "sibling type error must survive the multipleOf filter, got {err:?}"
+        );
     }
 
     // ── invalid payloads are rejected ────────────────────────────────────────
@@ -691,5 +852,48 @@ mod tests {
             }
             other => panic!("expected ValidationError, got {:?}", other),
         }
+    }
+
+    // ── multipleOf precision helpers (unit) ───────────────────────────────────
+
+    #[test]
+    fn exact_decimal_multiple_accepts_one_decimal_values() {
+        // Values that are exact multiples of 0.1 when read as base-10 decimals,
+        // even though several are inexact as f64 (21.4, 15.2, 6.6, 999.9).
+        for v in [21.4_f64, 15.2, 6.6, 0.1, 21.0, 0.0, 214.0, 999.9] {
+            assert!(
+                is_exact_decimal_multiple(v, 0.1),
+                "{v} should be an exact multiple of 0.1"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_decimal_multiple_rejects_finer_precision() {
+        // More than one decimal place is a genuine multipleOf: 0.1 violation.
+        for v in [4.11_f64, 21.45, 21.401, 0.01, 100.001] {
+            assert!(
+                !is_exact_decimal_multiple(v, 0.1),
+                "{v} should NOT be an exact multiple of 0.1"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_decimal_multiple_handles_integer_divisors_and_zero() {
+        assert!(is_exact_decimal_multiple(6.0, 2.0));
+        assert!(!is_exact_decimal_multiple(5.0, 2.0));
+        assert!(is_exact_decimal_multiple(-21.4, 0.1)); // sign-agnostic
+        assert!(!is_exact_decimal_multiple(5.0, 0.0)); // zero divisor → false
+    }
+
+    #[test]
+    fn decimal_mantissa_scale_decomposes_shortest_repr() {
+        assert_eq!(decimal_mantissa_scale(21.4), Some((214, 1)));
+        assert_eq!(decimal_mantissa_scale(0.1), Some((1, 1)));
+        assert_eq!(decimal_mantissa_scale(21.0), Some((21, 0)));
+        assert_eq!(decimal_mantissa_scale(-5.5), Some((-55, 1)));
+        assert_eq!(decimal_mantissa_scale(f64::NAN), None);
+        assert_eq!(decimal_mantissa_scale(f64::INFINITY), None);
     }
 }
