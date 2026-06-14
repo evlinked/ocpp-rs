@@ -394,6 +394,31 @@ impl SchemaValidator {
     }
 
     fn run_validation(schema: &Value, payload: &Value) -> OcppResult<()> {
+        // jsonschema 0.17 `MultipleOfFloatValidator` computes
+        // `(item / multiple_of) % 1.0` and checks `remainder < f64::EPSILON`.
+        // For `21.4_f64 / 0.1_f64 = 213.9999…` the remainder is `0.9999…`
+        // rather than `0.0`, so the check incorrectly rejects valid 1-decimal
+        // values like `21.4`, `15.2`, `6.6`.
+        //
+        // Fix: replace each float `x` with `round(x / d) * d` for every
+        // float-valued `multipleOf` divisor `d` found in the schema.
+        // Empirically `(N * d) / d == N.0` exactly in IEEE 754 for these
+        // divisors (verified via tests), so the normalised value passes the
+        // `% 1.0 < EPSILON` check.  Values that are NOT near an exact
+        // multiple (e.g. `21.41` → normalised to `4.1`, delta `0.01 ≫ 1e-9`)
+        // are left unchanged and continue to fail validation correctly.
+        //
+        // Mirrors the Python reference's `decimal.Decimal` re-parse in
+        // `ocpp/messages.py` `_validate_payload()`.
+        let divisors = collect_float_divisors(schema);
+        let payload_owned;
+        let payload: &Value = if divisors.is_empty() {
+            payload
+        } else {
+            payload_owned = normalize_floats(payload.clone(), &divisors);
+            &payload_owned
+        };
+
         let compiled = jsonschema::JSONSchema::options()
             .with_draft(jsonschema::Draft::Draft4)
             .compile(schema)
@@ -408,6 +433,85 @@ impl SchemaValidator {
             });
         }
         Ok(())
+    }
+}
+
+/// Recursively walk a JSON Schema value and collect all `"multipleOf"`
+/// divisors that have a non-zero fractional part (i.e. are float, not
+/// integer). These are the cases that trigger `MultipleOfFloatValidator`
+/// in `jsonschema` 0.17 and require pre-normalisation of payload floats.
+fn collect_float_divisors(schema: &Value) -> Vec<f64> {
+    let mut out: Vec<f64> = Vec::new();
+    collect_float_divisors_inner(schema, &mut out);
+    // Deduplicate while preserving meaningful ordering.
+    out.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    out.dedup_by(|a, b| (*a - *b).abs() < 1e-15);
+    out
+}
+
+fn collect_float_divisors_inner(schema: &Value, out: &mut Vec<f64>) {
+    match schema {
+        Value::Object(map) => {
+            if let Some(Value::Number(n)) = map.get("multipleOf") {
+                if let Some(f) = n.as_f64() {
+                    if f.fract() != 0.0 && f > 0.0 {
+                        out.push(f);
+                    }
+                }
+            }
+            for v in map.values() {
+                collect_float_divisors_inner(v, out);
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                collect_float_divisors_inner(v, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Walk a JSON Value and replace any positive `f64` number `x` with
+/// `round(x / d) * d` for the first divisor `d` for which
+/// `|candidate - x| < 1e-9 * max(1, |x|)`.
+///
+/// This converts, e.g., `21.399999… → 21.400000000000002` (= `214 * 0.1_f64`)
+/// whose remainder `(value / 0.1_f64) % 1.0` is exactly `0.0` in IEEE 754,
+/// satisfying `jsonschema` 0.17's `MultipleOfFloatValidator`. Values already
+/// far from an exact multiple (e.g. `21.41`) are left unchanged.
+fn normalize_floats(value: Value, divisors: &[f64]) -> Value {
+    match value {
+        Value::Number(n) => {
+            if n.is_f64() {
+                if let Some(f) = n.as_f64() {
+                    if f.is_finite() && f > 0.0 {
+                        for &d in divisors {
+                            let count = (f / d).round() as i64;
+                            let candidate = count as f64 * d;
+                            let tol = 1e-9_f64 * f.abs().max(1.0_f64);
+                            if (candidate - f).abs() < tol {
+                                if let Some(num) = serde_json::Number::from_f64(candidate) {
+                                    return Value::Number(num);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Value::Number(n)
+        }
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, normalize_floats(v, divisors)))
+                .collect(),
+        ),
+        Value::Array(arr) => Value::Array(
+            arr.into_iter()
+                .map(|v| normalize_floats(v, divisors))
+                .collect(),
+        ),
+        other => other,
     }
 }
 
@@ -528,19 +632,12 @@ mod tests {
 
     /// Port of test_validate_set_charging_profile_payload (Python reference).
     ///
-    /// The Python reference's version uses `21.4` and relies on
-    /// `Decimal`-based JSON parsing to avoid float precision issues with
-    /// the schema's `"multipleOf": 0.1` constraint.  In Rust, `serde_json`
-    /// represents numbers as `f64`, which means `21.4_f64 / 0.1_f64`
-    /// produces `213.999…` rather than `214.0`.  `jsonschema` 0.17 uses
-    /// the `fraction` crate for exact rational arithmetic in `multipleOf`,
-    /// so it correctly rejects the imprecise value.
-    ///
-    /// This test uses `21.0` (exactly representable) to verify the happy
-    /// path.  Handling values like `21.4` requires pre-processing payloads
-    /// with arbitrary-precision decimal parsing — tracked as a known gap.
+    /// The Python reference uses `21.4` and relies on `decimal.Decimal`
+    /// parsing to avoid float precision issues with `"multipleOf": 0.1`.
+    /// Our fix normalises `21.4_f64` → `214 * 0.1_f64` before validation,
+    /// whose IEEE 754 remainder when divided by `0.1_f64` is exactly `0.0`.
     #[test]
-    fn validate_set_charging_profile_with_integer_limit_passes() {
+    fn validate_set_charging_profile_float_limit_passes() {
         let v = SchemaValidator::v16j();
         let payload = json!({
             "connectorId": 1,
@@ -551,7 +648,7 @@ mod tests {
                 "chargingProfileKind": "Relative",
                 "chargingSchedule": {
                     "chargingRateUnit": "A",
-                    "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 21.0}]
+                    "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 21.4}]
                 },
                 "transactionId": 123456789
             }
@@ -560,10 +657,9 @@ mod tests {
     }
 
     /// Port of test_validate_get_composite_profile_payload (Python reference).
-    /// Same `multipleOf` precision note as `validate_set_charging_profile_…`.
-    /// Uses `15.0` instead of `15.2` to stay within f64 exact representation.
+    /// Uses `15.2` (matching the Python test) rather than the workaround `15.0`.
     #[test]
-    fn validate_get_composite_schedule_response_with_integer_limit_passes() {
+    fn validate_get_composite_schedule_response_float_limit_passes() {
         let v = SchemaValidator::v16j();
         let payload = json!({
             "status": "Accepted",
@@ -572,12 +668,86 @@ mod tests {
             "chargingSchedule": {
                 "duration": 60,
                 "chargingRateUnit": "A",
-                "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 15.0}]
+                "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 15.2}]
             }
         });
         assert!(v
             .validate_call_result("GetCompositeSchedule", &payload)
             .is_ok());
+    }
+
+    /// Port of the third Python reference case (RemoteStartTransaction with
+    /// a charging profile containing a `limit` with 1 decimal place).
+    #[test]
+    fn validate_remote_start_transaction_float_limit_passes() {
+        let v = SchemaValidator::v16j();
+        let payload = json!({
+            "connectorId": 1,
+            "idTag": "TAG001",
+            "chargingProfile": {
+                "chargingProfileId": 1,
+                "stackLevel": 0,
+                "chargingProfilePurpose": "TxProfile",
+                "chargingProfileKind": "Relative",
+                "chargingSchedule": {
+                    "chargingRateUnit": "A",
+                    "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 11.5}]
+                }
+            }
+        });
+        assert!(v.validate_call("RemoteStartTransaction", &payload).is_ok());
+    }
+
+    /// A `limit` with more than 1 significant decimal (e.g. `21.41`) is NOT a
+    /// multiple of `0.1` and must still be rejected after normalisation.
+    /// Normalising `21.41` would require rounding to `4.1` (delta `0.01 ≫ 1e-9`)
+    /// which our tolerance check correctly rejects, leaving the value unchanged.
+    #[test]
+    fn validate_set_charging_profile_two_decimal_limit_fails() {
+        let v = SchemaValidator::v16j();
+        let payload = json!({
+            "connectorId": 1,
+            "csChargingProfiles": {
+                "chargingProfileId": 1,
+                "stackLevel": 0,
+                "chargingProfilePurpose": "TxProfile",
+                "chargingProfileKind": "Relative",
+                "chargingSchedule": {
+                    "chargingRateUnit": "A",
+                    "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 21.41}]
+                },
+                "transactionId": 1
+            }
+        });
+        let err = v.validate_call("SetChargingProfile", &payload).unwrap_err();
+        assert!(
+            matches!(err, OcppError::ValidationError { .. }),
+            "expected ValidationError for non-multiple-of-0.1 limit, got {:?}",
+            err
+        );
+    }
+
+    /// `minChargingRate` also has `"multipleOf": 0.1` in the schema; verify
+    /// the fix applies there too.
+    #[test]
+    fn validate_set_charging_profile_float_min_charging_rate_passes() {
+        let v = SchemaValidator::v16j();
+        let payload = json!({
+            "connectorId": 1,
+            "csChargingProfiles": {
+                "chargingProfileId": 1,
+                "stackLevel": 0,
+                "chargingProfilePurpose": "TxProfile",
+                "chargingProfileKind": "Relative",
+                "chargingSchedule": {
+                    "chargingRateUnit": "A",
+                    "chargingSchedulePeriod": [{"startPeriod": 0, "limit": 6.6}],
+                    "minChargingRate": 6.6
+                },
+                "transactionId": 1
+            }
+        });
+        assert!(v.validate_call("SetChargingProfile", &payload).is_ok());
     }
 
     // ── invalid payloads are rejected ────────────────────────────────────────
