@@ -412,7 +412,13 @@ impl OcppResponse for DataTransferResponse {}
 /// GetConfiguration request message
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GetConfigurationRequest {
-    /// List of keys to retrieve (optional)
+    /// List of keys to retrieve (optional).
+    ///
+    /// Omitted from the wire when `None` — the OCPP 1.6J `GetConfiguration`
+    /// schema types `key` as an array, so serializing it as `null` would fail
+    /// schema validation. Matches the "absent optional field" convention used
+    /// by every other optional field and the Python reference.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<Vec<String>>,
 }
 

@@ -9,10 +9,12 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use ocpp_types::{OcppError, OcppResult};
 use serde_json::Value;
 
+use crate::schema_validation::SchemaValidator;
 use crate::{CallMessage, OcppAction};
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
@@ -49,15 +51,37 @@ type AfterFn = Box<dyn Fn(Value) -> BoxFuture<()> + Send + Sync>;
 pub struct ActionDispatcher {
     handlers: HashMap<&'static str, HandlerFn>,
     after_hooks: HashMap<&'static str, AfterFn>,
+    /// Optional JSON Schema validator. When present, every incoming CALL
+    /// payload is validated against its action schema before the handler is
+    /// invoked. Ports the `_validate()` call at the top of `_handle_call()` in
+    /// [`ocpp/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py).
+    /// Shared behind `Arc` so one validator (78 compiled schemas) can back
+    /// several dispatchers without re-parsing.
+    validator: Option<Arc<SchemaValidator>>,
 }
 
 impl ActionDispatcher {
-    /// Create an empty dispatcher.
+    /// Create an empty dispatcher with no schema validation.
     pub fn new() -> Self {
         Self {
             handlers: HashMap::new(),
             after_hooks: HashMap::new(),
+            validator: None,
         }
+    }
+
+    /// Attach a [`SchemaValidator`] so `dispatch()` validates each incoming
+    /// CALL payload against its action schema before dispatch.
+    ///
+    /// Builder-style: returns `self` for chaining after `new()`.
+    pub fn with_validator(mut self, validator: Arc<SchemaValidator>) -> Self {
+        self.validator = Some(validator);
+        self
+    }
+
+    /// Returns `true` if a schema validator is attached.
+    pub fn has_validator(&self) -> bool {
+        self.validator.is_some()
     }
 
     /// Register a typed `@on` handler for `Req::ACTION_NAME`.
@@ -119,6 +143,14 @@ impl ActionDispatcher {
     /// after the handler returns successfully (non-blocking).
     pub async fn dispatch(&self, call: &CallMessage) -> OcppResult<Value> {
         let action = call.action.as_str();
+
+        // Schema-validate the incoming payload before touching the handler,
+        // mirroring `_handle_call()` in charge_point.py which runs `_validate()`
+        // first and short-circuits to a CALLERROR on failure. A malformed
+        // payload therefore never reaches handler deserialization.
+        if let Some(validator) = &self.validator {
+            validator.validate_call(action, &call.payload)?;
+        }
 
         let handler = self
             .handlers
@@ -370,6 +402,105 @@ mod tests {
         assert!(d.has_handler("Ping"));
         assert!(!d.has_handler("Pong"));
         assert_eq!(d.handler_count(), 1);
+    }
+
+    // --- schema validation wiring (Issue #33) ---
+    //
+    // Python ref: ocpp/charge_point.py `_handle_call()` calls `_validate()`
+    // before invoking the handler. These tests use real OCPP 1.6J actions
+    // (BootNotification) so the bundled schemas apply.
+
+    use crate::schema_validation::SchemaValidator;
+    use crate::v16j::{BootNotificationRequest, BootNotificationResponse, RegistrationStatus};
+
+    fn validating_dispatcher() -> ActionDispatcher {
+        ActionDispatcher::new().with_validator(Arc::new(SchemaValidator::v16j()))
+    }
+
+    fn boot_response_payload() -> BootNotificationResponse {
+        BootNotificationResponse {
+            current_time: chrono::Utc::now(),
+            interval: 300,
+            status: RegistrationStatus::Accepted,
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_validator_rejects_malformed_payload() {
+        let called = Arc::new(AtomicBool::new(false));
+        let c = called.clone();
+
+        let mut d = validating_dispatcher();
+        d.on(move |_req: BootNotificationRequest| {
+            let c = c.clone();
+            async move {
+                c.store(true, Ordering::SeqCst);
+                Ok(boot_response_payload())
+            }
+        });
+
+        // Missing the required `chargePointVendor` field.
+        let bad = CallMessage::new(
+            "BootNotification".to_string(),
+            serde_json::json!({ "chargePointModel": "M" }),
+        )
+        .unwrap();
+
+        let err = d.dispatch(&bad).await.unwrap_err();
+        assert!(
+            matches!(err, OcppError::ValidationError { .. }),
+            "expected ValidationError, got {err:?}"
+        );
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "handler must NOT run when validation fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_with_validator_accepts_valid_payload() {
+        let called = Arc::new(AtomicBool::new(false));
+        let c = called.clone();
+
+        let mut d = validating_dispatcher();
+        d.on(move |_req: BootNotificationRequest| {
+            let c = c.clone();
+            async move {
+                c.store(true, Ordering::SeqCst);
+                Ok(boot_response_payload())
+            }
+        });
+
+        let good = CallMessage::new(
+            "BootNotification".to_string(),
+            serde_json::json!({ "chargePointVendor": "V", "chargePointModel": "M" }),
+        )
+        .unwrap();
+
+        let resp = d.dispatch(&good).await.unwrap();
+        assert_eq!(resp["status"], "Accepted");
+        assert!(called.load(Ordering::SeqCst), "handler should have run");
+    }
+
+    #[tokio::test]
+    async fn dispatch_without_validator_accepts_any_payload() {
+        // No validator → malformed payload bypasses schema checks and fails at
+        // serde deserialization instead (existing behaviour preserved).
+        let mut d = ActionDispatcher::new();
+        assert!(!d.has_validator());
+        d.on(|_req: BootNotificationRequest| async move { Ok(boot_response_payload()) });
+
+        let bad = CallMessage::new(
+            "BootNotification".to_string(),
+            serde_json::json!({ "chargePointModel": "M" }),
+        )
+        .unwrap();
+
+        let err = d.dispatch(&bad).await.unwrap_err();
+        assert!(
+            matches!(err, OcppError::Json { .. }),
+            "expected Json (serde) error without a validator, got {err:?}"
+        );
     }
 
     #[tokio::test]

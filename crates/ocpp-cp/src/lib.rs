@@ -27,7 +27,9 @@ use ocpp_messages::v16j::{
     StatusNotificationRequest, StopTransactionRequest, UnlockConnectorRequest,
     UnlockConnectorResponse,
 };
-use ocpp_messages::{ActionDispatcher, CallMessage, Message, MessageType, OcppAction};
+use ocpp_messages::{
+    ActionDispatcher, CallMessage, Message, MessageType, OcppAction, SchemaValidator,
+};
 use ocpp_transport::client::WebSocketClient;
 use ocpp_transport::{
     MessageHandler as TransportMessageHandler, Transport, TransportConfig, TransportEvent,
@@ -76,6 +78,11 @@ pub struct ChargePointConfig {
     /// Maximum BootNotification retries before returning `OcppError::BootRejected`.
     /// Mirrors the retry loop in `charge_point.py`; default 3.
     pub max_boot_retries: u32,
+    /// Validate every incoming CALL and outgoing CALLRESULT against the bundled
+    /// OCPP 1.6J JSON Schemas before dispatch/deserialization. Defaults to
+    /// `true`, matching the Python reference which always runs `_validate()`.
+    /// Set to `false` to opt out (e.g. for fuzzing or non-conformant peers).
+    pub validate_payloads: bool,
     /// Transport configuration (not serialized; uses Default on deserialization)
     #[serde(skip)]
     pub transport_config: TransportConfig,
@@ -105,6 +112,7 @@ impl Default for ChargePointConfig {
             auto_reconnect: true,
             call_timeout: 30, // 30 seconds, matches Python reference default
             max_boot_retries: 3,
+            validate_payloads: true,
             transport_config: TransportConfig::default(),
         }
     }
@@ -222,8 +230,14 @@ fn ocpp_error_to_callerror_code(e: &OcppError) -> (CallErrorCode, String) {
             CallErrorCode::NotSupported,
             format!("Action '{}' not supported", feature),
         ),
+        // Schema-validation failures map to FormationViolation, matching the
+        // default bucket of `_validate_payload()` in `ocpp/messages.py` (which
+        // raises `FormatViolationError` for every keyword except a few). The
+        // finer keyword-granular mapping (type → TypeConstraintViolation,
+        // required → ProtocolError) is tracked as a follow-up; it needs the
+        // failing JSON-Schema keyword surfaced through `OcppError`.
         OcppError::ValidationError { message } => {
-            (CallErrorCode::PropertyConstraintViolation, message.clone())
+            (CallErrorCode::FormationViolation, message.clone())
         }
         OcppError::Json { message } => (CallErrorCode::FormationViolation, message.clone()),
         OcppError::ProtocolViolation { message } => (CallErrorCode::ProtocolError, message.clone()),
@@ -265,6 +279,10 @@ pub struct ChargePoint {
     heartbeat_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Maps CSMS-assigned transaction ID → connector ID for stop_transaction lookup.
     active_transactions: Arc<RwLock<HashMap<i32, ConnectorId>>>,
+    /// Shared schema validator (when `config.validate_payloads`). Backs both
+    /// the dispatcher's incoming-CALL validation and `call()`'s CALLRESULT
+    /// validation. `None` when validation is disabled.
+    validator: Option<Arc<SchemaValidator>>,
 }
 
 impl ChargePoint {
@@ -292,10 +310,21 @@ impl ChargePoint {
             connectors.insert(connector_id, Connector::new(connector_config)?);
         }
 
+        // Build the shared validator once (compiles 78 schemas) and back both
+        // the dispatcher (incoming CALLs) and `call()` (CALLRESULTs) with it.
+        // Mirrors `ocpp/charge_point.py`, which always runs `_validate()`.
+        let validator = if config.validate_payloads {
+            Some(Arc::new(SchemaValidator::v16j()))
+        } else {
+            None
+        };
+
         let config_store = Arc::new(RwLock::new(ConfigurationStore::new()));
-        let dispatcher = Arc::new(RwLock::new(Self::build_default_dispatcher(
-            config_store.clone(),
-        )));
+        let mut dispatcher = Self::build_default_dispatcher(config_store.clone());
+        if let Some(v) = &validator {
+            dispatcher = dispatcher.with_validator(v.clone());
+        }
+        let dispatcher = Arc::new(RwLock::new(dispatcher));
 
         Ok(Self {
             config,
@@ -309,6 +338,7 @@ impl ChargePoint {
             is_connected: Arc::new(RwLock::new(false)),
             heartbeat_handle: Arc::new(RwLock::new(None)),
             active_transactions: Arc::new(RwLock::new(HashMap::new())),
+            validator,
         })
     }
 
@@ -638,6 +668,16 @@ impl ChargePoint {
 
         // 5. Propagate any CALLERROR, then deserialize the success payload.
         let payload = raw_result?;
+
+        // Validate the CALLRESULT against the `{action}Response` schema before
+        // deserializing, mirroring `_handle_call_result()` in charge_point.py.
+        // A conformant CSMS should never send a malformed response, but the
+        // incoming WebSocket frame is a trust boundary — reject it explicitly
+        // rather than surfacing an opaque serde error.
+        if let Some(validator) = &self.validator {
+            validator.validate_call_result(Req::ACTION_NAME, &payload)?;
+        }
+
         serde_json::from_value::<Req::Response>(payload).map_err(OcppError::from)
     }
 
@@ -1672,6 +1712,144 @@ mod tests {
             matches!(result, Err(OcppError::NotFound { .. })),
             "expected NotFound for unknown transaction ID, got: {result:?}"
         );
+    }
+
+    // --- schema validation wiring (Issue #33) ---
+    //
+    // Python ref: ocpp/charge_point.py `_handle_call()` / `_handle_call_result()`
+    // both run `_validate()`. Incoming malformed CALLs become CALLERRORs;
+    // malformed CALLRESULTs from the CSMS are rejected before deserialization.
+
+    #[test]
+    fn validate_payloads_default_is_true() {
+        let config = ChargePointConfig::default();
+        assert!(config.validate_payloads);
+    }
+
+    #[tokio::test]
+    async fn validator_present_by_default_absent_when_disabled() {
+        let on = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        assert!(on.validator.is_some());
+        assert!(on.dispatcher.read().await.has_validator());
+
+        let off = ChargePoint::new(ChargePointConfig {
+            validate_payloads: false,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(off.validator.is_none());
+        assert!(!off.dispatcher.read().await.has_validator());
+    }
+
+    #[tokio::test]
+    async fn incoming_malformed_call_returns_callerror_formation_violation() {
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+
+        // Schema-valid `type` but an extra property the schema forbids
+        // (additionalProperties: false). Deserializes fine via serde — only
+        // the validator catches it — so this proves dispatch-time validation
+        // is active, not just serde.
+        let call = CallMessage::new(
+            "Reset".to_string(),
+            serde_json::json!({ "type": "Soft", "unexpected": 1 }),
+        )
+        .unwrap();
+
+        match cp
+            .handle_message(Message::Call(call))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Message::CallError(e) => {
+                assert_eq!(e.error_code, CallErrorCode::FormationViolation);
+            }
+            other => panic!("expected CallError, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn validation_disabled_lets_extra_property_call_through() {
+        // Same payload, but with validation disabled the extra property is
+        // ignored by serde and the handler runs normally.
+        let cp = ChargePoint::new(ChargePointConfig {
+            validate_payloads: false,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let call = CallMessage::new(
+            "Reset".to_string(),
+            serde_json::json!({ "type": "Soft", "unexpected": 1 }),
+        )
+        .unwrap();
+
+        match cp
+            .handle_message(Message::Call(call))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Message::CallResult(r) => {
+                let body: ResetResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, ResetStatus::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn call_result_validation_rejects_malformed_response() {
+        // CSMS returns an empty AuthorizeResponse — missing the required
+        // `idTagInfo`. With validation on, `call()` rejects it as a
+        // ValidationError before deserialization.
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert("Authorize".to_string(), serde_json::json!({}));
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..Default::default()
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let err = cp.authorize("TAG001").await.unwrap_err();
+        assert!(
+            matches!(err, OcppError::ValidationError { .. }),
+            "expected ValidationError for malformed CALLRESULT, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_result_validation_disabled_accepts_schema_invalid_response() {
+        // Response carries an extra property (schema additionalProperties:
+        // false) that serde ignores. With validation disabled the call
+        // succeeds; with validation on it would be rejected — proving the
+        // CALLRESULT validation path is gated by `validate_payloads`.
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert(
+            "Authorize".to_string(),
+            serde_json::json!({ "idTagInfo": { "status": "Accepted" }, "extra": 7 }),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            validate_payloads: false,
+            ..Default::default()
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let info = cp.authorize("TAG001").await.unwrap();
+        assert_eq!(info.status, AuthorizationStatus::Accepted);
     }
 
     /// Spawn a mock CSMS that responds to each BootNotification CALL with a
