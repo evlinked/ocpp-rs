@@ -141,6 +141,15 @@ where
         Ok(())
     }
 
+    /// Consume this wrapper and return the inner [`WebSocketStream`].
+    ///
+    /// Used by [`crate::client::WebSocketClient`] to split the stream into independent
+    /// sink and stream halves so that send and receive can proceed
+    /// concurrently without a shared mutex.
+    pub fn into_inner(self) -> WebSocketStream<S> {
+        self.stream
+    }
+
     /// Get connection info
     pub fn connection_info(&self) -> &ConnectionInfo {
         &self.connection_info
