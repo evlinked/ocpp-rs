@@ -220,10 +220,12 @@ pub struct StatusNotificationRequest {
     #[serde(rename = "errorCode")]
     pub error_code: ChargePointErrorCode,
     /// Additional information about the error (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub info: Option<String>,
     /// Current status
     pub status: ChargePointStatus,
     /// Timestamp of status change (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<DateTime<Utc>>,
     /// Vendor-specific error code (optional)
     #[serde(rename = "vendorErrorCode", skip_serializing_if = "Option::is_none")]
@@ -264,6 +266,7 @@ pub struct StopTransactionRequest {
     #[serde(rename = "transactionId")]
     pub transaction_id: i32,
     /// Reason for stopping (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<Reason>,
     /// Transaction data (optional)
     #[serde(rename = "transactionData", skip_serializing_if = "Option::is_none")]
@@ -399,6 +402,7 @@ pub struct DataTransferResponse {
     /// Status of data transfer
     pub status: DataTransferStatus,
     /// Response data (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
 }
 
@@ -569,6 +573,7 @@ pub struct GetDiagnosticsRequest {
     /// Location (URL) where diagnostics should be uploaded
     pub location: String,
     /// Number of retries (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retries: Option<i32>,
     /// Retry interval in seconds (optional)
     #[serde(rename = "retryInterval", skip_serializing_if = "Option::is_none")]
@@ -630,6 +635,7 @@ pub struct UpdateFirmwareRequest {
     /// Location (URL) of firmware
     pub location: String,
     /// Number of retries (optional)
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub retries: Option<i32>,
     /// Retrieve date and time
     #[serde(rename = "retrieveDate")]
