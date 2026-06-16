@@ -832,6 +832,43 @@ mod tests {
         assert!(matches!(err, OcppError::NotSupported { .. }));
     }
 
+    // ── port fidelity: absent optionals omitted, not serialized as null ───────
+
+    /// The Python reference's `remove_nones()` drops `None` fields before
+    /// validation; our serde structs must do the same, or a `null` value fails
+    /// the action schema (e.g. `key: null` violates `key: array`). Regression
+    /// guard for the `skip_serializing_if` attributes on optional v16j fields.
+    #[test]
+    fn absent_optionals_are_omitted_and_payloads_validate() {
+        use crate::v16j::{GetConfigurationRequest, StatusNotificationRequest};
+        use ocpp_types::v16j::{ChargePointErrorCode, ChargePointStatus};
+
+        let v = SchemaValidator::v16j();
+
+        // `GetConfigurationRequest { key: None }` → `{}`, not `{"key": null}`.
+        let payload = serde_json::to_value(GetConfigurationRequest { key: None }).unwrap();
+        assert_eq!(payload, json!({}));
+        assert!(v.validate_call("GetConfiguration", &payload).is_ok());
+
+        // A StatusNotification with no optional fields set must validate.
+        let payload = serde_json::to_value(StatusNotificationRequest {
+            connector_id: 1,
+            error_code: ChargePointErrorCode::NoError,
+            status: ChargePointStatus::Available,
+            info: None,
+            timestamp: None,
+            vendor_error_code: None,
+            vendor_id: None,
+        })
+        .unwrap();
+        assert!(payload.get("info").is_none(), "info must be omitted");
+        assert!(
+            payload.get("timestamp").is_none(),
+            "timestamp must be omitted"
+        );
+        assert!(v.validate_call("StatusNotification", &payload).is_ok());
+    }
+
     // ── error message content ─────────────────────────────────────────────────
 
     #[test]

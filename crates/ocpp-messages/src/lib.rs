@@ -12,6 +12,7 @@ pub mod validation;
 pub use dispatcher::ActionDispatcher;
 pub use ocpp_types::{CallErrorMessage, CallMessage, CallResultMessage, Message, MessageType};
 use ocpp_types::{OcppError, OcppResult};
+pub use schema_validation::SchemaValidator;
 
 /// Re-export commonly used types
 pub use chrono::{DateTime, Utc};
