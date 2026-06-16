@@ -238,12 +238,14 @@ fn ocpp_error_to_callerror_code(e: &OcppError) -> (CallErrorCode, String) {
             CallErrorCode::NotSupported,
             format!("Action '{}' not supported", feature),
         ),
-        // Schema-validation failures map to FormationViolation, matching the
-        // default bucket of `_validate_payload()` in `ocpp/messages.py` (which
-        // raises `FormatViolationError` for every keyword except a few). The
-        // finer keyword-granular mapping (type → TypeConstraintViolation,
-        // required → ProtocolError) is tracked as a follow-up; it needs the
-        // failing JSON-Schema keyword surfaced through `OcppError`.
+        // JSON-Schema failures carry the dominant failing keyword, mapped to a
+        // keyword-granular CALLERROR code per `_validate_payload()` in
+        // `ocpp/messages.py` (`type`/`maxLength` → TypeConstraintViolation,
+        // `required` → ProtocolError, else → FormationViolation).
+        OcppError::SchemaViolation { keyword, message } => {
+            (keyword.call_error_code(), message.clone())
+        }
+        // Manual (non-schema) validation failures keep the default bucket.
         OcppError::ValidationError { message } => {
             (CallErrorCode::FormationViolation, message.clone())
         }
@@ -1904,6 +1906,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incoming_call_type_failure_returns_type_constraint_violation() {
+        // A `type` schema failure (`connectorId` as a string) must surface as
+        // CALLERROR `TypeConstraintViolation` through the full dispatch path,
+        // per `_validate_payload()` in the Python reference.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        let call = CallMessage::new(
+            "ChangeAvailability".to_string(),
+            serde_json::json!({ "connectorId": "not-an-int", "type": "Operative" }),
+        )
+        .unwrap();
+
+        match cp
+            .handle_message(Message::Call(call))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Message::CallError(e) => {
+                assert_eq!(e.error_code, CallErrorCode::TypeConstraintViolation);
+            }
+            other => panic!("expected CallError, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn incoming_call_required_failure_returns_protocol_error() {
+        // A missing required field is a `required` schema failure → CALLERROR
+        // `ProtocolError` ("Payload for Action is incomplete").
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        let call = CallMessage::new(
+            "ChangeAvailability".to_string(),
+            serde_json::json!({ "connectorId": 1 }), // missing required `type`
+        )
+        .unwrap();
+
+        match cp
+            .handle_message(Message::Call(call))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Message::CallError(e) => {
+                assert_eq!(e.error_code, CallErrorCode::ProtocolError);
+            }
+            other => panic!("expected CallError, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn validation_disabled_lets_extra_property_call_through() {
         // Same payload, but with validation disabled the extra property is
         // ignored by serde and the handler runs normally.
@@ -1953,9 +2004,10 @@ mod tests {
         cp.connect().await.unwrap();
 
         let err = cp.authorize("TAG001").await.unwrap_err();
+        // Empty AuthorizeResponse is missing the required `idTagInfo` field.
         assert!(
-            matches!(err, OcppError::ValidationError { .. }),
-            "expected ValidationError for malformed CALLRESULT, got: {err:?}"
+            matches!(err, OcppError::SchemaViolation { .. }),
+            "expected SchemaViolation for malformed CALLRESULT, got: {err:?}"
         );
     }
 

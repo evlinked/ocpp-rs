@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use jsonschema::error::ValidationErrorKind;
-use ocpp_types::{OcppError, OcppResult};
+use ocpp_types::{OcppError, OcppResult, SchemaKeyword};
 use serde_json::Value;
 
 /// (schema-name, embedded JSON text) pairs for all 78 OCPP 1.6J schemas.
@@ -407,17 +407,73 @@ impl SchemaValidator {
             // artifacts (e.g. `21.4` against `multipleOf: 0.1`). Every other
             // keyword violation is kept. This is the Rust equivalent of the
             // `decimal.Decimal` re-parse in `ocpp/messages.py::_validate_payload`.
-            let messages: Vec<String> = errors
-                .filter(|e| !is_multiple_of_precision_artifact(e))
-                .map(|e| e.to_string())
-                .collect();
-            if !messages.is_empty() {
-                return Err(OcppError::ValidationError {
+            //
+            // While collecting messages we also track the dominant failing
+            // keyword so the CALLERROR layer can pick a keyword-granular code
+            // (`type`/`maxLength` → TypeConstraintViolation, `required` →
+            // ProtocolError, else → FormationViolation). The Python reference
+            // inspects only the *first* `jsonschema` error; `jsonschema`'s
+            // iteration order isn't a stable contract, so instead we pick a
+            // deterministic, documented priority across all surviving errors:
+            // `required > type > maxLength > additionalProperties > other`.
+            let mut messages: Vec<String> = Vec::new();
+            let mut keyword: Option<SchemaKeyword> = None;
+            for error in errors {
+                if is_multiple_of_precision_artifact(&error) {
+                    continue;
+                }
+                let candidate = classify_keyword(&error);
+                keyword = Some(match keyword {
+                    Some(current) if keyword_priority(current) >= keyword_priority(candidate) => {
+                        current
+                    }
+                    _ => candidate,
+                });
+                messages.push(error.to_string());
+            }
+            if let Some(keyword) = keyword {
+                return Err(OcppError::SchemaViolation {
+                    keyword,
                     message: messages.join("; "),
                 });
             }
         }
         Ok(())
+    }
+}
+
+/// Collapse a `jsonschema` validation error to the single OCPP-relevant keyword
+/// the CALLERROR mapping cares about. Keywords with no dedicated OCPP code
+/// (`enum`, `minimum`, `multipleOf`, …) fall into [`SchemaKeyword::Other`],
+/// matching the default `FormatViolationError` bucket of the Python reference.
+fn classify_keyword(error: &jsonschema::ValidationError) -> SchemaKeyword {
+    match &error.kind {
+        ValidationErrorKind::Type { .. } => SchemaKeyword::Type,
+        ValidationErrorKind::MaxLength { .. } => SchemaKeyword::MaxLength,
+        ValidationErrorKind::AdditionalProperties { .. } => SchemaKeyword::AdditionalProperties,
+        ValidationErrorKind::Required { .. } => SchemaKeyword::Required,
+        _ => SchemaKeyword::Other,
+    }
+}
+
+/// Deterministic precedence for choosing one keyword when a payload trips
+/// several at once. Higher value wins, in this order: `type` (4), `maxLength`
+/// (3), `additionalProperties` (2), `required` (1), `other` (0).
+///
+/// A concrete violation on a *present* field (`type`/`maxLength`/an unexpected
+/// property) is more informative than the generic "a field is missing"
+/// (`required`), which almost any partial payload trips. This deprioritisation
+/// of `required` is exactly what the Python reference's tests expect: e.g.
+/// `test_validate_set_maxlength_violation_payload` sends an over-long `idTag` in
+/// a payload that is *also* missing required fields, yet expects
+/// `TypeConstraintViolation` (maxLength) rather than `ProtocolError` (required).
+fn keyword_priority(keyword: SchemaKeyword) -> u8 {
+    match keyword {
+        SchemaKeyword::Type => 4,
+        SchemaKeyword::MaxLength => 3,
+        SchemaKeyword::AdditionalProperties => 2,
+        SchemaKeyword::Required => 1,
+        SchemaKeyword::Other => 0,
     }
 }
 
@@ -503,6 +559,7 @@ fn decimal_mantissa_scale(x: f64) -> Option<(i128, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ocpp_types::CallErrorCode;
     use serde_json::json;
 
     // ── construction ──────────────────────────────────────────────────────────
@@ -708,9 +765,17 @@ mod tests {
             }
         });
         let err = v.validate_call("SetChargingProfile", &payload).unwrap_err();
+        // A genuine `multipleOf` failure has no dedicated OCPP code → `Other`
+        // (the Python reference's default `FormatViolationError` bucket).
         assert!(
-            matches!(err, OcppError::ValidationError { .. }),
-            "expected ValidationError for 4.11, got {err:?}"
+            matches!(
+                err,
+                OcppError::SchemaViolation {
+                    keyword: SchemaKeyword::Other,
+                    ..
+                }
+            ),
+            "expected SchemaViolation(Other) for 4.11, got {err:?}"
         );
     }
 
@@ -735,28 +800,44 @@ mod tests {
             }
         });
         let err = v.validate_call("SetChargingProfile", &payload).unwrap_err();
+        // A `type` failure survives → keyword is `Type`, never swallowed.
         assert!(
-            matches!(err, OcppError::ValidationError { .. }),
+            matches!(
+                err,
+                OcppError::SchemaViolation {
+                    keyword: SchemaKeyword::Type,
+                    ..
+                }
+            ),
             "sibling type error must survive the multipleOf filter, got {err:?}"
         );
     }
 
-    // ── invalid payloads are rejected ────────────────────────────────────────
+    // ── invalid payloads are rejected, with keyword-granular codes ────────────
+    //
+    // These port the per-keyword cases from the Python reference's
+    // `tests/test_messages.py` (`test_validate_payload_with_invalid_*`) and
+    // assert the exact `SchemaKeyword` → `CallErrorCode` mapping from
+    // `_validate_payload()`.
 
-    /// Port of test_validate_payload_with_invalid_additional_properties_payload
+    /// Port of `test_validate_payload_with_invalid_additional_properties_payload`.
+    /// `additionalProperties` → `FormationViolation`.
     #[test]
     fn validate_heartbeat_response_with_extra_key_fails() {
         let v = SchemaValidator::v16j();
         let payload = json!({"invalid_key": true});
         let err = v.validate_call_result("Heartbeat", &payload).unwrap_err();
-        assert!(
-            matches!(err, OcppError::ValidationError { .. }),
-            "expected ValidationError, got {:?}",
-            err
-        );
+        match err {
+            OcppError::SchemaViolation { keyword, .. } => {
+                assert_eq!(keyword, SchemaKeyword::AdditionalProperties);
+                assert_eq!(keyword.call_error_code(), CallErrorCode::FormationViolation);
+            }
+            other => panic!("expected SchemaViolation(AdditionalProperties), got {other:?}"),
+        }
     }
 
-    /// Port of test_validate_payload_with_invalid_type_payload
+    /// Port of `test_validate_payload_with_invalid_type_payload`.
+    /// `type` → `TypeConstraintViolation`.
     #[test]
     fn validate_start_transaction_with_wrong_type_fails() {
         let v = SchemaValidator::v16j();
@@ -767,14 +848,20 @@ mod tests {
             "timestamp": "2022-01-25T19:18:30.018Z"
         });
         let err = v.validate_call("StartTransaction", &payload).unwrap_err();
-        assert!(
-            matches!(err, OcppError::ValidationError { .. }),
-            "expected ValidationError, got {:?}",
-            err
-        );
+        match err {
+            OcppError::SchemaViolation { keyword, .. } => {
+                assert_eq!(keyword, SchemaKeyword::Type);
+                assert_eq!(
+                    keyword.call_error_code(),
+                    CallErrorCode::TypeConstraintViolation
+                );
+            }
+            other => panic!("expected SchemaViolation(Type), got {other:?}"),
+        }
     }
 
-    /// Port of test_validate_payload_with_invalid_missing_property_payload
+    /// Port of `test_validate_payload_with_invalid_missing_property_payload`.
+    /// `required` → `ProtocolError`.
     #[test]
     fn validate_start_transaction_missing_required_field_fails() {
         let v = SchemaValidator::v16j();
@@ -784,11 +871,13 @@ mod tests {
             // meterStart and timestamp are required but omitted
         });
         let err = v.validate_call("StartTransaction", &payload).unwrap_err();
-        assert!(
-            matches!(err, OcppError::ValidationError { .. }),
-            "expected ValidationError, got {:?}",
-            err
-        );
+        match err {
+            OcppError::SchemaViolation { keyword, .. } => {
+                assert_eq!(keyword, SchemaKeyword::Required);
+                assert_eq!(keyword.call_error_code(), CallErrorCode::ProtocolError);
+            }
+            other => panic!("expected SchemaViolation(Required), got {other:?}"),
+        }
     }
 
     #[test]
@@ -797,16 +886,77 @@ mod tests {
         // chargePointModel present but chargePointVendor missing
         let payload = json!({"chargePointModel": "Turbo-3000"});
         let err = v.validate_call("BootNotification", &payload).unwrap_err();
-        assert!(matches!(err, OcppError::ValidationError { .. }));
+        assert!(matches!(
+            err,
+            OcppError::SchemaViolation {
+                keyword: SchemaKeyword::Required,
+                ..
+            }
+        ));
     }
 
+    /// `maxLength` → `TypeConstraintViolation` (an `idTag` longer than the
+    /// schema's 20-char limit). This keyword shares the Python reference's
+    /// `TypeConstraintViolationError` branch with `type`.
+    #[test]
+    fn validate_authorize_with_overlong_id_tag_fails_max_length() {
+        let v = SchemaValidator::v16j();
+        let payload = json!({"idTag": "X".repeat(21)}); // CiString20Type → maxLength 20
+        let err = v.validate_call("Authorize", &payload).unwrap_err();
+        match err {
+            OcppError::SchemaViolation { keyword, .. } => {
+                assert_eq!(keyword, SchemaKeyword::MaxLength);
+                assert_eq!(
+                    keyword.call_error_code(),
+                    CallErrorCode::TypeConstraintViolation
+                );
+            }
+            other => panic!("expected SchemaViolation(MaxLength), got {other:?}"),
+        }
+    }
+
+    /// An `enum` failure has no dedicated OCPP code → `Other` →
+    /// `FormationViolation` (the default `FormatViolationError` bucket).
     #[test]
     fn validate_reset_with_unknown_type_enum_fails() {
         let v = SchemaValidator::v16j();
         // "Warm" is not a valid ResetType (only "Hard" and "Soft" are)
         let payload = json!({"type": "Warm"});
         let err = v.validate_call("Reset", &payload).unwrap_err();
-        assert!(matches!(err, OcppError::ValidationError { .. }));
+        match err {
+            OcppError::SchemaViolation { keyword, .. } => {
+                assert_eq!(keyword, SchemaKeyword::Other);
+                assert_eq!(keyword.call_error_code(), CallErrorCode::FormationViolation);
+            }
+            other => panic!("expected SchemaViolation(Other) for enum failure, got {other:?}"),
+        }
+    }
+
+    /// Port of `test_validate_set_maxlength_violation_payload`
+    /// ([`tests/test_messages.py`](https://github.com/mobilityhouse/ocpp/blob/master/tests/test_messages.py)).
+    /// The payload trips both `maxLength` (21-char `idTag`) and `required`
+    /// (missing `meterStart`/`timestamp`); the reference expects
+    /// `TypeConstraintViolation`, so our precedence must report `maxLength` over
+    /// `required`.
+    #[test]
+    fn multiple_failures_maxlength_outranks_required() {
+        let v = SchemaValidator::v16j();
+        let payload = json!({
+            "idTag": "012345678901234567890", // 21 chars → maxLength
+            "connectorId": 1
+            // meterStart + timestamp missing → required
+        });
+        let err = v.validate_call("StartTransaction", &payload).unwrap_err();
+        match err {
+            OcppError::SchemaViolation { keyword, .. } => {
+                assert_eq!(keyword, SchemaKeyword::MaxLength);
+                assert_eq!(
+                    keyword.call_error_code(),
+                    CallErrorCode::TypeConstraintViolation
+                );
+            }
+            other => panic!("maxLength must outrank required, got {other:?}"),
+        }
     }
 
     // ── unknown actions ───────────────────────────────────────────────────────
@@ -881,13 +1031,13 @@ mod tests {
             "timestamp": "2022-01-25T19:18:30.018Z"
         });
         match v.validate_call("StartTransaction", &payload) {
-            Err(OcppError::ValidationError { message }) => {
+            Err(OcppError::SchemaViolation { message, .. }) => {
                 assert!(
                     !message.is_empty(),
                     "validation error message must not be empty"
                 );
             }
-            other => panic!("expected ValidationError, got {:?}", other),
+            other => panic!("expected SchemaViolation, got {:?}", other),
         }
     }
 
