@@ -301,7 +301,11 @@ async fn handle_cp_socket(socket: WebSocket, charge_point_id: String, state: Arc
 }
 
 /// Map an `OcppError` to the appropriate OCPP error code for a CALLERROR frame.
-fn build_call_error(unique_id: &str, error: &OcppError) -> Message {
+///
+/// Shared with [`DispatchHandler`](crate::dispatch_handler::DispatchHandler) so
+/// server-side routing produces the same CALLERROR codes as the inline server
+/// receive loop.
+pub(crate) fn build_call_error(unique_id: &str, error: &OcppError) -> Message {
     let code = match error {
         OcppError::NotSupported { .. } => CallErrorCode::NotSupported,
         OcppError::ValidationError { .. } | OcppError::Json { .. } => {
