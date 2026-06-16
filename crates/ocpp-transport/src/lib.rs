@@ -4,6 +4,7 @@
 //! It handles WebSocket connections, message framing, and connection management for both
 //! client (Charge Point) and server (Central System) sides.
 
+pub mod central_system;
 pub mod client;
 pub mod dispatch_handler;
 pub mod error;
@@ -11,6 +12,10 @@ pub mod pending;
 pub mod server;
 pub mod websocket;
 
+pub use central_system::{
+    central_system_dispatcher, central_system_dispatcher_with, register_default_handlers,
+    CentralSystemConfig,
+};
 pub use client::WebSocketClient;
 pub use dispatch_handler::DispatchHandler;
 pub use error::*;

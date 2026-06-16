@@ -170,16 +170,41 @@ pub mod client {
     /// Connect to WebSocket server
     pub async fn connect(
         url: &str,
-        _subprotocols: &[String],
+        subprotocols: &[String],
         config: &TransportConfig,
     ) -> TransportResult<
         WebSocketConnection<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     > {
+        use tungstenite::client::IntoClientRequest;
+
         info!("Connecting to WebSocket server: {}", url);
 
         let url = Url::parse(url).map_err(|e| TransportError::ConnectionError {
             message: format!("Invalid URL: {}", e),
         })?;
+
+        // Build the handshake request and offer the configured OCPP
+        // subprotocols via `Sec-WebSocket-Protocol`. An OCPP CSMS (and the
+        // `OcppServer` in this crate) rejects the upgrade with HTTP 400 if the
+        // client does not offer `ocpp1.6`, so this header is mandatory rather
+        // than cosmetic.
+        let mut request =
+            url.as_str()
+                .into_client_request()
+                .map_err(|e| TransportError::ConnectionError {
+                    message: format!("Invalid handshake request: {}", e),
+                })?;
+        if !subprotocols.is_empty() {
+            let offered = subprotocols.join(", ");
+            request.headers_mut().insert(
+                "sec-websocket-protocol",
+                offered
+                    .parse()
+                    .map_err(|_| TransportError::ConnectionError {
+                        message: format!("Invalid subprotocol value: {:?}", subprotocols),
+                    })?,
+            );
+        }
 
         // Create WebSocket configuration
         let ws_config = tungstenite::protocol::WebSocketConfig {
@@ -193,7 +218,7 @@ pub mod client {
 
         let (ws_stream, response) = timeout(
             config.connection_timeout,
-            connect_async_with_config(url.clone(), Some(ws_config), false),
+            connect_async_with_config(request, Some(ws_config), false),
         )
         .await
         .map_err(|_| TransportError::Timeout {
