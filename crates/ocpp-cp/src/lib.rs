@@ -7,6 +7,7 @@
 //! - WebSocket connection to Central System
 //! - Real-world charging scenarios simulation
 
+pub mod auth_cache;
 pub mod connector;
 pub mod error;
 pub mod message_handler;
@@ -15,6 +16,7 @@ pub mod state_machine;
 pub mod transaction;
 
 use anyhow::Result;
+use auth_cache::AuthCache;
 use connector::{Connector, ConnectorConfig};
 use error::ChargePointError;
 use message_handler::ConfigurationStore;
@@ -90,6 +92,14 @@ pub struct ChargePointConfig {
     /// `true`, matching the Python reference which always runs `_validate()`.
     /// Set to `false` to opt out (e.g. for fuzzing or non-conformant peers).
     pub validate_payloads: bool,
+    /// Fallback time-to-live, in seconds, for authorization cache entries that
+    /// the CSMS returns without an explicit `idTagInfo.expiryDate`. Defaults to
+    /// 24 hours. See [`auth_cache::AuthCache`] and OCPP 1.6J §3.1.
+    pub auth_cache_ttl: u64,
+    /// When the CSMS is unreachable (an `Authorize` CALL times out), accept a
+    /// stale-but-previously-`Accepted` cached entry instead of failing safe.
+    /// Defaults to `false` (fail-safe: an unreachable CSMS yields `Invalid`).
+    pub offline_auth_stale_ok: bool,
     /// Transport configuration (not serialized; uses Default on deserialization)
     #[serde(skip)]
     pub transport_config: TransportConfig,
@@ -121,6 +131,8 @@ impl Default for ChargePointConfig {
             call_timeout: 30, // 30 seconds, matches Python reference default
             max_boot_retries: 3,
             validate_payloads: true,
+            auth_cache_ttl: 24 * 60 * 60, // 24 hours
+            offline_auth_stale_ok: false,
             transport_config: TransportConfig::default(),
         }
     }
@@ -297,6 +309,10 @@ pub struct ChargePoint {
     /// CSMS-assigned transaction ID. Each active transaction has its own task
     /// (connectors charge concurrently); cancelled on `stop_transaction`/`stop`.
     meter_sampler_handles: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
+    /// Authorization ID-tag cache (Issue #23). Shared with the default
+    /// `ClearCache` handler so a CSMS `ClearCache` command empties it. Backs the
+    /// cache-first behavior of [`ChargePoint::authorize`].
+    auth_cache: Arc<AuthCache>,
 }
 
 impl ChargePoint {
@@ -333,8 +349,11 @@ impl ChargePoint {
             None
         };
 
+        let auth_cache = Arc::new(AuthCache::new(Duration::from_secs(config.auth_cache_ttl)));
+
         let config_store = Arc::new(RwLock::new(ConfigurationStore::new()));
-        let mut dispatcher = Self::build_default_dispatcher(config_store.clone());
+        let mut dispatcher =
+            Self::build_default_dispatcher(config_store.clone(), auth_cache.clone());
         if let Some(v) = &validator {
             dispatcher = dispatcher.with_validator(v.clone());
         }
@@ -354,6 +373,7 @@ impl ChargePoint {
             active_transactions: Arc::new(RwLock::new(HashMap::new())),
             validator,
             meter_sampler_handles: Arc::new(RwLock::new(HashMap::new())),
+            auth_cache,
         })
     }
 
@@ -363,7 +383,10 @@ impl ChargePoint {
     /// Ports the default `@on` handler registrations from
     /// [`ocpp/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py)
     /// and [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py).
-    fn build_default_dispatcher(config_store: Arc<RwLock<ConfigurationStore>>) -> ActionDispatcher {
+    fn build_default_dispatcher(
+        config_store: Arc<RwLock<ConfigurationStore>>,
+        auth_cache: Arc<AuthCache>,
+    ) -> ActionDispatcher {
         let mut d = ActionDispatcher::new();
 
         // ChangeAvailability — always accept (Issue #21 will add real state tracking)
@@ -471,12 +494,21 @@ impl ChargePoint {
             })
         });
 
-        // ClearCache — always accept
-        d.on(|_req: ClearCacheRequest| async move {
-            Ok(ClearCacheResponse {
-                status: ClearCacheStatus::Accepted,
-            })
-        });
+        // ClearCache — empty the authorization cache, then accept (Issue #23).
+        // Ports the OCPP 1.6J ClearCache use case (§5.2): the CSMS asks the CP to
+        // discard its Authorization Cache.
+        {
+            let auth_cache = auth_cache.clone();
+            d.on(move |_req: ClearCacheRequest| {
+                let auth_cache = auth_cache.clone();
+                async move {
+                    auth_cache.clear();
+                    Ok(ClearCacheResponse {
+                        status: ClearCacheStatus::Accepted,
+                    })
+                }
+            });
+        }
 
         // DataTransfer — accept and echo data back
         d.on(|req: DataTransferRequest| async move {
@@ -945,19 +977,65 @@ impl ChargePoint {
         Ok(())
     }
 
-    /// Send an `Authorize` CALL to the CSMS and return the `IdTagInfo`.
+    /// Authorize an id tag, consulting the local authorization cache first.
     ///
     /// Ports `_send_authorize()` from
-    /// [`ocpp/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py).
+    /// [`ocpp/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py)
+    /// and adds the OCPP 1.6J §3.1 Authorization Cache behavior (Issue #23):
+    ///
+    /// 1. **Cache hit (`Accepted`)** → return the cached `IdTagInfo` without a
+    ///    CALL. Non-`Accepted` cached results are *not* short-circuited; the CP
+    ///    re-checks with the CSMS in case authorization has since been granted.
+    /// 2. **Miss / expired / non-accepted** → send `AuthorizeRequest` via
+    ///    [`ChargePoint::call`] and cache the fresh result.
+    /// 3. **CSMS unreachable (CALL times out)** → if
+    ///    [`ChargePointConfig::offline_auth_stale_ok`] is set and a (possibly
+    ///    stale) cached entry exists, honor it; otherwise fail safe with
+    ///    `AuthorizationStatus::Invalid`.
+    ///
     /// The caller is responsible for acting on the returned `status`; this
     /// method does not block the transaction flow by itself.
     pub async fn authorize(&self, id_tag: &str) -> OcppResult<IdTagInfo> {
-        let response = self
+        // 1. Cache-first: a fresh, previously-accepted tag needs no round-trip.
+        if let Some(cached) = self.auth_cache.get(id_tag) {
+            if cached.status == AuthorizationStatus::Accepted {
+                return Ok(cached);
+            }
+        }
+
+        // 2. Miss (or a cached non-accepted result): ask the CSMS.
+        match self
             .call(AuthorizeRequest {
                 id_tag: id_tag.to_string(),
             })
-            .await?;
-        Ok(response.id_tag_info)
+            .await
+        {
+            Ok(response) => {
+                self.auth_cache.insert(id_tag, response.id_tag_info.clone());
+                Ok(response.id_tag_info)
+            }
+            // 3. CSMS unreachable: offline authorization decision.
+            Err(OcppError::Timeout { .. }) => {
+                if self.config.offline_auth_stale_ok {
+                    if let Some(stale) = self.auth_cache.get_stale(id_tag) {
+                        if stale.status == AuthorizationStatus::Accepted {
+                            warn!(
+                                id_tag,
+                                "CSMS unreachable; honoring stale cached authorization"
+                            );
+                            return Ok(stale);
+                        }
+                    }
+                }
+                warn!(id_tag, "CSMS unreachable; failing authorization safe");
+                Ok(IdTagInfo {
+                    status: AuthorizationStatus::Invalid,
+                    parent_id_tag: None,
+                    expiry_date: None,
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Send a `StartTransaction` CALL to the CSMS, record the CSMS-assigned
@@ -1728,6 +1806,205 @@ mod tests {
 
         let info = cp.authorize("BLOCKED_TAG").await.unwrap();
         assert_eq!(info.status, AuthorizationStatus::Blocked);
+    }
+
+    // --- authorization cache tests (Issue #23) ---
+    // Python ref: ocpp/charge_point.py (cache-then-call); OCPP 1.6J §3.1.
+
+    fn accepted_info() -> IdTagInfo {
+        IdTagInfo {
+            status: AuthorizationStatus::Accepted,
+            parent_id_tag: None,
+            expiry_date: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn authorize_cache_hit_does_not_send_ocpp_call() {
+        // Pre-seed an Accepted entry. The CP is never connected, so if
+        // authorize() tried to send a CALL it would error on the missing client.
+        // A clean Accepted return therefore proves the cache short-circuited.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        cp.auth_cache.insert("TAG001", accepted_info());
+
+        let info = cp.authorize("TAG001").await.unwrap();
+        assert_eq!(info.status, AuthorizationStatus::Accepted);
+        assert!(
+            !cp.is_connected().await,
+            "test relies on the CP being offline"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_cache_miss_sends_ocpp_call_and_caches_result() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert(
+            "Authorize".to_string(),
+            serde_json::json!({"idTagInfo": {"status": "Accepted"}}),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..Default::default()
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        // Cold cache → CALL is sent → result returned and cached.
+        assert!(cp.auth_cache.get("TAG001").is_none());
+        let info = cp.authorize("TAG001").await.unwrap();
+        assert_eq!(info.status, AuthorizationStatus::Accepted);
+        let cached = cp
+            .auth_cache
+            .get("TAG001")
+            .expect("result should be cached");
+        assert_eq!(cached.status, AuthorizationStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn authorize_expired_entry_is_evicted_and_call_sent() {
+        // A stale Accepted entry must not be used; the CP re-checks with the
+        // CSMS, and the fresh (Blocked) result replaces the stale row.
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert(
+            "Authorize".to_string(),
+            serde_json::json!({"idTagInfo": {"status": "Blocked"}}),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..Default::default()
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let past = chrono::Utc::now() - chrono::Duration::seconds(10);
+        cp.auth_cache.insert(
+            "TAG001",
+            IdTagInfo {
+                status: AuthorizationStatus::Accepted,
+                parent_id_tag: None,
+                expiry_date: Some(past),
+            },
+        );
+
+        let info = cp.authorize("TAG001").await.unwrap();
+        // Stale Accepted ignored; CSMS verdict (Blocked) used and now cached.
+        assert_eq!(info.status, AuthorizationStatus::Blocked);
+        let refreshed = cp.auth_cache.get_stale("TAG001").unwrap();
+        assert_eq!(refreshed.status, AuthorizationStatus::Blocked);
+    }
+
+    #[tokio::test]
+    async fn clear_cache_command_empties_auth_cache() {
+        // Drive a real ClearCache CALL through the live dispatcher and assert it
+        // empties the authorization cache (Issue #23 wiring).
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        cp.auth_cache.insert("TAG001", accepted_info());
+        cp.auth_cache.insert("TAG002", accepted_info());
+        assert_eq!(cp.auth_cache.len(), 2);
+
+        let call = Message::Call(CallMessage {
+            message_type: MessageType::Call,
+            unique_id: "cc-1".to_string(),
+            action: "ClearCache".to_string(),
+            payload: serde_json::json!({}),
+        });
+        let response = cp.handle_message(call).await.unwrap();
+
+        match response {
+            Some(Message::CallResult(r)) => {
+                assert_eq!(r.payload["status"], "Accepted");
+            }
+            other => panic!("expected ClearCache CALLRESULT, got {other:?}"),
+        }
+        assert!(
+            cp.auth_cache.is_empty(),
+            "ClearCache should empty the cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_csms_timeout_with_stale_ok_returns_cached() {
+        // CSMS accepts the WebSocket and answers BootNotification but never
+        // answers Authorize → the CALL times out. With offline_auth_stale_ok the
+        // CP honors a stale-but-Accepted cached entry.
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        // Intentionally no "Authorize" route → no response → timeout.
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            call_timeout: 1, // keep the test fast
+            offline_auth_stale_ok: true,
+            ..Default::default()
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let past = chrono::Utc::now() - chrono::Duration::seconds(10);
+        cp.auth_cache.insert(
+            "TAG001",
+            IdTagInfo {
+                status: AuthorizationStatus::Accepted,
+                parent_id_tag: None,
+                expiry_date: Some(past),
+            },
+        );
+
+        let info = cp.authorize("TAG001").await.unwrap();
+        assert_eq!(info.status, AuthorizationStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn authorize_csms_timeout_without_stale_ok_fails_safe_invalid() {
+        // Same timeout, but offline_auth_stale_ok is false (default) → fail safe
+        // with Invalid even though a stale Accepted entry exists.
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            call_timeout: 1,
+            offline_auth_stale_ok: false,
+            ..Default::default()
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let past = chrono::Utc::now() - chrono::Duration::seconds(10);
+        cp.auth_cache.insert(
+            "TAG001",
+            IdTagInfo {
+                status: AuthorizationStatus::Accepted,
+                parent_id_tag: None,
+                expiry_date: Some(past),
+            },
+        );
+
+        let info = cp.authorize("TAG001").await.unwrap();
+        assert_eq!(info.status, AuthorizationStatus::Invalid);
+    }
+
+    #[test]
+    fn auth_cache_config_defaults() {
+        let config = ChargePointConfig::default();
+        assert_eq!(config.auth_cache_ttl, 24 * 60 * 60);
+        assert!(!config.offline_auth_stale_ok);
     }
 
     // --- start_transaction() tests (Issue #21) ---
