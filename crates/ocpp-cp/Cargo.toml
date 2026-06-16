@@ -25,6 +25,9 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 async-trait = "0.1"
 futures = "0.3"
+# Concurrent map backing the authorization cache (Issue #23). Same version
+# already compiled into the workspace via ocpp-transport.
+dashmap = "5.5"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }

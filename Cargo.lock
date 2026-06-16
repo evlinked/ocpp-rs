@@ -1093,6 +1093,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "dashmap",
  "futures",
  "futures-util",
  "ocpp-messages",
