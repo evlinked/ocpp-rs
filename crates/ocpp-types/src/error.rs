@@ -25,6 +25,17 @@ pub enum OcppError {
     #[error("Message validation error: {message}")]
     ValidationError { message: String },
 
+    /// JSON-Schema validation failure on a CALL/CALLRESULT payload, carrying the
+    /// dominant failing schema keyword so it can be mapped to a keyword-granular
+    /// CALLERROR code (`type`/`maxLength` → `TypeConstraintViolation`,
+    /// `required` → `ProtocolError`, everything else → `FormationViolation`),
+    /// mirroring the `e.validator` switch in `ocpp/messages.py::_validate_payload`.
+    #[error("Schema validation error ({keyword}): {message}")]
+    SchemaViolation {
+        keyword: SchemaKeyword,
+        message: String,
+    },
+
     /// Transport error
     #[error("Transport error: {message}")]
     Transport { message: String },
@@ -86,6 +97,63 @@ pub enum OcppError {
     /// BootNotification rejected by the CSMS after all retry attempts exhausted.
     #[error("Boot rejected by central system after {attempts} attempt(s)")]
     BootRejected { attempts: u32 },
+}
+
+/// The dominant failing JSON-Schema keyword from a schema-validation failure.
+///
+/// Mirrors the `e.validator` value inspected in
+/// [`ocpp/messages.py::_validate_payload`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/messages.py),
+/// which raises a different OCPP exception depending on which keyword failed.
+/// `SchemaValidator` collapses the rich `jsonschema` error set down to one of
+/// these so the CALLERROR layer can pick a faithful error code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaKeyword {
+    /// `type` — wrong JSON type (e.g. string where an integer is expected).
+    Type,
+    /// `maxLength` — a string exceeds its maximum length.
+    MaxLength,
+    /// `additionalProperties` — an unexpected property is present.
+    AdditionalProperties,
+    /// `required` — a required property is missing.
+    Required,
+    /// Any other keyword (`enum`, `minimum`, `multipleOf`, …). Falls into the
+    /// default `FormatViolationError` bucket of the Python reference.
+    Other,
+}
+
+impl SchemaKeyword {
+    /// Map the failing keyword to the OCPP CALLERROR code raised for it by
+    /// `_validate_payload()`:
+    ///
+    /// | keyword | code |
+    /// |---|---|
+    /// | `type`, `maxLength` | [`CallErrorCode::TypeConstraintViolation`] |
+    /// | `required` | [`CallErrorCode::ProtocolError`] |
+    /// | `additionalProperties`, *(default)* | [`CallErrorCode::FormationViolation`] |
+    pub fn call_error_code(self) -> CallErrorCode {
+        match self {
+            SchemaKeyword::Type | SchemaKeyword::MaxLength => {
+                CallErrorCode::TypeConstraintViolation
+            }
+            SchemaKeyword::Required => CallErrorCode::ProtocolError,
+            SchemaKeyword::AdditionalProperties | SchemaKeyword::Other => {
+                CallErrorCode::FormationViolation
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for SchemaKeyword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            SchemaKeyword::Type => "type",
+            SchemaKeyword::MaxLength => "maxLength",
+            SchemaKeyword::AdditionalProperties => "additionalProperties",
+            SchemaKeyword::Required => "required",
+            SchemaKeyword::Other => "other",
+        };
+        f.write_str(name)
+    }
 }
 
 impl From<serde_json::Error> for OcppError {

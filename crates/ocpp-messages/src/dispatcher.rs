@@ -447,9 +447,16 @@ mod tests {
         .unwrap();
 
         let err = d.dispatch(&bad).await.unwrap_err();
+        // Missing `chargePointVendor` is a `required` failure → keyword Required.
         assert!(
-            matches!(err, OcppError::ValidationError { .. }),
-            "expected ValidationError, got {err:?}"
+            matches!(
+                err,
+                OcppError::SchemaViolation {
+                    keyword: ocpp_types::SchemaKeyword::Required,
+                    ..
+                }
+            ),
+            "expected SchemaViolation(Required), got {err:?}"
         );
         assert!(
             !called.load(Ordering::SeqCst),

@@ -308,6 +308,9 @@ async fn handle_cp_socket(socket: WebSocket, charge_point_id: String, state: Arc
 pub(crate) fn build_call_error(unique_id: &str, error: &OcppError) -> Message {
     let code = match error {
         OcppError::NotSupported { .. } => CallErrorCode::NotSupported,
+        // Keyword-granular code from the failing JSON-Schema keyword, per
+        // `_validate_payload()` in `ocpp/messages.py`.
+        OcppError::SchemaViolation { keyword, .. } => keyword.call_error_code(),
         OcppError::ValidationError { .. } | OcppError::Json { .. } => {
             CallErrorCode::FormationViolation
         }
