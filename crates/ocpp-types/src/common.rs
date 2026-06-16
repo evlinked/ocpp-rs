@@ -39,23 +39,37 @@ pub struct SampledValue {
     pub unit: Option<UnitOfMeasure>,
 }
 
-/// Context in which a meter value was taken
+/// Context in which a meter value was taken.
+///
+/// Serialized using the dotted OCPP 1.6J wire values (e.g. `"Sample.Periodic"`),
+/// matching the `context` enum in the bundled `MeterValues.json` and
+/// `StopTransaction.json` schemas. A previous `#[serde(rename_all = "PascalCase")]`
+/// emitted undotted values like `"SamplePeriodic"`, which a spec-conformant CSMS
+/// rejects with `FormationViolation`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "PascalCase")]
 pub enum ReadingContext {
-    /// Value taken at start of interruption
+    /// Value taken at the start of an interruption.
+    #[serde(rename = "Interruption.Begin")]
     InterruptionBegin,
-    /// Value taken when resuming after interruption
+    /// Value taken when resuming after an interruption.
+    #[serde(rename = "Interruption.End")]
     InterruptionEnd,
-    /// Value taken at end of transaction
+    /// Value taken at a clock-aligned interval.
+    #[serde(rename = "Sample.Clock")]
     SampleClock,
-    /// Value taken at start of transaction
+    /// Value taken as a periodic sample during a transaction.
+    #[serde(rename = "Sample.Periodic")]
     SamplePeriodic,
-    /// Value taken during transaction
+    /// Value taken at the start of a transaction.
+    #[serde(rename = "Transaction.Begin")]
     TransactionBegin,
-    /// Value taken at end of transaction
+    /// Value taken at the end of a transaction.
+    #[serde(rename = "Transaction.End")]
     TransactionEnd,
-    /// Other context
+    /// Value taken in response to a `TriggerMessage` request.
+    #[serde(rename = "Trigger")]
+    Trigger,
+    /// Value taken for some other or unspecified reason.
     Other,
 }
 
@@ -352,6 +366,29 @@ mod tests {
         let json = serde_json::to_string(&meter_value).unwrap();
         let deserialized: MeterValue = serde_json::from_str(&json).unwrap();
         assert_eq!(meter_value, deserialized);
+    }
+
+    #[test]
+    fn reading_context_serializes_with_dotted_ocpp_values() {
+        // OCPP 1.6J MeterValues.json / StopTransaction.json define the `context`
+        // enum with dotted values. Assert the wire form matches the schema (a
+        // plain round-trip would pass even with the wrong, undotted encoding).
+        let cases = [
+            (ReadingContext::InterruptionBegin, "\"Interruption.Begin\""),
+            (ReadingContext::InterruptionEnd, "\"Interruption.End\""),
+            (ReadingContext::SampleClock, "\"Sample.Clock\""),
+            (ReadingContext::SamplePeriodic, "\"Sample.Periodic\""),
+            (ReadingContext::TransactionBegin, "\"Transaction.Begin\""),
+            (ReadingContext::TransactionEnd, "\"Transaction.End\""),
+            (ReadingContext::Trigger, "\"Trigger\""),
+            (ReadingContext::Other, "\"Other\""),
+        ];
+        for (ctx, wire) in cases {
+            let json = serde_json::to_string(&ctx).unwrap();
+            assert_eq!(json, wire, "wrong wire encoding for {ctx:?}");
+            let back: ReadingContext = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, ctx, "round-trip mismatch for {ctx:?}");
+        }
     }
 
     #[test]
