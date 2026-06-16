@@ -44,7 +44,7 @@ use crate::{MessageHandler, TransportEvent};
 /// The adapter is deliberately validation-agnostic: schema validation, when
 /// enabled, happens *inside* [`ActionDispatcher::dispatch`], and its
 /// `ValidationError` is mapped here to a `FormationViolation` CALLERROR via the
-/// shared [`build_call_error`].
+/// shared `build_call_error` helper in [`crate::server`].
 pub struct DispatchHandler {
     dispatcher: Arc<ActionDispatcher>,
 }
