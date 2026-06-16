@@ -33,6 +33,10 @@ pub struct TransportConfig {
     pub max_message_size: usize,
     /// Connection timeout
     pub connection_timeout: Duration,
+    /// How long a CSMS-initiated CALL waits for the matching CALLRESULT/CALLERROR
+    /// before failing with [`ocpp_types::OcppError::Timeout`]. Mirrors the CP-side
+    /// `ChargePointConfig::call_timeout` and the Python reference's 30 s default.
+    pub call_timeout: Duration,
     /// Keep-alive interval
     pub keep_alive_interval: Duration,
     /// Maximum number of pending messages
@@ -48,6 +52,7 @@ impl Default for TransportConfig {
         Self {
             max_message_size: 65536, // 64KB
             connection_timeout: Duration::from_secs(30),
+            call_timeout: Duration::from_secs(30),
             keep_alive_interval: Duration::from_secs(60),
             message_buffer_size: 1000,
             enable_compression: false,

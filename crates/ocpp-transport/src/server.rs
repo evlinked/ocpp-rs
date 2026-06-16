@@ -2,6 +2,7 @@
 
 use crate::{
     error::{TransportError, TransportResult},
+    pending::PendingCallMap,
     ConnectionInfo, ConnectionState, MessageHandler, TransportConfig, TransportEvent,
 };
 use axum::{
@@ -16,16 +17,33 @@ use axum::{
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
-use ocpp_messages::Message;
-use ocpp_types::{CallErrorCode, OcppError};
+use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
+use ocpp_types::{CallErrorCode, OcppError, OcppResult};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+/// Per-charge-point handle used to drive CSMS-initiated CALLs.
+///
+/// Cloned out of the `cp_handles` map by [`OcppServer::call`] so a frame can be
+/// written to the CP's WebSocket sink (`outbound`) and the matching
+/// CALLRESULT/CALLERROR correlated back (`pending`) — the server-side mirror of
+/// the [`WebSocketClient`](crate::WebSocketClient) machinery.
+#[derive(Clone)]
+struct CpHandle {
+    /// Writes text frames to this CP's WebSocket sink via the per-connection
+    /// receive loop, which owns the sink.
+    outbound: mpsc::UnboundedSender<WsMessage>,
+    /// In-flight CALL correlation map for CALLs the *server* initiated to this CP.
+    pending: Arc<PendingCallMap>,
+}
+
 /// State shared across all per-CP axum handler invocations.
 struct ServerState {
     connections: Arc<DashMap<Uuid, ConnectionInfo>>,
+    /// Routing handles keyed by charge-point id, used by [`OcppServer::call`].
+    cp_handles: Arc<DashMap<String, CpHandle>>,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     config: TransportConfig,
     message_handler: Arc<dyn MessageHandler>,
@@ -37,6 +55,7 @@ struct ServerState {
 pub struct OcppServer {
     config: TransportConfig,
     connections: Arc<DashMap<Uuid, ConnectionInfo>>,
+    cp_handles: Arc<DashMap<String, CpHandle>>,
     event_tx: mpsc::UnboundedSender<TransportEvent>,
     state: ConnectionState,
     message_handler: Arc<dyn MessageHandler>,
@@ -56,6 +75,7 @@ impl OcppServer {
         let server = Self {
             config,
             connections: Arc::new(DashMap::new()),
+            cp_handles: Arc::new(DashMap::new()),
             event_tx,
             state: ConnectionState::Closed,
             message_handler,
@@ -82,6 +102,7 @@ impl OcppServer {
 
         let shared = Arc::new(ServerState {
             connections: Arc::clone(&self.connections),
+            cp_handles: Arc::clone(&self.cp_handles),
             event_tx: self.event_tx.clone(),
             config: self.config.clone(),
             message_handler: Arc::clone(&self.message_handler),
@@ -114,6 +135,12 @@ impl OcppServer {
             handle.abort();
         }
 
+        // Cancel any in-flight server-initiated CALLs so their futures resolve
+        // with a transport error instead of hanging until timeout.
+        for entry in self.cp_handles.iter() {
+            entry.value().pending.cancel_all();
+        }
+        self.cp_handles.clear();
         self.connections.clear();
         self.local_addr = None;
         self.state = ConnectionState::Closed;
@@ -138,6 +165,109 @@ impl OcppServer {
     /// Info for every connected CP.
     pub fn get_all_connections(&self) -> Vec<ConnectionInfo> {
         self.connections.iter().map(|c| c.clone()).collect()
+    }
+
+    /// Whether a charge point with `cp_id` currently has a live session.
+    pub fn is_cp_connected(&self, cp_id: &str) -> bool {
+        self.cp_handles.contains_key(cp_id)
+    }
+
+    /// Ids of every charge point currently connected and routable via [`call`](Self::call).
+    pub fn connected_cp_ids(&self) -> Vec<String> {
+        self.cp_handles.iter().map(|e| e.key().clone()).collect()
+    }
+
+    /// Send a typed CALL to a specific connected charge point and await its CALLRESULT.
+    ///
+    /// This is the CSMS half of the bidirectional OCPP conversation and the
+    /// server-side mirror of [`ChargePoint::call`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py).
+    /// It is used to dispatch CS→CP actions such as `RemoteStartTransaction`,
+    /// `Reset`, or `ChangeAvailability`.
+    ///
+    /// 1. Resolve the per-CP routing handle by `cp_id`
+    /// 2. Register the `unique_id` in the CP's `PendingCallMap` *before* sending
+    ///    (race-free, identical to the CP-side `call()`)
+    /// 3. Write the CALL frame to the CP's WebSocket sink
+    /// 4. Await the response, bounded by `config.call_timeout`
+    /// 5. Deserialize the CALLRESULT payload into `Req::Response`
+    ///
+    /// # Errors
+    /// - [`OcppError::CpNotConnected`] if `cp_id` has no live session (checked
+    ///   before registering, and again if the sink channel has closed mid-flight)
+    /// - [`OcppError::CallError`] if the CP replies with a CALLERROR frame
+    /// - [`OcppError::Timeout`] if no response arrives within `config.call_timeout`
+    /// - [`OcppError::Transport`] if the connection closes while the CALL is in flight
+    ///
+    /// Concurrent calls — to the same CP or to different CPs — are independent:
+    /// each registers a distinct `unique_id`, and each CP owns its own pending map,
+    /// so there is no cross-CP or cross-call correlation.
+    pub async fn call<Req: OcppAction>(
+        &self,
+        cp_id: &str,
+        request: Req,
+    ) -> OcppResult<Req::Response> {
+        // 1. Resolve the routing handle. Clone it out so we don't hold a DashMap
+        //    guard across the await points below (which could deadlock writers).
+        let handle = self
+            .cp_handles
+            .get(cp_id)
+            .map(|h| h.clone())
+            .ok_or_else(|| OcppError::CpNotConnected {
+                cp_id: cp_id.to_string(),
+            })?;
+
+        let unique_id = Uuid::new_v4().to_string();
+
+        // 2. Register before sending to avoid the race where the CALLRESULT
+        //    arrives before the receiver is in the map.
+        let rx = handle.pending.register(unique_id.clone());
+
+        // 3. Build and send the CALL frame.
+        let call_msg = CallMessage {
+            message_type: MessageType::Call,
+            unique_id: unique_id.clone(),
+            action: Req::ACTION_NAME.to_string(),
+            payload: serde_json::to_value(&request).map_err(OcppError::from)?,
+        };
+        let text = serde_json::to_string(&Message::Call(call_msg)).map_err(OcppError::from)?;
+        if handle.outbound.send(WsMessage::Text(text)).is_err() {
+            // The per-CP receive loop has exited (CP disconnected) and dropped the
+            // sink half. Tidy up the now-orphaned pending entry.
+            handle.pending.reject(
+                &unique_id,
+                OcppError::CpNotConnected {
+                    cp_id: cp_id.to_string(),
+                },
+            );
+            return Err(OcppError::CpNotConnected {
+                cp_id: cp_id.to_string(),
+            });
+        }
+
+        // 4. Await the CALLRESULT/CALLERROR with the configured timeout.
+        let raw = match tokio::time::timeout(self.config.call_timeout, rx).await {
+            Ok(result) => result.map_err(|_| OcppError::Transport {
+                // oneshot RecvError → sender dropped, i.e. the CP disconnected.
+                message: format!("connection to '{cp_id}' closed while awaiting CALLRESULT"),
+            })?,
+            Err(_) => {
+                // Drop the now-useless pending entry so the map doesn't leak a
+                // dead receiver for a response that may never arrive.
+                handle.pending.reject(
+                    &unique_id,
+                    OcppError::Timeout {
+                        operation: Req::ACTION_NAME.to_string(),
+                    },
+                );
+                return Err(OcppError::Timeout {
+                    operation: format!("{} call to {}", Req::ACTION_NAME, cp_id),
+                });
+            }
+        };
+
+        // 5. Propagate any CALLERROR, then deserialize the success payload.
+        let payload = raw?;
+        serde_json::from_value::<Req::Response>(payload).map_err(OcppError::from)
     }
 
     /// Evict connections that have been idle for more than 2× the keep-alive interval.
@@ -210,17 +340,57 @@ async fn ws_handler(
         .on_upgrade(move |socket| handle_cp_socket(socket, charge_point_id, state)))
 }
 
-/// Per-charge-point receive loop.
+/// Classify an incoming text frame into a typed [`Message`].
 ///
-/// Parses incoming text frames as OCPP messages, dispatches CALLs through the
-/// `MessageHandler`, and writes CALLRESULT or CALLERROR responses back. On clean close or
-/// any WS error the connection is removed from the tracking map.
+/// The wire enum is `#[serde(untagged)]` and — because `MessageType` serialises
+/// as an UPPERCASE string and `CallMessage` accepts any type tag — a CALLERROR
+/// `["CALLERROR", id, code, desc, details]` would otherwise be mis-decoded as a
+/// CALL. We disambiguate on the message-type discriminator (field `"0"`) so a
+/// CP's CALLERROR response is correctly routed to the pending-call map instead
+/// of being dispatched as an inbound request.
+fn classify_frame(text: &str) -> Option<Message> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    match value.get("0").and_then(|t| t.as_str()) {
+        Some("CALLERROR") => serde_json::from_value(value).ok().map(Message::CallError),
+        Some("CALLRESULT") => serde_json::from_value(value).ok().map(Message::CallResult),
+        Some("CALL") => serde_json::from_value(value).ok().map(Message::Call),
+        // Unknown/absent discriminator: fall back to best-effort untagged decode.
+        _ => serde_json::from_str(text).ok(),
+    }
+}
+
+/// Per-charge-point send/receive loop.
+///
+/// A single task owns both halves of the socket and interleaves, via
+/// `tokio::select!`:
+/// - **outbound**: frames queued by [`OcppServer::call`] on the per-CP channel
+///   (CSMS→CP CALLs), and
+/// - **inbound**: frames from the CP — CALLs are dispatched through the
+///   `MessageHandler` and answered with CALLRESULT/CALLERROR; CALLRESULT/CALLERROR
+///   frames are correlated back to in-flight server CALLs via the `PendingCallMap`.
+///
+/// Owning the sink in one task (rather than behind a shared mutex) is the same
+/// design used by [`WebSocketClient`](crate::WebSocketClient) and avoids a
+/// send/receive deadlock. On close or any WS error the connection and its
+/// routing handle are removed and pending CALLs are cancelled.
 async fn handle_cp_socket(socket: WebSocket, charge_point_id: String, state: Arc<ServerState>) {
     let mut info = ConnectionInfo::new(charge_point_id.clone(), "csms".to_string());
     info.sub_protocol = Some("ocpp1.6".to_string());
     let connection_id = info.id;
 
+    // Outbound channel: `OcppServer::call` pushes CALL frames here; this loop
+    // drains them to the sink. Pending map: correlates the CP's responses.
+    let (out_tx, mut out_rx) = mpsc::unbounded_channel::<WsMessage>();
+    let pending = Arc::new(PendingCallMap::new());
+
     state.connections.insert(connection_id, info);
+    state.cp_handles.insert(
+        charge_point_id.clone(),
+        CpHandle {
+            outbound: out_tx,
+            pending: Arc::clone(&pending),
+        },
+    );
     let _ = state.event_tx.send(TransportEvent::Connected {
         connection_id,
         remote_addr: charge_point_id.clone(),
@@ -230,68 +400,104 @@ async fn handle_cp_socket(socket: WebSocket, charge_point_id: String, state: Arc
         charge_point_id, connection_id
     );
 
-    let (mut tx, mut rx) = socket.split();
+    let (mut sink, mut stream) = socket.split();
 
-    while let Some(result) = rx.next().await {
-        let text = match result {
-            Ok(WsMessage::Text(t)) => t,
-            Ok(WsMessage::Close(_)) | Err(_) => break,
-            _ => continue, // ping/pong/binary handled by axum or irrelevant
-        };
-
-        if text.len() > state.config.max_message_size {
-            warn!(
-                "Message from '{}' exceeds {} bytes; closing",
-                charge_point_id, state.config.max_message_size
-            );
-            break;
-        }
-
-        let response_text = match serde_json::from_str::<Message>(&text) {
-            Ok(Message::Call(call)) => {
-                let unique_id = call.unique_id.clone();
-                let msg = Message::Call(call);
-
-                let _ = state.event_tx.send(TransportEvent::MessageReceived {
-                    connection_id,
-                    message: msg.clone(),
-                });
-
-                match state.message_handler.handle_message(msg).await {
-                    Ok(Some(response)) => serde_json::to_string(&response)
-                        .map_err(|e| error!("Failed to serialize response: {}", e))
-                        .ok(),
-                    Ok(None) => None,
-                    Err(e) => {
-                        let callerror = build_call_error(&unique_id, &e);
-                        serde_json::to_string(&callerror)
-                            .map_err(|e| error!("Failed to serialize CALLERROR: {}", e))
-                            .ok()
+    'session: loop {
+        tokio::select! {
+            // ── Outbound: server-initiated CALL frames ────────────────────────
+            outbound = out_rx.recv() => {
+                match outbound {
+                    Some(frame) => {
+                        if sink.send(frame).await.is_err() {
+                            break 'session;
+                        }
                     }
+                    // All `CpHandle`s dropped — only happens during teardown.
+                    None => break 'session,
                 }
             }
-            Ok(msg) => {
-                // CALLRESULT / CALLERROR from CP (response to a CSMS-initiated CALL)
-                let _ = state.event_tx.send(TransportEvent::MessageReceived {
-                    connection_id,
-                    message: msg,
-                });
-                None
-            }
-            Err(e) => {
-                // Cannot correlate without a parseable unique_id — log and continue
-                warn!("Malformed OCPP frame from '{}': {}", charge_point_id, e);
-                None
-            }
-        };
+            // ── Inbound: frames from the charge point ─────────────────────────
+            incoming = stream.next() => {
+                let text = match incoming {
+                    Some(Ok(WsMessage::Text(t))) => t,
+                    Some(Ok(WsMessage::Close(_))) | Some(Err(_)) | None => break 'session,
+                    Some(Ok(_)) => continue, // ping/pong/binary handled elsewhere
+                };
 
-        if let Some(resp) = response_text {
-            if tx.send(WsMessage::Text(resp)).await.is_err() {
-                break;
+                if text.len() > state.config.max_message_size {
+                    warn!(
+                        "Message from '{}' exceeds {} bytes; closing",
+                        charge_point_id, state.config.max_message_size
+                    );
+                    break 'session;
+                }
+
+                match classify_frame(&text) {
+                    Some(Message::Call(call)) => {
+                        let unique_id = call.unique_id.clone();
+                        let msg = Message::Call(call);
+
+                        let _ = state.event_tx.send(TransportEvent::MessageReceived {
+                            connection_id,
+                            message: msg.clone(),
+                        });
+
+                        let response_text = match state.message_handler.handle_message(msg).await {
+                            Ok(Some(response)) => serde_json::to_string(&response)
+                                .map_err(|e| error!("Failed to serialize response: {}", e))
+                                .ok(),
+                            Ok(None) => None,
+                            Err(e) => {
+                                let callerror = build_call_error(&unique_id, &e);
+                                serde_json::to_string(&callerror)
+                                    .map_err(|e| error!("Failed to serialize CALLERROR: {}", e))
+                                    .ok()
+                            }
+                        };
+
+                        if let Some(resp) = response_text {
+                            if sink.send(WsMessage::Text(resp)).await.is_err() {
+                                break 'session;
+                            }
+                        }
+                    }
+                    Some(Message::CallResult(result)) => {
+                        // Response to a CSMS-initiated CALL. If it doesn't match a
+                        // pending call, surface it as an event for legacy observers.
+                        if !pending.resolve(&result.unique_id, result.payload.clone()) {
+                            let _ = state.event_tx.send(TransportEvent::MessageReceived {
+                                connection_id,
+                                message: Message::CallResult(result),
+                            });
+                        }
+                    }
+                    Some(Message::CallError(err)) => {
+                        let unique_id = err.unique_id.clone();
+                        let ocpp_err = OcppError::CallError {
+                            code: err.error_code.clone(),
+                            description: err.error_description.clone(),
+                            details: err.error_details.clone(),
+                        };
+                        if !pending.reject(&unique_id, ocpp_err) {
+                            warn!(
+                                "CALLERROR from '{}' for unknown unique_id '{}'",
+                                charge_point_id, unique_id
+                            );
+                        }
+                    }
+                    None => {
+                        // Cannot correlate without a parseable frame — log and continue.
+                        warn!("Malformed OCPP frame from '{}'", charge_point_id);
+                    }
+                }
             }
         }
     }
 
+    // Teardown: remove routing state and fail any in-flight server CALLs so
+    // their futures resolve instead of hanging until timeout.
+    state.cp_handles.remove(&charge_point_id);
+    pending.cancel_all();
     state.connections.remove(&connection_id);
     let _ = state.event_tx.send(TransportEvent::Disconnected {
         connection_id,
@@ -419,6 +625,52 @@ mod tests {
         req.headers_mut()
             .insert("sec-websocket-protocol", "ocpp1.6".parse().unwrap());
         req
+    }
+
+    /// Concrete WebSocket stream type returned by `connect_async`.
+    type CpWs = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// Connect a raw client as charge point `cp_id` and wait until the server has
+    /// registered its routing handle (so `server.call(cp_id, …)` can find it).
+    async fn connect_cp(server: &OcppServer, addr: SocketAddr, cp_id: &str) -> CpWs {
+        let (ws, _) = connect_async(ocpp_request(addr, cp_id))
+            .await
+            .expect("CP connects");
+        let start = tokio::time::Instant::now();
+        while !server.is_cp_connected(cp_id) && start.elapsed() < Duration::from_millis(500) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(server.is_cp_connected(cp_id), "server registered {cp_id}");
+        ws
+    }
+
+    /// Serialise a CALLRESULT frame the way the server's decoder expects.
+    fn call_result_frame(unique_id: &str, payload: serde_json::Value) -> String {
+        serde_json::to_string(&Message::CallResult(CallResultMessage {
+            message_type: MessageType::CallResult,
+            unique_id: unique_id.to_string(),
+            payload,
+        }))
+        .unwrap()
+    }
+
+    /// Read one CALL frame and return its `(action, unique_id)`.
+    async fn read_call(ws: &mut CpWs) -> (String, String) {
+        let frame = timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("CP receives a CALL")
+            .expect("stream open")
+            .expect("WS ok");
+        let WsMsg::Text(text) = frame else {
+            panic!("expected text CALL frame, got {frame:?}");
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        (
+            v.get("2").and_then(|a| a.as_str()).unwrap().to_string(),
+            v.get("1").and_then(|i| i.as_str()).unwrap().to_string(),
+        )
     }
 
     // ── Tests ────────────────────────────────────────────────────────────────
@@ -580,5 +832,175 @@ mod tests {
         let info = ConnectionInfo::new("192.168.1.1:9000".to_string(), "0.0.0.0:8080".to_string());
         let mgr = ConnectionManager::new(info.clone());
         assert_eq!(mgr.connection_id, info.id);
+    }
+
+    // ── CSMS-initiated CALL tests (Issue #30) ────────────────────────────────
+
+    use ocpp_messages::v16j::RemoteStartTransactionRequest;
+    use ocpp_types::v16j::RemoteStartStopStatus;
+
+    fn remote_start(tag: &str) -> RemoteStartTransactionRequest {
+        RemoteStartTransactionRequest {
+            connector_id: Some(1),
+            id_tag: tag.to_string(),
+            charging_profile: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn server_can_send_remote_start_to_connected_cp() {
+        let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
+        let mut cp = connect_cp(&server, addr, "CP_RS").await;
+
+        // CP side: answer the RemoteStartTransaction CALL with Accepted.
+        let responder = tokio::spawn(async move {
+            let (action, unique_id) = read_call(&mut cp).await;
+            assert_eq!(action, "RemoteStartTransaction");
+            cp.send(WsMsg::Text(call_result_frame(
+                &unique_id,
+                serde_json::json!({ "status": "Accepted" }),
+            )))
+            .await
+            .unwrap();
+            cp // keep the socket alive until the call resolves
+        });
+
+        let resp = server
+            .call("CP_RS", remote_start("TAG_001"))
+            .await
+            .expect("RemoteStartTransaction resolves");
+        assert_eq!(resp.status, RemoteStartStopStatus::Accepted);
+
+        responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_call_to_unknown_cp_returns_not_connected() {
+        let (mut server, _addr) = start_server(Arc::new(EchoHandler)).await;
+
+        let err = server
+            .call("GHOST", remote_start("TAG"))
+            .await
+            .expect_err("unknown CP must error");
+        assert!(
+            matches!(err, OcppError::CpNotConnected { ref cp_id } if cp_id == "GHOST"),
+            "expected CpNotConnected, got {err:?}"
+        );
+
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_call_times_out_when_cp_does_not_respond() {
+        let config = TransportConfig {
+            call_timeout: Duration::from_millis(150),
+            ..Default::default()
+        };
+        let (mut server, _rx) = OcppServer::new(config, Arc::new(EchoHandler));
+        server.start("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+
+        // CP connects but never answers the CALL.
+        let _cp = connect_cp(&server, addr, "CP_SILENT").await;
+
+        let err = server
+            .call("CP_SILENT", remote_start("TAG"))
+            .await
+            .expect_err("silent CP must time out");
+        assert!(
+            matches!(err, OcppError::Timeout { .. }),
+            "expected Timeout, got {err:?}"
+        );
+
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_call_surfaces_callerror() {
+        let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
+        let mut cp = connect_cp(&server, addr, "CP_ERR").await;
+
+        let responder = tokio::spawn(async move {
+            let (_action, unique_id) = read_call(&mut cp).await;
+            let frame =
+                serde_json::to_string(&Message::CallError(ocpp_types::CallErrorMessage::new(
+                    unique_id,
+                    CallErrorCode::InternalError,
+                    "boom".to_string(),
+                    None,
+                )))
+                .unwrap();
+            cp.send(WsMsg::Text(frame)).await.unwrap();
+            cp
+        });
+
+        let err = server
+            .call("CP_ERR", remote_start("TAG"))
+            .await
+            .expect_err("CALLERROR must surface as an error");
+        assert!(
+            matches!(err, OcppError::CallError { ref code, .. } if *code == CallErrorCode::InternalError),
+            "expected CallError(InternalError), got {err:?}"
+        );
+
+        responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_concurrent_calls_to_multiple_cps_correct() {
+        let (server, addr) = start_server(Arc::new(EchoHandler)).await;
+
+        // Five CPs; odd-numbered ones answer Accepted, even ones Rejected, so a
+        // cross-CP correlation bug would surface as a wrong status.
+        let mut responders = Vec::new();
+        for i in 0..5u32 {
+            let cp_id = format!("CP_{i}");
+            let mut cp = connect_cp(&server, addr, &cp_id).await;
+            let accepted = i % 2 == 1;
+            responders.push(tokio::spawn(async move {
+                let (_action, unique_id) = read_call(&mut cp).await;
+                let status = if accepted { "Accepted" } else { "Rejected" };
+                cp.send(WsMsg::Text(call_result_frame(
+                    &unique_id,
+                    serde_json::json!({ "status": status }),
+                )))
+                .await
+                .unwrap();
+                cp
+            }));
+        }
+
+        let server = Arc::new(server);
+        let calls = (0..5u32).map(|i| {
+            let server = Arc::clone(&server);
+            async move {
+                let resp = server
+                    .call(&format!("CP_{i}"), remote_start(&format!("TAG_{i}")))
+                    .await
+                    .expect("each call resolves");
+                (i, resp.status)
+            }
+        });
+        let results = futures_util::future::join_all(calls).await;
+
+        for (i, status) in results {
+            let expected = if i % 2 == 1 {
+                RemoteStartStopStatus::Accepted
+            } else {
+                RemoteStartStopStatus::Rejected
+            };
+            assert_eq!(status, expected, "CP_{i} got the wrong response");
+        }
+
+        for r in responders {
+            r.await.unwrap();
+        }
+        Arc::try_unwrap(server)
+            .unwrap_or_else(|_| panic!("server still shared"))
+            .stop()
+            .await
+            .unwrap();
     }
 }
