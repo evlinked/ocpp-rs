@@ -5,12 +5,14 @@
 //! client (Charge Point) and server (Central System) sides.
 
 pub mod client;
+pub mod dispatch_handler;
 pub mod error;
 pub mod pending;
 pub mod server;
 pub mod websocket;
 
 pub use client::WebSocketClient;
+pub use dispatch_handler::DispatchHandler;
 pub use error::*;
 pub use pending::PendingCallMap;
 
