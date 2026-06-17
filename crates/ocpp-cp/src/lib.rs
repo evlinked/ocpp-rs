@@ -28,7 +28,7 @@ use ocpp_messages::v16j::{
     RegistrationStatus, RemoteStartTransactionRequest, RemoteStartTransactionResponse,
     RemoteStopTransactionRequest, RemoteStopTransactionResponse, ResetRequest, ResetResponse,
     StartTransactionRequest, StatusNotificationRequest, StopTransactionRequest,
-    UnlockConnectorRequest, UnlockConnectorResponse,
+    TriggerMessageRequest, TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse,
 };
 use ocpp_messages::{
     ActionDispatcher, CallMessage, Message, MessageType, OcppAction, SchemaValidator,
@@ -42,8 +42,8 @@ use ocpp_types::common::{
 };
 use ocpp_types::v16j::{
     ChargePointErrorCode, ChargePointStatus, ChargePointVendorInfo, ClearCacheStatus,
-    ConfigurationStatus, DataTransferStatus, RemoteStartStopStatus, ResetStatus, ResetType,
-    UnlockStatus,
+    ConfigurationStatus, DataTransferStatus, MessageTrigger, RemoteStartStopStatus, ResetStatus,
+    ResetType, TriggerMessageStatus, UnlockStatus,
 };
 use ocpp_types::{
     CallErrorCode, CallErrorMessage, CallResultMessage, ConnectorId, OcppError, OcppResult,
@@ -201,6 +201,30 @@ enum RemoteCommand {
     /// End the matching transaction for an `Accepted` `RemoteStopTransaction`
     /// (OCPP 1.6J §5.12).
     StopTransaction { transaction_id: i32 },
+    /// Send a CSMS-requested message proactively for an `Accepted`
+    /// `TriggerMessage` (OCPP 1.6J §4.x). `connector_id` scopes connector-
+    /// specific messages (e.g. `StatusNotification`); `None` means all
+    /// connectors / not connector-specific.
+    TriggerMessage {
+        requested_message: MessageTrigger,
+        connector_id: Option<i32>,
+    },
+}
+
+/// Whether this charge point can proactively produce `message` on a
+/// `TriggerMessage` request (OCPP 1.6J §4.x).
+///
+/// `BootNotification`, `Heartbeat`, and `StatusNotification` are wired; the
+/// firmware/diagnostics notifications are not features this CP implements, and
+/// on-demand `MeterValues` needs live transaction/meter context — these return
+/// `NotImplemented` until a dedicated follow-up adds them.
+fn trigger_message_supported(message: &MessageTrigger) -> bool {
+    matches!(
+        message,
+        MessageTrigger::BootNotification
+            | MessageTrigger::Heartbeat
+            | MessageTrigger::StatusNotification
+    )
 }
 
 /// Charge point event handler trait
@@ -639,6 +663,35 @@ impl ChargePoint {
             });
         }
 
+        // TriggerMessage — acknowledge, then send the requested message as a real
+        // side effect (OCPP 1.6J §4.x). Like Reset, the send is queued on the
+        // command channel and run by the consumer task spawned in `connect()`, so
+        // the CALLRESULT is flushed before the triggered outbound CALL and the
+        // receive loop never re-enters itself. A `requestedMessage` the CP cannot
+        // produce yields `NotImplemented` (no work queued); a supported message
+        // the CP cannot honor right now (consumer gone, CP shutting down) yields
+        // `Rejected` rather than accept-and-drop.
+        {
+            let command_sender = command_sender.clone();
+            d.on(move |req: TriggerMessageRequest| {
+                let command_sender = command_sender.clone();
+                async move {
+                    let status = if trigger_message_supported(&req.requested_message) {
+                        match command_sender.send(RemoteCommand::TriggerMessage {
+                            requested_message: req.requested_message,
+                            connector_id: req.connector_id,
+                        }) {
+                            Ok(()) => TriggerMessageStatus::Accepted,
+                            Err(_) => TriggerMessageStatus::Rejected,
+                        }
+                    } else {
+                        TriggerMessageStatus::NotImplemented
+                    };
+                    Ok(TriggerMessageResponse { status })
+                }
+            });
+        }
+
         // UnlockConnector — always succeed (real connector unlock is Issue #21)
         d.on(|_req: UnlockConnectorRequest| async move {
             Ok(UnlockConnectorResponse {
@@ -798,6 +851,13 @@ impl ChargePoint {
                                 );
                             }
                         }
+                        RemoteCommand::TriggerMessage {
+                            requested_message,
+                            connector_id,
+                        } => {
+                            cp.send_triggered_message(requested_message, connector_id)
+                                .await;
+                        }
                     }
                 }
             });
@@ -956,8 +1016,12 @@ impl ChargePoint {
     ///
     /// Returns `OcppError::BootRejected` after `config.max_boot_retries + 1`
     /// consecutive rejections.
-    async fn boot_sequence(&self) -> OcppResult<()> {
-        let request = BootNotificationRequest {
+    /// Build a `BootNotificationRequest` from the configured vendor info.
+    ///
+    /// Shared by the boot handshake and the `TriggerMessage(BootNotification)`
+    /// side effect so both report identical charge-point identity.
+    fn boot_notification_request(&self) -> BootNotificationRequest {
+        BootNotificationRequest {
             charge_point_vendor: self.config.vendor_info.charge_point_vendor.clone(),
             charge_point_model: self.config.vendor_info.charge_point_model.clone(),
             charge_point_serial_number: self.config.vendor_info.charge_point_serial_number.clone(),
@@ -967,7 +1031,11 @@ impl ChargePoint {
             imsi: self.config.vendor_info.imsi.clone(),
             meter_type: self.config.vendor_info.meter_type.clone(),
             meter_serial_number: self.config.vendor_info.meter_serial_number.clone(),
-        };
+        }
+    }
+
+    async fn boot_sequence(&self) -> OcppResult<()> {
+        let request = self.boot_notification_request();
 
         let max_attempts = self.config.max_boot_retries + 1;
         for attempt in 1..=max_attempts {
@@ -1629,6 +1697,75 @@ impl ChargePoint {
         Ok(())
     }
 
+    /// Send the message a CSMS asked for via `TriggerMessage` (OCPP 1.6J §4.x).
+    ///
+    /// Runs on the command-consumer task (off the inbound-CALL path), so these
+    /// outbound CALLs never re-enter the receive loop. Only the variants
+    /// [`trigger_message_supported`] accepts reach here; anything else would be
+    /// an upstream drift between that gate and this match, and is logged.
+    async fn send_triggered_message(&self, message: MessageTrigger, connector_id: Option<i32>) {
+        match message {
+            MessageTrigger::BootNotification => {
+                if let Err(e) = self.call(self.boot_notification_request()).await {
+                    warn!("TriggerMessage(BootNotification): send failed: {e}");
+                }
+            }
+            MessageTrigger::Heartbeat => {
+                if let Err(e) = self.call(HeartbeatRequest {}).await {
+                    warn!("TriggerMessage(Heartbeat): send failed: {e}");
+                }
+            }
+            MessageTrigger::StatusNotification => {
+                self.trigger_status_notification(connector_id).await;
+            }
+            other => {
+                warn!("TriggerMessage({other:?}): not implemented, ignoring");
+            }
+        }
+    }
+
+    /// Emit `StatusNotification` for the connector(s) a `TriggerMessage` targets.
+    ///
+    /// `Some(id)` reports just that connector (id `0` is the charge point as a
+    /// whole); `None` reports connector `0` and every physical connector. Each
+    /// report carries the connector's *current* status so the CSMS can refresh
+    /// its view on demand.
+    async fn trigger_status_notification(&self, connector_id: Option<i32>) {
+        let ids: Vec<u32> = match connector_id {
+            Some(id) if (0..=self.config.connector_count as i32).contains(&id) => vec![id as u32],
+            Some(id) => {
+                warn!("TriggerMessage(StatusNotification): unknown connector {id}, ignoring");
+                return;
+            }
+            None => (0..=self.config.connector_count).collect(),
+        };
+
+        for id in ids {
+            let status = self.connector_report_status(id).await;
+            if let Err(e) = self
+                .send_status_notification(id, status, ChargePointErrorCode::NoError)
+                .await
+            {
+                warn!("TriggerMessage(StatusNotification): connector {id} send failed: {e}");
+            }
+        }
+    }
+
+    /// Current reportable status of connector `id` (id `0` = the charge point
+    /// itself, which has no per-connector state and reports `Available`).
+    async fn connector_report_status(&self, id: u32) -> ChargePointStatus {
+        if id == 0 {
+            return ChargePointStatus::Available;
+        }
+        match ConnectorId::new(id) {
+            Ok(cid) => match self.get_connector(cid).await {
+                Some(c) => c.status().await,
+                None => ChargePointStatus::Available,
+            },
+            Err(_) => ChargePointStatus::Available,
+        }
+    }
+
     /// Returns the number of registered `@on` handlers in the dispatcher.
     pub async fn handler_count(&self) -> usize {
         self.dispatcher.read().await.handler_count()
@@ -1802,9 +1939,9 @@ mod tests {
     // --- dispatcher wiring tests ---
 
     #[tokio::test]
-    async fn dispatcher_has_9_default_handlers() {
+    async fn dispatcher_has_10_default_handlers() {
         let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
-        assert_eq!(cp.handler_count().await, 9);
+        assert_eq!(cp.handler_count().await, 10);
     }
 
     #[tokio::test]
@@ -1820,6 +1957,44 @@ mod tests {
             Message::CallResult(r) => {
                 let body: ChangeAvailabilityResponse = r.payload_as().unwrap();
                 assert_eq!(body.status, AvailabilityStatus::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_trigger_message_supported_accepted() {
+        // A supported requestedMessage is queued on the command channel (whose
+        // receiver still lives, pre-connect) and accepted.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        let call = make_call(TriggerMessageRequest {
+            requested_message: MessageTrigger::Heartbeat,
+            connector_id: None,
+        });
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: TriggerMessageResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, TriggerMessageStatus::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_trigger_message_unsupported_not_implemented() {
+        // A requestedMessage the CP cannot produce is rejected as NotImplemented
+        // without queuing any work.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        let call = make_call(TriggerMessageRequest {
+            requested_message: MessageTrigger::FirmwareStatusNotification,
+            connector_id: None,
+        });
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: TriggerMessageResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, TriggerMessageStatus::NotImplemented);
             }
             other => panic!("expected CallResult, got: {other:?}"),
         }

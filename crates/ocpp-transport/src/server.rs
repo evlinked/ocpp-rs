@@ -20,10 +20,13 @@ use futures_util::{SinkExt, StreamExt};
 use ocpp_messages::v16j::{
     ChangeConfigurationRequest, GetConfigurationRequest, GetConfigurationResponse,
     RemoteStartTransactionRequest, RemoteStopTransactionRequest, ResetRequest,
-    StatusNotificationRequest,
+    StatusNotificationRequest, TriggerMessageRequest,
 };
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
-use ocpp_types::v16j::{ConfigurationStatus, RemoteStartStopStatus, ResetStatus, ResetType};
+use ocpp_types::v16j::{
+    ConfigurationStatus, MessageTrigger, RemoteStartStopStatus, ResetStatus, ResetType,
+    TriggerMessageStatus,
+};
 use ocpp_types::{CallErrorCode, OcppError, OcppResult};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -395,6 +398,38 @@ impl OcppServer {
                 ChangeConfigurationRequest {
                     key: key.into(),
                     value: value.into(),
+                },
+            )
+            .await?;
+        Ok(resp.status)
+    }
+
+    /// Ask a connected charge point to proactively send a specific message now.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `TriggerMessage` command (§4.x), mirroring how the Python reference's
+    /// central system drives it
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    ///
+    /// `connector_id` is optional and scopes connector-specific messages (e.g.
+    /// `StatusNotification`); `None` is not connector-specific. Returns the CP's
+    /// [`TriggerMessageStatus`] — `Accepted` when the CP will send the requested
+    /// message, `NotImplemented` for a message it does not support, or
+    /// `Rejected` if it cannot honor the request right now. Errors propagate
+    /// from [`call`](Self::call) (e.g. [`OcppError::CpNotConnected`],
+    /// [`OcppError::Timeout`]).
+    pub async fn trigger_message(
+        &self,
+        cp_id: &str,
+        requested_message: MessageTrigger,
+        connector_id: Option<i32>,
+    ) -> OcppResult<TriggerMessageStatus> {
+        let resp = self
+            .call(
+                cp_id,
+                TriggerMessageRequest {
+                    requested_message,
+                    connector_id,
                 },
             )
             .await?;
@@ -1205,6 +1240,50 @@ mod tests {
         assert_eq!(status, ConfigurationStatus::Rejected);
 
         responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn trigger_message_helper_sends_action_and_maps_status() {
+        let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
+        let mut cp = connect_cp(&server, addr, "CP_HELPER_TRG").await;
+
+        let responder = tokio::spawn(async move {
+            let (action, unique_id) = read_call(&mut cp).await;
+            assert_eq!(action, "TriggerMessage");
+            // A CP that doesn't support the requested message replies NotImplemented.
+            cp.send(WsMsg::Text(call_result_frame(
+                &unique_id,
+                serde_json::json!({ "status": "NotImplemented" }),
+            )))
+            .await
+            .unwrap();
+            cp
+        });
+
+        let status = server
+            .trigger_message("CP_HELPER_TRG", MessageTrigger::MeterValues, Some(1))
+            .await
+            .expect("trigger_message resolves");
+        assert_eq!(status, TriggerMessageStatus::NotImplemented);
+
+        responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn trigger_message_helper_errors_when_cp_absent() {
+        let (mut server, _addr) = start_server(Arc::new(EchoHandler)).await;
+
+        let err = server
+            .trigger_message("GHOST", MessageTrigger::Heartbeat, None)
+            .await
+            .expect_err("unknown CP must error");
+        assert!(
+            matches!(err, OcppError::CpNotConnected { ref cp_id } if cp_id == "GHOST"),
+            "expected CpNotConnected, got {err:?}"
+        );
+
         server.stop().await.unwrap();
     }
 
