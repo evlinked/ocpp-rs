@@ -18,10 +18,11 @@ use axum::{
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use ocpp_messages::v16j::{
+    ChangeConfigurationRequest, GetConfigurationRequest, GetConfigurationResponse,
     RemoteStartTransactionRequest, RemoteStopTransactionRequest, StatusNotificationRequest,
 };
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
-use ocpp_types::v16j::RemoteStartStopStatus;
+use ocpp_types::v16j::{ConfigurationStatus, RemoteStartStopStatus};
 use ocpp_types::{CallErrorCode, OcppError, OcppResult};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -328,6 +329,56 @@ impl OcppServer {
     ) -> OcppResult<RemoteStartStopStatus> {
         let resp = self
             .call(cp_id, RemoteStopTransactionRequest { transaction_id })
+            .await?;
+        Ok(resp.status)
+    }
+
+    /// Read configuration keys from a connected charge point.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `GetConfiguration` command (§5.8), mirroring how the Python reference's
+    /// central system reads CP configuration
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    ///
+    /// `keys` is optional: `None` requests *all* configuration keys, while
+    /// `Some(list)` requests only the named keys. The full
+    /// [`GetConfigurationResponse`] is returned — unlike the
+    /// [`RemoteStartStopStatus`] helpers — because both halves carry
+    /// information the CSMS needs: `configuration_keys` (the keys the CP knows,
+    /// with their values and read-only flags) and `unknown_keys` (requested
+    /// keys the CP does not recognise). Errors propagate from [`call`](Self::call)
+    /// (e.g. [`OcppError::CpNotConnected`], [`OcppError::Timeout`]).
+    pub async fn get_configuration(
+        &self,
+        cp_id: &str,
+        keys: Option<Vec<String>>,
+    ) -> OcppResult<GetConfigurationResponse> {
+        self.call(cp_id, GetConfigurationRequest { key: keys })
+            .await
+    }
+
+    /// Change a single configuration key on a connected charge point.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `ChangeConfiguration` command (§5.3). Returns the CP's
+    /// [`ConfigurationStatus`]: `Accepted` when the key was updated,
+    /// `Rejected` for a read-only key, `RebootRequired` when the change takes
+    /// effect only after a reboot, or `NotSupported` for a key the CP does not
+    /// accept. Errors propagate from [`call`](Self::call).
+    pub async fn change_configuration(
+        &self,
+        cp_id: &str,
+        key: impl Into<String>,
+        value: impl Into<String>,
+    ) -> OcppResult<ConfigurationStatus> {
+        let resp = self
+            .call(
+                cp_id,
+                ChangeConfigurationRequest {
+                    key: key.into(),
+                    value: value.into(),
+                },
+            )
             .await?;
         Ok(resp.status)
     }
@@ -1038,6 +1089,92 @@ mod tests {
         assert_eq!(status, RemoteStartStopStatus::Rejected);
 
         responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_configuration_helper_sends_action_and_returns_full_response() {
+        let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
+        let mut cp = connect_cp(&server, addr, "CP_HELPER_GC").await;
+
+        let responder = tokio::spawn(async move {
+            let (action, unique_id) = read_call(&mut cp).await;
+            assert_eq!(action, "GetConfiguration");
+            cp.send(WsMsg::Text(call_result_frame(
+                &unique_id,
+                serde_json::json!({
+                    "configurationKey": [
+                        { "key": "HeartbeatInterval", "readonly": false, "value": "86400" }
+                    ],
+                    "unknownKey": ["Bogus"]
+                }),
+            )))
+            .await
+            .unwrap();
+            cp
+        });
+
+        let resp = server
+            .get_configuration(
+                "CP_HELPER_GC",
+                Some(vec!["HeartbeatInterval".to_string(), "Bogus".to_string()]),
+            )
+            .await
+            .expect("get_configuration resolves");
+        let keys = resp.configuration_keys.expect("configurationKey present");
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].key, "HeartbeatInterval");
+        assert_eq!(keys[0].value.as_deref(), Some("86400"));
+        assert_eq!(
+            resp.unknown_keys.as_deref(),
+            Some(&["Bogus".to_string()][..])
+        );
+
+        responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn change_configuration_helper_sends_action_and_maps_status() {
+        let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
+        let mut cp = connect_cp(&server, addr, "CP_HELPER_CC").await;
+
+        let responder = tokio::spawn(async move {
+            let (action, unique_id) = read_call(&mut cp).await;
+            assert_eq!(action, "ChangeConfiguration");
+            // A read-only key is rejected by the CP.
+            cp.send(WsMsg::Text(call_result_frame(
+                &unique_id,
+                serde_json::json!({ "status": "Rejected" }),
+            )))
+            .await
+            .unwrap();
+            cp
+        });
+
+        let status = server
+            .change_configuration("CP_HELPER_CC", "NumberOfConnectors", "9")
+            .await
+            .expect("change_configuration resolves");
+        assert_eq!(status, ConfigurationStatus::Rejected);
+
+        responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_configuration_helper_errors_when_cp_absent() {
+        let (mut server, _addr) = start_server(Arc::new(EchoHandler)).await;
+
+        let err = server
+            .get_configuration("GHOST", None)
+            .await
+            .expect_err("unknown CP must error");
+        assert!(
+            matches!(err, OcppError::CpNotConnected { ref cp_id } if cp_id == "GHOST"),
+            "expected CpNotConnected, got {err:?}"
+        );
+
         server.stop().await.unwrap();
     }
 
