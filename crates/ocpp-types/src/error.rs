@@ -97,6 +97,11 @@ pub enum OcppError {
     /// BootNotification rejected by the CSMS after all retry attempts exhausted.
     #[error("Boot rejected by central system after {attempts} attempt(s)")]
     BootRejected { attempts: u32 },
+
+    /// A CSMS-initiated CALL targeted a charge point that is not currently
+    /// connected (no live WebSocket session for `cp_id`).
+    #[error("Charge point not connected: {cp_id}")]
+    CpNotConnected { cp_id: String },
 }
 
 /// The dominant failing JSON-Schema keyword from a schema-validation failure.
