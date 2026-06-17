@@ -192,6 +192,15 @@ pub enum ChargePointEvent {
 enum RemoteCommand {
     /// Perform a CSMS-initiated Reset (OCPP 1.6J §5.13).
     Reset { reset_type: ResetType },
+    /// Drive the local `StartTransaction` for an `Accepted`
+    /// `RemoteStartTransaction` (OCPP 1.6J §5.11).
+    StartTransaction {
+        connector_id: ConnectorId,
+        id_tag: String,
+    },
+    /// End the matching transaction for an `Accepted` `RemoteStopTransaction`
+    /// (OCPP 1.6J §5.12).
+    StopTransaction { transaction_id: i32 },
 }
 
 /// Charge point event handler trait
@@ -523,12 +532,17 @@ impl ChargePoint {
         // RemoteStartTransaction — accept only when the targeted connector exists
         // and is free to start charging (OCPP 1.6J §5.11). A missing `connectorId`
         // defaults to connector 1, matching the Python reference's example CP.
-        // (Actually driving the local StartTransaction on Accepted is tracked as a
-        // follow-up; see the note on Issue #49.)
+        // On `Accepted` the actual local `StartTransaction` is queued on the
+        // command channel and run by the consumer task in `connect()`, off the
+        // inbound-CALL path, so the CALLRESULT is flushed before the CP re-enters
+        // the WebSocket (Issue #55). Ports the `@on`/`@after('RemoteStartTransaction')`
+        // split from the Python reference's example charge point.
         {
             let connectors = connectors.clone();
+            let command_sender = command_sender.clone();
             d.on(move |req: RemoteStartTransactionRequest| {
                 let connectors = connectors.clone();
+                let command_sender = command_sender.clone();
                 async move {
                     let connector_id = req.connector_id.unwrap_or(1);
                     let status = match ConnectorId::new(connector_id) {
@@ -543,7 +557,17 @@ impl ChargePoint {
                                         ChargePointStatus::Available | ChargePointStatus::Reserved
                                     ) =>
                                 {
-                                    RemoteStartStopStatus::Accepted
+                                    // Free connector: queue the local StartTransaction
+                                    // off the CALL path. If the consumer has gone away
+                                    // (CP shutting down) we cannot honor it, so report
+                                    // Rejected rather than Accept-and-drop.
+                                    match command_sender.send(RemoteCommand::StartTransaction {
+                                        connector_id: cid,
+                                        id_tag: req.id_tag.clone(),
+                                    }) {
+                                        Ok(()) => RemoteStartStopStatus::Accepted,
+                                        Err(_) => RemoteStartStopStatus::Rejected,
+                                    }
                                 }
                                 // Known-but-busy connector, or an unknown connector id.
                                 _ => RemoteStartStopStatus::Rejected,
@@ -559,19 +583,30 @@ impl ChargePoint {
 
         // RemoteStopTransaction — accept only when the transaction id matches an
         // active transaction this CP is running (OCPP 1.6J §5.12); otherwise
-        // reject. (Actually ending the transaction on Accepted is the follow-up
-        // tracked on Issue #49.)
+        // reject. On `Accepted` the matching transaction is ended (StopTransaction,
+        // reason `Remote`) via the command channel and consumer task, off the
+        // inbound-CALL path so the CALLRESULT is flushed first (Issue #55).
         {
             let active_transactions = active_transactions.clone();
+            let command_sender = command_sender.clone();
             d.on(move |req: RemoteStopTransactionRequest| {
                 let active_transactions = active_transactions.clone();
+                let command_sender = command_sender.clone();
                 async move {
                     let known = active_transactions
                         .read()
                         .await
                         .contains_key(&req.transaction_id);
                     let status = if known {
-                        RemoteStartStopStatus::Accepted
+                        // Known transaction: queue the StopTransaction off the CALL
+                        // path; if the consumer is gone, report Rejected rather than
+                        // Accept-and-drop.
+                        match command_sender.send(RemoteCommand::StopTransaction {
+                            transaction_id: req.transaction_id,
+                        }) {
+                            Ok(()) => RemoteStartStopStatus::Accepted,
+                            Err(_) => RemoteStartStopStatus::Rejected,
+                        }
                     } else {
                         RemoteStartStopStatus::Rejected
                     };
@@ -721,10 +756,12 @@ impl ChargePoint {
     ///
     /// On the first call this also spawns the single, long-lived remote-command
     /// consumer task (it takes the receiver; later calls find `None`). The
-    /// consumer drives side effects — currently a CSMS `Reset` — off the inbound
-    /// CALL path so the CALLRESULT is sent first and the receive loop never
-    /// re-enters itself. A Hard reset reconnects via `establish_session` (not
-    /// `connect`), so it neither spawns a second consumer nor recurses.
+    /// consumer drives side effects — a CSMS `Reset`, or the local
+    /// `StartTransaction`/`StopTransaction` behind an `Accepted`
+    /// `RemoteStart`/`RemoteStopTransaction` — off the inbound CALL path so the
+    /// CALLRESULT is sent first and the receive loop never re-enters itself. A
+    /// Hard reset reconnects via `establish_session` (not `connect`), so it
+    /// neither spawns a second consumer nor recurses.
     pub async fn connect(&self) -> Result<()> {
         let maybe_rx = self.command_receiver.write().await.take();
         if let Some(mut rx) = maybe_rx {
@@ -734,6 +771,32 @@ impl ChargePoint {
                     match command {
                         RemoteCommand::Reset { reset_type } => {
                             cp.perform_reset(reset_type).await;
+                        }
+                        RemoteCommand::StartTransaction {
+                            connector_id,
+                            id_tag,
+                        } => {
+                            // meter_start is unknown for a remote-initiated start;
+                            // report 0, matching the Python reference's example CP.
+                            if let Err(e) = cp.start_transaction(connector_id, &id_tag, 0).await {
+                                warn!(
+                                    "remote start: failed to start transaction on \
+                                     connector {}: {e}",
+                                    connector_id.value()
+                                );
+                            }
+                        }
+                        RemoteCommand::StopTransaction { transaction_id } => {
+                            // meter_stop is unknown for a remote-initiated stop;
+                            // report 0, matching the reset path.
+                            if let Err(e) =
+                                cp.stop_transaction(transaction_id, 0, Reason::Remote).await
+                            {
+                                warn!(
+                                    "remote stop: failed to stop transaction \
+                                     {transaction_id}: {e}"
+                                );
+                            }
                         }
                     }
                 }
