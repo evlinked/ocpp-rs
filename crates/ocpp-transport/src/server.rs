@@ -33,6 +33,14 @@ use uuid::Uuid;
 /// the [`WebSocketClient`](crate::WebSocketClient) machinery.
 #[derive(Clone)]
 struct CpHandle {
+    /// Per-session identity token (the owning connection's `connection_id`).
+    ///
+    /// OCPP `cp_id`s are unique, so at most one entry per `cp_id` lives in
+    /// `cp_handles` — but on a racy reconnect a *new* session can overwrite the
+    /// entry while the *old* session is still tearing down. Teardown does a
+    /// compare-and-remove against this token so a stale session can only evict
+    /// its own handle, never the newer session's (see issue #50).
+    connection_id: Uuid,
     /// Writes text frames to this CP's WebSocket sink via the per-connection
     /// receive loop, which owns the sink.
     outbound: mpsc::UnboundedSender<WsMessage>,
@@ -388,6 +396,7 @@ async fn handle_cp_socket(socket: WebSocket, charge_point_id: String, state: Arc
     state.cp_handles.insert(
         charge_point_id.clone(),
         CpHandle {
+            connection_id,
             outbound: out_tx,
             pending: Arc::clone(&pending),
         },
@@ -537,7 +546,15 @@ async fn handle_cp_socket(socket: WebSocket, charge_point_id: String, state: Arc
 
     // Teardown: remove routing state and fail any in-flight server CALLs so
     // their futures resolve instead of hanging until timeout.
-    state.cp_handles.remove(&charge_point_id);
+    //
+    // Compare-and-remove: only evict the routing handle if it still belongs to
+    // *this* session. If the CP reconnected while we were tearing down, a newer
+    // session has already overwritten the entry with its own `connection_id`, and
+    // an unconditional `remove` here would wrongly evict the live session — making
+    // a connected CP look like `CpNotConnected` to `OcppServer::call` (issue #50).
+    state
+        .cp_handles
+        .remove_if(&charge_point_id, |_, h| h.connection_id == connection_id);
     pending.cancel_all();
     state.connections.remove(&connection_id);
     let _ = state.event_tx.send(TransportEvent::Disconnected {
@@ -1043,6 +1060,79 @@ mod tests {
             .stop()
             .await
             .unwrap();
+    }
+
+    /// Regression for issue #50: a charge point that reconnects while its
+    /// previous session is still tearing down must stay routable. The stale
+    /// session's teardown must not evict the *new* session's routing handle.
+    ///
+    /// The race window is reproduced deterministically. When session B connects
+    /// under the same `cp_id`, its `cp_handles.insert` overwrites A's handle —
+    /// which drops A's outbound sender, so A's session loop immediately observes
+    /// the closed channel and runs teardown. That teardown therefore executes
+    /// *after* B has taken ownership of the routing entry: exactly the race.
+    /// We use the `Disconnected` event (emitted at the end of teardown, after the
+    /// handle removal) as a happens-after barrier, then assert B is still
+    /// routable. With the pre-fix unconditional `remove(cp_id)`, A's teardown
+    /// evicts B's live handle and `server.call` wrongly returns `CpNotConnected`.
+    #[tokio::test]
+    async fn reconnect_teardown_does_not_evict_new_session_handle() {
+        let (mut server, mut rx) =
+            OcppServer::new(TransportConfig::default(), Arc::new(EchoHandler));
+        server.start("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+
+        // Session A connects first and registers the routing handle for CP_RECON.
+        let _cp_a = connect_cp(&server, addr, "CP_RECON").await;
+
+        // Session B reconnects under the *same* cp_id. Its insert overwrites A's
+        // handle, dropping A's outbound sender and tripping A's teardown.
+        let (mut cp_b, _) = connect_async(ocpp_request(addr, "CP_RECON"))
+            .await
+            .expect("B connects");
+
+        // Wait for A's teardown to finish, signalled by its Disconnected event.
+        // (Connected events for A and B are drained past on the way.)
+        let mut saw_disconnect = false;
+        let start = tokio::time::Instant::now();
+        while !saw_disconnect && start.elapsed() < Duration::from_secs(2) {
+            if let Ok(Some(ev)) = timeout(Duration::from_millis(200), rx.recv()).await {
+                saw_disconnect = matches!(ev, TransportEvent::Disconnected { .. });
+            }
+        }
+        assert!(
+            saw_disconnect,
+            "A's session should tear down once B overwrites its routing handle"
+        );
+
+        // B must still be routable: its handle outlived A's stale teardown.
+        assert!(
+            server.is_cp_connected("CP_RECON"),
+            "B's routing handle must survive A's teardown"
+        );
+
+        // The decisive check: a CSMS-initiated CALL routes to the live B session
+        // and resolves, rather than failing with CpNotConnected.
+        let responder = tokio::spawn(async move {
+            let (action, unique_id) = read_call(&mut cp_b).await;
+            assert_eq!(action, "RemoteStartTransaction");
+            cp_b.send(WsMsg::Text(call_result_frame(
+                &unique_id,
+                serde_json::json!({ "status": "Accepted" }),
+            )))
+            .await
+            .unwrap();
+            cp_b
+        });
+
+        let resp = server
+            .call("CP_RECON", remote_start("TAG_RC"))
+            .await
+            .expect("call must route to the live (B) session, not CpNotConnected");
+        assert_eq!(resp.status, RemoteStartStopStatus::Accepted);
+
+        responder.await.unwrap();
+        server.stop().await.unwrap();
     }
 
     // ── StatusNotification observability event tests (Issue #47) ─────────────
