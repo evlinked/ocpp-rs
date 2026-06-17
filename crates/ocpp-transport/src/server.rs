@@ -18,10 +18,11 @@ use axum::{
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use ocpp_messages::v16j::{
-    RemoteStartTransactionRequest, RemoteStopTransactionRequest, StatusNotificationRequest,
+    RemoteStartTransactionRequest, RemoteStopTransactionRequest, ResetRequest,
+    StatusNotificationRequest,
 };
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
-use ocpp_types::v16j::RemoteStartStopStatus;
+use ocpp_types::v16j::{RemoteStartStopStatus, ResetStatus, ResetType};
 use ocpp_types::{CallErrorCode, OcppError, OcppResult};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -280,6 +281,23 @@ impl OcppServer {
         // 5. Propagate any CALLERROR, then deserialize the success payload.
         let payload = raw?;
         serde_json::from_value::<Req::Response>(payload).map_err(OcppError::from)
+    }
+
+    /// Send a `Reset` command (Soft or Hard) to a connected charge point and
+    /// return the CP's [`ResetStatus`].
+    ///
+    /// Thin typed wrapper over [`call`](Self::call) — the CSMS half of the
+    /// OCPP 1.6J Reset use case (§5.13). Mirrors how the Python reference
+    /// drives the command from
+    /// [`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py).
+    ///
+    /// `Accepted` means the CP has committed to *attempting* the reset; the
+    /// reset itself (graceful transaction shutdown for Soft, a full reboot for
+    /// Hard) then runs CP-side. Surfaces the same errors as [`call`](Self::call)
+    /// (e.g. [`OcppError::CpNotConnected`], [`OcppError::Timeout`]).
+    pub async fn reset(&self, cp_id: &str, reset_type: ResetType) -> OcppResult<ResetStatus> {
+        let response = self.call(cp_id, ResetRequest { reset_type }).await?;
+        Ok(response.status)
     }
 
     /// Ask a connected charge point to start a transaction remotely.
@@ -987,6 +1005,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_reset_helper_sends_reset_and_maps_status() {
+        let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
+        let mut cp = connect_cp(&server, addr, "CP_RESET").await;
+
+        // CP side: answer the Reset CALL with Accepted.
+        let responder = tokio::spawn(async move {
+            let (action, unique_id) = read_call(&mut cp).await;
+            assert_eq!(action, "Reset");
+            cp.send(WsMsg::Text(call_result_frame(
+                &unique_id,
+                serde_json::json!({ "status": "Accepted" }),
+            )))
+            .await
+            .unwrap();
+            cp // keep the socket alive until the call resolves
+        });
+
+        let status = server
+            .reset("CP_RESET", ResetType::Hard)
+            .await
+            .expect("Reset resolves");
+        assert_eq!(status, ResetStatus::Accepted);
+
+        responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn remote_start_transaction_helper_sends_action_and_maps_status() {
         let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
         let mut cp = connect_cp(&server, addr, "CP_HELPER_RS").await;
@@ -1038,6 +1084,22 @@ mod tests {
         assert_eq!(status, RemoteStartStopStatus::Rejected);
 
         responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_reset_to_unknown_cp_returns_not_connected() {
+        let (mut server, _addr) = start_server(Arc::new(EchoHandler)).await;
+
+        let err = server
+            .reset("GHOST", ResetType::Soft)
+            .await
+            .expect_err("unknown CP must error");
+        assert!(
+            matches!(err, OcppError::CpNotConnected { ref cp_id } if cp_id == "GHOST"),
+            "expected CpNotConnected, got {err:?}"
+        );
+
         server.stop().await.unwrap();
     }
 
