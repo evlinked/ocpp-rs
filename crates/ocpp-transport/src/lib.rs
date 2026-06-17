@@ -22,6 +22,7 @@ pub use error::*;
 pub use pending::PendingCallMap;
 
 use ocpp_messages::Message;
+use ocpp_types::v16j::ChargePointStatus;
 use ocpp_types::OcppResult;
 use std::time::Duration;
 use uuid::Uuid;
@@ -95,6 +96,26 @@ pub enum TransportEvent {
     MessageSent {
         connection_id: Uuid,
         message_id: String,
+    },
+    /// A connected charge point reported a connector state change via
+    /// `StatusNotification`.
+    ///
+    /// Emitted by the server's per-CP receive loop in addition to (not instead
+    /// of) the default empty CALLRESULT, so a CSMS can *react* to connector
+    /// transitions instead of dropping them on the floor. Mirrors the Python
+    /// reference's `@on('StatusNotification')` central-system handler
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    ///
+    /// Carries the originating `cp_id` — which lives at the connection layer, not
+    /// in the deserialized payload — so subscribers can tell which charge point
+    /// reported the change.
+    StatusNotification {
+        /// Charge-point id (the WebSocket path segment) that reported the change.
+        cp_id: String,
+        /// Connector the status applies to (`0` = the charge point as a whole).
+        connector_id: u32,
+        /// The reported connector status.
+        status: ChargePointStatus,
     },
     /// Error occurred
     Error {

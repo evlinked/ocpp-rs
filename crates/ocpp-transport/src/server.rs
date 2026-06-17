@@ -17,6 +17,7 @@ use axum::{
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
+use ocpp_messages::v16j::StatusNotificationRequest;
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
 use ocpp_types::{CallErrorCode, OcppError, OcppResult};
 use std::{net::SocketAddr, sync::Arc};
@@ -435,6 +436,16 @@ async fn handle_cp_socket(socket: WebSocket, charge_point_id: String, state: Arc
                 match classify_frame(&text) {
                     Some(Message::Call(call)) => {
                         let unique_id = call.unique_id.clone();
+                        // `StatusNotification` is the one inbound action the CSMS
+                        // surfaces as a *semantic* event (#47). The `cp_id` lives
+                        // here at the connection layer, not in the payload the
+                        // dispatcher sees, so we snapshot the payload before
+                        // wrapping the frame and emit the event only after the
+                        // handler accepts it (below) — keeping the empty CALLRESULT
+                        // and avoiding an event for a frame the CSMS rejects.
+                        let status_payload = (call.action
+                            == StatusNotificationRequest::ACTION_NAME)
+                            .then(|| call.payload.clone());
                         let msg = Message::Call(call);
 
                         let _ = state.event_tx.send(TransportEvent::MessageReceived {
@@ -442,7 +453,37 @@ async fn handle_cp_socket(socket: WebSocket, charge_point_id: String, state: Arc
                             message: msg.clone(),
                         });
 
-                        let response_text = match state.message_handler.handle_message(msg).await {
+                        let dispatch_result = state.message_handler.handle_message(msg).await;
+
+                        // Emit the connector-state event for an accepted
+                        // StatusNotification. Deserialization (which validates the
+                        // status/error enums) doubles as a guard against emitting
+                        // for a malformed payload the dispatcher would also reject.
+                        if dispatch_result.is_ok() {
+                            if let Some(payload) = status_payload {
+                                match serde_json::from_value::<StatusNotificationRequest>(payload) {
+                                    Ok(req) => {
+                                        info!(
+                                            "ChargePoint '{}' connector {} -> {:?}",
+                                            charge_point_id, req.connector_id, req.status
+                                        );
+                                        let _ = state.event_tx.send(
+                                            TransportEvent::StatusNotification {
+                                                cp_id: charge_point_id.clone(),
+                                                connector_id: req.connector_id,
+                                                status: req.status,
+                                            },
+                                        );
+                                    }
+                                    Err(e) => warn!(
+                                        "Accepted StatusNotification from '{}' failed to decode for event: {}",
+                                        charge_point_id, e
+                                    ),
+                                }
+                            }
+                        }
+
+                        let response_text = match dispatch_result {
                             Ok(Some(response)) => serde_json::to_string(&response)
                                 .map_err(|e| error!("Failed to serialize response: {}", e))
                                 .ok(),
@@ -1002,5 +1043,132 @@ mod tests {
             .stop()
             .await
             .unwrap();
+    }
+
+    // ── StatusNotification observability event tests (Issue #47) ─────────────
+
+    use ocpp_types::v16j::ChargePointStatus;
+
+    /// Drain every event currently queued on `rx`, stopping after a short period
+    /// of silence. By the time the CP has received its CALLRESULT the server has
+    /// already emitted any event for that frame (emission happens-before the
+    /// reply is sent), so this captures them deterministically.
+    async fn drain_events(rx: &mut mpsc::UnboundedReceiver<TransportEvent>) -> Vec<TransportEvent> {
+        let mut out = Vec::new();
+        while let Ok(Some(ev)) = timeout(Duration::from_millis(200), rx.recv()).await {
+            out.push(ev);
+        }
+        out
+    }
+
+    fn status_notification_frame(connector_id: u32, status: &str) -> String {
+        let call = Message::call(
+            "StatusNotification".to_string(),
+            serde_json::json!({
+                "connectorId": connector_id,
+                "errorCode": "NoError",
+                "status": status,
+            }),
+        )
+        .unwrap();
+        serde_json::to_string(&call).unwrap()
+    }
+
+    /// A CP-sent StatusNotification produces exactly one
+    /// `TransportEvent::StatusNotification` carrying the right `cp_id`,
+    /// `connector_id` and `status`, while the CALLRESULT stays empty `{}`.
+    #[tokio::test]
+    async fn status_notification_emits_event_with_cp_id() {
+        let (mut server, mut rx) =
+            OcppServer::new(TransportConfig::default(), Arc::new(EchoHandler));
+        server.start("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let (mut ws, _) = connect_async(ocpp_request(addr, "CP_STATUS"))
+            .await
+            .unwrap();
+        let call_text = status_notification_frame(1, "Charging");
+        let call_id = {
+            let v: serde_json::Value = serde_json::from_str(&call_text).unwrap();
+            v.get("1").and_then(|i| i.as_str()).unwrap().to_string()
+        };
+        ws.send(WsMsg::Text(call_text)).await.unwrap();
+
+        // The reply must be the empty StatusNotification CALLRESULT (no regression).
+        let frame = timeout(Duration::from_secs(2), ws.next())
+            .await
+            .expect("timed out waiting for CALLRESULT")
+            .expect("stream ended")
+            .expect("WS error");
+        let WsMsg::Text(text) = frame else {
+            panic!("expected text frame, got {frame:?}");
+        };
+        let resp: Message = serde_json::from_str(&text).unwrap();
+        match resp {
+            Message::CallResult(r) => {
+                assert_eq!(r.unique_id, call_id);
+                assert_eq!(
+                    r.payload,
+                    serde_json::json!({}),
+                    "CALLRESULT must stay empty"
+                );
+            }
+            other => panic!("expected CALLRESULT, got {other:?}"),
+        }
+
+        let events = drain_events(&mut rx).await;
+        let statuses: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                TransportEvent::StatusNotification {
+                    cp_id,
+                    connector_id,
+                    status,
+                } => Some((cp_id.clone(), *connector_id, *status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            statuses.len(),
+            1,
+            "expected exactly one StatusNotification event, got {statuses:?}"
+        );
+        assert_eq!(
+            statuses[0],
+            ("CP_STATUS".to_string(), 1, ChargePointStatus::Charging)
+        );
+
+        server.stop().await.unwrap();
+    }
+
+    /// A StatusNotification whose payload doesn't deserialize (unknown status
+    /// enum) must NOT emit a connector-state event — the deserialization guard
+    /// keeps the channel free of half-parsed transitions.
+    #[tokio::test]
+    async fn malformed_status_notification_emits_no_event() {
+        let (mut server, mut rx) =
+            OcppServer::new(TransportConfig::default(), Arc::new(EchoHandler));
+        server.start("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let (mut ws, _) = connect_async(ocpp_request(addr, "CP_BAD")).await.unwrap();
+        // EchoHandler does no schema validation, so dispatch succeeds; only the
+        // typed decode guards event emission. "Bogus" is not a ChargePointStatus.
+        ws.send(WsMsg::Text(status_notification_frame(1, "Bogus")))
+            .await
+            .unwrap();
+
+        // Drain the reply so the inbound frame is fully processed.
+        let _ = timeout(Duration::from_secs(2), ws.next()).await;
+
+        let events = drain_events(&mut rx).await;
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, TransportEvent::StatusNotification { .. })),
+            "no StatusNotification event expected for an undecodable payload, got {events:?}"
+        );
+
+        server.stop().await.unwrap();
     }
 }

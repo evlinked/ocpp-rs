@@ -658,6 +658,18 @@ impl TransportMessageHandler for MessageHandler {
             } => {
                 debug!("Message sent to {}: {}", connection_id, message_id);
             }
+            // CSMS-side observability event (#47): a CP only ever sends
+            // StatusNotification, so receiving one here is unexpected — log it.
+            ocpp_transport::TransportEvent::StatusNotification {
+                cp_id,
+                connector_id,
+                status,
+            } => {
+                debug!(
+                    "StatusNotification event for {} connector {}: {:?}",
+                    cp_id, connector_id, status
+                );
+            }
             ocpp_transport::TransportEvent::Error {
                 connection_id,
                 error,
