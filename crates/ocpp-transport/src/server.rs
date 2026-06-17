@@ -17,9 +17,12 @@ use axum::{
 };
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
-use ocpp_messages::v16j::{ResetRequest, StatusNotificationRequest};
+use ocpp_messages::v16j::{
+    RemoteStartTransactionRequest, RemoteStopTransactionRequest, ResetRequest,
+    StatusNotificationRequest,
+};
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
-use ocpp_types::v16j::{ResetStatus, ResetType};
+use ocpp_types::v16j::{RemoteStartStopStatus, ResetStatus, ResetType};
 use ocpp_types::{CallErrorCode, OcppError, OcppResult};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -295,6 +298,56 @@ impl OcppServer {
     pub async fn reset(&self, cp_id: &str, reset_type: ResetType) -> OcppResult<ResetStatus> {
         let response = self.call(cp_id, ResetRequest { reset_type }).await?;
         Ok(response.status)
+    }
+
+    /// Ask a connected charge point to start a transaction remotely.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `RemoteStartTransaction` command (§5.11), mirroring how the Python
+    /// reference's central system drives it
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    ///
+    /// `connector_id` is optional: `None` lets the charge point pick a connector.
+    /// Returns the CP's [`RemoteStartStopStatus`] — `Accepted` if the CP will act
+    /// on the request, `Rejected` otherwise. Errors propagate from [`call`](Self::call)
+    /// (e.g. [`OcppError::CpNotConnected`], [`OcppError::Timeout`]).
+    pub async fn remote_start_transaction(
+        &self,
+        cp_id: &str,
+        id_tag: impl Into<String>,
+        connector_id: Option<u32>,
+    ) -> OcppResult<RemoteStartStopStatus> {
+        let resp = self
+            .call(
+                cp_id,
+                RemoteStartTransactionRequest {
+                    connector_id,
+                    id_tag: id_tag.into(),
+                    charging_profile: None,
+                },
+            )
+            .await?;
+        Ok(resp.status)
+    }
+
+    /// Ask a connected charge point to stop an ongoing transaction remotely.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `RemoteStopTransaction` command (§5.12). `transaction_id` is the
+    /// CSMS-assigned id returned by the original `StartTransaction`.
+    ///
+    /// Returns the CP's [`RemoteStartStopStatus`] — `Accepted` if the CP knows
+    /// the transaction and will stop it, `Rejected` if it does not. Errors
+    /// propagate from [`call`](Self::call).
+    pub async fn remote_stop_transaction(
+        &self,
+        cp_id: &str,
+        transaction_id: i32,
+    ) -> OcppResult<RemoteStartStopStatus> {
+        let resp = self
+            .call(cp_id, RemoteStopTransactionRequest { transaction_id })
+            .await?;
+        Ok(resp.status)
     }
 
     /// Evict connections that have been idle for more than 2× the keep-alive interval.
@@ -980,11 +1033,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn remote_start_transaction_helper_sends_action_and_maps_status() {
+        let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
+        let mut cp = connect_cp(&server, addr, "CP_HELPER_RS").await;
+
+        let responder = tokio::spawn(async move {
+            let (action, unique_id) = read_call(&mut cp).await;
+            assert_eq!(action, "RemoteStartTransaction");
+            cp.send(WsMsg::Text(call_result_frame(
+                &unique_id,
+                serde_json::json!({ "status": "Accepted" }),
+            )))
+            .await
+            .unwrap();
+            cp
+        });
+
+        let status = server
+            .remote_start_transaction("CP_HELPER_RS", "TAG_001", Some(1))
+            .await
+            .expect("remote_start_transaction resolves");
+        assert_eq!(status, RemoteStartStopStatus::Accepted);
+
+        responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_stop_transaction_helper_sends_action_and_maps_status() {
+        let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
+        let mut cp = connect_cp(&server, addr, "CP_HELPER_RST").await;
+
+        let responder = tokio::spawn(async move {
+            let (action, unique_id) = read_call(&mut cp).await;
+            assert_eq!(action, "RemoteStopTransaction");
+            // A CP that doesn't know the transaction id replies Rejected.
+            cp.send(WsMsg::Text(call_result_frame(
+                &unique_id,
+                serde_json::json!({ "status": "Rejected" }),
+            )))
+            .await
+            .unwrap();
+            cp
+        });
+
+        let status = server
+            .remote_stop_transaction("CP_HELPER_RST", 999)
+            .await
+            .expect("remote_stop_transaction resolves");
+        assert_eq!(status, RemoteStartStopStatus::Rejected);
+
+        responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn server_reset_to_unknown_cp_returns_not_connected() {
         let (mut server, _addr) = start_server(Arc::new(EchoHandler)).await;
 
         let err = server
             .reset("GHOST", ResetType::Soft)
+            .await
+            .expect_err("unknown CP must error");
+        assert!(
+            matches!(err, OcppError::CpNotConnected { ref cp_id } if cp_id == "GHOST"),
+            "expected CpNotConnected, got {err:?}"
+        );
+
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_start_transaction_helper_errors_when_cp_absent() {
+        let (mut server, _addr) = start_server(Arc::new(EchoHandler)).await;
+
+        let err = server
+            .remote_start_transaction("GHOST", "TAG", None)
             .await
             .expect_err("unknown CP must error");
         assert!(

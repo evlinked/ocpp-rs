@@ -393,11 +393,19 @@ impl ChargePoint {
 
         let (command_sender, command_receiver) = mpsc::unbounded_channel();
 
+        // Wrap the shared state the default handlers need *before* building the
+        // dispatcher: RemoteStart/RemoteStop consult live connector status and
+        // the active-transaction map to answer Accepted/Rejected faithfully.
+        let connectors = Arc::new(RwLock::new(connectors));
+        let active_transactions = Arc::new(RwLock::new(HashMap::new()));
+
         let config_store = Arc::new(RwLock::new(ConfigurationStore::new()));
         let mut dispatcher = Self::build_default_dispatcher(
             config_store.clone(),
             auth_cache.clone(),
             command_sender,
+            connectors.clone(),
+            active_transactions.clone(),
         );
         if let Some(v) = &validator {
             dispatcher = dispatcher.with_validator(v.clone());
@@ -406,7 +414,7 @@ impl ChargePoint {
 
         Ok(Self {
             config,
-            connectors: Arc::new(RwLock::new(connectors)),
+            connectors,
             client: Arc::new(RwLock::new(None)),
             dispatcher,
             config_store,
@@ -415,7 +423,7 @@ impl ChargePoint {
             registration_status: Arc::new(RwLock::new(RegistrationStatus::Rejected)),
             is_connected: Arc::new(RwLock::new(false)),
             heartbeat_handle: Arc::new(RwLock::new(None)),
-            active_transactions: Arc::new(RwLock::new(HashMap::new())),
+            active_transactions,
             validator,
             meter_sampler_handles: Arc::new(RwLock::new(HashMap::new())),
             auth_cache,
@@ -434,6 +442,8 @@ impl ChargePoint {
         config_store: Arc<RwLock<ConfigurationStore>>,
         auth_cache: Arc<AuthCache>,
         command_sender: mpsc::UnboundedSender<RemoteCommand>,
+        connectors: Arc<RwLock<HashMap<ConnectorId, Connector>>>,
+        active_transactions: Arc<RwLock<HashMap<i32, ConnectorId>>>,
     ) -> ActionDispatcher {
         let mut d = ActionDispatcher::new();
 
@@ -510,19 +520,65 @@ impl ChargePoint {
             });
         }
 
-        // RemoteStartTransaction — accept (real auth/connector checks are Issue #21)
-        d.on(|_req: RemoteStartTransactionRequest| async move {
-            Ok(RemoteStartTransactionResponse {
-                status: RemoteStartStopStatus::Accepted,
-            })
-        });
+        // RemoteStartTransaction — accept only when the targeted connector exists
+        // and is free to start charging (OCPP 1.6J §5.11). A missing `connectorId`
+        // defaults to connector 1, matching the Python reference's example CP.
+        // (Actually driving the local StartTransaction on Accepted is tracked as a
+        // follow-up; see the note on Issue #49.)
+        {
+            let connectors = connectors.clone();
+            d.on(move |req: RemoteStartTransactionRequest| {
+                let connectors = connectors.clone();
+                async move {
+                    let connector_id = req.connector_id.unwrap_or(1);
+                    let status = match ConnectorId::new(connector_id) {
+                        Ok(cid) => {
+                            // Clone the connector out of the map so we don't hold
+                            // the map guard across the inner status read.
+                            let connector = connectors.read().await.get(&cid).cloned();
+                            match connector {
+                                Some(connector)
+                                    if matches!(
+                                        connector.status().await,
+                                        ChargePointStatus::Available | ChargePointStatus::Reserved
+                                    ) =>
+                                {
+                                    RemoteStartStopStatus::Accepted
+                                }
+                                // Known-but-busy connector, or an unknown connector id.
+                                _ => RemoteStartStopStatus::Rejected,
+                            }
+                        }
+                        // connectorId 0 / out of range → not a chargeable connector.
+                        Err(_) => RemoteStartStopStatus::Rejected,
+                    };
+                    Ok(RemoteStartTransactionResponse { status })
+                }
+            });
+        }
 
-        // RemoteStopTransaction — accept (real transaction lookup is Issue #21)
-        d.on(|_req: RemoteStopTransactionRequest| async move {
-            Ok(RemoteStopTransactionResponse {
-                status: RemoteStartStopStatus::Accepted,
-            })
-        });
+        // RemoteStopTransaction — accept only when the transaction id matches an
+        // active transaction this CP is running (OCPP 1.6J §5.12); otherwise
+        // reject. (Actually ending the transaction on Accepted is the follow-up
+        // tracked on Issue #49.)
+        {
+            let active_transactions = active_transactions.clone();
+            d.on(move |req: RemoteStopTransactionRequest| {
+                let active_transactions = active_transactions.clone();
+                async move {
+                    let known = active_transactions
+                        .read()
+                        .await
+                        .contains_key(&req.transaction_id);
+                    let status = if known {
+                        RemoteStartStopStatus::Accepted
+                    } else {
+                        RemoteStartStopStatus::Rejected
+                    };
+                    Ok(RemoteStopTransactionResponse { status })
+                }
+            });
+        }
 
         // Reset — acknowledge, then carry out the reset as a real side effect
         // (OCPP 1.6J §5.13). The work is queued on the command channel and run
@@ -1801,14 +1857,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_remote_stop_returns_accepted() {
+    async fn remote_start_unknown_connector_returns_rejected() {
+        // Default config has connectors 1..=2; connector 7 does not exist, so the
+        // CP cannot honor a remote start there (OCPP 1.6J §5.11).
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        let call = make_call(RemoteStartTransactionRequest {
+            connector_id: Some(7),
+            id_tag: "abc".to_string(),
+            charging_profile: None,
+        });
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: RemoteStartTransactionResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, RemoteStartStopStatus::Rejected);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_stop_unknown_transaction_returns_rejected() {
+        // No transaction is active, so transaction id 42 is unknown and the CP
+        // must reject the remote stop (OCPP 1.6J §5.12).
         let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
         let call = make_call(RemoteStopTransactionRequest { transaction_id: 42 });
         let resp = cp.handle_message(Message::Call(call)).await.unwrap();
         match resp.unwrap() {
             Message::CallResult(r) => {
                 let body: RemoteStopTransactionResponse = r.payload_as().unwrap();
-                assert_eq!(body.status, RemoteStartStopStatus::Accepted);
+                assert_eq!(body.status, RemoteStartStopStatus::Rejected);
             }
             other => panic!("expected CallResult, got: {other:?}"),
         }
