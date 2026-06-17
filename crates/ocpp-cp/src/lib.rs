@@ -667,7 +667,7 @@ impl ChargePoint {
     /// consumer task (it takes the receiver; later calls find `None`). The
     /// consumer drives side effects — currently a CSMS `Reset` — off the inbound
     /// CALL path so the CALLRESULT is sent first and the receive loop never
-    /// re-enters itself. A Hard reset reconnects via [`establish_session`] (not
+    /// re-enters itself. A Hard reset reconnects via `establish_session` (not
     /// `connect`), so it neither spawns a second consumer nor recurses.
     pub async fn connect(&self) -> Result<()> {
         let maybe_rx = self.command_receiver.write().await.take();
