@@ -240,7 +240,7 @@ pub enum DataTransferStatus {
 }
 
 /// Reset type enumeration
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum ResetType {
     /// Hard reset (reboot)

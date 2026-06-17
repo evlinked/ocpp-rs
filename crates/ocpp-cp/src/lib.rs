@@ -171,8 +171,27 @@ pub enum ChargePointEvent {
         transaction_id: i32,
         reason: String,
     },
+    /// A CSMS-initiated `Reset` was accepted and is being carried out
+    /// (OCPP 1.6J §5.13). Emitted by the command-consumer task as the reset
+    /// side effect begins, after the `Reset` CALLRESULT has been returned.
+    ResetRequested { reset_type: ResetType },
     /// Error occurred
     Error { error: ChargePointError },
+}
+
+/// Internal command queued by an inbound CALL handler for asynchronous,
+/// out-of-band execution by the command-consumer task spawned in
+/// [`ChargePoint::connect`].
+///
+/// The dispatcher's `@on` handlers are `'static` closures that cannot reach
+/// `&ChargePoint`, and invoking a side effect inline would re-enter the
+/// WebSocket (send an outbound CALL + await its CALLRESULT) while the receive
+/// loop is mid-dispatch — a deadlock. Channelling the work decouples the side
+/// effect from the response path so the CALLRESULT is flushed first.
+#[derive(Debug, Clone)]
+enum RemoteCommand {
+    /// Perform a CSMS-initiated Reset (OCPP 1.6J §5.13).
+    Reset { reset_type: ResetType },
 }
 
 /// Charge point event handler trait
@@ -273,6 +292,13 @@ fn ocpp_error_to_callerror_code(e: &OcppError) -> (CallErrorCode, String) {
 // ---------------------------------------------------------------------------
 
 /// Main charge point implementation
+///
+/// `ChargePoint` is cheap to [`Clone`]: every field is either an [`Arc`] over
+/// shared state or itself trivially cloneable, so a clone is a new handle onto
+/// the *same* connectors, client, transactions and event stream. This lets the
+/// command-consumer task (see [`ChargePoint::connect`]) own a handle and drive
+/// side effects such as `Reset` without a separate handle type.
+#[derive(Clone)]
 pub struct ChargePoint {
     /// Configuration
     config: ChargePointConfig,
@@ -314,6 +340,19 @@ pub struct ChargePoint {
     /// `ClearCache` handler so a CSMS `ClearCache` command empties it. Backs the
     /// cache-first behavior of [`ChargePoint::authorize`].
     auth_cache: Arc<AuthCache>,
+    /// Receiver for [`RemoteCommand`]s queued by inbound CALL handlers (e.g. the
+    /// default `Reset` handler). Taken exactly once by the first
+    /// [`ChargePoint::connect`] to spawn the single long-lived command-consumer
+    /// task; `None` thereafter, so a reconnect (e.g. a Hard reset) does not spawn
+    /// a second consumer. The sender half lives inside the dispatcher closures,
+    /// which the `ChargePoint` keeps alive, so the channel stays open.
+    command_receiver: Arc<RwLock<Option<mpsc::UnboundedReceiver<RemoteCommand>>>>,
+    /// Join handle for the command-consumer task. The consumer owns a
+    /// `ChargePoint` clone (and thus, transitively, a `RemoteCommand` sender via
+    /// the dispatcher), so the channel never closes on its own — the task is
+    /// aborted by [`stop`](Self::stop) to break that cycle and free the shared
+    /// state, exactly like the heartbeat task.
+    command_consumer: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl ChargePoint {
@@ -352,9 +391,14 @@ impl ChargePoint {
 
         let auth_cache = Arc::new(AuthCache::new(Duration::from_secs(config.auth_cache_ttl)));
 
+        let (command_sender, command_receiver) = mpsc::unbounded_channel();
+
         let config_store = Arc::new(RwLock::new(ConfigurationStore::new()));
-        let mut dispatcher =
-            Self::build_default_dispatcher(config_store.clone(), auth_cache.clone());
+        let mut dispatcher = Self::build_default_dispatcher(
+            config_store.clone(),
+            auth_cache.clone(),
+            command_sender,
+        );
         if let Some(v) = &validator {
             dispatcher = dispatcher.with_validator(v.clone());
         }
@@ -375,6 +419,8 @@ impl ChargePoint {
             validator,
             meter_sampler_handles: Arc::new(RwLock::new(HashMap::new())),
             auth_cache,
+            command_receiver: Arc::new(RwLock::new(Some(command_receiver))),
+            command_consumer: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -387,6 +433,7 @@ impl ChargePoint {
     fn build_default_dispatcher(
         config_store: Arc<RwLock<ConfigurationStore>>,
         auth_cache: Arc<AuthCache>,
+        command_sender: mpsc::UnboundedSender<RemoteCommand>,
     ) -> ActionDispatcher {
         let mut d = ActionDispatcher::new();
 
@@ -477,16 +524,29 @@ impl ChargePoint {
             })
         });
 
-        // Reset — always accept
-        d.on(|req: ResetRequest| async move {
-            match req.reset_type {
-                ResetType::Soft => info!("Soft reset requested"),
-                ResetType::Hard => info!("Hard reset requested"),
-            }
-            Ok(ResetResponse {
-                status: ResetStatus::Accepted,
-            })
-        });
+        // Reset — acknowledge, then carry out the reset as a real side effect
+        // (OCPP 1.6J §5.13). The work is queued on the command channel and run
+        // by the consumer task spawned in `connect()`, so the CALLRESULT is
+        // flushed before any outbound CALL (graceful StopTransaction, re-boot)
+        // and the receive loop never re-enters itself. Returning `Accepted`
+        // commits only to *attempting* the reset; if the consumer has gone away
+        // (the CP is shutting down) the command cannot be honored, so we report
+        // `Rejected` rather than silently dropping it.
+        {
+            let command_sender = command_sender.clone();
+            d.on(move |req: ResetRequest| {
+                let command_sender = command_sender.clone();
+                async move {
+                    let status = match command_sender.send(RemoteCommand::Reset {
+                        reset_type: req.reset_type,
+                    }) {
+                        Ok(()) => ResetStatus::Accepted,
+                        Err(_) => ResetStatus::Rejected,
+                    };
+                    Ok(ResetResponse { status })
+                }
+            });
+        }
 
         // UnlockConnector — always succeed (real connector unlock is Issue #21)
         d.on(|_req: UnlockConnectorRequest| async move {
@@ -578,13 +638,14 @@ impl ChargePoint {
     pub async fn stop(&self) -> Result<()> {
         info!("Stopping charge point: {}", self.config.charge_point_id);
 
-        // Stop heartbeat
-        if let Some(handle) = self.heartbeat_handle.write().await.take() {
-            handle.abort();
-        }
+        // Stop the heartbeat and all periodic MeterValues samplers.
+        self.quiesce_background_tasks().await;
 
-        // Stop all periodic MeterValues samplers
-        for (_txn_id, handle) in self.meter_sampler_handles.write().await.drain() {
+        // Abort the remote-command consumer. It owns a `ChargePoint` clone whose
+        // dispatcher holds a command sender, so it would otherwise keep the
+        // channel — and all shared state — alive forever. Done only here (never
+        // during a reset's quiesce), since the consumer drives the reset itself.
+        if let Some(handle) = self.command_consumer.write().await.take() {
             handle.abort();
         }
 
@@ -600,8 +661,40 @@ impl ChargePoint {
         Ok(())
     }
 
-    /// Connect to central system
+    /// Connect to central system.
+    ///
+    /// On the first call this also spawns the single, long-lived remote-command
+    /// consumer task (it takes the receiver; later calls find `None`). The
+    /// consumer drives side effects — currently a CSMS `Reset` — off the inbound
+    /// CALL path so the CALLRESULT is sent first and the receive loop never
+    /// re-enters itself. A Hard reset reconnects via [`establish_session`] (not
+    /// `connect`), so it neither spawns a second consumer nor recurses.
     pub async fn connect(&self) -> Result<()> {
+        let maybe_rx = self.command_receiver.write().await.take();
+        if let Some(mut rx) = maybe_rx {
+            let cp = self.clone();
+            let handle = tokio::spawn(async move {
+                while let Some(command) = rx.recv().await {
+                    match command {
+                        RemoteCommand::Reset { reset_type } => {
+                            cp.perform_reset(reset_type).await;
+                        }
+                    }
+                }
+            });
+            *self.command_consumer.write().await = Some(handle);
+        }
+
+        self.establish_session().await
+    }
+
+    /// Open a WebSocket session to the central system and run the boot
+    /// handshake (`BootNotification` → retry loop → heartbeat start).
+    ///
+    /// Split out of [`connect`](Self::connect) so the Hard-reset path can
+    /// re-establish a session without re-running the consumer-spawn logic and
+    /// without the `connect → perform_reset → connect` recursion.
+    async fn establish_session(&self) -> Result<()> {
         let url = format!(
             "{}/ocpp/{}",
             self.config.central_system_url.trim_end_matches('/'),
@@ -1225,6 +1318,91 @@ impl ChargePoint {
         );
 
         Ok(())
+    }
+
+    /// Abort the heartbeat task and every periodic `MeterValues` sampler.
+    ///
+    /// Shared by [`stop`](Self::stop) and the reset path: both need to silence
+    /// the background emitters before the connection is torn down or re-booted,
+    /// so the old tasks don't leak or race a fresh boot. Aborting `JoinHandle`s
+    /// is required because dropping one merely detaches the task.
+    async fn quiesce_background_tasks(&self) {
+        if let Some(handle) = self.heartbeat_handle.write().await.take() {
+            handle.abort();
+        }
+        for (_txn_id, handle) in self.meter_sampler_handles.write().await.drain() {
+            handle.abort();
+        }
+    }
+
+    /// Carry out a CSMS-initiated `Reset` (OCPP 1.6J §5.13) as a real simulator
+    /// side effect. Invoked only from the command-consumer task (see
+    /// [`connect`](Self::connect)), never inline in the inbound-CALL handler, so
+    /// the `Reset` CALLRESULT is flushed first and there is no receive-loop
+    /// re-entrancy/deadlock.
+    ///
+    /// - **Soft** — gracefully stop any active transaction(s) with reason
+    ///   `SoftReset`, then restart the application on the *existing* connection
+    ///   by re-running the boot handshake (fresh `BootNotification`, connector
+    ///   status re-announced, heartbeat restarted).
+    /// - **Hard** — gracefully stop any active transaction(s) with reason
+    ///   `HardReset`, then perform a full reboot: tear the session down and
+    ///   reconnect from scratch, re-announcing connector status on the new boot.
+    ///
+    /// Mirrors the `@on('Reset')` / `@after('Reset')` split in the Python
+    /// reference's [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py):
+    /// the handler returns the status, the after-effect performs the reset.
+    async fn perform_reset(&self, reset_type: ResetType) {
+        let _ = self
+            .event_sender
+            .send(ChargePointEvent::ResetRequested { reset_type });
+
+        // Gracefully end any in-flight transactions with the reset-specific
+        // reason. Snapshot the ids first so we don't hold the map lock across
+        // the StopTransaction round-trips.
+        let reason = match reset_type {
+            ResetType::Soft => Reason::SoftReset,
+            ResetType::Hard => Reason::HardReset,
+        };
+        let active_txns: Vec<i32> = self
+            .active_transactions
+            .read()
+            .await
+            .keys()
+            .copied()
+            .collect();
+        for txn_id in active_txns {
+            // meter_stop is unknown for a reset-triggered stop; report 0 like the
+            // Python reference's example, which does not meter a forced stop.
+            if let Err(e) = self.stop_transaction(txn_id, 0, reason.clone()).await {
+                warn!("reset: failed to stop transaction {txn_id}: {e}");
+            }
+        }
+
+        // Silence heartbeat + samplers before re-booting so the old tasks don't
+        // leak or race the fresh boot (Soft re-boots in place; Hard reconnects,
+        // and `disconnect` does not itself abort these).
+        self.quiesce_background_tasks().await;
+
+        match reset_type {
+            ResetType::Soft => {
+                info!("Soft reset: restarting on the existing connection");
+                if let Err(e) = self.boot_sequence().await {
+                    error!("soft reset: boot sequence failed: {e}");
+                }
+            }
+            ResetType::Hard => {
+                info!("Hard reset: tearing down session and reconnecting");
+                if let Err(e) = self.disconnect().await {
+                    warn!("hard reset: disconnect failed: {e}");
+                }
+                // Re-establish the session directly (not via `connect`) so we do
+                // not re-take the command receiver or recurse.
+                if let Err(e) = self.establish_session().await {
+                    error!("hard reset: reconnect failed: {e}");
+                }
+            }
+        }
     }
 
     /// Set connector fault
