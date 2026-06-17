@@ -22,5 +22,9 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# End-to-end CP ↔ CSMS session test (Issue #29) drives both halves in-process.
+ocpp-transport = { path = "../ocpp-transport" }
+ocpp-cp = { path = "../ocpp-cp" }
 tokio = { workspace = true, features = ["test-util", "macros"] }
+chrono = { workspace = true }
 

@@ -1077,7 +1077,10 @@ name = "ocpp-conformance"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
+ "ocpp-cp",
  "ocpp-messages",
+ "ocpp-transport",
  "ocpp-types",
  "serde",
  "serde_json",
