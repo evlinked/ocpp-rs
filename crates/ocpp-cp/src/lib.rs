@@ -41,8 +41,9 @@ use ocpp_types::common::{
     AuthorizationStatus, AvailabilityStatus, IdTagInfo, KeyValue, Measurand, ReadingContext, Reason,
 };
 use ocpp_types::v16j::{
-    ChargePointStatus, ChargePointVendorInfo, ClearCacheStatus, ConfigurationStatus,
-    DataTransferStatus, RemoteStartStopStatus, ResetStatus, ResetType, UnlockStatus,
+    ChargePointErrorCode, ChargePointStatus, ChargePointVendorInfo, ClearCacheStatus,
+    ConfigurationStatus, DataTransferStatus, RemoteStartStopStatus, ResetStatus, ResetType,
+    UnlockStatus,
 };
 use ocpp_types::{
     CallErrorCode, CallErrorMessage, CallResultMessage, ConnectorId, OcppError, OcppResult,
@@ -770,6 +771,10 @@ impl ChargePoint {
                                     current_time: response.current_time,
                                     interval: response.interval,
                                 });
+                        // Announce every connector as Available once accepted, so
+                        // the CSMS has an accurate connector inventory from the
+                        // start (OCPP 1.6J spec §4.8).
+                        self.announce_connectors_available().await?;
                     }
                     // Use the CSMS-supplied interval, not the static config value.
                     self.start_heartbeat(response.interval.max(1) as u64).await;
@@ -794,6 +799,26 @@ impl ChargePoint {
             }
         }
         unreachable!()
+    }
+
+    /// Send `StatusNotification(Available, NoError)` for connector `0` (the
+    /// charge point as a whole) and for each configured connector.
+    ///
+    /// Called once after the BootNotification is accepted so the CSMS knows the
+    /// initial operational state of every connector. Mirrors the boot-time
+    /// status reporting in `examples/v16/charge_point.py`.
+    async fn announce_connectors_available(&self) -> OcppResult<()> {
+        // Connector 0 represents the charge point itself; 1..=connector_count
+        // are the physical connectors created in `ChargePoint::new`.
+        for connector_id in 0..=self.config.connector_count {
+            self.send_status_notification(
+                connector_id,
+                ChargePointStatus::Available,
+                ChargePointErrorCode::NoError,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     /// Start the heartbeat background task using the CSMS-supplied interval.
@@ -1053,6 +1078,14 @@ impl ChargePoint {
         id_tag: &str,
         meter_start: i32,
     ) -> OcppResult<i32> {
+        // Connector is now preparing for a transaction (Available -> Preparing).
+        self.send_status_notification(
+            connector_id.value(),
+            ChargePointStatus::Preparing,
+            ChargePointErrorCode::NoError,
+        )
+        .await?;
+
         let response = self
             .call(StartTransactionRequest {
                 connector_id: connector_id.value(),
@@ -1092,6 +1125,14 @@ impl ChargePoint {
                     })?;
             }
         }
+
+        // Connector accepted and energising (Preparing -> Charging).
+        self.send_status_notification(
+            connector_id.value(),
+            ChargePointStatus::Charging,
+            ChargePointErrorCode::NoError,
+        )
+        .await?;
 
         // Begin periodic MeterValues sampling for this transaction.
         self.start_meter_sampler(connector_id, transaction_id).await;
@@ -1139,6 +1180,14 @@ impl ChargePoint {
         })
         .await?;
 
+        // Transaction is wrapping up (Charging -> Finishing).
+        self.send_status_notification(
+            connector_id.value(),
+            ChargePointStatus::Finishing,
+            ChargePointErrorCode::NoError,
+        )
+        .await?;
+
         // Stop periodic MeterValues sampling for this transaction.
         self.stop_meter_sampler(transaction_id).await;
 
@@ -1160,6 +1209,14 @@ impl ChargePoint {
                     })?;
             }
         }
+
+        // Connector is free again (Finishing -> Available).
+        self.send_status_notification(
+            connector_id.value(),
+            ChargePointStatus::Available,
+            ChargePointErrorCode::NoError,
+        )
+        .await?;
 
         info!(
             "Transaction {} stopped on connector {}",
@@ -1245,32 +1302,32 @@ impl ChargePoint {
         Ok(())
     }
 
-    /// Send status notification for a connector
+    /// Send a `StatusNotification` CALL to the CSMS for a single connector and
+    /// await the (empty) CALLRESULT.
+    ///
+    /// `connector_id` is a raw `u32` rather than a [`ConnectorId`] because OCPP
+    /// 1.6J reserves connector `0` for the charge point as a whole (used for the
+    /// boot-time availability announcement), and `ConnectorId` rejects `0`.
+    ///
+    /// Ports the `StatusNotification` call from
+    /// [`ocpp/v16/call.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v16/call.py)
+    /// (OCPP 1.6J spec §3.14). The timestamp is set to `Utc::now()`.
     pub async fn send_status_notification(
         &self,
-        connector_id: ConnectorId,
+        connector_id: u32,
         status: ChargePointStatus,
-        error_code: ocpp_types::v16j::ChargePointErrorCode,
-        info: Option<String>,
-    ) -> Result<()> {
-        let request = StatusNotificationRequest {
-            connector_id: connector_id.value(),
+        error_code: ChargePointErrorCode,
+    ) -> OcppResult<()> {
+        self.call(StatusNotificationRequest {
+            connector_id,
             error_code,
-            info,
+            info: None,
             status,
             timestamp: Some(chrono::Utc::now()),
             vendor_error_code: None,
             vendor_id: None,
-        };
-
-        let message = Message::Call(ocpp_messages::CallMessage::new(
-            StatusNotificationRequest::ACTION_NAME.to_string(),
-            request,
-        )?);
-
-        if let Some(client) = self.client.read().await.as_ref() {
-            client.send_message(message).await?;
-        }
+        })
+        .await?;
 
         Ok(())
     }
@@ -1717,7 +1774,11 @@ mod tests {
     }
 
     /// Spawn a mock CSMS that routes each incoming CALL by action name and
-    /// responds with the configured payload. Unknown actions receive no reply.
+    /// responds with the configured payload. Unknown actions receive no reply,
+    /// except `StatusNotification`, which is always answered with an empty
+    /// CALLRESULT — the charge point now emits these automatically during the
+    /// boot and transaction lifecycle (Issue #28), so every connected-session
+    /// test would otherwise hang on the un-routed notification.
     ///
     /// This is the action-routing sibling of `spawn_mock_csms` — it handles
     /// messages out-of-order and can serve multiple concurrent actions (e.g.
@@ -1737,11 +1798,14 @@ mod tests {
                 while let Some(Ok(frame)) = ws.next().await {
                     if let tokio_tungstenite::tungstenite::Message::Text(text) = frame {
                         if let Ok(Message::Call(call)) = serde_json::from_str::<Message>(&text) {
-                            if let Some(payload) = routes.get(&call.action) {
+                            let payload = routes.get(&call.action).cloned().or_else(|| {
+                                (call.action == "StatusNotification").then(|| serde_json::json!({}))
+                            });
+                            if let Some(payload) = payload {
                                 let result = Message::CallResult(CallResultMessage {
                                     message_type: MessageType::CallResult,
                                     unique_id: call.unique_id,
-                                    payload: payload.clone(),
+                                    payload,
                                 });
                                 let json = serde_json::to_string(&result).unwrap();
                                 let _ = ws
@@ -2338,7 +2402,17 @@ mod tests {
                     if let tokio_tungstenite::tungstenite::Message::Text(text) = frame {
                         // Parse using the same serde schema the transport uses.
                         if let Ok(Message::Call(call)) = serde_json::from_str::<Message>(&text) {
-                            if let Some(payload) = resp_iter.next() {
+                            // Auto-answer lifecycle `StatusNotification` frames
+                            // (Issue #28) with an empty CALLRESULT without
+                            // consuming a queued response, so the ordered
+                            // `responses` stay aligned with the actions the test
+                            // actually exercises.
+                            let payload = if call.action == "StatusNotification" {
+                                Some(serde_json::json!({}))
+                            } else {
+                                resp_iter.next()
+                            };
+                            if let Some(payload) = payload {
                                 let result = Message::CallResult(CallResultMessage {
                                     message_type: MessageType::CallResult,
                                     unique_id: call.unique_id,
@@ -2469,11 +2543,18 @@ mod tests {
                         if let Ok(Message::Call(call)) = serde_json::from_str::<Message>(&text) {
                             // Record the call for the test to observe, then reply.
                             let _ = tx.send(call.clone());
-                            if let Some(payload) = routes.get(&call.action) {
+                            // Auto-answer lifecycle `StatusNotification` frames
+                            // (Issue #28) with an empty CALLRESULT so connected
+                            // sessions don't stall; they're still recorded above
+                            // and simply skipped by `recv_until_action`.
+                            let payload = routes.get(&call.action).cloned().or_else(|| {
+                                (call.action == "StatusNotification").then(|| serde_json::json!({}))
+                            });
+                            if let Some(payload) = payload {
                                 let result = Message::CallResult(CallResultMessage {
                                     message_type: MessageType::CallResult,
                                     unique_id: call.unique_id,
-                                    payload: payload.clone(),
+                                    payload,
                                 });
                                 let json = serde_json::to_string(&result).unwrap();
                                 let _ = ws
