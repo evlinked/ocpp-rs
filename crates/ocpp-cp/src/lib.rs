@@ -58,11 +58,19 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-/// AutoCharge configuration (OCPP 1.6J, no new messages).
+/// AutoCharge configuration.
+///
+/// **AutoCharge is a de-facto industry extension, not part of the OCPP
+/// specification.** It predates and differs from ISO 15118 "Plug & Charge"
+/// (which OCPP 2.0.1 supports natively); on OCPP 1.6J — which has no native
+/// Plug & Charge — it provides a "plug-in just works" experience by using the
+/// EV's MAC / EVCCID as the `idTag` over the *standard* Charge-Point-initiated
+/// `Authorize` + `StartTransaction` operations. It therefore needs **no new or
+/// AutoCharge-specific OCPP messages**.
 ///
 /// AutoCharge lets a driver start a session with no RFID card and no app tap:
 /// on plug-in the charge point identifies the vehicle by its EV MAC / EVCCID
-/// and uses that as the `idTag`, driving the *normal* `Authorize` +
+/// and uses that as the `idTag`, driving the normal `Authorize` +
 /// `StartTransaction` flow automatically.
 ///
 /// Disabled by default, so an existing simulator behaves exactly as before
@@ -123,8 +131,9 @@ pub struct ChargePointConfig {
     /// stale-but-previously-`Accepted` cached entry instead of failing safe.
     /// Defaults to `false` (fail-safe: an unreachable CSMS yields `Invalid`).
     pub offline_auth_stale_ok: bool,
-    /// AutoCharge behavior (OCPP 1.6J §5.1/§5.11 reused). Disabled by default;
-    /// see [`AutoChargeConfig`].
+    /// AutoCharge behavior — a de-facto industry extension layered on the
+    /// standard `Authorize`/`StartTransaction` operations, not an OCPP spec
+    /// feature. Disabled by default; see [`AutoChargeConfig`].
     #[serde(default)]
     pub auto_charge: AutoChargeConfig,
     /// Transport configuration (not serialized; uses Default on deserialization)
@@ -237,16 +246,18 @@ enum RemoteCommand {
         connector_id: Option<i32>,
     },
     /// AutoCharge plug-in: run the local `Authorize` + `StartTransaction` flow
-    /// with the EV-derived `id_tag` (OCPP 1.6J §5.1/§5.11). Queued from
-    /// [`ChargePoint::plug_in`] so the round-trips run off the plug-in path.
+    /// with the EV-derived `id_tag`. Uses the standard Charge-Point-initiated
+    /// operations `Authorize` (OCPP 1.6 §4.1) and `StartTransaction` (§4.8) — no
+    /// AutoCharge-specific message. Queued from [`ChargePoint::plug_in`] so the
+    /// round-trips run off the plug-in path.
     AutoStart {
         connector_id: ConnectorId,
         id_tag: String,
         meter_start: i32,
     },
-    /// AutoCharge unplug: end the matching transaction with reason
-    /// `EVDisconnected` (OCPP 1.6J §5.13). Queued from [`ChargePoint::plug_out`]
-    /// for a charging AutoCharge connector.
+    /// AutoCharge unplug: end the matching transaction with `StopTransaction`
+    /// (OCPP 1.6 §4.10) carrying reason `EVDisconnected`. Queued from
+    /// [`ChargePoint::plug_out`] for a charging AutoCharge connector.
     AutoStop { transaction_id: i32 },
 }
 

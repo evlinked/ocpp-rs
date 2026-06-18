@@ -1,11 +1,17 @@
-//! AutoCharge identifier helpers (OCPP 1.6J, no new messages).
+//! AutoCharge identifier helpers.
 //!
-//! AutoCharge lets a vehicle start a session with no RFID/app by using its
-//! **EV MAC address / EVCCID** (obtained over the HomePlug Green PHY link) as
-//! the OCPP `idTag`. The charge point and the back office must agree on the
-//! exact wire form of that derived `idTag`, so the normalization lives here in
-//! `ocpp-types` where both the CP simulator (`ocpp-cp`) and the CSMS-side
-//! recognizer/registry can share it.
+//! **AutoCharge is a de-facto industry extension, not part of the OCPP
+//! specification.** It differs from ISO 15118 "Plug & Charge" (standardized,
+//! and natively supported by OCPP 2.0.1): on OCPP 1.6J — which has no native
+//! Plug & Charge — AutoCharge lets a vehicle start a session with no RFID/app
+//! by using its **EV MAC address / EVCCID** (obtained over the HomePlug Green
+//! PHY link) as the OCPP `idTag` over the *standard* `Authorize` /
+//! `StartTransaction` operations, so it needs no new OCPP messages.
+//!
+//! The charge point and the back office must agree on the exact wire form of
+//! that derived `idTag`, so the normalization lives here in `ocpp-types` where
+//! both the CP simulator (`ocpp-cp`) and the CSMS-side recognizer/registry can
+//! share it.
 //!
 //! Canonical form: **12 uppercase hex characters**, separators (`:` / `-`) and
 //! surrounding whitespace stripped, with an optional configured vendor/operator

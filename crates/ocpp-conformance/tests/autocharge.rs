@@ -3,9 +3,10 @@
 //! AutoCharge lets a driver start a session with no RFID/app: on plug-in the
 //! charge point derives an `idTag` from the EV's MAC / EVCCID and drives the
 //! normal `Authorize` + `StartTransaction` flow; on unplug it stops the
-//! transaction with reason `EVDisconnected`. There is no `mobilityhouse/ocpp`
-//! reference — this is a feature built on the already-ported 1.6J primitives
-//! (`Authorize` §5.1, `StartTransaction` §5.11, `StopTransaction`).
+//! transaction with reason `EVDisconnected`. AutoCharge is a de-facto industry
+//! extension (not part of the OCPP spec) with no `mobilityhouse/ocpp`
+//! reference — it is built on the already-ported, standard 1.6 primitives
+//! `Authorize` (§4.1), `StartTransaction` (§4.8) and `StopTransaction` (§4.10).
 //!
 //! These tests exercise the *side effect* on a real CP <-> CSMS loopback:
 //! plugging in an AutoCharge-enabled connector with an enrolled EV must make
@@ -210,7 +211,7 @@ async fn autocharge_plug_in_starts_and_unplug_stops() {
     // Enroll the EV on connector 1.
     cp.set_ev_identifier(connector, EV_MAC).await;
 
-    // 1. Plug in: AutoCharge derives the idTag and authorizes it (§5.1).
+    // 1. Plug in: AutoCharge derives the idTag and authorizes it (§4.1).
     cp.plug_in(connector).await.expect("plug in");
     let authorized = timeout(SIDE_EFFECT_TIMEOUT, auth_rx.recv())
         .await
@@ -221,7 +222,7 @@ async fn autocharge_plug_in_starts_and_unplug_stops() {
         "Authorize carries the MAC-derived idTag"
     );
 
-    // 2. ...then starts the transaction with the same idTag (§5.11).
+    // 2. ...then starts the transaction with the same idTag (§4.8).
     let started = timeout(SIDE_EFFECT_TIMEOUT, start_rx.recv())
         .await
         .expect("CSMS observes a StartTransaction after plug-in")
