@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ocpp_cp::{ChargePoint, ChargePointConfig};
+use ocpp_cp::{ChargePoint, ChargePointConfig, FirmwareUpdateFailure};
 use ocpp_messages::v16j::{
     BootNotificationRequest, BootNotificationResponse, FirmwareStatusNotificationRequest,
     FirmwareStatusNotificationResponse, HeartbeatRequest, HeartbeatResponse, RegistrationStatus,
@@ -83,6 +83,16 @@ async fn start_csms(dispatcher: ActionDispatcher) -> (OcppServer, SocketAddr) {
 }
 
 fn cp_config(addr: SocketAddr, id: &str) -> ChargePointConfig {
+    cp_config_with_fault(addr, id, None)
+}
+
+/// `cp_config`, but with the opt-in firmware-update fault injection set so a
+/// test can drive a `DownloadFailed` / `InstallationFailed` branch (Issue #83).
+fn cp_config_with_fault(
+    addr: SocketAddr,
+    id: &str,
+    failure: Option<FirmwareUpdateFailure>,
+) -> ChargePointConfig {
     ChargePointConfig {
         charge_point_id: id.to_string(),
         central_system_url: format!("ws://{addr}"),
@@ -91,6 +101,7 @@ fn cp_config(addr: SocketAddr, id: &str) -> ChargePointConfig {
         auto_reconnect: false,
         // Keep the meter sampler quiet so it doesn't interleave with the asserts.
         meter_values_interval: 3600,
+        firmware_update_failure: failure,
         ..ChargePointConfig::default()
     }
 }
@@ -154,6 +165,123 @@ async fn csms_update_firmware_drives_update_state_machine() {
         "the CP now supports a FirmwareStatusNotification trigger"
     );
     recv_status(&mut fw_rx, FirmwareStatus::Installed).await;
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+/// Issue #83 — the firmware simulator can model a *download* failure, not just
+/// the happy path. With the opt-in `Download` fault set, an `UpdateFirmware`
+/// drives `Downloading → DownloadFailed` (installation never attempted), and
+/// the failed status is retained so a later
+/// `TriggerMessage(FirmwareStatusNotification)` reports `DownloadFailed`.
+#[tokio::test]
+async fn csms_update_firmware_download_failure_is_observable() {
+    let cp_id = "CP_FW_DL_FAIL_01";
+    let (fw_tx, mut fw_rx) = mpsc::unbounded_channel();
+    let (mut server, addr) = start_csms(recording_csms_dispatcher(fw_tx)).await;
+
+    // A charge point whose firmware download will fail.
+    let cp = ChargePoint::new(cp_config_with_fault(
+        addr,
+        cp_id,
+        Some(FirmwareUpdateFailure::Download),
+    ))
+    .expect("build charge point");
+    cp.connect().await.expect("connect + boot sequence");
+    assert!(
+        server.is_cp_connected(cp_id),
+        "the CSMS must be able to route CALLs to the booted CP"
+    );
+
+    // UpdateFirmware is still accepted (empty conf per spec); only the simulated
+    // download fails partway through.
+    server
+        .update_firmware(
+            cp_id,
+            "ftp://example.test/firmware.bin",
+            chrono::Utc::now(),
+            None,
+            None,
+        )
+        .await
+        .expect("update_firmware resolves");
+
+    // The download stage reports Downloading then DownloadFailed, in order, and
+    // the update stops there — Installing/Installed are never sent.
+    recv_status(&mut fw_rx, FirmwareStatus::Downloading).await;
+    recv_status(&mut fw_rx, FirmwareStatus::DownloadFailed).await;
+
+    // The failed status is retained: a trigger reports the *current* status
+    // (DownloadFailed) without re-running the update.
+    let status = server
+        .trigger_message(cp_id, MessageTrigger::FirmwareStatusNotification, None)
+        .await
+        .expect("trigger_message(Firmware) resolves");
+    assert_eq!(
+        status,
+        TriggerMessageStatus::Accepted,
+        "the CP supports a FirmwareStatusNotification trigger after a failed download"
+    );
+    recv_status(&mut fw_rx, FirmwareStatus::DownloadFailed).await;
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+/// Issue #83 — the firmware simulator can model an *installation* failure. With
+/// the opt-in `Installation` fault set, an `UpdateFirmware` drives
+/// `Downloading → Downloaded → Installing → InstallationFailed`, and the failed
+/// status is retained so a later `TriggerMessage(FirmwareStatusNotification)`
+/// reports `InstallationFailed`.
+#[tokio::test]
+async fn csms_update_firmware_installation_failure_is_observable() {
+    let cp_id = "CP_FW_INST_FAIL_01";
+    let (fw_tx, mut fw_rx) = mpsc::unbounded_channel();
+    let (mut server, addr) = start_csms(recording_csms_dispatcher(fw_tx)).await;
+
+    // A charge point whose firmware installation will fail (download succeeds).
+    let cp = ChargePoint::new(cp_config_with_fault(
+        addr,
+        cp_id,
+        Some(FirmwareUpdateFailure::Installation),
+    ))
+    .expect("build charge point");
+    cp.connect().await.expect("connect + boot sequence");
+    assert!(
+        server.is_cp_connected(cp_id),
+        "the CSMS must be able to route CALLs to the booted CP"
+    );
+
+    server
+        .update_firmware(
+            cp_id,
+            "ftp://example.test/firmware.bin",
+            chrono::Utc::now(),
+            None,
+            None,
+        )
+        .await
+        .expect("update_firmware resolves");
+
+    // Download succeeds, then installation fails: the CSMS observes the full
+    // Downloading → Downloaded → Installing → InstallationFailed progression.
+    recv_status(&mut fw_rx, FirmwareStatus::Downloading).await;
+    recv_status(&mut fw_rx, FirmwareStatus::Downloaded).await;
+    recv_status(&mut fw_rx, FirmwareStatus::Installing).await;
+    recv_status(&mut fw_rx, FirmwareStatus::InstallationFailed).await;
+
+    // The failed status is retained: a trigger reports InstallationFailed.
+    let status = server
+        .trigger_message(cp_id, MessageTrigger::FirmwareStatusNotification, None)
+        .await
+        .expect("trigger_message(Firmware) resolves");
+    assert_eq!(
+        status,
+        TriggerMessageStatus::Accepted,
+        "the CP supports a FirmwareStatusNotification trigger after a failed install"
+    );
+    recv_status(&mut fw_rx, FirmwareStatus::InstallationFailed).await;
 
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");

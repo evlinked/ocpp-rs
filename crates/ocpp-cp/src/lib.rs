@@ -113,6 +113,13 @@ pub struct ChargePointConfig {
     /// fails, not just one that succeeds. Defaults to `false` (happy path);
     /// the failure path is strictly opt-in so existing behavior is unchanged.
     pub diagnostics_upload_should_fail: bool,
+    /// Fault injection for the simulated firmware update (`UpdateFirmware`,
+    /// OCPP 1.6J §4.x). `None` (the default) runs the happy path
+    /// (`Downloading → Downloaded → Installing → Installed`); `Some(stage)`
+    /// makes that stage fail instead, so a CSMS / back office can be exercised
+    /// against a firmware rollout that fails, not just one that succeeds. The
+    /// failure path is strictly opt-in so existing behavior is unchanged.
+    pub firmware_update_failure: Option<FirmwareUpdateFailure>,
     /// Transport configuration (not serialized; uses Default on deserialization)
     #[serde(skip)]
     pub transport_config: TransportConfig,
@@ -147,9 +154,25 @@ impl Default for ChargePointConfig {
             auth_cache_ttl: 24 * 60 * 60, // 24 hours
             offline_auth_stale_ok: false,
             diagnostics_upload_should_fail: false,
+            firmware_update_failure: None,
             transport_config: TransportConfig::default(),
         }
     }
+}
+
+/// Which stage of a simulated firmware update should fail, for fault injection
+/// (Issue #83). The two stages are the two failure points of the OCPP 1.6J
+/// firmware-update state machine and are mutually exclusive — a download that
+/// fails never reaches installation. See
+/// [`ChargePointConfig::firmware_update_failure`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FirmwareUpdateFailure {
+    /// Fail during download: `Downloading → DownloadFailed`. The update stops;
+    /// installation is never attempted.
+    Download,
+    /// Fail during installation: `Downloading → Downloaded → Installing →
+    /// InstallationFailed`.
+    Installation,
 }
 
 /// Charge point events
@@ -2067,21 +2090,44 @@ impl ChargePoint {
     /// update on a short timer, stepping through the happy-path sequence the
     /// spec defines — `Downloading` → `Downloaded` → `Installing` →
     /// `Installed` — announcing each step. (`UpdateFirmware.req`'s `retrieveDate`
-    /// scheduling and the `DownloadFailed`/`InstallationFailed` error paths are
-    /// out of scope for the simulator.) The latest status is retained so a
-    /// subsequent `TriggerMessage(FirmwareStatusNotification)` reports it.
-    /// Mirrors the progress reporting in the Python reference's
+    /// scheduling is out of scope for the simulator.) The latest status is
+    /// retained so a subsequent `TriggerMessage(FirmwareStatusNotification)`
+    /// reports it. Mirrors the progress reporting in the Python reference's
     /// [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py).
+    ///
+    /// With [`ChargePointConfig::firmware_update_failure`] set (opt-in fault
+    /// injection) the chosen stage fails instead: `Some(Download)` stops at
+    /// `Downloading → DownloadFailed` (installation never attempted), and
+    /// `Some(Installation)` proceeds to `Installing` then reports
+    /// `InstallationFailed`. The failed status is retained like any other, so a
+    /// CSMS can be tested against a firmware rollout that fails (OCPP 1.6J §4.x;
+    /// `FirmwareStatus`).
     async fn run_firmware_update(&self) {
         self.set_firmware_status(FirmwareStatus::Downloading).await;
-        for status in [
-            FirmwareStatus::Downloaded,
-            FirmwareStatus::Installing,
-            FirmwareStatus::Installed,
-        ] {
-            tokio::time::sleep(FIRMWARE_UPDATE_STEP_DURATION).await;
-            self.set_firmware_status(status).await;
+        tokio::time::sleep(FIRMWARE_UPDATE_STEP_DURATION).await;
+
+        // Download-stage terminal: a download failure stops the update here and
+        // never attempts installation.
+        if self.config.firmware_update_failure == Some(FirmwareUpdateFailure::Download) {
+            self.set_firmware_status(FirmwareStatus::DownloadFailed)
+                .await;
+            return;
         }
+        self.set_firmware_status(FirmwareStatus::Downloaded).await;
+
+        tokio::time::sleep(FIRMWARE_UPDATE_STEP_DURATION).await;
+        self.set_firmware_status(FirmwareStatus::Installing).await;
+        tokio::time::sleep(FIRMWARE_UPDATE_STEP_DURATION).await;
+
+        // Install-stage terminal: `Installed` on the happy path, or
+        // `InstallationFailed` when install fault injection is on.
+        let terminal =
+            if self.config.firmware_update_failure == Some(FirmwareUpdateFailure::Installation) {
+                FirmwareStatus::InstallationFailed
+            } else {
+                FirmwareStatus::Installed
+            };
+        self.set_firmware_status(terminal).await;
     }
 
     /// Record `status` as the CP's current firmware status and announce it to
