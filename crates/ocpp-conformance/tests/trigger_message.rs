@@ -10,8 +10,8 @@
 //!      observes a fresh `BootNotification` CALL from the CP.
 //!   2. `trigger_message(StatusNotification, Some(1))` → `Accepted`, and the
 //!      CSMS observes a `StatusNotification` scoped to connector 1.
-//!   3. `trigger_message(DiagnosticsStatusNotification)` → `NotImplemented`
-//!      (a message this CP cannot produce), and nothing is sent.
+//!   3. `trigger_message(FirmwareStatusNotification)` → `NotImplemented`
+//!      (a message this CP cannot produce yet), and nothing is sent.
 //!
 //! Rust counterpart of the Python reference's central system driving
 //! `TriggerMessage`
@@ -181,10 +181,13 @@ async fn csms_trigger_message_drives_cp_to_send_requested_messages() {
     );
 
     // 3. Trigger an unsupported message → NotImplemented, and nothing is sent.
+    //    `FirmwareStatusNotification` has no state machine yet (that's #70);
+    //    `DiagnosticsStatusNotification` is now supported (#69) and is covered
+    //    in `diagnostics.rs`.
     let status = server
-        .trigger_message(cp_id, MessageTrigger::DiagnosticsStatusNotification, None)
+        .trigger_message(cp_id, MessageTrigger::FirmwareStatusNotification, None)
         .await
-        .expect("trigger_message(Diagnostics) resolves");
+        .expect("trigger_message(Firmware) resolves");
     assert_eq!(
         status,
         TriggerMessageStatus::NotImplemented,

@@ -24,12 +24,13 @@ use ocpp_messages::v16j::{
     AuthorizeRequest, BootNotificationRequest, BootNotificationResponse, CancelReservationRequest,
     CancelReservationResponse, ChangeAvailabilityRequest, ChangeAvailabilityResponse,
     ChangeConfigurationRequest, ChangeConfigurationResponse, ClearCacheRequest, ClearCacheResponse,
-    DataTransferRequest, DataTransferResponse, GetConfigurationRequest, GetConfigurationResponse,
-    HeartbeatRequest, MeterValuesRequest, RegistrationStatus, RemoteStartTransactionRequest,
-    RemoteStartTransactionResponse, RemoteStopTransactionRequest, RemoteStopTransactionResponse,
-    ReserveNowRequest, ReserveNowResponse, ResetRequest, ResetResponse, StartTransactionRequest,
-    StatusNotificationRequest, StopTransactionRequest, TriggerMessageRequest,
-    TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse,
+    DataTransferRequest, DataTransferResponse, DiagnosticsStatusNotificationRequest,
+    GetConfigurationRequest, GetConfigurationResponse, GetDiagnosticsRequest,
+    GetDiagnosticsResponse, HeartbeatRequest, MeterValuesRequest, RegistrationStatus,
+    RemoteStartTransactionRequest, RemoteStartTransactionResponse, RemoteStopTransactionRequest,
+    RemoteStopTransactionResponse, ReserveNowRequest, ReserveNowResponse, ResetRequest,
+    ResetResponse, StartTransactionRequest, StatusNotificationRequest, StopTransactionRequest,
+    TriggerMessageRequest, TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse,
 };
 use ocpp_messages::{
     ActionDispatcher, CallMessage, Message, MessageType, OcppAction, SchemaValidator,
@@ -43,7 +44,7 @@ use ocpp_types::common::{
 };
 use ocpp_types::v16j::{
     CancelReservationStatus, ChargePointErrorCode, ChargePointStatus, ChargePointVendorInfo,
-    ClearCacheStatus, ConfigurationStatus, DataTransferStatus, MessageTrigger,
+    ClearCacheStatus, ConfigurationStatus, DataTransferStatus, DiagnosticsStatus, MessageTrigger,
     RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus,
     UnlockStatus,
 };
@@ -211,15 +212,20 @@ enum RemoteCommand {
         requested_message: MessageTrigger,
         connector_id: Option<i32>,
     },
+    /// Run the simulated diagnostics-upload state machine for an `Accepted`
+    /// `GetDiagnostics` (OCPP 1.6J §4.x, firmware-management profile). Emits
+    /// `DiagnosticsStatusNotification(Uploading)` then `Uploaded`.
+    GetDiagnostics,
 }
 
 /// Whether this charge point can proactively produce `message` on a
 /// `TriggerMessage` request (OCPP 1.6J §4.x).
 ///
-/// `BootNotification`, `Heartbeat`, `StatusNotification`, and on-demand
-/// `MeterValues` are wired; the firmware/diagnostics notifications are not
-/// features this CP implements yet and return `NotImplemented` until their
-/// state machines (`UpdateFirmware` / `GetDiagnostics`) land.
+/// `BootNotification`, `Heartbeat`, `StatusNotification`, on-demand
+/// `MeterValues`, and `DiagnosticsStatusNotification` (the CP tracks a
+/// diagnostics-upload status from `GetDiagnostics`) are wired;
+/// `FirmwareStatusNotification` is not a feature this CP implements yet and
+/// returns `NotImplemented` until the `UpdateFirmware` state machine lands.
 fn trigger_message_supported(message: &MessageTrigger) -> bool {
     matches!(
         message,
@@ -227,8 +233,14 @@ fn trigger_message_supported(message: &MessageTrigger) -> bool {
             | MessageTrigger::Heartbeat
             | MessageTrigger::StatusNotification
             | MessageTrigger::MeterValues
+            | MessageTrigger::DiagnosticsStatusNotification
     )
 }
+
+/// How long the simulated diagnostics upload "takes" between the
+/// `Uploading` and `Uploaded` `DiagnosticsStatusNotification`s. Short so the
+/// simulator stays responsive; the CP has no real archive to upload.
+const DIAGNOSTICS_UPLOAD_DURATION: Duration = Duration::from_millis(200);
 
 /// Charge point event handler trait
 #[async_trait::async_trait]
@@ -394,6 +406,12 @@ pub struct ChargePoint {
     /// aborted by [`stop`](Self::stop) to break that cycle and free the shared
     /// state, exactly like the heartbeat task.
     command_consumer: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
+    /// Current diagnostics-upload status (OCPP 1.6J §4.x). Starts `Idle`;
+    /// driven through `Uploading` → `Uploaded` by the simulated upload a
+    /// `GetDiagnostics` kicks off. Read on demand by
+    /// `TriggerMessage(DiagnosticsStatusNotification)` to report the latest
+    /// status without re-running the upload.
+    diagnostics_status: Arc<RwLock<DiagnosticsStatus>>,
 }
 
 impl ChargePoint {
@@ -473,6 +491,7 @@ impl ChargePoint {
             auth_cache,
             command_receiver: Arc::new(RwLock::new(Some(command_receiver))),
             command_consumer: Arc::new(RwLock::new(None)),
+            diagnostics_status: Arc::new(RwLock::new(DiagnosticsStatus::Idle)),
         })
     }
 
@@ -700,6 +719,34 @@ impl ChargePoint {
                         TriggerMessageStatus::NotImplemented
                     };
                     Ok(TriggerMessageResponse { status })
+                }
+            });
+        }
+
+        // GetDiagnostics — acknowledge with the file name the CP would upload,
+        // then run the diagnostics-upload state machine as a real side effect
+        // (OCPP 1.6J §4.x, firmware-management profile). Like Reset, the upload
+        // is queued on the command channel and run by the consumer task spawned
+        // in `connect()`, so the GetDiagnostics CALLRESULT is flushed before the
+        // first `DiagnosticsStatusNotification` and the receive loop never
+        // re-enters itself. The simulator has no real archive, so it reports a
+        // generated `fileName` and drives Uploading → Uploaded on a timer. If
+        // the consumer has gone away (CP shutting down), the upload cannot run,
+        // so we omit the file name rather than promise an upload that won't
+        // happen.
+        {
+            let command_sender = command_sender.clone();
+            d.on(move |_req: GetDiagnosticsRequest| {
+                let command_sender = command_sender.clone();
+                async move {
+                    let file_name = match command_sender.send(RemoteCommand::GetDiagnostics) {
+                        Ok(()) => Some(format!(
+                            "diagnostics-{}.tar.gz",
+                            chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
+                        )),
+                        Err(_) => None,
+                    };
+                    Ok(GetDiagnosticsResponse { file_name })
                 }
             });
         }
@@ -944,6 +991,9 @@ impl ChargePoint {
                         } => {
                             cp.send_triggered_message(requested_message, connector_id)
                                 .await;
+                        }
+                        RemoteCommand::GetDiagnostics => {
+                            cp.run_diagnostics_upload().await;
                         }
                     }
                 }
@@ -1816,9 +1866,57 @@ impl ChargePoint {
             MessageTrigger::MeterValues => {
                 self.trigger_meter_values(connector_id).await;
             }
+            MessageTrigger::DiagnosticsStatusNotification => {
+                // Report the CP's *current* diagnostics status on demand without
+                // disturbing any in-flight upload (Idle when no GetDiagnostics
+                // has run). Closes the deferred half of Issue #65.
+                let status = *self.diagnostics_status.read().await;
+                self.send_diagnostics_status_notification(status).await;
+            }
             other => {
                 warn!("TriggerMessage({other:?}): not implemented, ignoring");
             }
+        }
+    }
+
+    /// Run the simulated diagnostics-upload state machine for an `Accepted`
+    /// `GetDiagnostics` (OCPP 1.6J §4.x, firmware-management profile).
+    ///
+    /// Invoked only from the command-consumer task (see [`connect`](Self::connect)),
+    /// never inline in the inbound-CALL handler, so the `GetDiagnostics`
+    /// CALLRESULT is flushed before the first `DiagnosticsStatusNotification`
+    /// and there is no receive-loop re-entrancy/deadlock.
+    ///
+    /// The simulator has no real archive to upload, so it models the upload on
+    /// a short timer: report `Uploading`, wait [`DIAGNOSTICS_UPLOAD_DURATION`],
+    /// then report `Uploaded`. The latest status is retained so a subsequent
+    /// `TriggerMessage(DiagnosticsStatusNotification)` reports it. Mirrors the
+    /// progress reporting in the Python reference's
+    /// [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py).
+    async fn run_diagnostics_upload(&self) {
+        self.set_diagnostics_status(DiagnosticsStatus::Uploading)
+            .await;
+        tokio::time::sleep(DIAGNOSTICS_UPLOAD_DURATION).await;
+        self.set_diagnostics_status(DiagnosticsStatus::Uploaded)
+            .await;
+    }
+
+    /// Record `status` as the CP's current diagnostics status and announce it to
+    /// the CSMS with a `DiagnosticsStatusNotification`.
+    async fn set_diagnostics_status(&self, status: DiagnosticsStatus) {
+        *self.diagnostics_status.write().await = status;
+        self.send_diagnostics_status_notification(status).await;
+    }
+
+    /// Send a single `DiagnosticsStatusNotification(status)` CALL to the CSMS
+    /// (OCPP 1.6J §4.x). Does not mutate the stored status — callers that change
+    /// state use [`set_diagnostics_status`](Self::set_diagnostics_status).
+    async fn send_diagnostics_status_notification(&self, status: DiagnosticsStatus) {
+        if let Err(e) = self
+            .call(DiagnosticsStatusNotificationRequest { status })
+            .await
+        {
+            warn!("DiagnosticsStatusNotification({status:?}): send failed: {e}");
         }
     }
 
@@ -2121,10 +2219,11 @@ mod tests {
     // --- dispatcher wiring tests ---
 
     #[tokio::test]
-    async fn dispatcher_has_12_default_handlers() {
+    async fn dispatcher_has_13_default_handlers() {
         let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
-        // 10 core CSMS→CP handlers + ReserveNow + CancelReservation (§5.14/§5.4).
-        assert_eq!(cp.handler_count().await, 12);
+        // 10 Core Profile actions + GetDiagnostics (firmware-management, #69)
+        // + ReserveNow + CancelReservation (§5.14/§5.4, #71).
+        assert_eq!(cp.handler_count().await, 13);
     }
 
     #[tokio::test]
