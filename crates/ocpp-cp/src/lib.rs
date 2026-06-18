@@ -275,6 +275,18 @@ enum RemoteCommand {
         connector_id: ConnectorId,
         status: ChargePointStatus,
     },
+    /// Auto-free a reservation whose `expiryDate` has passed (OCPP 1.6J §5.14,
+    /// Issue #85). Queued by the per-reservation expiry timer armed on an
+    /// `Accepted` `ReserveNow`. Carries the `connector_id` the timer was armed
+    /// for so a stale fire — e.g. the `reservationId` was reused for a
+    /// *different* connector after a `CancelReservation` — is ignored rather
+    /// than freeing the wrong connector. The actual free + `StatusNotification`
+    /// run here (off the inbound-CALL path) for the same anti-re-entrancy reason
+    /// as the other side effects.
+    ExpireReservation {
+        reservation_id: i32,
+        connector_id: ConnectorId,
+    },
 }
 
 /// Whether this charge point can proactively produce `message` on a
@@ -449,6 +461,16 @@ pub struct ChargePoint {
     /// `CancelReservation`, and emptied for a connector when a transaction
     /// starts on it (a start consumes the reservation).
     reservations: Arc<RwLock<HashMap<i32, ConnectorId>>>,
+    /// Pending reservation auto-expiry timers, keyed by `reservationId` (OCPP
+    /// 1.6J §5.14, Issue #85). On an `Accepted` `ReserveNow` a task is armed to
+    /// sleep until `expiryDate` then queue [`RemoteCommand::ExpireReservation`],
+    /// freeing the connector if the hold is still live. Disarmed (aborted +
+    /// dropped) when a `CancelReservation` or a start consumes the reservation,
+    /// and on `stop`/reset via
+    /// [`quiesce_background_tasks`](Self::quiesce_background_tasks), so a stale
+    /// timer can never double-free or fire on a connector that has since moved
+    /// on.
+    reservation_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
     /// Shared schema validator (when `config.validate_payloads`). Backs both
     /// the dispatcher's incoming-CALL validation and `call()`'s CALLRESULT
     /// validation. `None` when validation is disabled.
@@ -532,6 +554,7 @@ impl ChargePoint {
         let connectors = Arc::new(RwLock::new(connectors));
         let active_transactions = Arc::new(RwLock::new(HashMap::new()));
         let reservations = Arc::new(RwLock::new(HashMap::new()));
+        let reservation_timers = Arc::new(RwLock::new(HashMap::new()));
 
         let config_store = Arc::new(RwLock::new(ConfigurationStore::new()));
         let mut dispatcher = Self::build_default_dispatcher(
@@ -541,6 +564,7 @@ impl ChargePoint {
             connectors.clone(),
             active_transactions.clone(),
             reservations.clone(),
+            reservation_timers.clone(),
         );
         if let Some(v) = &validator {
             dispatcher = dispatcher.with_validator(v.clone());
@@ -560,6 +584,7 @@ impl ChargePoint {
             heartbeat_handle: Arc::new(RwLock::new(None)),
             active_transactions,
             reservations,
+            reservation_timers,
             validator,
             meter_sampler_handles: Arc::new(RwLock::new(HashMap::new())),
             auth_cache,
@@ -583,6 +608,7 @@ impl ChargePoint {
         connectors: Arc<RwLock<HashMap<ConnectorId, Connector>>>,
         active_transactions: Arc<RwLock<HashMap<i32, ConnectorId>>>,
         reservations: Arc<RwLock<HashMap<i32, ConnectorId>>>,
+        reservation_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
     ) -> ActionDispatcher {
         let mut d = ActionDispatcher::new();
 
@@ -871,10 +897,12 @@ impl ChargePoint {
         {
             let connectors = connectors.clone();
             let reservations = reservations.clone();
+            let reservation_timers = reservation_timers.clone();
             let command_sender = command_sender.clone();
             d.on(move |req: ReserveNowRequest| {
                 let connectors = connectors.clone();
                 let reservations = reservations.clone();
+                let reservation_timers = reservation_timers.clone();
                 let command_sender = command_sender.clone();
                 async move {
                     let status = match ConnectorId::new(req.connector_id as u32) {
@@ -891,12 +919,53 @@ impl ChargePoint {
                                             // already Accepted; a dropped
                                             // notification (consumer gone, CP
                                             // shutting down) must not undo it.
+                                            // Enqueued *before* arming the timer
+                                            // so that a past-dated expiry (zero
+                                            // delay → immediate fire) still emits
+                                            // Reserved before the Available the
+                                            // expiry produces — the command
+                                            // channel preserves send order.
                                             let _ = command_sender.send(
                                                 RemoteCommand::EmitConnectorStatus {
                                                     connector_id: cid,
                                                     status: ChargePointStatus::Reserved,
                                                 },
                                             );
+                                            // Arm the auto-expiry timer (Issue
+                                            // #85): sleep until expiryDate, then
+                                            // queue ExpireReservation to free the
+                                            // connector if the hold is still
+                                            // live. A past/now expiryDate yields
+                                            // a zero delay (`to_std` errors on a
+                                            // negative span) and fires
+                                            // immediately, so a stale reservation
+                                            // frees right away. The send is
+                                            // best-effort — a gone consumer just
+                                            // means no expiry, never a panic.
+                                            let delay = (req.expiry_date - chrono::Utc::now())
+                                                .to_std()
+                                                .unwrap_or(Duration::ZERO);
+                                            let reservation_id = req.reservation_id;
+                                            let timer_sender = command_sender.clone();
+                                            let handle = tokio::spawn(async move {
+                                                tokio::time::sleep(delay).await;
+                                                let _ = timer_sender.send(
+                                                    RemoteCommand::ExpireReservation {
+                                                        reservation_id,
+                                                        connector_id: cid,
+                                                    },
+                                                );
+                                            });
+                                            // Replace (and abort) any prior timer
+                                            // for this reservationId — defensive
+                                            // against a CSMS reusing an id.
+                                            if let Some(prev) = reservation_timers
+                                                .write()
+                                                .await
+                                                .insert(req.reservation_id, handle)
+                                            {
+                                                prev.abort();
+                                            }
                                             ReservationStatus::Accepted
                                         }
                                         Err(_) => ReservationStatus::Rejected,
@@ -932,15 +1001,28 @@ impl ChargePoint {
         {
             let connectors = connectors.clone();
             let reservations = reservations.clone();
+            let reservation_timers = reservation_timers.clone();
             let command_sender = command_sender.clone();
             d.on(move |req: CancelReservationRequest| {
                 let connectors = connectors.clone();
                 let reservations = reservations.clone();
+                let reservation_timers = reservation_timers.clone();
                 let command_sender = command_sender.clone();
                 async move {
                     let held = reservations.write().await.remove(&req.reservation_id);
                     let status = match held {
                         Some(cid) => {
+                            // Disarm the pending auto-expiry timer (Issue #85) so
+                            // it cannot later double-free the connector. Aborting
+                            // closes the race window in all but a vanishingly
+                            // narrow case (the timer already sent its command);
+                            // the ExpireReservation handler's own
+                            // still-held/same-connector guard covers that tail.
+                            if let Some(handle) =
+                                reservation_timers.write().await.remove(&req.reservation_id)
+                            {
+                                handle.abort();
+                            }
                             if let Some(mut connector) = connectors.read().await.get(&cid).cloned()
                             {
                                 let was_reserved =
@@ -1149,6 +1231,12 @@ impl ChargePoint {
                                     connector_id.value()
                                 );
                             }
+                        }
+                        RemoteCommand::ExpireReservation {
+                            reservation_id,
+                            connector_id,
+                        } => {
+                            cp.expire_reservation(reservation_id, connector_id).await;
                         }
                     }
                 }
@@ -1687,11 +1775,29 @@ impl ChargePoint {
 
         // A start on a reserved connector consumes its reservation (OCPP 1.6J
         // §5.14): drop any reservation held on this connector so a later
-        // CancelReservation for it is correctly Rejected.
-        self.reservations
-            .write()
-            .await
-            .retain(|_, cid| *cid != connector_id);
+        // CancelReservation for it is correctly Rejected, and disarm its
+        // pending auto-expiry timer so it can't free a connector that has since
+        // moved on to Charging (Issue #85).
+        let consumed: Vec<i32> = {
+            let mut reservations = self.reservations.write().await;
+            let consumed: Vec<i32> = reservations
+                .iter()
+                .filter(|(_, cid)| **cid == connector_id)
+                .map(|(rid, _)| *rid)
+                .collect();
+            for rid in &consumed {
+                reservations.remove(rid);
+            }
+            consumed
+        };
+        if !consumed.is_empty() {
+            let mut timers = self.reservation_timers.write().await;
+            for rid in &consumed {
+                if let Some(handle) = timers.remove(rid) {
+                    handle.abort();
+                }
+            }
+        }
 
         // Transition connector to Charging
         {
@@ -1807,7 +1913,65 @@ impl ChargePoint {
         Ok(())
     }
 
-    /// Abort the heartbeat task and every periodic `MeterValues` sampler.
+    /// Free a reservation whose `expiryDate` has passed (OCPP 1.6J §5.14, Issue
+    /// #85). Invoked only from the command-consumer task via
+    /// [`RemoteCommand::ExpireReservation`], never inline in an inbound-CALL
+    /// handler, so the outbound `StatusNotification` does not re-enter the
+    /// receive loop.
+    ///
+    /// Idempotent and race-safe: it acts only if `reservation_id` is *still*
+    /// held on `connector_id`. A `CancelReservation` or a start that already
+    /// removed the hold — or a `reservationId` reused for a *different*
+    /// connector — makes this a no-op, so the timer can never double-free or
+    /// free the wrong connector. The connector is freed (→ `Available`) only if
+    /// it is still `Reserved`, mirroring `CancelReservation`.
+    async fn expire_reservation(&self, reservation_id: i32, connector_id: ConnectorId) {
+        // Claim the reservation atomically: only proceed if it is still held on
+        // the connector this timer was armed for.
+        {
+            let mut reservations = self.reservations.write().await;
+            match reservations.get(&reservation_id) {
+                Some(cid) if *cid == connector_id => {
+                    reservations.remove(&reservation_id);
+                }
+                // Already cancelled / consumed by a start, or the id was reused
+                // for another connector → nothing to expire.
+                _ => return,
+            }
+        }
+        // Our timer has fired; drop its (now-finished) handle.
+        self.reservation_timers
+            .write()
+            .await
+            .remove(&reservation_id);
+
+        // Free the connector if it is still Reserved, then announce it — exactly
+        // as CancelReservation does. If the connector has moved on (e.g.
+        // Faulted) we still dropped the stale hold above but emit nothing.
+        if let Some(mut connector) = self.connectors.read().await.get(&connector_id).cloned() {
+            let was_reserved = connector.status().await == ChargePointStatus::Reserved;
+            let _ = connector.cancel_reservation().await;
+            if was_reserved {
+                if let Err(e) = self
+                    .send_status_notification(
+                        connector_id.value(),
+                        ChargePointStatus::Available,
+                        ChargePointErrorCode::NoError,
+                    )
+                    .await
+                {
+                    warn!(
+                        "reservation {reservation_id} expiry StatusNotification(Available) for \
+                         connector {} failed: {e}",
+                        connector_id.value()
+                    );
+                }
+            }
+        }
+    }
+
+    /// Abort the heartbeat task, every periodic `MeterValues` sampler, and every
+    /// pending reservation auto-expiry timer.
     ///
     /// Shared by [`stop`](Self::stop) and the reset path: both need to silence
     /// the background emitters before the connection is torn down or re-booted,
@@ -1818,6 +1982,11 @@ impl ChargePoint {
             handle.abort();
         }
         for (_txn_id, handle) in self.meter_sampler_handles.write().await.drain() {
+            handle.abort();
+        }
+        // Silence reservation expiry timers (Issue #85) so a hold can't auto-free
+        // after the connection is gone or across a reset's re-boot.
+        for (_res_id, handle) in self.reservation_timers.write().await.drain() {
             handle.abort();
         }
     }
