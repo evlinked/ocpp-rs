@@ -18,16 +18,17 @@ use axum::{
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use ocpp_messages::v16j::{
-    ChangeConfigurationRequest, ClearCacheRequest, GetConfigurationRequest,
-    GetConfigurationResponse, RemoteStartTransactionRequest, RemoteStopTransactionRequest,
-    ResetRequest, StatusNotificationRequest, TriggerMessageRequest,
+    CancelReservationRequest, ChangeConfigurationRequest, ClearCacheRequest,
+    GetConfigurationRequest, GetConfigurationResponse, RemoteStartTransactionRequest,
+    RemoteStopTransactionRequest, ReserveNowRequest, ResetRequest, StatusNotificationRequest,
+    TriggerMessageRequest,
 };
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
 use ocpp_types::v16j::{
-    ClearCacheStatus, ConfigurationStatus, MessageTrigger, RemoteStartStopStatus, ResetStatus,
-    ResetType, TriggerMessageStatus,
+    CancelReservationStatus, ClearCacheStatus, ConfigurationStatus, MessageTrigger,
+    RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus,
 };
-use ocpp_types::{CallErrorCode, OcppError, OcppResult};
+use ocpp_types::{CallErrorCode, DateTime, OcppError, OcppResult, Utc};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{error, info, warn};
@@ -450,6 +451,62 @@ impl OcppServer {
     /// [`OcppError::CpNotConnected`], [`OcppError::Timeout`]).
     pub async fn clear_cache(&self, cp_id: &str) -> OcppResult<ClearCacheStatus> {
         let resp = self.call(cp_id, ClearCacheRequest {}).await?;
+        Ok(resp.status)
+    }
+
+    /// Reserve a connector on a connected charge point until `expiry_date`.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `ReserveNow` command (§5.14), mirroring how the Python reference's
+    /// central system drives it
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    ///
+    /// `connector_id` is the connector to reserve; `reservation_id` is the
+    /// caller-chosen id used later to [`cancel_reservation`](Self::cancel_reservation).
+    /// Returns the CP's [`ReservationStatus`] — `Accepted` when the connector is
+    /// held, or `Occupied` / `Faulted` / `Unavailable` / `Rejected` per the
+    /// connector's state. Errors propagate from [`call`](Self::call) (e.g.
+    /// [`OcppError::CpNotConnected`], [`OcppError::Timeout`]).
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reserve_now(
+        &self,
+        cp_id: &str,
+        connector_id: i32,
+        id_tag: impl Into<String>,
+        expiry_date: DateTime<Utc>,
+        reservation_id: i32,
+        parent_id_tag: Option<String>,
+    ) -> OcppResult<ReservationStatus> {
+        let resp = self
+            .call(
+                cp_id,
+                ReserveNowRequest {
+                    connector_id,
+                    expiry_date,
+                    id_tag: id_tag.into(),
+                    reservation_id,
+                    parent_id_tag,
+                },
+            )
+            .await?;
+        Ok(resp.status)
+    }
+
+    /// Cancel a reservation on a connected charge point by `reservation_id`.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `CancelReservation` command (§5.4). Returns the CP's
+    /// [`CancelReservationStatus`] — `Accepted` if the CP held that reservation
+    /// (the connector is freed), `Rejected` if the id is unknown. Errors
+    /// propagate from [`call`](Self::call).
+    pub async fn cancel_reservation(
+        &self,
+        cp_id: &str,
+        reservation_id: i32,
+    ) -> OcppResult<CancelReservationStatus> {
+        let resp = self
+            .call(cp_id, CancelReservationRequest { reservation_id })
+            .await?;
         Ok(resp.status)
     }
 
