@@ -30,6 +30,7 @@ use ocpp_types::v16j::{
     CancelReservationStatus, ChargePointStatus, RemoteStartStopStatus, ReservationStatus,
 };
 use ocpp_types::ConnectorId;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 const TXN_ID: i32 = 99;
@@ -85,6 +86,56 @@ async fn start_csms() -> (OcppServer, SocketAddr) {
     server.start("127.0.0.1:0").await.expect("server start");
     let addr = server.local_addr().expect("server local addr");
     (server, addr)
+}
+
+/// A CSMS dispatcher that records every `StatusNotification` (connectorId,
+/// status) the CP sends, so a test can assert the reservation transitions
+/// (`Reserved` / `Available`, Issue #80) actually reach the CSMS rather than
+/// only changing the connector's local state.
+fn recording_csms_dispatcher(
+    status_tx: mpsc::UnboundedSender<(u32, ChargePointStatus)>,
+) -> ActionDispatcher {
+    let mut d = csms_dispatcher();
+    // Override the no-op StatusNotification handler with a recording one.
+    d.on(move |req: StatusNotificationRequest| {
+        let status_tx = status_tx.clone();
+        async move {
+            let _ = status_tx.send((req.connector_id, req.status));
+            Ok(StatusNotificationResponse {})
+        }
+    });
+    d
+}
+
+async fn start_recording_csms(dispatcher: ActionDispatcher) -> (OcppServer, SocketAddr) {
+    let handler = Arc::new(DispatchHandler::new(Arc::new(dispatcher)));
+    let (mut server, _events) = OcppServer::new(TransportConfig::default(), handler);
+    server.start("127.0.0.1:0").await.expect("server start");
+    let addr = server.local_addr().expect("server local addr");
+    (server, addr)
+}
+
+/// Pull `StatusNotification`s until one matches `(connector, want)`, discarding
+/// the earlier lifecycle notifications (e.g. the boot-time `Available`). Fails
+/// the test if none arrives before [`SIDE_EFFECT_TIMEOUT`].
+async fn recv_status_notification(
+    rx: &mut mpsc::UnboundedReceiver<(u32, ChargePointStatus)>,
+    connector: u32,
+    want: ChargePointStatus,
+) {
+    let poll = async {
+        loop {
+            let (cid, status) = rx.recv().await.expect("status channel open");
+            if cid == connector && status == want {
+                return;
+            }
+        }
+    };
+    timeout(SIDE_EFFECT_TIMEOUT, poll)
+        .await
+        .unwrap_or_else(|_| {
+            panic!("CSMS did not observe StatusNotification({connector}, {want:?}) in time")
+        });
 }
 
 fn cp_config(addr: SocketAddr, id: &str) -> ChargePointConfig {
@@ -190,6 +241,43 @@ async fn reserve_then_cancel_lifecycle() {
         CancelReservationStatus::Rejected,
         "cancelling an unknown reservation id is rejected"
     );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+/// Issue #80: a back office watching connector availability should see a
+/// connector flip to `Reserved` the moment a reservation is held, and back to
+/// `Available` when it is cancelled — not on some later, unrelated status
+/// event. Asserts the CSMS *observes* both `StatusNotification` CALLs, which
+/// the CP sends off the inbound-CALL path via the `RemoteCommand` consumer.
+#[tokio::test]
+async fn reserve_and_cancel_emit_status_notifications() {
+    let cp_id = "CP_RESERVE_NOTIFY";
+    let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+    let (mut server, addr) = start_recording_csms(recording_csms_dispatcher(status_tx)).await;
+    let cp = ChargePoint::new(cp_config(addr, cp_id)).expect("build charge point");
+    cp.connect().await.expect("connect + boot sequence");
+    assert!(server.is_cp_connected(cp_id), "CSMS must route to the CP");
+
+    let expiry = chrono::Utc::now() + chrono::Duration::hours(1);
+
+    // ReserveNow(Accepted) → CSMS observes StatusNotification(1, Reserved).
+    // (The boot-time Available for connector 1 is drained by the recv loop.)
+    let status = server
+        .reserve_now(cp_id, 1, "RES_TAG", expiry, 5001, None)
+        .await
+        .expect("reserve_now resolves");
+    assert_eq!(status, ReservationStatus::Accepted);
+    recv_status_notification(&mut status_rx, 1, ChargePointStatus::Reserved).await;
+
+    // CancelReservation(Accepted) → CSMS observes StatusNotification(1, Available).
+    let status = server
+        .cancel_reservation(cp_id, 5001)
+        .await
+        .expect("cancel_reservation resolves");
+    assert_eq!(status, CancelReservationStatus::Accepted);
+    recv_status_notification(&mut status_rx, 1, ChargePointStatus::Available).await;
 
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");
