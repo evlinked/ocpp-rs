@@ -25,16 +25,25 @@ use std::time::Duration;
 use ocpp_cp::{ChargePoint, ChargePointConfig};
 use ocpp_messages::v16j::{
     AuthorizeRequest, AuthorizeResponse, BootNotificationRequest, BootNotificationResponse,
-    HeartbeatRequest, HeartbeatResponse, RegistrationStatus, StatusNotificationRequest,
-    StatusNotificationResponse,
+    HeartbeatRequest, HeartbeatResponse, MeterValuesRequest, MeterValuesResponse,
+    RegistrationStatus, StartTransactionRequest, StartTransactionResponse,
+    StatusNotificationRequest, StatusNotificationResponse,
 };
 use ocpp_messages::ActionDispatcher;
 use ocpp_transport::server::OcppServer;
 use ocpp_transport::{DispatchHandler, TransportConfig};
 use ocpp_types::common::{AuthorizationStatus, IdTagInfo};
 use ocpp_types::v16j::{MessageTrigger, TriggerMessageStatus};
+use ocpp_types::ConnectorId;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
+
+/// What the CSMS recorded for a triggered `MeterValues`: the reporting
+/// connector and the `transactionId` it carried (`None` for an idle connector).
+type MeterRecord = (u32, Option<i32>);
+
+/// Transaction id the recording CSMS assigns to a `StartTransaction`.
+const TXN_ID: i32 = 4242;
 
 /// Bound on how long a triggered message may take to reach the CSMS before the
 /// test gives up. Generous so a loaded CI box doesn't flake.
@@ -47,6 +56,7 @@ const TRIGGER_TIMEOUT: Duration = Duration::from_secs(5);
 fn recording_csms_dispatcher(
     boot_tx: mpsc::UnboundedSender<()>,
     status_tx: mpsc::UnboundedSender<u32>,
+    meter_tx: mpsc::UnboundedSender<MeterRecord>,
 ) -> ActionDispatcher {
     let mut d = ActionDispatcher::new();
 
@@ -89,6 +99,28 @@ fn recording_csms_dispatcher(
             },
         })
     });
+    // Assign a fixed transaction id so the test can correlate a triggered
+    // MeterValues against the active transaction.
+    d.on(|_req: StartTransactionRequest| async move {
+        Ok(StartTransactionResponse {
+            transaction_id: TXN_ID,
+            id_tag_info: IdTagInfo {
+                status: AuthorizationStatus::Accepted,
+                parent_id_tag: None,
+                expiry_date: None,
+            },
+        })
+    });
+    {
+        let meter_tx = meter_tx.clone();
+        d.on(move |req: MeterValuesRequest| {
+            let meter_tx = meter_tx.clone();
+            async move {
+                let _ = meter_tx.send((req.connector_id, req.transaction_id));
+                Ok(MeterValuesResponse {})
+            }
+        });
+    }
 
     d
 }
@@ -127,7 +159,9 @@ async fn csms_trigger_message_drives_cp_to_send_requested_messages() {
     let cp_id = "CP_TRIGGER_01";
     let (boot_tx, mut boot_rx) = mpsc::unbounded_channel();
     let (status_tx, mut status_rx) = mpsc::unbounded_channel();
-    let (mut server, addr) = start_csms(recording_csms_dispatcher(boot_tx, status_tx)).await;
+    let (meter_tx, _meter_rx) = mpsc::unbounded_channel();
+    let (mut server, addr) =
+        start_csms(recording_csms_dispatcher(boot_tx, status_tx, meter_tx)).await;
 
     // Connect a real charge point and run its boot handshake.
     let cp = ChargePoint::new(cp_config(addr, cp_id)).expect("build charge point");
@@ -200,6 +234,92 @@ async fn csms_trigger_message_drives_cp_to_send_requested_messages() {
             .await
             .is_err(),
         "an unsupported trigger must not produce a StatusNotification"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+/// A `TriggerMessage(MeterValues, Some(connectorId))` makes the CP report that
+/// connector's *current* meter reading on demand (Issue #65):
+///
+///   1. **Idle** connector → `Accepted`, and the CSMS observes a `MeterValues`
+///      for connector 1 with **no** `transactionId` (a clock-aligned snapshot).
+///   2. With an **active transaction** on that connector → the triggered
+///      `MeterValues` carries the matching `transactionId`.
+#[tokio::test]
+async fn csms_trigger_meter_values_reports_connector_reading() {
+    let cp_id = "CP_TRIGGER_MV";
+    let (boot_tx, mut boot_rx) = mpsc::unbounded_channel();
+    let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+    let (meter_tx, mut meter_rx) = mpsc::unbounded_channel();
+    let (mut server, addr) =
+        start_csms(recording_csms_dispatcher(boot_tx, status_tx, meter_tx)).await;
+
+    let cp = ChargePoint::new(cp_config(addr, cp_id)).expect("build charge point");
+    cp.connect().await.expect("connect + boot sequence");
+    assert!(
+        server.is_cp_connected(cp_id),
+        "the CSMS must be able to route CALLs to the booted CP"
+    );
+
+    // Discard boot-time chatter; nothing has produced a MeterValues yet.
+    drain(&mut boot_rx);
+    drain(&mut status_rx);
+    drain(&mut meter_rx);
+
+    // 1. Idle connector → Accepted, reported with no transactionId.
+    let status = server
+        .trigger_message(cp_id, MessageTrigger::MeterValues, Some(1))
+        .await
+        .expect("trigger_message(MeterValues) resolves");
+    assert_eq!(
+        status,
+        TriggerMessageStatus::Accepted,
+        "the CP supports a MeterValues trigger"
+    );
+    let (connector_id, transaction_id) = timeout(TRIGGER_TIMEOUT, meter_rx.recv())
+        .await
+        .expect("CSMS observes a triggered MeterValues")
+        .expect("meter channel open");
+    assert_eq!(
+        connector_id, 1,
+        "MeterValues is scoped to the requested connector"
+    );
+    assert_eq!(
+        transaction_id, None,
+        "an idle connector reports a clock-aligned reading with no transactionId"
+    );
+
+    // 2. Start a transaction on connector 1, then trigger again: the report now
+    //    carries the active transaction id.
+    let txn = cp
+        .start_transaction(ConnectorId::new(1).unwrap(), "TAG-MV", 0)
+        .await
+        .expect("start transaction");
+    assert_eq!(txn, TXN_ID, "CP adopts the CSMS-assigned transaction id");
+    // Starting a transaction fires an immediate Transaction.Begin MeterValues
+    // snapshot from the periodic sampler; drain it so the assert below sees only
+    // the trigger-induced frame.
+    timeout(TRIGGER_TIMEOUT, meter_rx.recv())
+        .await
+        .expect("CSMS observes the transaction-begin MeterValues snapshot")
+        .expect("meter channel open");
+
+    let status = server
+        .trigger_message(cp_id, MessageTrigger::MeterValues, Some(1))
+        .await
+        .expect("trigger_message(MeterValues) resolves");
+    assert_eq!(status, TriggerMessageStatus::Accepted);
+    let (connector_id, transaction_id) = timeout(TRIGGER_TIMEOUT, meter_rx.recv())
+        .await
+        .expect("CSMS observes a triggered MeterValues during the transaction")
+        .expect("meter channel open");
+    assert_eq!(connector_id, 1);
+    assert_eq!(
+        transaction_id,
+        Some(TXN_ID),
+        "a triggered MeterValues during a transaction carries its transactionId"
     );
 
     cp.disconnect().await.expect("disconnect");
