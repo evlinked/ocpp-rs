@@ -22,6 +22,7 @@ use ocpp_messages::v16j::{
     GetConfigurationRequest, GetConfigurationResponse, GetDiagnosticsRequest,
     GetDiagnosticsResponse, RemoteStartTransactionRequest, RemoteStopTransactionRequest,
     ReserveNowRequest, ResetRequest, StatusNotificationRequest, TriggerMessageRequest,
+    UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
 use ocpp_types::v16j::{
@@ -543,6 +544,42 @@ impl OcppServer {
                 retry_interval,
                 start_time,
                 stop_time,
+            },
+        )
+        .await
+    }
+
+    /// Instruct a connected charge point to download and install firmware from
+    /// `location` at/after `retrieve_date`.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `UpdateFirmware` command (§4.x, firmware-management profile), mirroring
+    /// how the Python reference's central system drives it
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    ///
+    /// `location` is the URL the CP downloads from; `retrieve_date` is the
+    /// earliest time the CP should start the download. `retries` /
+    /// `retry_interval` bound the CP's download attempts — both optional,
+    /// matching the spec. `UpdateFirmware.conf` carries no fields per the spec,
+    /// so the returned [`UpdateFirmwareResponse`] is empty; the CP reports its
+    /// progress out-of-band via `FirmwareStatusNotification` CALLs. Errors
+    /// propagate from [`call`](Self::call) (e.g. [`OcppError::CpNotConnected`],
+    /// [`OcppError::Timeout`]).
+    pub async fn update_firmware(
+        &self,
+        cp_id: &str,
+        location: impl Into<String>,
+        retrieve_date: DateTime<Utc>,
+        retries: Option<i32>,
+        retry_interval: Option<i32>,
+    ) -> OcppResult<UpdateFirmwareResponse> {
+        self.call(
+            cp_id,
+            UpdateFirmwareRequest {
+                location: location.into(),
+                retries,
+                retrieve_date,
+                retry_interval,
             },
         )
         .await
