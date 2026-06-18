@@ -216,6 +216,16 @@ enum RemoteCommand {
     /// `GetDiagnostics` (OCPP 1.6J §4.x, firmware-management profile). Emits
     /// `DiagnosticsStatusNotification(Uploading)` then `Uploaded`.
     GetDiagnostics,
+    /// Emit a `StatusNotification` CALL for a connector whose status changed as
+    /// a local side effect of an inbound command — currently the `Reserved` /
+    /// `Available` transitions behind an `Accepted` `ReserveNow` /
+    /// `CancelReservation` (OCPP 1.6J §5.14/§5.4, Issue #80). Queued rather than
+    /// sent inline for the same reason as the other side effects: the outbound
+    /// CALL must not re-enter the receive loop mid-dispatch.
+    EmitConnectorStatus {
+        connector_id: ConnectorId,
+        status: ChargePointStatus,
+    },
 }
 
 /// Whether this charge point can proactively produce `message` on a
@@ -763,15 +773,20 @@ impl ChargePoint {
         // status: a free connector is reserved (→ `Reserved`) and the
         // reservationId recorded; a busy connector → `Occupied`, a faulted one →
         // `Faulted`, an unavailable one → `Unavailable`; an unknown/out-of-range
-        // connector id (incl. 0) → `Rejected`. The reserve is a local state
-        // change (no outbound CALL), so it runs inline with no re-entrancy.
-        // Ports `ReserveNow` from the Python reference's `call.py`/`enums.py`.
+        // connector id (incl. 0) → `Rejected`. The reserve itself is a local
+        // state change, but on `Accepted` we also queue a `StatusNotification`
+        // (`Reserved`) to the CSMS off the inbound-CALL path so a back office's
+        // live connector view flips immediately (Issue #80) without waiting for
+        // the next status event. Ports `ReserveNow` from the Python reference's
+        // `call.py`/`enums.py`.
         {
             let connectors = connectors.clone();
             let reservations = reservations.clone();
+            let command_sender = command_sender.clone();
             d.on(move |req: ReserveNowRequest| {
                 let connectors = connectors.clone();
                 let reservations = reservations.clone();
+                let command_sender = command_sender.clone();
                 async move {
                     let status = match ConnectorId::new(req.connector_id as u32) {
                         Ok(cid) => match connectors.read().await.get(&cid).cloned() {
@@ -783,6 +798,16 @@ impl ChargePoint {
                                                 .write()
                                                 .await
                                                 .insert(req.reservation_id, cid);
+                                            // Best-effort: the reservation is
+                                            // already Accepted; a dropped
+                                            // notification (consumer gone, CP
+                                            // shutting down) must not undo it.
+                                            let _ = command_sender.send(
+                                                RemoteCommand::EmitConnectorStatus {
+                                                    connector_id: cid,
+                                                    status: ChargePointStatus::Reserved,
+                                                },
+                                            );
                                             ReservationStatus::Accepted
                                         }
                                         Err(_) => ReservationStatus::Rejected,
@@ -807,22 +832,41 @@ impl ChargePoint {
 
         // CancelReservation — clear a reservation by reservationId (OCPP 1.6J
         // §5.4). `Accepted` if the id is held (the connector is freed,
-        // `Reserved` → `Available`), `Rejected` if it is unknown. Local state
-        // change only — no outbound CALL, no re-entrancy. Ports
+        // `Reserved` → `Available`), `Rejected` if it is unknown. Freeing the
+        // connector is a local state change; on `Accepted` we also queue a
+        // `StatusNotification` (`Available`) off the inbound-CALL path so the
+        // CSMS sees the connector free up immediately (Issue #80). A
+        // `cancel_reservation()` that did not actually flip `Reserved` →
+        // `Available` (the connector moved on, e.g. a faulted/occupied edge)
+        // emits nothing — we only announce the transition we made. Ports
         // `CancelReservation` from the Python reference's `call.py`/`enums.py`.
         {
             let connectors = connectors.clone();
             let reservations = reservations.clone();
+            let command_sender = command_sender.clone();
             d.on(move |req: CancelReservationRequest| {
                 let connectors = connectors.clone();
                 let reservations = reservations.clone();
+                let command_sender = command_sender.clone();
                 async move {
                     let held = reservations.write().await.remove(&req.reservation_id);
                     let status = match held {
                         Some(cid) => {
                             if let Some(mut connector) = connectors.read().await.get(&cid).cloned()
                             {
+                                let was_reserved =
+                                    connector.status().await == ChargePointStatus::Reserved;
                                 let _ = connector.cancel_reservation().await;
+                                if was_reserved {
+                                    // Best-effort: cancellation is already
+                                    // Accepted; a dropped notification must not
+                                    // undo it.
+                                    let _ =
+                                        command_sender.send(RemoteCommand::EmitConnectorStatus {
+                                            connector_id: cid,
+                                            status: ChargePointStatus::Available,
+                                        });
+                                }
                             }
                             CancelReservationStatus::Accepted
                         }
@@ -994,6 +1038,25 @@ impl ChargePoint {
                         }
                         RemoteCommand::GetDiagnostics => {
                             cp.run_diagnostics_upload().await;
+                        }
+                        RemoteCommand::EmitConnectorStatus {
+                            connector_id,
+                            status,
+                        } => {
+                            if let Err(e) = cp
+                                .send_status_notification(
+                                    connector_id.value(),
+                                    status,
+                                    ChargePointErrorCode::NoError,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    "reservation StatusNotification({status:?}) for connector \
+                                     {} failed: {e}",
+                                    connector_id.value()
+                                );
+                            }
                         }
                     }
                 }
