@@ -21,14 +21,15 @@ use connector::{Connector, ConnectorConfig};
 use error::ChargePointError;
 use message_handler::ConfigurationStore;
 use ocpp_messages::v16j::{
-    AuthorizeRequest, BootNotificationRequest, BootNotificationResponse, ChangeAvailabilityRequest,
-    ChangeAvailabilityResponse, ChangeConfigurationRequest, ChangeConfigurationResponse,
-    ClearCacheRequest, ClearCacheResponse, DataTransferRequest, DataTransferResponse,
-    GetConfigurationRequest, GetConfigurationResponse, HeartbeatRequest, MeterValuesRequest,
-    RegistrationStatus, RemoteStartTransactionRequest, RemoteStartTransactionResponse,
-    RemoteStopTransactionRequest, RemoteStopTransactionResponse, ResetRequest, ResetResponse,
-    StartTransactionRequest, StatusNotificationRequest, StopTransactionRequest,
-    TriggerMessageRequest, TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse,
+    AuthorizeRequest, BootNotificationRequest, BootNotificationResponse, CancelReservationRequest,
+    CancelReservationResponse, ChangeAvailabilityRequest, ChangeAvailabilityResponse,
+    ChangeConfigurationRequest, ChangeConfigurationResponse, ClearCacheRequest, ClearCacheResponse,
+    DataTransferRequest, DataTransferResponse, GetConfigurationRequest, GetConfigurationResponse,
+    HeartbeatRequest, MeterValuesRequest, RegistrationStatus, RemoteStartTransactionRequest,
+    RemoteStartTransactionResponse, RemoteStopTransactionRequest, RemoteStopTransactionResponse,
+    ReserveNowRequest, ReserveNowResponse, ResetRequest, ResetResponse, StartTransactionRequest,
+    StatusNotificationRequest, StopTransactionRequest, TriggerMessageRequest,
+    TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse,
 };
 use ocpp_messages::{
     ActionDispatcher, CallMessage, Message, MessageType, OcppAction, SchemaValidator,
@@ -41,9 +42,10 @@ use ocpp_types::common::{
     AuthorizationStatus, AvailabilityStatus, IdTagInfo, KeyValue, Measurand, ReadingContext, Reason,
 };
 use ocpp_types::v16j::{
-    ChargePointErrorCode, ChargePointStatus, ChargePointVendorInfo, ClearCacheStatus,
-    ConfigurationStatus, DataTransferStatus, MessageTrigger, RemoteStartStopStatus, ResetStatus,
-    ResetType, TriggerMessageStatus, UnlockStatus,
+    CancelReservationStatus, ChargePointErrorCode, ChargePointStatus, ChargePointVendorInfo,
+    ClearCacheStatus, ConfigurationStatus, DataTransferStatus, MessageTrigger,
+    RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus,
+    UnlockStatus,
 };
 use ocpp_types::{
     CallErrorCode, CallErrorMessage, CallResultMessage, ConnectorId, OcppError, OcppResult,
@@ -209,6 +211,17 @@ enum RemoteCommand {
         requested_message: MessageTrigger,
         connector_id: Option<i32>,
     },
+    /// Mark a connector `Reserved` for an `Accepted` `ReserveNow` (OCPP 1.6J
+    /// §5.14) and report the new status. Queued off the inbound-CALL path so the
+    /// `ReserveNow` CALLRESULT is flushed before the `StatusNotification`.
+    Reserve {
+        connector_id: ConnectorId,
+        id_tag: String,
+        reservation_id: i32,
+    },
+    /// Clear a held reservation for an `Accepted` `CancelReservation` (OCPP 1.6J
+    /// §5.4) and report the connector back to `Available`.
+    CancelReservation { connector_id: ConnectorId },
 }
 
 /// Whether this charge point can proactively produce `message` on a
@@ -716,6 +729,107 @@ impl ChargePoint {
             });
         }
 
+        // ReserveNow — reserve a connector for an id tag until expiry (OCPP 1.6J
+        // §5.14). The status is decided inline from the targeted connector's
+        // current state; on `Accepted` the actual reservation (status change +
+        // StatusNotification) is queued on the command channel and run by the
+        // consumer task in `connect()`, off the inbound-CALL path, so the
+        // CALLRESULT is flushed before the CP re-enters the WebSocket. A free
+        // connector → `Accepted`; an in-use or already-reserved connector →
+        // `Occupied`; `Faulted`/`Unavailable` map straight through; an unknown
+        // connector id (or `0`) → `Rejected`.
+        {
+            let connectors = connectors.clone();
+            let command_sender = command_sender.clone();
+            d.on(move |req: ReserveNowRequest| {
+                let connectors = connectors.clone();
+                let command_sender = command_sender.clone();
+                async move {
+                    // ReserveNow.connectorId is an i32 on the wire; a specific
+                    // connector must be 1..; 0 (the CP as a whole) and negative
+                    // ids are not reservable.
+                    let cid = u32::try_from(req.connector_id)
+                        .ok()
+                        .and_then(|n| ConnectorId::new(n).ok());
+                    let status = match cid {
+                        Some(cid) => {
+                            let connector = connectors.read().await.get(&cid).cloned();
+                            match connector {
+                                Some(connector) => match connector.status().await {
+                                    ChargePointStatus::Available => {
+                                        // Free connector: queue the reservation off the
+                                        // CALL path. If the consumer is gone (CP shutting
+                                        // down) we cannot honor it, so report Rejected
+                                        // rather than Accept-and-drop.
+                                        match command_sender.send(RemoteCommand::Reserve {
+                                            connector_id: cid,
+                                            id_tag: req.id_tag.clone(),
+                                            reservation_id: req.reservation_id,
+                                        }) {
+                                            Ok(()) => ReservationStatus::Accepted,
+                                            Err(_) => ReservationStatus::Rejected,
+                                        }
+                                    }
+                                    ChargePointStatus::Faulted => ReservationStatus::Faulted,
+                                    ChargePointStatus::Unavailable => {
+                                        ReservationStatus::Unavailable
+                                    }
+                                    // In a transaction, finishing, or already reserved.
+                                    _ => ReservationStatus::Occupied,
+                                },
+                                // Unknown connector id.
+                                None => ReservationStatus::Rejected,
+                            }
+                        }
+                        // connectorId 0 / negative → not a reservable connector.
+                        None => ReservationStatus::Rejected,
+                    };
+                    Ok(ReserveNowResponse { status })
+                }
+            });
+        }
+
+        // CancelReservation — clear a reservation by its id (OCPP 1.6J §5.4).
+        // `Accepted` only when some connector currently holds the given
+        // `reservationId`; the clear (status → Available + StatusNotification)
+        // is queued off the inbound-CALL path. An unknown `reservationId` →
+        // `Rejected`.
+        {
+            let connectors = connectors.clone();
+            let command_sender = command_sender.clone();
+            d.on(move |req: CancelReservationRequest| {
+                let connectors = connectors.clone();
+                let command_sender = command_sender.clone();
+                async move {
+                    // Snapshot the connectors so we don't hold the map guard
+                    // across the per-connector reservation reads.
+                    let snapshot: Vec<(ConnectorId, Connector)> = connectors
+                        .read()
+                        .await
+                        .iter()
+                        .map(|(cid, c)| (*cid, c.clone()))
+                        .collect();
+                    let mut target = None;
+                    for (cid, connector) in &snapshot {
+                        if connector.reservation_id().await == Some(req.reservation_id) {
+                            target = Some(*cid);
+                            break;
+                        }
+                    }
+                    let status = match target {
+                        Some(cid) => match command_sender
+                            .send(RemoteCommand::CancelReservation { connector_id: cid })
+                        {
+                            Ok(()) => CancelReservationStatus::Accepted,
+                            Err(_) => CancelReservationStatus::Rejected,
+                        },
+                        None => CancelReservationStatus::Rejected,
+                    };
+                    Ok(CancelReservationResponse { status })
+                }
+            });
+        }
+
         // DataTransfer — accept and echo data back
         d.on(|req: DataTransferRequest| async move {
             Ok(DataTransferResponse {
@@ -858,6 +972,17 @@ impl ChargePoint {
                         } => {
                             cp.send_triggered_message(requested_message, connector_id)
                                 .await;
+                        }
+                        RemoteCommand::Reserve {
+                            connector_id,
+                            id_tag,
+                            reservation_id,
+                        } => {
+                            cp.perform_reserve(connector_id, id_tag, reservation_id)
+                                .await;
+                        }
+                        RemoteCommand::CancelReservation { connector_id } => {
+                            cp.perform_cancel_reservation(connector_id).await;
                         }
                     }
                 }
@@ -1593,6 +1718,100 @@ impl ChargePoint {
         }
     }
 
+    /// Carry out an `Accepted` `ReserveNow` (OCPP 1.6J §5.14): mark the
+    /// connector `Reserved` for the id tag under `reservation_id`, then report
+    /// the new status to the CSMS.
+    ///
+    /// Invoked only from the command-consumer task (see [`connect`](Self::connect)),
+    /// off the inbound-CALL path, so the `ReserveNow` CALLRESULT is flushed
+    /// before the `StatusNotification` and the receive loop never re-enters
+    /// itself. The handler already gated this on a free connector; if the
+    /// connector raced out of `Available` in between, [`Connector::reserve`]
+    /// fails and we log without sending a (now-wrong) `Reserved` notification.
+    async fn perform_reserve(
+        &self,
+        connector_id: ConnectorId,
+        id_tag: String,
+        reservation_id: i32,
+    ) {
+        {
+            let mut connectors = self.connectors.write().await;
+            match connectors.get_mut(&connector_id) {
+                Some(connector) => {
+                    if let Err(e) = connector.reserve(id_tag, reservation_id).await {
+                        warn!(
+                            "ReserveNow: connector {} no longer reservable: {e}",
+                            connector_id.value()
+                        );
+                        return;
+                    }
+                }
+                None => {
+                    warn!("ReserveNow: unknown connector {}", connector_id.value());
+                    return;
+                }
+            }
+        }
+
+        if let Err(e) = self
+            .send_status_notification(
+                connector_id.value(),
+                ChargePointStatus::Reserved,
+                ChargePointErrorCode::NoError,
+            )
+            .await
+        {
+            warn!(
+                "ReserveNow: StatusNotification(Reserved) for connector {} failed: {e}",
+                connector_id.value()
+            );
+        }
+    }
+
+    /// Carry out an `Accepted` `CancelReservation` (OCPP 1.6J §5.4): clear the
+    /// reservation on `connector_id` (status → `Available`) and report it.
+    ///
+    /// Like [`perform_reserve`](Self::perform_reserve), runs on the command-
+    /// consumer task so the `CancelReservation` CALLRESULT is flushed before the
+    /// `StatusNotification`.
+    async fn perform_cancel_reservation(&self, connector_id: ConnectorId) {
+        {
+            let mut connectors = self.connectors.write().await;
+            match connectors.get_mut(&connector_id) {
+                Some(connector) => {
+                    if let Err(e) = connector.cancel_reservation().await {
+                        warn!(
+                            "CancelReservation: connector {} clear failed: {e}",
+                            connector_id.value()
+                        );
+                        return;
+                    }
+                }
+                None => {
+                    warn!(
+                        "CancelReservation: unknown connector {}",
+                        connector_id.value()
+                    );
+                    return;
+                }
+            }
+        }
+
+        if let Err(e) = self
+            .send_status_notification(
+                connector_id.value(),
+                ChargePointStatus::Available,
+                ChargePointErrorCode::NoError,
+            )
+            .await
+        {
+            warn!(
+                "CancelReservation: StatusNotification(Available) for connector {} failed: {e}",
+                connector_id.value()
+            );
+        }
+    }
+
     /// Set connector fault
     pub async fn set_fault(
         &self,
@@ -2027,9 +2246,9 @@ mod tests {
     // --- dispatcher wiring tests ---
 
     #[tokio::test]
-    async fn dispatcher_has_10_default_handlers() {
+    async fn dispatcher_has_12_default_handlers() {
         let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
-        assert_eq!(cp.handler_count().await, 10);
+        assert_eq!(cp.handler_count().await, 12);
     }
 
     #[tokio::test]

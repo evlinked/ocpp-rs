@@ -139,6 +139,9 @@ pub struct Connector {
     current_transaction: Arc<RwLock<Option<Transaction>>>,
     /// Reservation ID tag
     reserved_for: Arc<RwLock<Option<String>>>,
+    /// Active reservation ID (OCPP 1.6J `ReserveNow.reservationId`), set while
+    /// the connector is `Reserved` so a `CancelReservation` can be matched by id.
+    reservation_id: Arc<RwLock<Option<i32>>>,
     /// Last meter reading
     last_meter_reading: Arc<RwLock<MeterReading>>,
     /// Event sender
@@ -156,6 +159,7 @@ impl Connector {
             error_info: Arc::new(RwLock::new(None)),
             current_transaction: Arc::new(RwLock::new(None)),
             reserved_for: Arc::new(RwLock::new(None)),
+            reservation_id: Arc::new(RwLock::new(None)),
             last_meter_reading: Arc::new(RwLock::new(MeterReading::new(0.0, 0.0, 0.0, 0.0))),
             event_sender: Arc::new(RwLock::new(None)),
         })
@@ -396,8 +400,10 @@ impl Connector {
                 self.send_event(ConnectorEvent::Authorized { id_tag }).await;
                 self.send_event(ConnectorEvent::ChargingStarted).await;
 
-                // Clear reservation if any
+                // Clear reservation if any (a local/remote start by the
+                // reserving id tag consumes the reservation, §5.14).
                 *self.reserved_for.write().await = None;
+                *self.reservation_id.write().await = None;
 
                 info!(
                     "Transaction started on connector {} with ID: {}",
@@ -585,12 +591,13 @@ impl Connector {
         Ok(())
     }
 
-    /// Reserve connector for a user
-    pub async fn reserve(&mut self, id_tag: String) -> Result<()> {
+    /// Reserve connector for a user under the given `ReserveNow.reservationId`.
+    pub async fn reserve(&mut self, id_tag: String, reservation_id: i32) -> Result<()> {
         let current_status = self.status().await;
 
         if current_status == ChargePointStatus::Available {
             *self.reserved_for.write().await = Some(id_tag.clone());
+            *self.reservation_id.write().await = Some(reservation_id);
             self.set_status(ChargePointStatus::Reserved).await?;
             info!(
                 "Connector {} reserved for user: {}",
@@ -611,6 +618,7 @@ impl Connector {
     /// Cancel reservation
     pub async fn cancel_reservation(&mut self) -> Result<()> {
         *self.reserved_for.write().await = None;
+        *self.reservation_id.write().await = None;
 
         let current_status = self.status().await;
         if current_status == ChargePointStatus::Reserved {
@@ -652,6 +660,11 @@ impl Connector {
     /// Get reservation info
     pub async fn reserved_for(&self) -> Option<String> {
         self.reserved_for.read().await.clone()
+    }
+
+    /// Get the active reservation ID, if this connector currently holds one.
+    pub async fn reservation_id(&self) -> Option<i32> {
+        *self.reservation_id.read().await
     }
 }
 
@@ -869,14 +882,46 @@ mod tests {
         let mut connector = Connector::new(config).unwrap();
 
         // Reserve connector
-        connector.reserve("user123".to_string()).await.unwrap();
+        connector.reserve("user123".to_string(), 42).await.unwrap();
         assert_eq!(connector.status().await, ChargePointStatus::Reserved);
         assert_eq!(connector.reserved_for().await, Some("user123".to_string()));
+        assert_eq!(connector.reservation_id().await, Some(42));
 
         // Cancel reservation
         connector.cancel_reservation().await.unwrap();
         assert_eq!(connector.status().await, ChargePointStatus::Available);
         assert_eq!(connector.reserved_for().await, None);
+        assert_eq!(connector.reservation_id().await, None);
+    }
+
+    #[tokio::test]
+    async fn test_reservation_consumed_by_start() {
+        let config = ConnectorConfig {
+            connector_id: ConnectorId(1),
+            connector_type: "Type2".to_string(),
+            max_amperage: 32.0,
+            max_voltage: 230.0,
+            max_power: 7360.0,
+            phases: 1,
+            energy_meter_serial: Some("EM001".to_string()),
+        };
+
+        let mut connector = Connector::new(config).unwrap();
+
+        // Reserve, then the reserving driver plugs in and starts charging.
+        connector.reserve("driver-1".to_string(), 7).await.unwrap();
+        assert_eq!(connector.reservation_id().await, Some(7));
+
+        connector.plug_in().await.unwrap(); // Reserved -> Preparing
+        connector
+            .start_transaction("driver-1".to_string())
+            .await
+            .unwrap();
+
+        // The local start by the reserving id tag consumes the reservation (§5.14).
+        assert_eq!(connector.status().await, ChargePointStatus::Charging);
+        assert_eq!(connector.reserved_for().await, None);
+        assert_eq!(connector.reservation_id().await, None);
     }
 
     #[tokio::test]

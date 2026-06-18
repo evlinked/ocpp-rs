@@ -15,17 +15,19 @@ use axum::{
     routing::get,
     Router,
 };
+use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use ocpp_messages::v16j::{
-    ChangeConfigurationRequest, ClearCacheRequest, GetConfigurationRequest,
-    GetConfigurationResponse, RemoteStartTransactionRequest, RemoteStopTransactionRequest,
-    ResetRequest, StatusNotificationRequest, TriggerMessageRequest,
+    CancelReservationRequest, ChangeConfigurationRequest, ClearCacheRequest,
+    GetConfigurationRequest, GetConfigurationResponse, RemoteStartTransactionRequest,
+    RemoteStopTransactionRequest, ReserveNowRequest, ResetRequest, StatusNotificationRequest,
+    TriggerMessageRequest,
 };
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
 use ocpp_types::v16j::{
-    ClearCacheStatus, ConfigurationStatus, MessageTrigger, RemoteStartStopStatus, ResetStatus,
-    ResetType, TriggerMessageStatus,
+    CancelReservationStatus, ClearCacheStatus, ConfigurationStatus, MessageTrigger,
+    RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus,
 };
 use ocpp_types::{CallErrorCode, OcppError, OcppResult};
 use std::{net::SocketAddr, sync::Arc};
@@ -450,6 +452,64 @@ impl OcppServer {
     /// [`OcppError::CpNotConnected`], [`OcppError::Timeout`]).
     pub async fn clear_cache(&self, cp_id: &str) -> OcppResult<ClearCacheStatus> {
         let resp = self.call(cp_id, ClearCacheRequest {}).await?;
+        Ok(resp.status)
+    }
+
+    /// Reserve a connector on a charge point for an id tag until `expiry_date`.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `ReserveNow` command (§5.14), mirroring how the Python reference's central
+    /// system drives it
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    ///
+    /// `connector_id` names the connector to reserve; `reservation_id` is the
+    /// CSMS-assigned id used later to [`cancel_reservation`](Self::cancel_reservation).
+    /// `parent_id_tag` is optional (group/parent authorization). Returns the CP's
+    /// [`ReservationStatus`] — `Accepted` when the connector is held, `Occupied`
+    /// when it is in use or already reserved, `Faulted`/`Unavailable` per the
+    /// connector state, or `Rejected` for an unknown connector. Errors propagate
+    /// from [`call`](Self::call) (e.g. [`OcppError::CpNotConnected`],
+    /// [`OcppError::Timeout`]).
+    pub async fn reserve_now(
+        &self,
+        cp_id: &str,
+        connector_id: i32,
+        id_tag: impl Into<String>,
+        reservation_id: i32,
+        expiry_date: DateTime<Utc>,
+        parent_id_tag: Option<String>,
+    ) -> OcppResult<ReservationStatus> {
+        let resp = self
+            .call(
+                cp_id,
+                ReserveNowRequest {
+                    connector_id,
+                    expiry_date,
+                    id_tag: id_tag.into(),
+                    reservation_id,
+                    parent_id_tag,
+                },
+            )
+            .await?;
+        Ok(resp.status)
+    }
+
+    /// Cancel a reservation on a charge point by its `reservation_id`.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `CancelReservation` command (§5.4). Returns the CP's
+    /// [`CancelReservationStatus`] — `Accepted` when the CP held the reservation
+    /// and cleared it, `Rejected` for an unknown `reservation_id`. Errors
+    /// propagate from [`call`](Self::call) (e.g. [`OcppError::CpNotConnected`],
+    /// [`OcppError::Timeout`]).
+    pub async fn cancel_reservation(
+        &self,
+        cp_id: &str,
+        reservation_id: i32,
+    ) -> OcppResult<CancelReservationStatus> {
+        let resp = self
+            .call(cp_id, CancelReservationRequest { reservation_id })
+            .await?;
         Ok(resp.status)
     }
 
