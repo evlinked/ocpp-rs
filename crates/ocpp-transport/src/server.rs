@@ -19,8 +19,9 @@ use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use ocpp_messages::v16j::{
     ChangeConfigurationRequest, ClearCacheRequest, GetConfigurationRequest,
-    GetConfigurationResponse, RemoteStartTransactionRequest, RemoteStopTransactionRequest,
-    ResetRequest, StatusNotificationRequest, TriggerMessageRequest,
+    GetConfigurationResponse, GetDiagnosticsRequest, GetDiagnosticsResponse,
+    RemoteStartTransactionRequest, RemoteStopTransactionRequest, ResetRequest,
+    StatusNotificationRequest, TriggerMessageRequest,
 };
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
 use ocpp_types::v16j::{
@@ -451,6 +452,44 @@ impl OcppServer {
     pub async fn clear_cache(&self, cp_id: &str) -> OcppResult<ClearCacheStatus> {
         let resp = self.call(cp_id, ClearCacheRequest {}).await?;
         Ok(resp.status)
+    }
+
+    /// Ask a connected charge point to upload a diagnostics archive to `location`.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `GetDiagnostics` command (§4.x, firmware-management profile), mirroring
+    /// how the Python reference's central system drives it
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    ///
+    /// `location` is the URL the CP uploads to. `retries` / `retry_interval`
+    /// bound the CP's upload attempts; `start_time` / `stop_time` scope which
+    /// log entries to collect — all optional, matching the spec. The full
+    /// [`GetDiagnosticsResponse`] is returned because its `file_name` (the name
+    /// of the archive the CP will produce, present only when the CP accepts the
+    /// request) is information the CSMS needs to correlate the subsequent
+    /// `DiagnosticsStatusNotification` progress. Errors propagate from
+    /// [`call`](Self::call) (e.g. [`OcppError::CpNotConnected`],
+    /// [`OcppError::Timeout`]).
+    pub async fn get_diagnostics(
+        &self,
+        cp_id: &str,
+        location: impl Into<String>,
+        retries: Option<i32>,
+        retry_interval: Option<i32>,
+        start_time: Option<chrono::DateTime<chrono::Utc>>,
+        stop_time: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> OcppResult<GetDiagnosticsResponse> {
+        self.call(
+            cp_id,
+            GetDiagnosticsRequest {
+                location: location.into(),
+                retries,
+                retry_interval,
+                start_time,
+                stop_time,
+            },
+        )
+        .await
     }
 
     /// Evict connections that have been idle for more than 2× the keep-alive interval.
