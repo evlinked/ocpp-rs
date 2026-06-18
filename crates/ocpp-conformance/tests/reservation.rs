@@ -283,6 +283,176 @@ async fn reserve_and_cancel_emit_status_notifications() {
     server.stop().await.expect("server stop");
 }
 
+/// Issue #85: a reservation whose `expiryDate` passes must free its connector
+/// on its own — even if no `CancelReservation` ever arrives. Asserts the
+/// connector flips `Reserved → Available`, the CSMS observes the resulting
+/// `StatusNotification(Available)`, and the now-expired reservation can no
+/// longer be cancelled.
+#[tokio::test]
+async fn reservation_auto_expires() {
+    let cp_id = "CP_RESERVE_EXPIRE";
+    let (status_tx, mut status_rx) = mpsc::unbounded_channel();
+    let (mut server, addr) = start_recording_csms(recording_csms_dispatcher(status_tx)).await;
+    let cp = ChargePoint::new(cp_config(addr, cp_id)).expect("build charge point");
+    cp.connect().await.expect("connect + boot sequence");
+    assert!(server.is_cp_connected(cp_id), "CSMS must route to the CP");
+
+    let connector = ConnectorId::new(1).unwrap();
+    // A short, real expiry so the timer fires well within SIDE_EFFECT_TIMEOUT.
+    let expiry = chrono::Utc::now() + chrono::Duration::milliseconds(400);
+
+    let status = server
+        .reserve_now(cp_id, 1, "RES_TAG", expiry, 6001, None)
+        .await
+        .expect("reserve_now resolves");
+    assert_eq!(status, ReservationStatus::Accepted);
+    wait_for_status(&cp, connector, ChargePointStatus::Reserved).await;
+
+    // Without any CancelReservation, the connector frees itself once expiry
+    // passes and the CSMS observes StatusNotification(1, Available).
+    recv_status_notification(&mut status_rx, 1, ChargePointStatus::Available).await;
+    wait_for_status(&cp, connector, ChargePointStatus::Available).await;
+
+    // The expired reservation is gone, so cancelling it now → Rejected.
+    let status = server
+        .cancel_reservation(cp_id, 6001)
+        .await
+        .expect("cancel_reservation resolves");
+    assert_eq!(
+        status,
+        CancelReservationStatus::Rejected,
+        "an auto-expired reservation can no longer be cancelled"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+/// Issue #85: cancelling a reservation must disarm its pending auto-expiry
+/// timer, so a stale timer can never fire and free a connector that has since
+/// been re-reserved. Re-reserves the same connector/id with a long expiry, then
+/// waits past the *original* short expiry and asserts the connector stays
+/// `Reserved` — proving the disarmed timer did not fire.
+#[tokio::test]
+async fn cancel_disarms_expiry_timer() {
+    let cp_id = "CP_RESERVE_CANCEL_DISARM";
+    let (mut server, addr) = start_csms().await;
+    let cp = ChargePoint::new(cp_config(addr, cp_id)).expect("build charge point");
+    cp.connect().await.expect("connect + boot sequence");
+
+    let connector = ConnectorId::new(1).unwrap();
+    let short = chrono::Utc::now() + chrono::Duration::milliseconds(300);
+
+    // Reserve with a short expiry, then cancel before it fires.
+    let status = server
+        .reserve_now(cp_id, 1, "RES_TAG", short, 7001, None)
+        .await
+        .expect("reserve_now resolves");
+    assert_eq!(status, ReservationStatus::Accepted);
+    wait_for_status(&cp, connector, ChargePointStatus::Reserved).await;
+
+    let status = server
+        .cancel_reservation(cp_id, 7001)
+        .await
+        .expect("cancel_reservation resolves");
+    assert_eq!(status, CancelReservationStatus::Accepted);
+    wait_for_status(&cp, connector, ChargePointStatus::Available).await;
+
+    // Re-reserve the same connector with the same id but a long expiry.
+    let long = chrono::Utc::now() + chrono::Duration::hours(1);
+    let status = server
+        .reserve_now(cp_id, 1, "RES_TAG", long, 7001, None)
+        .await
+        .expect("reserve_now resolves");
+    assert_eq!(status, ReservationStatus::Accepted);
+    wait_for_status(&cp, connector, ChargePointStatus::Reserved).await;
+
+    // Wait comfortably past the original short expiry; the disarmed timer must
+    // not fire, so the connector stays Reserved for the new reservation.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        status_of(&cp, connector).await,
+        ChargePointStatus::Reserved,
+        "the cancelled reservation's timer must not free the re-reserved connector"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+/// Issue #85: a start that consumes a reservation must disarm its auto-expiry
+/// timer, so the timer can't later free a connector that is now charging.
+#[tokio::test]
+async fn start_consume_disarms_expiry_timer() {
+    let cp_id = "CP_RESERVE_START_DISARM";
+    let (mut server, addr) = start_csms().await;
+    let cp = ChargePoint::new(cp_config(addr, cp_id)).expect("build charge point");
+    cp.connect().await.expect("connect + boot sequence");
+
+    let connector = ConnectorId::new(1).unwrap();
+    let short = chrono::Utc::now() + chrono::Duration::milliseconds(300);
+
+    let status = server
+        .reserve_now(cp_id, 1, "RES_TAG", short, 8001, None)
+        .await
+        .expect("reserve_now resolves");
+    assert_eq!(status, ReservationStatus::Accepted);
+    wait_for_status(&cp, connector, ChargePointStatus::Reserved).await;
+
+    // A start with the reserving idTag consumes the reservation → Charging.
+    let rs = server
+        .remote_start_transaction(cp_id, "RES_TAG", Some(1))
+        .await
+        .expect("remote start resolves");
+    assert_eq!(rs, RemoteStartStopStatus::Accepted);
+    wait_for_status(&cp, connector, ChargePointStatus::Charging).await;
+
+    // Wait past the original short expiry; the disarmed timer must not fire and
+    // free the now-charging connector.
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        status_of(&cp, connector).await,
+        ChargePointStatus::Charging,
+        "the consumed reservation's timer must not free the charging connector"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+/// Issue #85: a reservation whose `expiryDate` is already in the past at reserve
+/// time is nonsensical (it would free instantly), so it is rejected outright and
+/// the connector is left untouched (`Available`).
+#[tokio::test]
+async fn past_dated_expiry_is_rejected() {
+    let cp_id = "CP_RESERVE_PAST";
+    let (mut server, addr) = start_csms().await;
+    let cp = ChargePoint::new(cp_config(addr, cp_id)).expect("build charge point");
+    cp.connect().await.expect("connect + boot sequence");
+
+    let connector = ConnectorId::new(1).unwrap();
+    let past = chrono::Utc::now() - chrono::Duration::hours(1);
+
+    let status = server
+        .reserve_now(cp_id, 1, "RES_TAG", past, 9001, None)
+        .await
+        .expect("reserve_now resolves");
+    assert_eq!(
+        status,
+        ReservationStatus::Rejected,
+        "a past-dated expiryDate is rejected"
+    );
+    // The connector was never reserved.
+    assert_eq!(
+        status_of(&cp, connector).await,
+        ChargePointStatus::Available,
+        "a rejected reservation must not touch the connector"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
 #[tokio::test]
 async fn start_consumes_reservation() {
     let cp_id = "CP_RESERVE_02";
