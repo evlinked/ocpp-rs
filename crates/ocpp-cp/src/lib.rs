@@ -62,6 +62,30 @@ use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+/// Opt-in outcome of the simulated firmware update (`UpdateFirmware`, OCPP
+/// 1.6J §4.x). Selects which branch of the firmware state machine the
+/// simulator follows so a CSMS can be tested against failed rollouts, not just
+/// successful ones.
+///
+/// Firmware updates have two distinct failure points — the download phase and
+/// the install phase — so unlike the single-failure diagnostics upload
+/// ([`ChargePointConfig::diagnostics_upload_should_fail`]) this is an enum
+/// rather than a `bool`. The terminal/resting statuses (`DownloadFailed`,
+/// `InstallationFailed`) are the faithful 1.6J `FirmwareStatus` values and are
+/// retained by the CP so a subsequent
+/// `TriggerMessage(FirmwareStatusNotification)` reports them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FirmwareUpdateOutcome {
+    /// Happy path: `Downloading → Downloaded → Installing → Installed`.
+    #[default]
+    Succeed,
+    /// Download phase fails: `Downloading → DownloadFailed` (no install).
+    DownloadFailed,
+    /// Install phase fails: `Downloading → Downloaded → Installing →
+    /// InstallationFailed`.
+    InstallationFailed,
+}
+
 /// Charge point configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChargePointConfig {
@@ -113,6 +137,15 @@ pub struct ChargePointConfig {
     /// fails, not just one that succeeds. Defaults to `false` (happy path);
     /// the failure path is strictly opt-in so existing behavior is unchanged.
     pub diagnostics_upload_should_fail: bool,
+    /// Fault injection for the simulated firmware update (`UpdateFirmware`,
+    /// OCPP 1.6J §4.x). Defaults to [`FirmwareUpdateOutcome::Succeed`] (happy
+    /// path); set [`FirmwareUpdateOutcome::DownloadFailed`] or
+    /// [`FirmwareUpdateOutcome::InstallationFailed`] to drive the simulator
+    /// down the corresponding error branch, so a CSMS / back office can be
+    /// exercised against a firmware rollout that fails, not just one that
+    /// succeeds. The failure path is strictly opt-in so existing behavior is
+    /// unchanged.
+    pub firmware_update_outcome: FirmwareUpdateOutcome,
     /// Transport configuration (not serialized; uses Default on deserialization)
     #[serde(skip)]
     pub transport_config: TransportConfig,
@@ -147,6 +180,7 @@ impl Default for ChargePointConfig {
             auth_cache_ttl: 24 * 60 * 60, // 24 hours
             offline_auth_stale_ok: false,
             diagnostics_upload_should_fail: false,
+            firmware_update_outcome: FirmwareUpdateOutcome::Succeed,
             transport_config: TransportConfig::default(),
         }
     }
@@ -2064,24 +2098,45 @@ impl ChargePoint {
     /// there is no receive-loop re-entrancy/deadlock.
     ///
     /// The simulator has no real image to download or install, so it models the
-    /// update on a short timer, stepping through the happy-path sequence the
-    /// spec defines — `Downloading` → `Downloaded` → `Installing` →
-    /// `Installed` — announcing each step. (`UpdateFirmware.req`'s `retrieveDate`
-    /// scheduling and the `DownloadFailed`/`InstallationFailed` error paths are
-    /// out of scope for the simulator.) The latest status is retained so a
-    /// subsequent `TriggerMessage(FirmwareStatusNotification)` reports it.
-    /// Mirrors the progress reporting in the Python reference's
+    /// update on a short timer, stepping through the sequence the spec defines
+    /// and announcing each step. On the happy path (the default) that is
+    /// `Downloading` → `Downloaded` → `Installing` → `Installed`.
+    ///
+    /// With [`ChargePointConfig::firmware_update_outcome`] set to a failure
+    /// variant (opt-in fault injection) the simulator instead takes the matching
+    /// error branch — `Downloading → DownloadFailed`, or `Downloading →
+    /// Downloaded → Installing → InstallationFailed` — so a CSMS can be tested
+    /// against a firmware rollout that fails (OCPP 1.6J §4.x; `FirmwareStatus`).
+    /// (`UpdateFirmware.req`'s `retrieveDate` scheduling remains out of scope.)
+    ///
+    /// The latest status — success or failure — is retained so a subsequent
+    /// `TriggerMessage(FirmwareStatusNotification)` reports it. Mirrors the
+    /// progress reporting in the Python reference's
     /// [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py).
     async fn run_firmware_update(&self) {
         self.set_firmware_status(FirmwareStatus::Downloading).await;
-        for status in [
-            FirmwareStatus::Downloaded,
-            FirmwareStatus::Installing,
-            FirmwareStatus::Installed,
-        ] {
-            tokio::time::sleep(FIRMWARE_UPDATE_STEP_DURATION).await;
-            self.set_firmware_status(status).await;
+        tokio::time::sleep(FIRMWARE_UPDATE_STEP_DURATION).await;
+
+        if self.config.firmware_update_outcome == FirmwareUpdateOutcome::DownloadFailed {
+            // Download phase fails: the CP rests in DownloadFailed; there is no
+            // image to install, so the sequence stops here.
+            self.set_firmware_status(FirmwareStatus::DownloadFailed)
+                .await;
+            return;
         }
+        self.set_firmware_status(FirmwareStatus::Downloaded).await;
+        tokio::time::sleep(FIRMWARE_UPDATE_STEP_DURATION).await;
+
+        self.set_firmware_status(FirmwareStatus::Installing).await;
+        tokio::time::sleep(FIRMWARE_UPDATE_STEP_DURATION).await;
+
+        let terminal =
+            if self.config.firmware_update_outcome == FirmwareUpdateOutcome::InstallationFailed {
+                FirmwareStatus::InstallationFailed
+            } else {
+                FirmwareStatus::Installed
+            };
+        self.set_firmware_status(terminal).await;
     }
 
     /// Record `status` as the CP's current firmware status and announce it to
@@ -3184,6 +3239,21 @@ mod tests {
     fn validate_payloads_default_is_true() {
         let config = ChargePointConfig::default();
         assert!(config.validate_payloads);
+    }
+
+    #[test]
+    fn firmware_update_outcome_defaults_to_succeed() {
+        // Fault injection must be opt-in: the default config takes the happy
+        // path so existing simulator behavior is unchanged (Issue #83).
+        let config = ChargePointConfig::default();
+        assert_eq!(
+            config.firmware_update_outcome,
+            FirmwareUpdateOutcome::Succeed
+        );
+        assert_eq!(
+            FirmwareUpdateOutcome::default(),
+            FirmwareUpdateOutcome::Succeed
+        );
     }
 
     #[tokio::test]
