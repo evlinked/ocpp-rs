@@ -3,6 +3,7 @@
 //! This crate provides the foundational types and data structures for OCPP protocol implementation.
 //! It includes common types, enums, and utilities used across all OCPP versions.
 
+pub mod autocharge;
 pub mod common;
 pub mod error;
 pub mod message;

@@ -37,6 +37,7 @@ use ocpp_transport::client::WebSocketClient;
 use ocpp_transport::{
     MessageHandler as TransportMessageHandler, Transport, TransportConfig, TransportEvent,
 };
+use ocpp_types::autocharge::derive_autocharge_id_tag;
 use ocpp_types::common::{
     AuthorizationStatus, AvailabilityStatus, IdTagInfo, KeyValue, Measurand, ReadingContext, Reason,
 };
@@ -56,6 +57,27 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+
+/// AutoCharge configuration (OCPP 1.6J, no new messages).
+///
+/// AutoCharge lets a driver start a session with no RFID card and no app tap:
+/// on plug-in the charge point identifies the vehicle by its EV MAC / EVCCID
+/// and uses that as the `idTag`, driving the *normal* `Authorize` +
+/// `StartTransaction` flow automatically.
+///
+/// Disabled by default, so an existing simulator behaves exactly as before
+/// (plug-in stays inert until a transaction is started explicitly).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AutoChargeConfig {
+    /// Master switch. When `false` (the default) plug-in never auto-starts a
+    /// transaction — today's behavior is unchanged.
+    pub enabled: bool,
+    /// Optional vendor/operator prefix prepended to the MAC-derived `idTag`.
+    /// The derived id is `prefix + <12 uppercase hex>` and must still fit
+    /// OCPP's `CiString20Type` (see
+    /// [`ocpp_types::autocharge::derive_autocharge_id_tag`]).
+    pub id_tag_prefix: Option<String>,
+}
 
 /// Charge point configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,6 +123,10 @@ pub struct ChargePointConfig {
     /// stale-but-previously-`Accepted` cached entry instead of failing safe.
     /// Defaults to `false` (fail-safe: an unreachable CSMS yields `Invalid`).
     pub offline_auth_stale_ok: bool,
+    /// AutoCharge behavior (OCPP 1.6J §5.1/§5.11 reused). Disabled by default;
+    /// see [`AutoChargeConfig`].
+    #[serde(default)]
+    pub auto_charge: AutoChargeConfig,
     /// Transport configuration (not serialized; uses Default on deserialization)
     #[serde(skip)]
     pub transport_config: TransportConfig,
@@ -134,6 +160,7 @@ impl Default for ChargePointConfig {
             validate_payloads: true,
             auth_cache_ttl: 24 * 60 * 60, // 24 hours
             offline_auth_stale_ok: false,
+            auto_charge: AutoChargeConfig::default(),
             transport_config: TransportConfig::default(),
         }
     }
@@ -209,6 +236,18 @@ enum RemoteCommand {
         requested_message: MessageTrigger,
         connector_id: Option<i32>,
     },
+    /// AutoCharge plug-in: run the local `Authorize` + `StartTransaction` flow
+    /// with the EV-derived `id_tag` (OCPP 1.6J §5.1/§5.11). Queued from
+    /// [`ChargePoint::plug_in`] so the round-trips run off the plug-in path.
+    AutoStart {
+        connector_id: ConnectorId,
+        id_tag: String,
+        meter_start: i32,
+    },
+    /// AutoCharge unplug: end the matching transaction with reason
+    /// `EVDisconnected` (OCPP 1.6J §5.13). Queued from [`ChargePoint::plug_out`]
+    /// for a charging AutoCharge connector.
+    AutoStop { transaction_id: i32 },
 }
 
 /// Whether this charge point can proactively produce `message` on a
@@ -380,6 +419,16 @@ pub struct ChargePoint {
     /// a second consumer. The sender half lives inside the dispatcher closures,
     /// which the `ChargePoint` keeps alive, so the channel stays open.
     command_receiver: Arc<RwLock<Option<mpsc::UnboundedReceiver<RemoteCommand>>>>,
+    /// Sender half of the [`RemoteCommand`] channel, retained on the
+    /// `ChargePoint` so plug-in/plug-out can queue AutoCharge side effects
+    /// ([`RemoteCommand::AutoStart`] / [`RemoteCommand::AutoStop`]) onto the same
+    /// consumer task the inbound-CALL handlers use — keeping the `Authorize` /
+    /// `StartTransaction` / `StopTransaction` round-trips off the caller's path.
+    command_sender: mpsc::UnboundedSender<RemoteCommand>,
+    /// Per-connector simulated EV identifier (MAC / EVCCID) the simulator sets
+    /// via [`ChargePoint::set_ev_identifier`]. Read on plug-in to derive the
+    /// AutoCharge `idTag`. Absent for connectors with no EV enrolled.
+    ev_identifiers: Arc<RwLock<HashMap<ConnectorId, String>>>,
     /// Join handle for the command-consumer task. The consumer owns a
     /// `ChargePoint` clone (and thus, transitively, a `RemoteCommand` sender via
     /// the dispatcher), so the channel never closes on its own — the task is
@@ -425,6 +474,9 @@ impl ChargePoint {
         let auth_cache = Arc::new(AuthCache::new(Duration::from_secs(config.auth_cache_ttl)));
 
         let (command_sender, command_receiver) = mpsc::unbounded_channel();
+        // The dispatcher's `@on` closures take one sender; the `ChargePoint`
+        // keeps another so plug-in/plug-out can queue AutoCharge side effects.
+        let cp_command_sender = command_sender.clone();
 
         // Wrap the shared state the default handlers need *before* building the
         // dispatcher: RemoteStart/RemoteStop consult live connector status and
@@ -461,6 +513,8 @@ impl ChargePoint {
             meter_sampler_handles: Arc::new(RwLock::new(HashMap::new())),
             auth_cache,
             command_receiver: Arc::new(RwLock::new(Some(command_receiver))),
+            command_sender: cp_command_sender,
+            ev_identifiers: Arc::new(RwLock::new(HashMap::new())),
             command_consumer: Arc::new(RwLock::new(None)),
         })
     }
@@ -857,6 +911,25 @@ impl ChargePoint {
                         } => {
                             cp.send_triggered_message(requested_message, connector_id)
                                 .await;
+                        }
+                        RemoteCommand::AutoStart {
+                            connector_id,
+                            id_tag,
+                            meter_start,
+                        } => {
+                            cp.perform_autocharge_start(connector_id, id_tag, meter_start)
+                                .await;
+                        }
+                        RemoteCommand::AutoStop { transaction_id } => {
+                            if let Err(e) = cp
+                                .stop_transaction(transaction_id, 0, Reason::EVDisconnected)
+                                .await
+                            {
+                                warn!(
+                                    "autocharge: failed to stop transaction \
+                                     {transaction_id} on unplug: {e}"
+                                );
+                            }
                         }
                     }
                 }
@@ -1264,22 +1337,204 @@ impl ChargePoint {
         self.connectors.read().await.clone()
     }
 
-    /// Plug in connector
+    /// Plug in connector.
+    ///
+    /// With AutoCharge enabled ([`AutoChargeConfig`]) and an EV identifier set
+    /// on this connector ([`set_ev_identifier`](Self::set_ev_identifier)), a
+    /// transition into `Preparing` (cable plugged on a free/reserved connector)
+    /// queues an auto-start: derive the `idTag` from the EV MAC and drive the
+    /// existing `Authorize` + `StartTransaction` flow. The round-trips run on
+    /// the command-consumer task, off this call path, so they never re-enter the
+    /// receive loop.
     pub async fn plug_in(&self, connector_id: ConnectorId) -> Result<()> {
-        let mut connectors = self.connectors.write().await;
-        if let Some(connector) = connectors.get_mut(&connector_id) {
+        // Snapshot just enough state under the connectors lock to decide whether
+        // AutoCharge should fire, then release the lock before queuing anything.
+        let (entered_preparing, meter_start) = {
+            let mut connectors = self.connectors.write().await;
+            let Some(connector) = connectors.get_mut(&connector_id) else {
+                return Ok(());
+            };
+            let before = connector.status().await;
             connector.plug_in().await?;
+            let after = connector.status().await;
+            let entered_preparing = after == ChargePointStatus::Preparing
+                && matches!(
+                    before,
+                    ChargePointStatus::Available | ChargePointStatus::Reserved
+                );
+            let meter_start = connector.last_meter_reading().await.energy_wh as i32;
+            (entered_preparing, meter_start)
+        };
+
+        if self.config.auto_charge.enabled && entered_preparing {
+            self.maybe_autocharge_start(connector_id, meter_start).await;
         }
         Ok(())
     }
 
-    /// Plug out connector
+    /// Plug out connector.
+    ///
+    /// With AutoCharge enabled, unplugging a connector that is running a
+    /// transaction ends it with reason `EVDisconnected` (the `StopTransaction`
+    /// runs off this call path); the connector returns to `Available`.
     pub async fn plug_out(&self, connector_id: ConnectorId) -> Result<()> {
+        if self.config.auto_charge.enabled {
+            if let Some(transaction_id) = self.active_transaction_on_connector(connector_id).await {
+                // Record the physical unplug without the connector's local
+                // "emergency stop" status churn — the queued StopTransaction is
+                // what drives Charging -> Finishing -> Available for the CSMS.
+                {
+                    let mut connectors = self.connectors.write().await;
+                    if let Some(connector) = connectors.get_mut(&connector_id) {
+                        connector.set_unplugged().await;
+                    }
+                }
+                if self
+                    .command_sender
+                    .send(RemoteCommand::AutoStop { transaction_id })
+                    .is_err()
+                {
+                    warn!(
+                        "autocharge: command consumer gone; cannot stop transaction \
+                         {transaction_id} on connector {connector_id}"
+                    );
+                }
+                return Ok(());
+            }
+        }
+
         let mut connectors = self.connectors.write().await;
         if let Some(connector) = connectors.get_mut(&connector_id) {
             connector.plug_out().await?;
         }
         Ok(())
+    }
+
+    /// Set (or replace) the simulated EV identifier (MAC / EVCCID) presented on
+    /// `connector_id`. With AutoCharge enabled, plugging this connector in then
+    /// auto-starts a transaction using the derived `idTag`. See
+    /// [`AutoChargeConfig`].
+    pub async fn set_ev_identifier(
+        &self,
+        connector_id: ConnectorId,
+        ev_identifier: impl Into<String>,
+    ) {
+        self.ev_identifiers
+            .write()
+            .await
+            .insert(connector_id, ev_identifier.into());
+    }
+
+    /// Remove the simulated EV identifier from `connector_id`, if any.
+    pub async fn clear_ev_identifier(&self, connector_id: ConnectorId) {
+        self.ev_identifiers.write().await.remove(&connector_id);
+    }
+
+    /// Find the active CSMS transaction id running on `connector_id`, if any
+    /// (reverse lookup over the `transaction_id -> connector_id` map).
+    async fn active_transaction_on_connector(&self, connector_id: ConnectorId) -> Option<i32> {
+        self.active_transactions
+            .read()
+            .await
+            .iter()
+            .find_map(|(txn_id, conn)| (*conn == connector_id).then_some(*txn_id))
+    }
+
+    /// Derive the AutoCharge `idTag` for `connector_id` and queue the auto-start
+    /// side effect. Inert (logged, no queue) when no EV identifier is set or the
+    /// identifier is not a valid MAC — never a hard error on the plug-in path.
+    async fn maybe_autocharge_start(&self, connector_id: ConnectorId, meter_start: i32) {
+        let Some(ev_id) = self.ev_identifiers.read().await.get(&connector_id).cloned() else {
+            // No EV enrolled on this connector: AutoCharge stays inert.
+            return;
+        };
+        let prefix = self.config.auto_charge.id_tag_prefix.as_deref();
+        match derive_autocharge_id_tag(&ev_id, prefix) {
+            Some(id_tag) => {
+                if self
+                    .command_sender
+                    .send(RemoteCommand::AutoStart {
+                        connector_id,
+                        id_tag,
+                        meter_start,
+                    })
+                    .is_err()
+                {
+                    warn!(
+                        "autocharge: command consumer gone; cannot start on connector \
+                         {connector_id}"
+                    );
+                }
+            }
+            None => {
+                warn!(
+                    "autocharge: EV identifier {ev_id:?} on connector {connector_id} is not a \
+                     valid MAC; staying inert"
+                );
+            }
+        }
+    }
+
+    /// Run the AutoCharge auto-start: `Authorize` the derived `idTag`, then
+    /// `StartTransaction` on success. On any non-`Accepted` authorization or a
+    /// transport failure, no transaction is started and the connector is moved
+    /// to `Finishing` (a later unplug returns it to `Available`). Invoked only
+    /// from the command-consumer task, off the plug-in path.
+    async fn perform_autocharge_start(
+        &self,
+        connector_id: ConnectorId,
+        id_tag: String,
+        meter_start: i32,
+    ) {
+        match self.authorize(&id_tag).await {
+            Ok(info) if info.status == AuthorizationStatus::Accepted => {
+                if let Err(e) = self
+                    .start_transaction(connector_id, &id_tag, meter_start)
+                    .await
+                {
+                    warn!(
+                        "autocharge: StartTransaction failed for {id_tag} on connector \
+                         {connector_id}: {e}"
+                    );
+                    self.abort_autocharge_preparing(connector_id).await;
+                }
+            }
+            Ok(info) => {
+                warn!(
+                    "autocharge: Authorize returned {:?} for {id_tag} on connector \
+                     {connector_id}; not starting",
+                    info.status
+                );
+                self.abort_autocharge_preparing(connector_id).await;
+            }
+            Err(e) => {
+                warn!("autocharge: Authorize failed for {id_tag} on connector {connector_id}: {e}");
+                self.abort_autocharge_preparing(connector_id).await;
+            }
+        }
+    }
+
+    /// Move a connector out of the `Preparing` state after a failed AutoCharge
+    /// start, reporting `Finishing` to the CSMS. A subsequent unplug
+    /// (`Finishing -> Available`) frees the connector via the normal state
+    /// machine.
+    async fn abort_autocharge_preparing(&self, connector_id: ConnectorId) {
+        {
+            let mut connectors = self.connectors.write().await;
+            if let Some(connector) = connectors.get_mut(&connector_id) {
+                let _ = connector.set_status(ChargePointStatus::Finishing).await;
+            }
+        }
+        if let Err(e) = self
+            .send_status_notification(
+                connector_id.value(),
+                ChargePointStatus::Finishing,
+                ChargePointErrorCode::NoError,
+            )
+            .await
+        {
+            warn!("autocharge: failed to report Finishing on connector {connector_id}: {e}");
+        }
     }
 
     /// Authorize an id tag, consulting the local authorization cache first.

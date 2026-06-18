@@ -336,6 +336,16 @@ impl Connector {
         Ok(())
     }
 
+    /// Record a physical unplug without driving any OCPP status transition.
+    ///
+    /// Used by the AutoCharge auto-stop path, where the queued `StopTransaction`
+    /// (not the connector's local "emergency stop") owns the
+    /// `Charging -> Finishing -> Available` status sequence reported to the CSMS.
+    pub async fn set_unplugged(&self) {
+        *self.physical_state.write().await = ConnectorPhysicalState::Unplugged;
+        self.send_event(ConnectorEvent::Unplugged).await;
+    }
+
     /// Start transaction
     pub async fn start_transaction(&mut self, id_tag: String) -> Result<()> {
         let current_status = self.status().await;
