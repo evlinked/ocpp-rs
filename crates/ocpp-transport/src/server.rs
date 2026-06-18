@@ -18,12 +18,14 @@ use axum::{
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use ocpp_messages::v16j::{
-    ChangeConfigurationRequest, GetConfigurationRequest, GetConfigurationResponse,
-    RemoteStartTransactionRequest, RemoteStopTransactionRequest, ResetRequest,
-    StatusNotificationRequest,
+    ChangeConfigurationRequest, ClearCacheRequest, GetConfigurationRequest,
+    GetConfigurationResponse, RemoteStartTransactionRequest, RemoteStopTransactionRequest,
+    ResetRequest, StatusNotificationRequest,
 };
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
-use ocpp_types::v16j::{ConfigurationStatus, RemoteStartStopStatus, ResetStatus, ResetType};
+use ocpp_types::v16j::{
+    ClearCacheStatus, ConfigurationStatus, RemoteStartStopStatus, ResetStatus, ResetType,
+};
 use ocpp_types::{CallErrorCode, OcppError, OcppResult};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -398,6 +400,23 @@ impl OcppServer {
                 },
             )
             .await?;
+        Ok(resp.status)
+    }
+
+    /// Ask a connected charge point to clear its authorization cache.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `ClearCache` command (§5.2), mirroring how the Python reference's central
+    /// system drives it
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    ///
+    /// `ClearCache` carries no request fields, so the helper takes only `cp_id`.
+    /// Returns the CP's [`ClearCacheStatus`] — `Accepted` once the local
+    /// authorization cache has been emptied, `Rejected` if the CP declines.
+    /// Errors propagate from [`call`](Self::call) (e.g.
+    /// [`OcppError::CpNotConnected`], [`OcppError::Timeout`]).
+    pub async fn clear_cache(&self, cp_id: &str) -> OcppResult<ClearCacheStatus> {
+        let resp = self.call(cp_id, ClearCacheRequest {}).await?;
         Ok(resp.status)
     }
 
@@ -1205,6 +1224,49 @@ mod tests {
         assert_eq!(status, ConfigurationStatus::Rejected);
 
         responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_cache_helper_sends_action_and_maps_status() {
+        let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
+        let mut cp = connect_cp(&server, addr, "CP_HELPER_CLR").await;
+
+        let responder = tokio::spawn(async move {
+            let (action, unique_id) = read_call(&mut cp).await;
+            assert_eq!(action, "ClearCache");
+            cp.send(WsMsg::Text(call_result_frame(
+                &unique_id,
+                serde_json::json!({ "status": "Accepted" }),
+            )))
+            .await
+            .unwrap();
+            cp
+        });
+
+        let status = server
+            .clear_cache("CP_HELPER_CLR")
+            .await
+            .expect("clear_cache resolves");
+        assert_eq!(status, ClearCacheStatus::Accepted);
+
+        responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn clear_cache_helper_errors_when_cp_absent() {
+        let (mut server, _addr) = start_server(Arc::new(EchoHandler)).await;
+
+        let err = server
+            .clear_cache("GHOST")
+            .await
+            .expect_err("unknown CP must error");
+        assert!(
+            matches!(err, OcppError::CpNotConnected { ref cp_id } if cp_id == "GHOST"),
+            "expected CpNotConnected, got {err:?}"
+        );
+
         server.stop().await.unwrap();
     }
 
