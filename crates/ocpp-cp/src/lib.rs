@@ -104,6 +104,13 @@ pub struct ChargePointConfig {
     /// stale-but-previously-`Accepted` cached entry instead of failing safe.
     /// Defaults to `false` (fail-safe: an unreachable CSMS yields `Invalid`).
     pub offline_auth_stale_ok: bool,
+    /// Fault injection: when `true`, the simulated diagnostics upload
+    /// (`GetDiagnostics`, OCPP 1.6J §4.x) takes the failure branch —
+    /// `Uploading → UploadFailed` instead of `Uploading → Uploaded` — so a
+    /// CSMS / back office can be exercised against a diagnostics upload that
+    /// fails, not just one that succeeds. Defaults to `false` (happy path);
+    /// the failure path is strictly opt-in so existing behavior is unchanged.
+    pub diagnostics_upload_should_fail: bool,
     /// Transport configuration (not serialized; uses Default on deserialization)
     #[serde(skip)]
     pub transport_config: TransportConfig,
@@ -137,6 +144,7 @@ impl Default for ChargePointConfig {
             validate_payloads: true,
             auth_cache_ttl: 24 * 60 * 60, // 24 hours
             offline_auth_stale_ok: false,
+            diagnostics_upload_should_fail: false,
             transport_config: TransportConfig::default(),
         }
     }
@@ -1952,16 +1960,25 @@ impl ChargePoint {
     ///
     /// The simulator has no real archive to upload, so it models the upload on
     /// a short timer: report `Uploading`, wait [`DIAGNOSTICS_UPLOAD_DURATION`],
-    /// then report `Uploaded`. The latest status is retained so a subsequent
-    /// `TriggerMessage(DiagnosticsStatusNotification)` reports it. Mirrors the
-    /// progress reporting in the Python reference's
+    /// then report a terminal status. The latest status is retained so a
+    /// subsequent `TriggerMessage(DiagnosticsStatusNotification)` reports it.
+    /// Mirrors the progress reporting in the Python reference's
     /// [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py).
+    ///
+    /// The terminal status is `Uploaded` on the happy path; with
+    /// [`ChargePointConfig::diagnostics_upload_should_fail`] set (opt-in fault
+    /// injection) it is `UploadFailed` instead, so a CSMS can be tested against
+    /// a diagnostics upload that fails (OCPP 1.6J §4.x; `DiagnosticsStatus`).
     async fn run_diagnostics_upload(&self) {
         self.set_diagnostics_status(DiagnosticsStatus::Uploading)
             .await;
         tokio::time::sleep(DIAGNOSTICS_UPLOAD_DURATION).await;
-        self.set_diagnostics_status(DiagnosticsStatus::Uploaded)
-            .await;
+        let terminal = if self.config.diagnostics_upload_should_fail {
+            DiagnosticsStatus::UploadFailed
+        } else {
+            DiagnosticsStatus::Uploaded
+        };
+        self.set_diagnostics_status(terminal).await;
     }
 
     /// Record `status` as the CP's current diagnostics status and announce it to
