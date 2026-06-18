@@ -24,7 +24,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ocpp_cp::{ChargePoint, ChargePointConfig};
+use ocpp_cp::{ChargePoint, ChargePointConfig, FirmwareUpdateOutcome};
 use ocpp_messages::v16j::{
     BootNotificationRequest, BootNotificationResponse, FirmwareStatusNotificationRequest,
     FirmwareStatusNotificationResponse, HeartbeatRequest, HeartbeatResponse, RegistrationStatus,
@@ -83,6 +83,17 @@ async fn start_csms(dispatcher: ActionDispatcher) -> (OcppServer, SocketAddr) {
 }
 
 fn cp_config(addr: SocketAddr, id: &str) -> ChargePointConfig {
+    cp_config_with_outcome(addr, id, FirmwareUpdateOutcome::Succeed)
+}
+
+/// `cp_config`, but selecting which branch of the simulated firmware update the
+/// CP follows so a test can drive the `DownloadFailed` / `InstallationFailed`
+/// error paths (Issue #83).
+fn cp_config_with_outcome(
+    addr: SocketAddr,
+    id: &str,
+    outcome: FirmwareUpdateOutcome,
+) -> ChargePointConfig {
     ChargePointConfig {
         charge_point_id: id.to_string(),
         central_system_url: format!("ws://{addr}"),
@@ -91,6 +102,7 @@ fn cp_config(addr: SocketAddr, id: &str) -> ChargePointConfig {
         auto_reconnect: false,
         // Keep the meter sampler quiet so it doesn't interleave with the asserts.
         meter_values_interval: 3600,
+        firmware_update_outcome: outcome,
         ..ChargePointConfig::default()
     }
 }
@@ -107,6 +119,21 @@ async fn recv_status(rx: &mut mpsc::UnboundedReceiver<FirmwareStatus>, expected:
             return;
         }
     }
+}
+
+/// Pull the *next* notification and assert it equals `expected`, failing if it
+/// differs or none arrives before [`FW_TIMEOUT`]. Unlike [`recv_status`], this
+/// does not skip intervening statuses — used after a failure to prove the
+/// state machine stopped (no stray `Downloaded` / `Installed` leaked through).
+async fn recv_exact(rx: &mut mpsc::UnboundedReceiver<FirmwareStatus>, expected: FirmwareStatus) {
+    let status = timeout(FW_TIMEOUT, rx.recv())
+        .await
+        .expect("CSMS observes a FirmwareStatusNotification")
+        .expect("firmware channel open");
+    assert_eq!(
+        status, expected,
+        "expected the next firmware status to be {expected:?}, got {status:?}"
+    );
 }
 
 #[tokio::test]
@@ -154,6 +181,121 @@ async fn csms_update_firmware_drives_update_state_machine() {
         "the CP now supports a FirmwareStatusNotification trigger"
     );
     recv_status(&mut fw_rx, FirmwareStatus::Installed).await;
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+/// Issue #83 — the firmware simulator can model a download that fails, not just
+/// the happy path. With the opt-in `FirmwareUpdateOutcome::DownloadFailed` knob
+/// set, an `UpdateFirmware` drives `Downloading → DownloadFailed` and stops (no
+/// install), and the failed status is retained so a later
+/// `TriggerMessage(FirmwareStatusNotification)` reports `DownloadFailed`.
+#[tokio::test]
+async fn csms_update_firmware_download_failure_is_observable() {
+    let cp_id = "CP_FW_DL_FAIL_01";
+    let (fw_tx, mut fw_rx) = mpsc::unbounded_channel();
+    let (mut server, addr) = start_csms(recording_csms_dispatcher(fw_tx)).await;
+
+    let cp = ChargePoint::new(cp_config_with_outcome(
+        addr,
+        cp_id,
+        FirmwareUpdateOutcome::DownloadFailed,
+    ))
+    .expect("build charge point");
+    cp.connect().await.expect("connect + boot sequence");
+    assert!(
+        server.is_cp_connected(cp_id),
+        "the CSMS must be able to route CALLs to the booted CP"
+    );
+
+    // UpdateFirmware still resolves (empty conf per spec); the update only fails
+    // partway through.
+    server
+        .update_firmware(
+            cp_id,
+            "ftp://example.test/firmware.bin",
+            chrono::Utc::now(),
+            None,
+            None,
+        )
+        .await
+        .expect("update_firmware resolves");
+
+    // Downloading then DownloadFailed — and nothing after (no Downloaded /
+    // Installing / Installed): the next status the CSMS sees is the trigger's
+    // re-report of the retained DownloadFailed.
+    recv_status(&mut fw_rx, FirmwareStatus::Downloading).await;
+    recv_status(&mut fw_rx, FirmwareStatus::DownloadFailed).await;
+
+    let status = server
+        .trigger_message(cp_id, MessageTrigger::FirmwareStatusNotification, None)
+        .await
+        .expect("trigger_message(Firmware) resolves");
+    assert_eq!(
+        status,
+        TriggerMessageStatus::Accepted,
+        "the CP supports a FirmwareStatusNotification trigger after a failed download"
+    );
+    recv_exact(&mut fw_rx, FirmwareStatus::DownloadFailed).await;
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+/// Issue #83 — the firmware simulator can model an install that fails. With the
+/// opt-in `FirmwareUpdateOutcome::InstallationFailed` knob set, an
+/// `UpdateFirmware` drives `Downloading → Downloaded → Installing →
+/// InstallationFailed`, and the failed status is retained so a later
+/// `TriggerMessage(FirmwareStatusNotification)` reports `InstallationFailed`.
+#[tokio::test]
+async fn csms_update_firmware_installation_failure_is_observable() {
+    let cp_id = "CP_FW_INST_FAIL_01";
+    let (fw_tx, mut fw_rx) = mpsc::unbounded_channel();
+    let (mut server, addr) = start_csms(recording_csms_dispatcher(fw_tx)).await;
+
+    let cp = ChargePoint::new(cp_config_with_outcome(
+        addr,
+        cp_id,
+        FirmwareUpdateOutcome::InstallationFailed,
+    ))
+    .expect("build charge point");
+    cp.connect().await.expect("connect + boot sequence");
+    assert!(
+        server.is_cp_connected(cp_id),
+        "the CSMS must be able to route CALLs to the booted CP"
+    );
+
+    server
+        .update_firmware(
+            cp_id,
+            "ftp://example.test/firmware.bin",
+            chrono::Utc::now(),
+            None,
+            None,
+        )
+        .await
+        .expect("update_firmware resolves");
+
+    // The download succeeds; the install fails. The CSMS sees the full
+    // Downloading → Downloaded → Installing progression, then InstallationFailed.
+    recv_status(&mut fw_rx, FirmwareStatus::Downloading).await;
+    recv_status(&mut fw_rx, FirmwareStatus::Downloaded).await;
+    recv_status(&mut fw_rx, FirmwareStatus::Installing).await;
+    recv_status(&mut fw_rx, FirmwareStatus::InstallationFailed).await;
+
+    // No Installed leaks after the failure: the next status is the trigger's
+    // re-report of the retained InstallationFailed.
+    let status = server
+        .trigger_message(cp_id, MessageTrigger::FirmwareStatusNotification, None)
+        .await
+        .expect("trigger_message(Firmware) resolves");
+    assert_eq!(
+        status,
+        TriggerMessageStatus::Accepted,
+        "the CP supports a FirmwareStatusNotification trigger after a failed install"
+    );
+    recv_exact(&mut fw_rx, FirmwareStatus::InstallationFailed).await;
 
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");
