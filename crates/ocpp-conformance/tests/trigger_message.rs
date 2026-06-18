@@ -10,8 +10,10 @@
 //!      observes a fresh `BootNotification` CALL from the CP.
 //!   2. `trigger_message(StatusNotification, Some(1))` → `Accepted`, and the
 //!      CSMS observes a `StatusNotification` scoped to connector 1.
-//!   3. `trigger_message(FirmwareStatusNotification)` → `NotImplemented`
-//!      (a message this CP cannot produce yet), and nothing is sent.
+//!   3. `trigger_message(FirmwareStatusNotification)` → `Accepted` (now a
+//!      supported trigger, #70), and no unrelated `BootNotification` /
+//!      `StatusNotification` is sent. The firmware-status flow itself is
+//!      covered end-to-end in `firmware.rs`.
 //!
 //! Rust counterpart of the Python reference's central system driving
 //! `TriggerMessage`
@@ -180,31 +182,34 @@ async fn csms_trigger_message_drives_cp_to_send_requested_messages() {
         "the StatusNotification is scoped to the requested connector"
     );
 
-    // 3. Trigger an unsupported message → NotImplemented, and nothing is sent.
-    //    `FirmwareStatusNotification` has no state machine yet (that's #70);
-    //    `DiagnosticsStatusNotification` is now supported (#69) and is covered
-    //    in `diagnostics.rs`.
+    // 3. Trigger FirmwareStatusNotification → Accepted (now supported, #70).
+    //    The firmware-status notification flow itself is covered in
+    //    `firmware.rs`; here we only assert the trigger is accepted and does not
+    //    spuriously emit an unrelated BootNotification or StatusNotification.
+    //    (`DiagnosticsStatusNotification`, also supported since #69, is covered
+    //    in `diagnostics.rs`.)
     let status = server
         .trigger_message(cp_id, MessageTrigger::FirmwareStatusNotification, None)
         .await
         .expect("trigger_message(Firmware) resolves");
     assert_eq!(
         status,
-        TriggerMessageStatus::NotImplemented,
-        "the CP reports NotImplemented for a message it cannot produce"
+        TriggerMessageStatus::Accepted,
+        "the CP now supports a FirmwareStatusNotification trigger"
     );
-    // No BootNotification or StatusNotification should follow a NotImplemented.
+    // The firmware trigger must not produce a BootNotification or
+    // StatusNotification (those ride their own channels in this dispatcher).
     assert!(
         timeout(Duration::from_millis(300), boot_rx.recv())
             .await
             .is_err(),
-        "an unsupported trigger must not produce a BootNotification"
+        "a FirmwareStatusNotification trigger must not produce a BootNotification"
     );
     assert!(
         timeout(Duration::from_millis(300), status_rx.recv())
             .await
             .is_err(),
-        "an unsupported trigger must not produce a StatusNotification"
+        "a FirmwareStatusNotification trigger must not produce a StatusNotification"
     );
 
     cp.disconnect().await.expect("disconnect");

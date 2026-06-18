@@ -119,7 +119,7 @@ pub enum DiagnosticsStatus {
 }
 
 /// Firmware status enumeration (core + security extension variants)
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum FirmwareStatus {
     /// Firmware downloaded
