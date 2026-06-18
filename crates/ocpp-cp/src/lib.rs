@@ -106,6 +106,13 @@ pub struct ChargePointConfig {
     /// stale-but-previously-`Accepted` cached entry instead of failing safe.
     /// Defaults to `false` (fail-safe: an unreachable CSMS yields `Invalid`).
     pub offline_auth_stale_ok: bool,
+    /// Fault injection: when `true`, the simulated diagnostics upload
+    /// (`GetDiagnostics`, OCPP 1.6J §4.x) takes the failure branch —
+    /// `Uploading → UploadFailed` instead of `Uploading → Uploaded` — so a
+    /// CSMS / back office can be exercised against a diagnostics upload that
+    /// fails, not just one that succeeds. Defaults to `false` (happy path);
+    /// the failure path is strictly opt-in so existing behavior is unchanged.
+    pub diagnostics_upload_should_fail: bool,
     /// Transport configuration (not serialized; uses Default on deserialization)
     #[serde(skip)]
     pub transport_config: TransportConfig,
@@ -139,6 +146,7 @@ impl Default for ChargePointConfig {
             validate_payloads: true,
             auth_cache_ttl: 24 * 60 * 60, // 24 hours
             offline_auth_stale_ok: false,
+            diagnostics_upload_should_fail: false,
             transport_config: TransportConfig::default(),
         }
     }
@@ -223,6 +231,16 @@ enum RemoteCommand {
     /// `FirmwareStatusNotification(Downloading)` → `Downloaded` → `Installing`
     /// → `Installed`.
     UpdateFirmware,
+    /// Emit a `StatusNotification` CALL for a connector whose status changed as
+    /// a local side effect of an inbound command — currently the `Reserved` /
+    /// `Available` transitions behind an `Accepted` `ReserveNow` /
+    /// `CancelReservation` (OCPP 1.6J §5.14/§5.4, Issue #80). Queued rather than
+    /// sent inline for the same reason as the other side effects: the outbound
+    /// CALL must not re-enter the receive loop mid-dispatch.
+    EmitConnectorStatus {
+        connector_id: ConnectorId,
+        status: ChargePointStatus,
+    },
 }
 
 /// Whether this charge point can proactively produce `message` on a
@@ -810,15 +828,20 @@ impl ChargePoint {
         // status: a free connector is reserved (→ `Reserved`) and the
         // reservationId recorded; a busy connector → `Occupied`, a faulted one →
         // `Faulted`, an unavailable one → `Unavailable`; an unknown/out-of-range
-        // connector id (incl. 0) → `Rejected`. The reserve is a local state
-        // change (no outbound CALL), so it runs inline with no re-entrancy.
-        // Ports `ReserveNow` from the Python reference's `call.py`/`enums.py`.
+        // connector id (incl. 0) → `Rejected`. The reserve itself is a local
+        // state change, but on `Accepted` we also queue a `StatusNotification`
+        // (`Reserved`) to the CSMS off the inbound-CALL path so a back office's
+        // live connector view flips immediately (Issue #80) without waiting for
+        // the next status event. Ports `ReserveNow` from the Python reference's
+        // `call.py`/`enums.py`.
         {
             let connectors = connectors.clone();
             let reservations = reservations.clone();
+            let command_sender = command_sender.clone();
             d.on(move |req: ReserveNowRequest| {
                 let connectors = connectors.clone();
                 let reservations = reservations.clone();
+                let command_sender = command_sender.clone();
                 async move {
                     let status = match ConnectorId::new(req.connector_id as u32) {
                         Ok(cid) => match connectors.read().await.get(&cid).cloned() {
@@ -830,6 +853,16 @@ impl ChargePoint {
                                                 .write()
                                                 .await
                                                 .insert(req.reservation_id, cid);
+                                            // Best-effort: the reservation is
+                                            // already Accepted; a dropped
+                                            // notification (consumer gone, CP
+                                            // shutting down) must not undo it.
+                                            let _ = command_sender.send(
+                                                RemoteCommand::EmitConnectorStatus {
+                                                    connector_id: cid,
+                                                    status: ChargePointStatus::Reserved,
+                                                },
+                                            );
                                             ReservationStatus::Accepted
                                         }
                                         Err(_) => ReservationStatus::Rejected,
@@ -854,22 +887,41 @@ impl ChargePoint {
 
         // CancelReservation — clear a reservation by reservationId (OCPP 1.6J
         // §5.4). `Accepted` if the id is held (the connector is freed,
-        // `Reserved` → `Available`), `Rejected` if it is unknown. Local state
-        // change only — no outbound CALL, no re-entrancy. Ports
+        // `Reserved` → `Available`), `Rejected` if it is unknown. Freeing the
+        // connector is a local state change; on `Accepted` we also queue a
+        // `StatusNotification` (`Available`) off the inbound-CALL path so the
+        // CSMS sees the connector free up immediately (Issue #80). A
+        // `cancel_reservation()` that did not actually flip `Reserved` →
+        // `Available` (the connector moved on, e.g. a faulted/occupied edge)
+        // emits nothing — we only announce the transition we made. Ports
         // `CancelReservation` from the Python reference's `call.py`/`enums.py`.
         {
             let connectors = connectors.clone();
             let reservations = reservations.clone();
+            let command_sender = command_sender.clone();
             d.on(move |req: CancelReservationRequest| {
                 let connectors = connectors.clone();
                 let reservations = reservations.clone();
+                let command_sender = command_sender.clone();
                 async move {
                     let held = reservations.write().await.remove(&req.reservation_id);
                     let status = match held {
                         Some(cid) => {
                             if let Some(mut connector) = connectors.read().await.get(&cid).cloned()
                             {
+                                let was_reserved =
+                                    connector.status().await == ChargePointStatus::Reserved;
                                 let _ = connector.cancel_reservation().await;
+                                if was_reserved {
+                                    // Best-effort: cancellation is already
+                                    // Accepted; a dropped notification must not
+                                    // undo it.
+                                    let _ =
+                                        command_sender.send(RemoteCommand::EmitConnectorStatus {
+                                            connector_id: cid,
+                                            status: ChargePointStatus::Available,
+                                        });
+                                }
                             }
                             CancelReservationStatus::Accepted
                         }
@@ -1044,6 +1096,25 @@ impl ChargePoint {
                         }
                         RemoteCommand::UpdateFirmware => {
                             cp.run_firmware_update().await;
+                        }
+                        RemoteCommand::EmitConnectorStatus {
+                            connector_id,
+                            status,
+                        } => {
+                            if let Err(e) = cp
+                                .send_status_notification(
+                                    connector_id.value(),
+                                    status,
+                                    ChargePointErrorCode::NoError,
+                                )
+                                .await
+                            {
+                                warn!(
+                                    "reservation StatusNotification({status:?}) for connector \
+                                     {} failed: {e}",
+                                    connector_id.value()
+                                );
+                            }
                         }
                     }
                 }
@@ -1944,16 +2015,25 @@ impl ChargePoint {
     ///
     /// The simulator has no real archive to upload, so it models the upload on
     /// a short timer: report `Uploading`, wait [`DIAGNOSTICS_UPLOAD_DURATION`],
-    /// then report `Uploaded`. The latest status is retained so a subsequent
-    /// `TriggerMessage(DiagnosticsStatusNotification)` reports it. Mirrors the
-    /// progress reporting in the Python reference's
+    /// then report a terminal status. The latest status is retained so a
+    /// subsequent `TriggerMessage(DiagnosticsStatusNotification)` reports it.
+    /// Mirrors the progress reporting in the Python reference's
     /// [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py).
+    ///
+    /// The terminal status is `Uploaded` on the happy path; with
+    /// [`ChargePointConfig::diagnostics_upload_should_fail`] set (opt-in fault
+    /// injection) it is `UploadFailed` instead, so a CSMS can be tested against
+    /// a diagnostics upload that fails (OCPP 1.6J §4.x; `DiagnosticsStatus`).
     async fn run_diagnostics_upload(&self) {
         self.set_diagnostics_status(DiagnosticsStatus::Uploading)
             .await;
         tokio::time::sleep(DIAGNOSTICS_UPLOAD_DURATION).await;
-        self.set_diagnostics_status(DiagnosticsStatus::Uploaded)
-            .await;
+        let terminal = if self.config.diagnostics_upload_should_fail {
+            DiagnosticsStatus::UploadFailed
+        } else {
+            DiagnosticsStatus::Uploaded
+        };
+        self.set_diagnostics_status(terminal).await;
     }
 
     /// Record `status` as the CP's current diagnostics status and announce it to

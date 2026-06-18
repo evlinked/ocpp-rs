@@ -83,6 +83,12 @@ async fn start_csms(dispatcher: ActionDispatcher) -> (OcppServer, SocketAddr) {
 }
 
 fn cp_config(addr: SocketAddr, id: &str) -> ChargePointConfig {
+    cp_config_with_fault(addr, id, false)
+}
+
+/// `cp_config`, but with the opt-in diagnostics-upload fault injection toggled
+/// so a test can drive the `Uploading → UploadFailed` branch (Issue #83).
+fn cp_config_with_fault(addr: SocketAddr, id: &str, fail_upload: bool) -> ChargePointConfig {
     ChargePointConfig {
         charge_point_id: id.to_string(),
         central_system_url: format!("ws://{addr}"),
@@ -91,6 +97,7 @@ fn cp_config(addr: SocketAddr, id: &str) -> ChargePointConfig {
         auto_reconnect: false,
         // Keep the meter sampler quiet so it doesn't interleave with the asserts.
         meter_values_interval: 3600,
+        diagnostics_upload_should_fail: fail_upload,
         ..ChargePointConfig::default()
     }
 }
@@ -155,6 +162,56 @@ async fn csms_get_diagnostics_drives_upload_state_machine() {
         "the CP now supports a DiagnosticsStatusNotification trigger"
     );
     recv_status(&mut diag_rx, DiagnosticsStatus::Uploaded).await;
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+/// Issue #83 — the diagnostics simulator can model a *failed* upload, not just
+/// the happy path. With the opt-in `diagnostics_upload_should_fail` knob set, a
+/// `GetDiagnostics` drives `Uploading → UploadFailed`, and the failed status is
+/// retained so a later `TriggerMessage(DiagnosticsStatusNotification)` reports
+/// `UploadFailed`.
+#[tokio::test]
+async fn csms_get_diagnostics_upload_failure_is_observable() {
+    let cp_id = "CP_DIAG_FAIL_01";
+    let (diag_tx, mut diag_rx) = mpsc::unbounded_channel();
+    let (mut server, addr) = start_csms(recording_csms_dispatcher(diag_tx)).await;
+
+    // A charge point with fault injection on: its diagnostics upload will fail.
+    let cp = ChargePoint::new(cp_config_with_fault(addr, cp_id, true)).expect("build charge point");
+    cp.connect().await.expect("connect + boot sequence");
+    assert!(
+        server.is_cp_connected(cp_id),
+        "the CSMS must be able to route CALLs to the booted CP"
+    );
+
+    // GetDiagnostics is still Accepted — the upload only fails partway through.
+    let resp = server
+        .get_diagnostics(cp_id, "ftp://example.test/diag", None, None, None, None)
+        .await
+        .expect("get_diagnostics resolves");
+    assert!(
+        resp.file_name.is_some_and(|n| !n.is_empty()),
+        "an accepted GetDiagnostics returns a non-empty file name even when the upload will fail"
+    );
+
+    // The simulated upload reports Uploading then UploadFailed, in order.
+    recv_status(&mut diag_rx, DiagnosticsStatus::Uploading).await;
+    recv_status(&mut diag_rx, DiagnosticsStatus::UploadFailed).await;
+
+    // The failed status is retained: a trigger reports the *current* status
+    // (UploadFailed) without re-running the upload.
+    let status = server
+        .trigger_message(cp_id, MessageTrigger::DiagnosticsStatusNotification, None)
+        .await
+        .expect("trigger_message(Diagnostics) resolves");
+    assert_eq!(
+        status,
+        TriggerMessageStatus::Accepted,
+        "the CP supports a DiagnosticsStatusNotification trigger after a failed upload"
+    );
+    recv_status(&mut diag_rx, DiagnosticsStatus::UploadFailed).await;
 
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");
