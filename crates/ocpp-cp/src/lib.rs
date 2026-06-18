@@ -25,12 +25,14 @@ use ocpp_messages::v16j::{
     CancelReservationResponse, ChangeAvailabilityRequest, ChangeAvailabilityResponse,
     ChangeConfigurationRequest, ChangeConfigurationResponse, ClearCacheRequest, ClearCacheResponse,
     DataTransferRequest, DataTransferResponse, DiagnosticsStatusNotificationRequest,
-    GetConfigurationRequest, GetConfigurationResponse, GetDiagnosticsRequest,
-    GetDiagnosticsResponse, HeartbeatRequest, MeterValuesRequest, RegistrationStatus,
-    RemoteStartTransactionRequest, RemoteStartTransactionResponse, RemoteStopTransactionRequest,
-    RemoteStopTransactionResponse, ReserveNowRequest, ReserveNowResponse, ResetRequest,
-    ResetResponse, StartTransactionRequest, StatusNotificationRequest, StopTransactionRequest,
-    TriggerMessageRequest, TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse,
+    FirmwareStatusNotificationRequest, GetConfigurationRequest, GetConfigurationResponse,
+    GetDiagnosticsRequest, GetDiagnosticsResponse, HeartbeatRequest, MeterValuesRequest,
+    RegistrationStatus, RemoteStartTransactionRequest, RemoteStartTransactionResponse,
+    RemoteStopTransactionRequest, RemoteStopTransactionResponse, ReserveNowRequest,
+    ReserveNowResponse, ResetRequest, ResetResponse, StartTransactionRequest,
+    StatusNotificationRequest, StopTransactionRequest, TriggerMessageRequest,
+    TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse, UpdateFirmwareRequest,
+    UpdateFirmwareResponse,
 };
 use ocpp_messages::{
     ActionDispatcher, CallMessage, Message, MessageType, OcppAction, SchemaValidator,
@@ -44,9 +46,9 @@ use ocpp_types::common::{
 };
 use ocpp_types::v16j::{
     CancelReservationStatus, ChargePointErrorCode, ChargePointStatus, ChargePointVendorInfo,
-    ClearCacheStatus, ConfigurationStatus, DataTransferStatus, DiagnosticsStatus, MessageTrigger,
-    RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus,
-    UnlockStatus,
+    ClearCacheStatus, ConfigurationStatus, DataTransferStatus, DiagnosticsStatus, FirmwareStatus,
+    MessageTrigger, RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType,
+    TriggerMessageStatus, UnlockStatus,
 };
 use ocpp_types::{
     CallErrorCode, CallErrorMessage, CallResultMessage, ConnectorId, OcppError, OcppResult,
@@ -216,31 +218,44 @@ enum RemoteCommand {
     /// `GetDiagnostics` (OCPP 1.6J §4.x, firmware-management profile). Emits
     /// `DiagnosticsStatusNotification(Uploading)` then `Uploaded`.
     GetDiagnostics,
+    /// Run the simulated firmware download/install state machine for an
+    /// `Accepted` `UpdateFirmware` (OCPP 1.6J §4.x, firmware-management
+    /// profile). Emits `FirmwareStatusNotification` `Downloading` →
+    /// `Downloaded` → `Installing` → `Installed`.
+    UpdateFirmware,
 }
 
 /// Whether this charge point can proactively produce `message` on a
 /// `TriggerMessage` request (OCPP 1.6J §4.x).
 ///
-/// `BootNotification`, `Heartbeat`, `StatusNotification`, on-demand
-/// `MeterValues`, and `DiagnosticsStatusNotification` (the CP tracks a
-/// diagnostics-upload status from `GetDiagnostics`) are wired;
-/// `FirmwareStatusNotification` is not a feature this CP implements yet and
-/// returns `NotImplemented` until the `UpdateFirmware` state machine lands.
+/// Every `MessageTrigger` variant is now wired: `BootNotification`,
+/// `Heartbeat`, `StatusNotification`, on-demand `MeterValues`,
+/// `DiagnosticsStatusNotification` (the CP tracks a diagnostics-upload status
+/// from `GetDiagnostics`), and `FirmwareStatusNotification` (the CP tracks a
+/// firmware-update status from `UpdateFirmware`). Written as an exhaustive
+/// match — no catch-all — so adding a future `MessageTrigger` variant fails to
+/// compile here and at [`ChargePoint::send_triggered_message`] until its
+/// support (or an explicit `NotImplemented`) is decided.
 fn trigger_message_supported(message: &MessageTrigger) -> bool {
-    matches!(
-        message,
+    match message {
         MessageTrigger::BootNotification
-            | MessageTrigger::Heartbeat
-            | MessageTrigger::StatusNotification
-            | MessageTrigger::MeterValues
-            | MessageTrigger::DiagnosticsStatusNotification
-    )
+        | MessageTrigger::Heartbeat
+        | MessageTrigger::StatusNotification
+        | MessageTrigger::MeterValues
+        | MessageTrigger::DiagnosticsStatusNotification
+        | MessageTrigger::FirmwareStatusNotification => true,
+    }
 }
 
 /// How long the simulated diagnostics upload "takes" between the
 /// `Uploading` and `Uploaded` `DiagnosticsStatusNotification`s. Short so the
 /// simulator stays responsive; the CP has no real archive to upload.
 const DIAGNOSTICS_UPLOAD_DURATION: Duration = Duration::from_millis(200);
+
+/// How long each simulated firmware step "takes" between successive
+/// `FirmwareStatusNotification` transitions. Short so the simulator stays
+/// responsive; the CP has no real firmware image to download or install.
+const FIRMWARE_STEP_DURATION: Duration = Duration::from_millis(100);
 
 /// Charge point event handler trait
 #[async_trait::async_trait]
@@ -412,6 +427,12 @@ pub struct ChargePoint {
     /// `TriggerMessage(DiagnosticsStatusNotification)` to report the latest
     /// status without re-running the upload.
     diagnostics_status: Arc<RwLock<DiagnosticsStatus>>,
+    /// Current firmware-update status (OCPP 1.6J §4.x). Starts `Idle`; driven
+    /// through `Downloading` → `Downloaded` → `Installing` → `Installed` by the
+    /// simulated update an `UpdateFirmware` kicks off. Read on demand by
+    /// `TriggerMessage(FirmwareStatusNotification)` to report the latest status
+    /// without re-running the update.
+    firmware_status: Arc<RwLock<FirmwareStatus>>,
 }
 
 impl ChargePoint {
@@ -492,6 +513,7 @@ impl ChargePoint {
             command_receiver: Arc::new(RwLock::new(Some(command_receiver))),
             command_consumer: Arc::new(RwLock::new(None)),
             diagnostics_status: Arc::new(RwLock::new(DiagnosticsStatus::Idle)),
+            firmware_status: Arc::new(RwLock::new(FirmwareStatus::Idle)),
         })
     }
 
@@ -751,6 +773,30 @@ impl ChargePoint {
             });
         }
 
+        // UpdateFirmware — acknowledge with the (empty) UpdateFirmware.conf the
+        // spec mandates, then run the simulated firmware download/install state
+        // machine as a real side effect (OCPP 1.6J §4.x, firmware-management
+        // profile). Like GetDiagnostics, the update is queued on the command
+        // channel and run by the consumer task spawned in `connect()`, so the
+        // UpdateFirmware CALLRESULT is flushed before the first
+        // `FirmwareStatusNotification` and the receive loop never re-enters
+        // itself. The simulator has no real image to fetch, so it drives
+        // Downloading → Downloaded → Installing → Installed on a timer. The conf
+        // carries no status either way, so if the consumer has gone away (CP
+        // shutting down) we still answer faithfully and simply drop the update.
+        // Ports `UpdateFirmware` from the Python reference's `call.py` /
+        // `call_result.py`.
+        {
+            let command_sender = command_sender.clone();
+            d.on(move |_req: UpdateFirmwareRequest| {
+                let command_sender = command_sender.clone();
+                async move {
+                    let _ = command_sender.send(RemoteCommand::UpdateFirmware);
+                    Ok(UpdateFirmwareResponse {})
+                }
+            });
+        }
+
         // UnlockConnector — always succeed (real connector unlock is Issue #21)
         d.on(|_req: UnlockConnectorRequest| async move {
             Ok(UnlockConnectorResponse {
@@ -994,6 +1040,9 @@ impl ChargePoint {
                         }
                         RemoteCommand::GetDiagnostics => {
                             cp.run_diagnostics_upload().await;
+                        }
+                        RemoteCommand::UpdateFirmware => {
+                            cp.run_firmware_update().await;
                         }
                     }
                 }
@@ -1845,9 +1894,10 @@ impl ChargePoint {
     /// Send the message a CSMS asked for via `TriggerMessage` (OCPP 1.6J §4.x).
     ///
     /// Runs on the command-consumer task (off the inbound-CALL path), so these
-    /// outbound CALLs never re-enter the receive loop. Only the variants
-    /// [`trigger_message_supported`] accepts reach here; anything else would be
-    /// an upstream drift between that gate and this match, and is logged.
+    /// outbound CALLs never re-enter the receive loop. The match is exhaustive
+    /// over every `MessageTrigger` variant and mirrors [`trigger_message_supported`]:
+    /// adding a future variant fails to compile in both places until its
+    /// behavior is decided.
     async fn send_triggered_message(&self, message: MessageTrigger, connector_id: Option<i32>) {
         match message {
             MessageTrigger::BootNotification => {
@@ -1873,8 +1923,12 @@ impl ChargePoint {
                 let status = *self.diagnostics_status.read().await;
                 self.send_diagnostics_status_notification(status).await;
             }
-            other => {
-                warn!("TriggerMessage({other:?}): not implemented, ignoring");
+            MessageTrigger::FirmwareStatusNotification => {
+                // Report the CP's *current* firmware status on demand without
+                // disturbing any in-flight update (Idle when no UpdateFirmware
+                // has run). Closes the deferred half of Issue #65.
+                let status = self.firmware_status.read().await.clone();
+                self.send_firmware_status_notification(status).await;
             }
         }
     }
@@ -1917,6 +1971,54 @@ impl ChargePoint {
             .await
         {
             warn!("DiagnosticsStatusNotification({status:?}): send failed: {e}");
+        }
+    }
+
+    /// Run the simulated firmware download/install state machine for an
+    /// `Accepted` `UpdateFirmware` (OCPP 1.6J §4.x, firmware-management profile).
+    ///
+    /// Invoked only from the command-consumer task (see [`connect`](Self::connect)),
+    /// never inline in the inbound-CALL handler, so the `UpdateFirmware`
+    /// CALLRESULT is flushed before the first `FirmwareStatusNotification` and
+    /// there is no receive-loop re-entrancy/deadlock.
+    ///
+    /// The simulator has no real image to download or install, so it models the
+    /// update on a short timer, reporting each step:
+    /// `Downloading` → `Downloaded` → `Installing` → `Installed`, with
+    /// [`FIRMWARE_STEP_DURATION`] between transitions. Only the happy path is
+    /// modeled (no `DownloadFailed` / `InstallationFailed`), matching the
+    /// diagnostics simulator's scope. The latest status is retained so a
+    /// subsequent `TriggerMessage(FirmwareStatusNotification)` reports it.
+    /// Mirrors the progress reporting in the Python reference's
+    /// [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py).
+    async fn run_firmware_update(&self) {
+        self.set_firmware_status(FirmwareStatus::Downloading).await;
+        tokio::time::sleep(FIRMWARE_STEP_DURATION).await;
+        self.set_firmware_status(FirmwareStatus::Downloaded).await;
+        tokio::time::sleep(FIRMWARE_STEP_DURATION).await;
+        self.set_firmware_status(FirmwareStatus::Installing).await;
+        tokio::time::sleep(FIRMWARE_STEP_DURATION).await;
+        self.set_firmware_status(FirmwareStatus::Installed).await;
+    }
+
+    /// Record `status` as the CP's current firmware status and announce it to
+    /// the CSMS with a `FirmwareStatusNotification`.
+    async fn set_firmware_status(&self, status: FirmwareStatus) {
+        *self.firmware_status.write().await = status.clone();
+        self.send_firmware_status_notification(status).await;
+    }
+
+    /// Send a single `FirmwareStatusNotification(status)` CALL to the CSMS
+    /// (OCPP 1.6J §4.x). Does not mutate the stored status — callers that change
+    /// state use [`set_firmware_status`](Self::set_firmware_status).
+    async fn send_firmware_status_notification(&self, status: FirmwareStatus) {
+        if let Err(e) = self
+            .call(FirmwareStatusNotificationRequest {
+                status: status.clone(),
+            })
+            .await
+        {
+            warn!("FirmwareStatusNotification({status:?}): send failed: {e}");
         }
     }
 
@@ -2219,11 +2321,12 @@ mod tests {
     // --- dispatcher wiring tests ---
 
     #[tokio::test]
-    async fn dispatcher_has_13_default_handlers() {
+    async fn dispatcher_has_14_default_handlers() {
         let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
-        // 10 Core Profile actions + GetDiagnostics (firmware-management, #69)
-        // + ReserveNow + CancelReservation (§5.14/§5.4, #71).
-        assert_eq!(cp.handler_count().await, 13);
+        // 10 Core Profile actions + GetDiagnostics + UpdateFirmware
+        // (firmware-management, #69/#70) + ReserveNow + CancelReservation
+        // (§5.14/§5.4, #71).
+        assert_eq!(cp.handler_count().await, 14);
     }
 
     #[tokio::test]
@@ -2283,9 +2386,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_trigger_message_unsupported_not_implemented() {
-        // A requestedMessage the CP cannot produce is rejected as NotImplemented
-        // without queuing any work.
+    async fn default_trigger_message_firmware_status_accepted() {
+        // FirmwareStatusNotification is the last trigger to gain support (#70):
+        // with the UpdateFirmware state machine in place the CP can report its
+        // current firmware status on demand, so the trigger is now Accepted.
+        // Every MessageTrigger variant is supported, so there is no remaining
+        // NotImplemented case to assert.
         let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
         let call = make_call(TriggerMessageRequest {
             requested_message: MessageTrigger::FirmwareStatusNotification,
@@ -2295,7 +2401,7 @@ mod tests {
         match resp.unwrap() {
             Message::CallResult(r) => {
                 let body: TriggerMessageResponse = r.payload_as().unwrap();
-                assert_eq!(body.status, TriggerMessageStatus::NotImplemented);
+                assert_eq!(body.status, TriggerMessageStatus::Accepted);
             }
             other => panic!("expected CallResult, got: {other:?}"),
         }

@@ -10,8 +10,10 @@
 //!      observes a fresh `BootNotification` CALL from the CP.
 //!   2. `trigger_message(StatusNotification, Some(1))` → `Accepted`, and the
 //!      CSMS observes a `StatusNotification` scoped to connector 1.
-//!   3. `trigger_message(FirmwareStatusNotification)` → `NotImplemented`
-//!      (a message this CP cannot produce yet), and nothing is sent.
+//!   3. `trigger_message(FirmwareStatusNotification)` → `Accepted`, and the
+//!      CSMS observes a `FirmwareStatusNotification` carrying the CP's current
+//!      status (`Idle`, as no `UpdateFirmware` has run) — the last trigger to
+//!      gain support (#70); the full update flow lives in `firmware.rs`.
 //!
 //! Rust counterpart of the Python reference's central system driving
 //! `TriggerMessage`
@@ -25,16 +27,18 @@ use std::time::Duration;
 use ocpp_cp::{ChargePoint, ChargePointConfig};
 use ocpp_messages::v16j::{
     AuthorizeRequest, AuthorizeResponse, BootNotificationRequest, BootNotificationResponse,
-    HeartbeatRequest, HeartbeatResponse, MeterValuesRequest, MeterValuesResponse,
-    RegistrationStatus, StartTransactionRequest, StartTransactionResponse,
-    StatusNotificationRequest, StatusNotificationResponse, StopTransactionRequest,
-    StopTransactionResponse,
+    FirmwareStatusNotificationRequest, FirmwareStatusNotificationResponse, HeartbeatRequest,
+    HeartbeatResponse, MeterValuesRequest, MeterValuesResponse, RegistrationStatus,
+    StartTransactionRequest, StartTransactionResponse, StatusNotificationRequest,
+    StatusNotificationResponse, StopTransactionRequest, StopTransactionResponse,
 };
 use ocpp_messages::ActionDispatcher;
 use ocpp_transport::server::OcppServer;
 use ocpp_transport::{DispatchHandler, TransportConfig};
 use ocpp_types::common::{AuthorizationStatus, IdTagInfo, ReadingContext};
-use ocpp_types::v16j::{MessageTrigger, RemoteStartStopStatus, TriggerMessageStatus};
+use ocpp_types::v16j::{
+    FirmwareStatus, MessageTrigger, RemoteStartStopStatus, TriggerMessageStatus,
+};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -49,6 +53,7 @@ const TRIGGER_TIMEOUT: Duration = Duration::from_secs(5);
 fn recording_csms_dispatcher(
     boot_tx: mpsc::UnboundedSender<()>,
     status_tx: mpsc::UnboundedSender<u32>,
+    firmware_tx: mpsc::UnboundedSender<FirmwareStatus>,
 ) -> ActionDispatcher {
     let mut d = ActionDispatcher::new();
 
@@ -91,6 +96,16 @@ fn recording_csms_dispatcher(
             },
         })
     });
+    {
+        let firmware_tx = firmware_tx.clone();
+        d.on(move |req: FirmwareStatusNotificationRequest| {
+            let firmware_tx = firmware_tx.clone();
+            async move {
+                let _ = firmware_tx.send(req.status);
+                Ok(FirmwareStatusNotificationResponse {})
+            }
+        });
+    }
 
     d
 }
@@ -129,7 +144,9 @@ async fn csms_trigger_message_drives_cp_to_send_requested_messages() {
     let cp_id = "CP_TRIGGER_01";
     let (boot_tx, mut boot_rx) = mpsc::unbounded_channel();
     let (status_tx, mut status_rx) = mpsc::unbounded_channel();
-    let (mut server, addr) = start_csms(recording_csms_dispatcher(boot_tx, status_tx)).await;
+    let (firmware_tx, mut firmware_rx) = mpsc::unbounded_channel();
+    let (mut server, addr) =
+        start_csms(recording_csms_dispatcher(boot_tx, status_tx, firmware_tx)).await;
 
     // Connect a real charge point and run its boot handshake.
     let cp = ChargePoint::new(cp_config(addr, cp_id)).expect("build charge point");
@@ -180,31 +197,27 @@ async fn csms_trigger_message_drives_cp_to_send_requested_messages() {
         "the StatusNotification is scoped to the requested connector"
     );
 
-    // 3. Trigger an unsupported message → NotImplemented, and nothing is sent.
-    //    `FirmwareStatusNotification` has no state machine yet (that's #70);
-    //    `DiagnosticsStatusNotification` is now supported (#69) and is covered
-    //    in `diagnostics.rs`.
+    // 3. Trigger a FirmwareStatusNotification → Accepted, and the CP reports its
+    //    *current* firmware status. No UpdateFirmware has run, so that status is
+    //    Idle. This is the last trigger to gain support (#70); the full
+    //    UpdateFirmware download/install flow is covered in `firmware.rs`.
     let status = server
         .trigger_message(cp_id, MessageTrigger::FirmwareStatusNotification, None)
         .await
         .expect("trigger_message(Firmware) resolves");
     assert_eq!(
         status,
-        TriggerMessageStatus::NotImplemented,
-        "the CP reports NotImplemented for a message it cannot produce"
+        TriggerMessageStatus::Accepted,
+        "the CP now supports a FirmwareStatusNotification trigger"
     );
-    // No BootNotification or StatusNotification should follow a NotImplemented.
-    assert!(
-        timeout(Duration::from_millis(300), boot_rx.recv())
-            .await
-            .is_err(),
-        "an unsupported trigger must not produce a BootNotification"
-    );
-    assert!(
-        timeout(Duration::from_millis(300), status_rx.recv())
-            .await
-            .is_err(),
-        "an unsupported trigger must not produce a StatusNotification"
+    let firmware_status = timeout(TRIGGER_TIMEOUT, firmware_rx.recv())
+        .await
+        .expect("CSMS observes a triggered FirmwareStatusNotification")
+        .expect("firmware channel open");
+    assert_eq!(
+        firmware_status,
+        FirmwareStatus::Idle,
+        "with no UpdateFirmware in flight the CP reports Idle"
     );
 
     cp.disconnect().await.expect("disconnect");
