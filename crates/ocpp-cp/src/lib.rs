@@ -21,14 +21,15 @@ use connector::{Connector, ConnectorConfig};
 use error::ChargePointError;
 use message_handler::ConfigurationStore;
 use ocpp_messages::v16j::{
-    AuthorizeRequest, BootNotificationRequest, BootNotificationResponse, ChangeAvailabilityRequest,
-    ChangeAvailabilityResponse, ChangeConfigurationRequest, ChangeConfigurationResponse,
-    ClearCacheRequest, ClearCacheResponse, DataTransferRequest, DataTransferResponse,
-    DiagnosticsStatusNotificationRequest, GetConfigurationRequest, GetConfigurationResponse,
-    GetDiagnosticsRequest, GetDiagnosticsResponse, HeartbeatRequest, MeterValuesRequest,
-    RegistrationStatus, RemoteStartTransactionRequest, RemoteStartTransactionResponse,
-    RemoteStopTransactionRequest, RemoteStopTransactionResponse, ResetRequest, ResetResponse,
-    StartTransactionRequest, StatusNotificationRequest, StopTransactionRequest,
+    AuthorizeRequest, BootNotificationRequest, BootNotificationResponse, CancelReservationRequest,
+    CancelReservationResponse, ChangeAvailabilityRequest, ChangeAvailabilityResponse,
+    ChangeConfigurationRequest, ChangeConfigurationResponse, ClearCacheRequest, ClearCacheResponse,
+    DataTransferRequest, DataTransferResponse, DiagnosticsStatusNotificationRequest,
+    GetConfigurationRequest, GetConfigurationResponse, GetDiagnosticsRequest,
+    GetDiagnosticsResponse, HeartbeatRequest, MeterValuesRequest, RegistrationStatus,
+    RemoteStartTransactionRequest, RemoteStartTransactionResponse, RemoteStopTransactionRequest,
+    RemoteStopTransactionResponse, ReserveNowRequest, ReserveNowResponse, ResetRequest,
+    ResetResponse, StartTransactionRequest, StatusNotificationRequest, StopTransactionRequest,
     TriggerMessageRequest, TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse,
 };
 use ocpp_messages::{
@@ -42,9 +43,10 @@ use ocpp_types::common::{
     AuthorizationStatus, AvailabilityStatus, IdTagInfo, KeyValue, Measurand, ReadingContext, Reason,
 };
 use ocpp_types::v16j::{
-    ChargePointErrorCode, ChargePointStatus, ChargePointVendorInfo, ClearCacheStatus,
-    ConfigurationStatus, DataTransferStatus, DiagnosticsStatus, MessageTrigger,
-    RemoteStartStopStatus, ResetStatus, ResetType, TriggerMessageStatus, UnlockStatus,
+    CancelReservationStatus, ChargePointErrorCode, ChargePointStatus, ChargePointVendorInfo,
+    ClearCacheStatus, ConfigurationStatus, DataTransferStatus, DiagnosticsStatus, MessageTrigger,
+    RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus,
+    UnlockStatus,
 };
 use ocpp_types::{
     CallErrorCode, CallErrorMessage, CallResultMessage, ConnectorId, OcppError, OcppResult,
@@ -374,6 +376,11 @@ pub struct ChargePoint {
     heartbeat_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Maps CSMS-assigned transaction ID → connector ID for stop_transaction lookup.
     active_transactions: Arc<RwLock<HashMap<i32, ConnectorId>>>,
+    /// Maps an active reservation ID → the connector it holds (OCPP 1.6J §5.14).
+    /// Populated by the default `ReserveNow` handler, consulted/cleared by
+    /// `CancelReservation`, and emptied for a connector when a transaction
+    /// starts on it (a start consumes the reservation).
+    reservations: Arc<RwLock<HashMap<i32, ConnectorId>>>,
     /// Shared schema validator (when `config.validate_payloads`). Backs both
     /// the dispatcher's incoming-CALL validation and `call()`'s CALLRESULT
     /// validation. `None` when validation is disabled.
@@ -450,6 +457,7 @@ impl ChargePoint {
         // the active-transaction map to answer Accepted/Rejected faithfully.
         let connectors = Arc::new(RwLock::new(connectors));
         let active_transactions = Arc::new(RwLock::new(HashMap::new()));
+        let reservations = Arc::new(RwLock::new(HashMap::new()));
 
         let config_store = Arc::new(RwLock::new(ConfigurationStore::new()));
         let mut dispatcher = Self::build_default_dispatcher(
@@ -458,6 +466,7 @@ impl ChargePoint {
             command_sender,
             connectors.clone(),
             active_transactions.clone(),
+            reservations.clone(),
         );
         if let Some(v) = &validator {
             dispatcher = dispatcher.with_validator(v.clone());
@@ -476,6 +485,7 @@ impl ChargePoint {
             is_connected: Arc::new(RwLock::new(false)),
             heartbeat_handle: Arc::new(RwLock::new(None)),
             active_transactions,
+            reservations,
             validator,
             meter_sampler_handles: Arc::new(RwLock::new(HashMap::new())),
             auth_cache,
@@ -497,6 +507,7 @@ impl ChargePoint {
         command_sender: mpsc::UnboundedSender<RemoteCommand>,
         connectors: Arc<RwLock<HashMap<ConnectorId, Connector>>>,
         active_transactions: Arc<RwLock<HashMap<i32, ConnectorId>>>,
+        reservations: Arc<RwLock<HashMap<i32, ConnectorId>>>,
     ) -> ActionDispatcher {
         let mut d = ActionDispatcher::new();
 
@@ -746,6 +757,81 @@ impl ChargePoint {
                 status: UnlockStatus::Unlocked,
             })
         });
+
+        // ReserveNow — reserve a connector for an idTag until expiryDate (OCPP
+        // 1.6J §5.14). Faithful status semantics keyed off the connector's live
+        // status: a free connector is reserved (→ `Reserved`) and the
+        // reservationId recorded; a busy connector → `Occupied`, a faulted one →
+        // `Faulted`, an unavailable one → `Unavailable`; an unknown/out-of-range
+        // connector id (incl. 0) → `Rejected`. The reserve is a local state
+        // change (no outbound CALL), so it runs inline with no re-entrancy.
+        // Ports `ReserveNow` from the Python reference's `call.py`/`enums.py`.
+        {
+            let connectors = connectors.clone();
+            let reservations = reservations.clone();
+            d.on(move |req: ReserveNowRequest| {
+                let connectors = connectors.clone();
+                let reservations = reservations.clone();
+                async move {
+                    let status = match ConnectorId::new(req.connector_id as u32) {
+                        Ok(cid) => match connectors.read().await.get(&cid).cloned() {
+                            Some(mut connector) => match connector.status().await {
+                                ChargePointStatus::Available => {
+                                    match connector.reserve(req.id_tag.clone()).await {
+                                        Ok(()) => {
+                                            reservations
+                                                .write()
+                                                .await
+                                                .insert(req.reservation_id, cid);
+                                            ReservationStatus::Accepted
+                                        }
+                                        Err(_) => ReservationStatus::Rejected,
+                                    }
+                                }
+                                ChargePointStatus::Faulted => ReservationStatus::Faulted,
+                                ChargePointStatus::Unavailable => ReservationStatus::Unavailable,
+                                // Reserved / Occupied / Preparing / Charging /
+                                // Suspended* / Finishing — connector is in use.
+                                _ => ReservationStatus::Occupied,
+                            },
+                            // Known protocol but no such connector on this CP.
+                            None => ReservationStatus::Rejected,
+                        },
+                        // connectorId 0 / out of range → not a reservable connector.
+                        Err(_) => ReservationStatus::Rejected,
+                    };
+                    Ok(ReserveNowResponse { status })
+                }
+            });
+        }
+
+        // CancelReservation — clear a reservation by reservationId (OCPP 1.6J
+        // §5.4). `Accepted` if the id is held (the connector is freed,
+        // `Reserved` → `Available`), `Rejected` if it is unknown. Local state
+        // change only — no outbound CALL, no re-entrancy. Ports
+        // `CancelReservation` from the Python reference's `call.py`/`enums.py`.
+        {
+            let connectors = connectors.clone();
+            let reservations = reservations.clone();
+            d.on(move |req: CancelReservationRequest| {
+                let connectors = connectors.clone();
+                let reservations = reservations.clone();
+                async move {
+                    let held = reservations.write().await.remove(&req.reservation_id);
+                    let status = match held {
+                        Some(cid) => {
+                            if let Some(mut connector) = connectors.read().await.get(&cid).cloned()
+                            {
+                                let _ = connector.cancel_reservation().await;
+                            }
+                            CancelReservationStatus::Accepted
+                        }
+                        None => CancelReservationStatus::Rejected,
+                    };
+                    Ok(CancelReservationResponse { status })
+                }
+            });
+        }
 
         // ClearCache — empty the authorization cache, then accept (Issue #23).
         // Ports the OCPP 1.6J ClearCache use case (§5.2): the CSMS asks the CP to
@@ -1444,6 +1530,14 @@ impl ChargePoint {
             .await
             .insert(transaction_id, connector_id);
 
+        // A start on a reserved connector consumes its reservation (OCPP 1.6J
+        // §5.14): drop any reservation held on this connector so a later
+        // CancelReservation for it is correctly Rejected.
+        self.reservations
+            .write()
+            .await
+            .retain(|_, cid| *cid != connector_id);
+
         // Transition connector to Charging
         {
             let mut connectors = self.connectors.write().await;
@@ -2125,10 +2219,11 @@ mod tests {
     // --- dispatcher wiring tests ---
 
     #[tokio::test]
-    async fn dispatcher_has_11_default_handlers() {
+    async fn dispatcher_has_13_default_handlers() {
         let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
-        // 10 Core Profile actions + GetDiagnostics (firmware-management, #69).
-        assert_eq!(cp.handler_count().await, 11);
+        // 10 Core Profile actions + GetDiagnostics (firmware-management, #69)
+        // + ReserveNow + CancelReservation (§5.14/§5.4, #71).
+        assert_eq!(cp.handler_count().await, 13);
     }
 
     #[tokio::test]
