@@ -22,12 +22,13 @@ use ocpp_messages::v16j::{
     GetConfigurationRequest, GetConfigurationResponse, GetDiagnosticsRequest,
     GetDiagnosticsResponse, RemoteStartTransactionRequest, RemoteStopTransactionRequest,
     ReserveNowRequest, ResetRequest, StatusNotificationRequest, TriggerMessageRequest,
-    UpdateFirmwareRequest, UpdateFirmwareResponse,
+    UnlockConnectorRequest, UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
 use ocpp_types::v16j::{
     CancelReservationStatus, ClearCacheStatus, ConfigurationStatus, MessageTrigger,
     RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus,
+    UnlockStatus,
 };
 use ocpp_types::{CallErrorCode, DateTime, OcppError, OcppResult, Utc};
 use std::{net::SocketAddr, sync::Arc};
@@ -507,6 +508,31 @@ impl OcppServer {
     ) -> OcppResult<CancelReservationStatus> {
         let resp = self
             .call(cp_id, CancelReservationRequest { reservation_id })
+            .await?;
+        Ok(resp.status)
+    }
+
+    /// Ask a connected charge point to unlock one of its connectors.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `UnlockConnector` command (§5.21), mirroring how the Python reference's
+    /// central system drives it
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    ///
+    /// `connector_id` is the connector to unlock. Per the spec the CP stops any
+    /// transaction in progress on that connector before releasing the cable.
+    /// Returns the CP's [`UnlockStatus`] — `Unlocked` on success, `UnlockFailed`
+    /// if the lock could not be released (or the connector id is unknown), or
+    /// `NotSupported` for a connector with no controllable lock. Errors propagate
+    /// from [`call`](Self::call) (e.g. [`OcppError::CpNotConnected`],
+    /// [`OcppError::Timeout`]).
+    pub async fn unlock_connector(
+        &self,
+        cp_id: &str,
+        connector_id: u32,
+    ) -> OcppResult<UnlockStatus> {
+        let resp = self
+            .call(cp_id, UnlockConnectorRequest { connector_id })
             .await?;
         Ok(resp.status)
     }
