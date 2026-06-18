@@ -25,14 +25,16 @@ use std::time::Duration;
 use ocpp_cp::{ChargePoint, ChargePointConfig};
 use ocpp_messages::v16j::{
     AuthorizeRequest, AuthorizeResponse, BootNotificationRequest, BootNotificationResponse,
-    HeartbeatRequest, HeartbeatResponse, RegistrationStatus, StatusNotificationRequest,
-    StatusNotificationResponse,
+    HeartbeatRequest, HeartbeatResponse, MeterValuesRequest, MeterValuesResponse,
+    RegistrationStatus, StartTransactionRequest, StartTransactionResponse,
+    StatusNotificationRequest, StatusNotificationResponse, StopTransactionRequest,
+    StopTransactionResponse,
 };
 use ocpp_messages::ActionDispatcher;
 use ocpp_transport::server::OcppServer;
 use ocpp_transport::{DispatchHandler, TransportConfig};
-use ocpp_types::common::{AuthorizationStatus, IdTagInfo};
-use ocpp_types::v16j::{MessageTrigger, TriggerMessageStatus};
+use ocpp_types::common::{AuthorizationStatus, IdTagInfo, ReadingContext};
+use ocpp_types::v16j::{MessageTrigger, RemoteStartStopStatus, TriggerMessageStatus};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -200,6 +202,175 @@ async fn csms_trigger_message_drives_cp_to_send_requested_messages() {
             .await
             .is_err(),
         "an unsupported trigger must not produce a StatusNotification"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+/// Transaction id the recording CSMS hands back for any `StartTransaction`, so
+/// the test can assert a triggered `MeterValues` attaches the in-flight id.
+const TRIGGERED_TX_ID: i32 = 4242;
+
+/// What the CSMS recorded from a `MeterValues` CALL: which connector, the
+/// optional in-flight transaction id, and the `ReadingContext` of the first
+/// sample — which lets the test tell a *triggered* read (`Trigger`) apart from
+/// the periodic `Transaction.Begin` snapshot the sampler emits at charge start.
+#[derive(Debug)]
+struct MeterValuesRecord {
+    connector_id: u32,
+    transaction_id: Option<i32>,
+    context: Option<ReadingContext>,
+}
+
+fn accepted_id_tag() -> IdTagInfo {
+    IdTagInfo {
+        status: AuthorizationStatus::Accepted,
+        parent_id_tag: None,
+        expiry_date: None,
+    }
+}
+
+/// A CSMS dispatcher that supports a full `StartTransaction` round-trip and
+/// records every `MeterValues` CALL, so the test can drive an on-demand
+/// `MeterValues` trigger and inspect exactly what the CP sent.
+fn recording_meter_values_dispatcher(
+    mv_tx: mpsc::UnboundedSender<MeterValuesRecord>,
+) -> ActionDispatcher {
+    let mut d = ActionDispatcher::new();
+
+    d.on(|_req: BootNotificationRequest| async move {
+        Ok(BootNotificationResponse {
+            current_time: chrono::Utc::now(),
+            interval: 300,
+            status: RegistrationStatus::Accepted,
+        })
+    });
+    d.on(|_req: HeartbeatRequest| async move {
+        Ok(HeartbeatResponse {
+            current_time: chrono::Utc::now(),
+        })
+    });
+    d.on(|_req: StatusNotificationRequest| async move { Ok(StatusNotificationResponse {}) });
+    d.on(|_req: AuthorizeRequest| async move {
+        Ok(AuthorizeResponse {
+            id_tag_info: accepted_id_tag(),
+        })
+    });
+    d.on(|_req: StartTransactionRequest| async move {
+        Ok(StartTransactionResponse {
+            id_tag_info: accepted_id_tag(),
+            transaction_id: TRIGGERED_TX_ID,
+        })
+    });
+    d.on(|_req: StopTransactionRequest| async move {
+        Ok(StopTransactionResponse { id_tag_info: None })
+    });
+    {
+        let mv_tx = mv_tx.clone();
+        d.on(move |req: MeterValuesRequest| {
+            let mv_tx = mv_tx.clone();
+            async move {
+                let context = req
+                    .meter_values
+                    .first()
+                    .and_then(|mv| mv.sampled_values.first())
+                    .and_then(|sv| sv.context.clone());
+                let _ = mv_tx.send(MeterValuesRecord {
+                    connector_id: req.connector_id,
+                    transaction_id: req.transaction_id,
+                    context,
+                });
+                Ok(MeterValuesResponse {})
+            }
+        });
+    }
+
+    d
+}
+
+/// Pull `MeterValues` records until one carries `context`, skipping the rest
+/// (e.g. the sampler's `Transaction.Begin` snapshot). Fails the test if no
+/// matching frame arrives before [`TRIGGER_TIMEOUT`].
+async fn recv_meter_values_with_context(
+    rx: &mut mpsc::UnboundedReceiver<MeterValuesRecord>,
+    context: ReadingContext,
+) -> MeterValuesRecord {
+    loop {
+        let rec = timeout(TRIGGER_TIMEOUT, rx.recv())
+            .await
+            .expect("CSMS observes a MeterValues frame")
+            .expect("meter-values channel open");
+        if rec.context.as_ref() == Some(&context) {
+            return rec;
+        }
+    }
+}
+
+#[tokio::test]
+async fn csms_trigger_meter_values_reports_current_reading() {
+    let cp_id = "CP_TRIGGER_MV";
+    let (mv_tx, mut mv_rx) = mpsc::unbounded_channel();
+    let (mut server, addr) = start_csms(recording_meter_values_dispatcher(mv_tx)).await;
+
+    let cp = ChargePoint::new(cp_config(addr, cp_id)).expect("build charge point");
+    cp.connect().await.expect("connect + boot sequence");
+    assert!(
+        server.is_cp_connected(cp_id),
+        "the CSMS must be able to route CALLs to the booted CP"
+    );
+
+    // 1. Idle connector: a triggered MeterValues reports the standing meter
+    //    register with ReadingContext::Trigger and no transaction id.
+    let status = server
+        .trigger_message(cp_id, MessageTrigger::MeterValues, Some(1))
+        .await
+        .expect("trigger_message(MeterValues) resolves");
+    assert_eq!(
+        status,
+        TriggerMessageStatus::Accepted,
+        "the CP now supports an on-demand MeterValues trigger"
+    );
+    let idle = recv_meter_values_with_context(&mut mv_rx, ReadingContext::Trigger).await;
+    assert_eq!(
+        idle.connector_id, 1,
+        "the triggered MeterValues is scoped to the requested connector"
+    );
+    assert_eq!(
+        idle.transaction_id, None,
+        "an idle connector reports its meter with no transaction id"
+    );
+
+    // 2. Start a charge remotely; once the sampler's Transaction.Begin snapshot
+    //    confirms the transaction is live, a triggered MeterValues attaches the
+    //    in-flight transaction id.
+    let start = server
+        .remote_start_transaction(cp_id, "TAG_MV", Some(1))
+        .await
+        .expect("remote_start_transaction resolves");
+    assert_eq!(
+        start,
+        RemoteStartStopStatus::Accepted,
+        "a free connector accepts the remote start"
+    );
+    let begin = recv_meter_values_with_context(&mut mv_rx, ReadingContext::TransactionBegin).await;
+    assert_eq!(
+        begin.transaction_id,
+        Some(TRIGGERED_TX_ID),
+        "the begin snapshot carries the new transaction id"
+    );
+
+    let status = server
+        .trigger_message(cp_id, MessageTrigger::MeterValues, Some(1))
+        .await
+        .expect("trigger_message(MeterValues) resolves");
+    assert_eq!(status, TriggerMessageStatus::Accepted);
+    let active = recv_meter_values_with_context(&mut mv_rx, ReadingContext::Trigger).await;
+    assert_eq!(active.connector_id, 1);
+    assert_eq!(
+        active.transaction_id,
+        Some(TRIGGERED_TX_ID),
+        "a charging connector attaches the in-flight transaction id to the triggered MeterValues"
     );
 
     cp.disconnect().await.expect("disconnect");

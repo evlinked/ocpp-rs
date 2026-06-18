@@ -214,16 +214,17 @@ enum RemoteCommand {
 /// Whether this charge point can proactively produce `message` on a
 /// `TriggerMessage` request (OCPP 1.6J §4.x).
 ///
-/// `BootNotification`, `Heartbeat`, and `StatusNotification` are wired; the
-/// firmware/diagnostics notifications are not features this CP implements, and
-/// on-demand `MeterValues` needs live transaction/meter context — these return
-/// `NotImplemented` until a dedicated follow-up adds them.
+/// `BootNotification`, `Heartbeat`, `StatusNotification`, and on-demand
+/// `MeterValues` are wired; the firmware/diagnostics notifications are not
+/// features this CP implements yet and return `NotImplemented` until their
+/// state machines (`UpdateFirmware` / `GetDiagnostics`) land.
 fn trigger_message_supported(message: &MessageTrigger) -> bool {
     matches!(
         message,
         MessageTrigger::BootNotification
             | MessageTrigger::Heartbeat
             | MessageTrigger::StatusNotification
+            | MessageTrigger::MeterValues
     )
 }
 
@@ -1718,6 +1719,9 @@ impl ChargePoint {
             MessageTrigger::StatusNotification => {
                 self.trigger_status_notification(connector_id).await;
             }
+            MessageTrigger::MeterValues => {
+                self.trigger_meter_values(connector_id).await;
+            }
             other => {
                 warn!("TriggerMessage({other:?}): not implemented, ignoring");
             }
@@ -1749,6 +1753,90 @@ impl ChargePoint {
                 warn!("TriggerMessage(StatusNotification): connector {id} send failed: {e}");
             }
         }
+    }
+
+    /// Emit an on-demand `MeterValues` for the connector(s) a `TriggerMessage`
+    /// targets (OCPP 1.6J §4.x, `requestedMessage = MeterValues`).
+    ///
+    /// `Some(id)` reports just connector `id`; `None` reports every physical
+    /// connector. Each frame carries the connector's *current* meter reading
+    /// tagged `ReadingContext::Trigger`, plus the active `transactionId` when
+    /// the connector is charging. An **idle** connector still reports its
+    /// standing meter register (transaction id omitted) — the faithful
+    /// "read the meter now" behavior, matching how the periodic sampler reads
+    /// the same `last_meter_reading()`. Connector `0` has no meter, so a
+    /// `Some(0)` or out-of-range target is logged and ignored.
+    async fn trigger_meter_values(&self, connector_id: Option<i32>) {
+        let count = self.config.connector_count as i32;
+        let ids: Vec<u32> = match connector_id {
+            Some(id) if (1..=count).contains(&id) => vec![id as u32],
+            Some(id) => {
+                warn!("TriggerMessage(MeterValues): no meter for connector {id}, ignoring");
+                return;
+            }
+            None => (1..=self.config.connector_count).collect(),
+        };
+
+        let measurands = self.config.meter_value_measurands.clone();
+        for id in ids {
+            let connector_id = match ConnectorId::new(id) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            // Read the connector's latest meter value, releasing the lock
+            // before building/sending so it is never held across the send.
+            let reading = {
+                let connectors = self.connectors.read().await;
+                match connectors.get(&connector_id) {
+                    Some(connector) => connector.last_meter_reading().await,
+                    None => continue,
+                }
+            };
+
+            let transaction_id = self.connector_active_transaction(connector_id).await;
+            let request = meter_sampler::build_meter_values_request(
+                connector_id,
+                transaction_id,
+                &reading,
+                &measurands,
+                ReadingContext::Trigger,
+            );
+            if !meter_sampler::has_samples(&request) {
+                // No supported measurands → nothing worth sending; the OCPP
+                // 1.6J MeterValues.json schema forbids an empty sampledValue list.
+                continue;
+            }
+
+            let message = match ocpp_messages::CallMessage::new(
+                MeterValuesRequest::ACTION_NAME.to_string(),
+                request,
+            ) {
+                Ok(call) => Message::Call(call),
+                Err(e) => {
+                    error!("TriggerMessage(MeterValues): build failed: {e}");
+                    continue;
+                }
+            };
+
+            if let Some(client) = self.client.read().await.as_ref() {
+                if let Err(e) = client.send_message(message).await {
+                    warn!("TriggerMessage(MeterValues): connector {id} send failed: {e}");
+                }
+            }
+        }
+    }
+
+    /// Reverse-lookup the CSMS-assigned `transactionId` currently active on
+    /// `connector_id`, if any. Reads the same `transaction_id → connector` map
+    /// that `stop_transaction` keeps, so a triggered `MeterValues` can attach
+    /// the in-flight transaction id.
+    async fn connector_active_transaction(&self, connector_id: ConnectorId) -> Option<i32> {
+        self.active_transactions
+            .read()
+            .await
+            .iter()
+            .find_map(|(txn, cid)| (*cid == connector_id).then_some(*txn))
     }
 
     /// Current reportable status of connector `id` (id `0` = the charge point
@@ -1970,6 +2058,25 @@ mod tests {
         let call = make_call(TriggerMessageRequest {
             requested_message: MessageTrigger::Heartbeat,
             connector_id: None,
+        });
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: TriggerMessageResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, TriggerMessageStatus::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_trigger_message_meter_values_accepted() {
+        // On-demand MeterValues is now a supported requestedMessage: the CALL is
+        // accepted and the send is queued on the command channel (Issue #65).
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        let call = make_call(TriggerMessageRequest {
+            requested_message: MessageTrigger::MeterValues,
+            connector_id: Some(1),
         });
         let resp = cp.handle_message(Message::Call(call)).await.unwrap();
         match resp.unwrap() {
