@@ -29,7 +29,7 @@ use ocpp_messages::ActionDispatcher;
 use ocpp_transport::server::OcppServer;
 use ocpp_transport::{DispatchHandler, TransportConfig};
 use ocpp_types::common::{AuthorizationStatus, IdTagInfo};
-use ocpp_types::v16j::{AuthorizationData, UpdateStatus, UpdateType};
+use ocpp_types::v16j::{AuthorizationData, ConfigurationStatus, UpdateStatus, UpdateType};
 
 /// A minimal CSMS dispatcher: just enough to boot a CP and keep it quiet. The
 /// Local Authorization List commands flow CS→CP, so the CSMS needs no extra
@@ -88,6 +88,129 @@ fn delete(id: &str) -> AuthorizationData {
         id_tag: id.to_string(),
         id_tag_info: None,
     }
+}
+
+/// A capacity-bounded CP reports its `LocalAuthListMaxLength` (read-only) and
+/// rejects any `SendLocalList` that would push the list over that limit
+/// (OCPP 1.6J §9), leaving the list untouched on rejection — proven black-box
+/// over a real CP↔CSMS loop.
+#[tokio::test]
+async fn csms_local_list_capacity_is_bounded_and_reported() {
+    let cp_id = "CP_LOCALLIST_CAP";
+    let (mut server, addr) = start_csms(csms_dispatcher()).await;
+
+    // A CP whose Local Authorization List holds at most two entries.
+    let cp = ChargePoint::new(ChargePointConfig {
+        local_auth_list_max_length: 2,
+        ..cp_config(addr, cp_id)
+    })
+    .expect("build charge point");
+    cp.connect().await.expect("connect + boot sequence");
+    assert!(server.is_cp_connected(cp_id));
+
+    // 1. GetConfiguration reports the capacity, read-only.
+    let resp = server
+        .get_configuration(cp_id, Some(vec!["LocalAuthListMaxLength".to_string()]))
+        .await
+        .expect("GetConfiguration resolves");
+    let keys = resp.configuration_keys.expect("known key returned");
+    let max_len = keys
+        .iter()
+        .find(|k| k.key == "LocalAuthListMaxLength")
+        .expect("LocalAuthListMaxLength is reported");
+    assert_eq!(
+        max_len.value.as_deref(),
+        Some("2"),
+        "the reported limit matches the configured capacity"
+    );
+    assert_eq!(
+        max_len.readonly,
+        Some(true),
+        "LocalAuthListMaxLength is a read-only capability"
+    );
+
+    // 2. A full update over the limit is rejected and changes nothing.
+    let over = server
+        .send_local_list(
+            cp_id,
+            1,
+            UpdateType::Full,
+            vec![
+                entry("TAG-A", AuthorizationStatus::Accepted),
+                entry("TAG-B", AuthorizationStatus::Accepted),
+                entry("TAG-C", AuthorizationStatus::Accepted),
+            ],
+        )
+        .await
+        .expect("SendLocalList(over-capacity Full) resolves");
+    assert_eq!(
+        over,
+        UpdateStatus::Failed,
+        "a full update exceeding LocalAuthListMaxLength is rejected"
+    );
+    assert_eq!(
+        server.get_local_list_version(cp_id).await.unwrap(),
+        0,
+        "a rejected update leaves the version at 0"
+    );
+    assert!(cp.local_list().is_empty(), "nothing was applied");
+
+    // 3. A full update at the limit is accepted.
+    let at = server
+        .send_local_list(
+            cp_id,
+            2,
+            UpdateType::Full,
+            vec![
+                entry("TAG-A", AuthorizationStatus::Accepted),
+                entry("TAG-B", AuthorizationStatus::Accepted),
+            ],
+        )
+        .await
+        .expect("SendLocalList(at-capacity Full) resolves");
+    assert_eq!(
+        at,
+        UpdateStatus::Accepted,
+        "a full update at the limit fits"
+    );
+    assert_eq!(cp.local_list().len(), 2);
+
+    // 4. A differential that would add a third entry is rejected, untouched.
+    let diff_over = server
+        .send_local_list(
+            cp_id,
+            3,
+            UpdateType::Differential,
+            vec![entry("TAG-C", AuthorizationStatus::Accepted)],
+        )
+        .await
+        .expect("SendLocalList(over-capacity Differential) resolves");
+    assert_eq!(
+        diff_over,
+        UpdateStatus::Failed,
+        "a differential update over the limit is rejected"
+    );
+    assert_eq!(
+        server.get_local_list_version(cp_id).await.unwrap(),
+        2,
+        "the rejected differential did not advance the version"
+    );
+    assert_eq!(cp.local_list().len(), 2, "nothing partially applied");
+    assert_eq!(cp.local_list().get("TAG-C"), None);
+
+    // 5. A read-only LocalAuthListMaxLength cannot be changed by the CSMS.
+    let change = server
+        .change_configuration(cp_id, "LocalAuthListMaxLength", "9")
+        .await
+        .expect("ChangeConfiguration resolves");
+    assert_eq!(
+        change,
+        ConfigurationStatus::Rejected,
+        "LocalAuthListMaxLength is read-only"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
 }
 
 #[tokio::test]
