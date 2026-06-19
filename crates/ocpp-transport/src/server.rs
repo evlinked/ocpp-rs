@@ -21,16 +21,17 @@ use ocpp_messages::v16j::{
     CancelReservationRequest, ChangeConfigurationRequest, ClearCacheRequest,
     ClearChargingProfileRequest, GetCompositeScheduleRequest, GetCompositeScheduleResponse,
     GetConfigurationRequest, GetConfigurationResponse, GetDiagnosticsRequest,
-    GetDiagnosticsResponse, RemoteStartTransactionRequest, RemoteStopTransactionRequest,
-    ReserveNowRequest, ResetRequest, SetChargingProfileRequest, StatusNotificationRequest,
-    TriggerMessageRequest, UnlockConnectorRequest, UpdateFirmwareRequest, UpdateFirmwareResponse,
+    GetDiagnosticsResponse, GetLocalListVersionRequest, RemoteStartTransactionRequest,
+    RemoteStopTransactionRequest, ReserveNowRequest, ResetRequest, SendLocalListRequest,
+    SetChargingProfileRequest, StatusNotificationRequest, TriggerMessageRequest,
+    UnlockConnectorRequest, UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
 use ocpp_types::v16j::{
-    CancelReservationStatus, ChargingProfile, ChargingProfilePurposeType, ChargingProfileStatus,
-    ChargingRateUnitType, ClearCacheStatus, ClearChargingProfileStatus, ConfigurationStatus,
-    MessageTrigger, RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType,
-    TriggerMessageStatus, UnlockStatus,
+    AuthorizationData, CancelReservationStatus, ChargingProfile, ChargingProfilePurposeType,
+    ChargingProfileStatus, ChargingRateUnitType, ClearCacheStatus, ClearChargingProfileStatus,
+    ConfigurationStatus, MessageTrigger, RemoteStartStopStatus, ReservationStatus, ResetStatus,
+    ResetType, TriggerMessageStatus, UnlockStatus, UpdateStatus, UpdateType,
 };
 use ocpp_types::{CallErrorCode, DateTime, OcppError, OcppResult, Utc};
 use std::{net::SocketAddr, sync::Arc};
@@ -478,6 +479,57 @@ impl OcppServer {
     /// [`OcppError::CpNotConnected`], [`OcppError::Timeout`]).
     pub async fn clear_cache(&self, cp_id: &str) -> OcppResult<ClearCacheStatus> {
         let resp = self.call(cp_id, ClearCacheRequest {}).await?;
+        Ok(resp.status)
+    }
+
+    /// Ask a connected charge point for the version of its Local Authorization
+    /// List.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `GetLocalListVersion` command (§5.x), mirroring how the Python
+    /// reference's central system drives it
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    ///
+    /// `GetLocalListVersion` carries no request fields. Returns the list version
+    /// — `0` for an empty list, `-1` if the CP does not support the feature, or
+    /// the `listVersion` of the last accepted [`send_local_list`](Self::send_local_list).
+    /// Errors propagate from [`call`](Self::call).
+    pub async fn get_local_list_version(&self, cp_id: &str) -> OcppResult<i32> {
+        let resp = self.call(cp_id, GetLocalListVersionRequest {}).await?;
+        Ok(resp.list_version)
+    }
+
+    /// Push a Local Authorization List update to a connected charge point.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `SendLocalList` command (§5.x), mirroring how the Python reference's
+    /// central system drives it
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    ///
+    /// `list_version` is the version the list will carry after this update;
+    /// `update_type` selects a [`UpdateType::Full`] replace or a
+    /// [`UpdateType::Differential`] delta; `local_authorization_list` carries the
+    /// entries (an entry with no `idTagInfo` in a differential update deletes that
+    /// id tag). Returns the CP's [`UpdateStatus`] — `Accepted`, `Failed`,
+    /// `NotSupported`, or `VersionMismatch`. Errors propagate from
+    /// [`call`](Self::call).
+    pub async fn send_local_list(
+        &self,
+        cp_id: &str,
+        list_version: i32,
+        update_type: UpdateType,
+        local_authorization_list: Vec<AuthorizationData>,
+    ) -> OcppResult<UpdateStatus> {
+        let resp = self
+            .call(
+                cp_id,
+                SendLocalListRequest {
+                    list_version,
+                    update_type,
+                    local_authorization_list,
+                },
+            )
+            .await?;
         Ok(resp.status)
     }
 
