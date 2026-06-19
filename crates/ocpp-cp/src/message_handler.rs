@@ -50,7 +50,10 @@ impl ConfigurationStore {
         keys.insert("GetConfigurationMaxKeys".to_string(), "100".to_string());
         keys.insert("HeartbeatInterval".to_string(), "86400".to_string());
         keys.insert("LocalAuthListEnabled".to_string(), "false".to_string());
-        keys.insert("LocalAuthListMaxLength".to_string(), "0".to_string());
+        keys.insert(
+            "LocalAuthListMaxLength".to_string(),
+            crate::local_list::DEFAULT_LOCAL_AUTH_LIST_MAX_LENGTH.to_string(),
+        );
         keys.insert("LocalAuthorizeOffline".to_string(), "true".to_string());
         keys.insert("LocalPreAuthorize".to_string(), "false".to_string());
         keys.insert("MeterValuesAlignedData".to_string(), "".to_string());
@@ -86,6 +89,9 @@ impl ConfigurationStore {
         // Mark some keys as read-only
         readonly_keys.insert("NumberOfConnectors".to_string());
         readonly_keys.insert("SupportedFeatureProfiles".to_string());
+        // LocalAuthListMaxLength is a fixed CP capability, not a tunable
+        // (OCPP 1.6J §9): a CSMS may read it but not change it.
+        readonly_keys.insert("LocalAuthListMaxLength".to_string());
 
         Self {
             keys,
@@ -105,6 +111,16 @@ impl ConfigurationStore {
         }
         self.keys.insert(key.to_string(), value);
         Ok(())
+    }
+
+    /// Seed a **read-only** key with a value, bypassing the [`set`](Self::set)
+    /// read-only guard. Intended for construction-time wiring of fixed CP
+    /// capabilities (e.g. `LocalAuthListMaxLength`) whose value comes from the
+    /// charge point's configuration rather than a `ChangeConfiguration` from the
+    /// CSMS. The key is (re)marked read-only so a later CSMS write is rejected.
+    pub fn set_readonly(&mut self, key: &str, value: String) {
+        self.keys.insert(key.to_string(), value);
+        self.readonly_keys.insert(key.to_string());
     }
 
     /// Get all keys
@@ -713,6 +729,26 @@ mod tests {
         // Test readonly
         assert!(store.set("NumberOfConnectors", "5".to_string()).is_err());
         assert!(store.is_readonly("NumberOfConnectors"));
+    }
+
+    #[test]
+    fn local_auth_list_max_length_is_readonly_and_defaults_to_capacity() {
+        let mut store = ConfigurationStore::new();
+        // Reported as the default CP capacity, read-only.
+        assert_eq!(
+            store.get("LocalAuthListMaxLength"),
+            Some(&crate::local_list::DEFAULT_LOCAL_AUTH_LIST_MAX_LENGTH.to_string())
+        );
+        assert!(store.is_readonly("LocalAuthListMaxLength"));
+        // A CSMS ChangeConfiguration is rejected.
+        assert!(store
+            .set("LocalAuthListMaxLength", "5".to_string())
+            .is_err());
+
+        // Construction-time seeding overrides the value but keeps it read-only.
+        store.set_readonly("LocalAuthListMaxLength", "7".to_string());
+        assert_eq!(store.get("LocalAuthListMaxLength"), Some(&"7".to_string()));
+        assert!(store.is_readonly("LocalAuthListMaxLength"));
     }
 
     #[tokio::test]

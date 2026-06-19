@@ -188,6 +188,13 @@ pub struct ChargePointConfig {
     /// `UnlockStatus` outcomes. The failure paths are strictly opt-in so existing
     /// behavior is unchanged.
     pub unlock_connector_outcome: UnlockConnectorOutcome,
+    /// Maximum number of entries the CP's Local Authorization List may hold —
+    /// the capacity enforced by [`local_list::LocalAuthList`] and reported for
+    /// the read-only `LocalAuthListMaxLength` configuration key (OCPP 1.6J §9).
+    /// A `SendLocalList` whose resulting list would exceed this is rejected with
+    /// `UpdateStatus::Failed`. Defaults to
+    /// [`local_list::DEFAULT_LOCAL_AUTH_LIST_MAX_LENGTH`].
+    pub local_auth_list_max_length: usize,
     /// Transport configuration (not serialized; uses Default on deserialization)
     #[serde(skip)]
     pub transport_config: TransportConfig,
@@ -224,6 +231,7 @@ impl Default for ChargePointConfig {
             diagnostics_upload_should_fail: false,
             firmware_update_outcome: FirmwareUpdateOutcome::Succeed,
             unlock_connector_outcome: UnlockConnectorOutcome::Unlock,
+            local_auth_list_max_length: local_list::DEFAULT_LOCAL_AUTH_LIST_MAX_LENGTH,
             transport_config: TransportConfig::default(),
         }
     }
@@ -609,7 +617,9 @@ impl ChargePoint {
 
         let data_transfer = Arc::new(DataTransferRegistry::new());
 
-        let local_list = Arc::new(LocalAuthList::new());
+        let local_list = Arc::new(LocalAuthList::with_max_length(
+            config.local_auth_list_max_length,
+        ));
 
         let (command_sender, command_receiver) = mpsc::unbounded_channel();
 
@@ -621,7 +631,17 @@ impl ChargePoint {
         let reservations = Arc::new(RwLock::new(HashMap::new()));
         let expiry_timers = Arc::new(RwLock::new(HashMap::new()));
 
-        let config_store = Arc::new(RwLock::new(ConfigurationStore::new()));
+        // Report the CP's actual Local Authorization List capacity for the
+        // read-only `LocalAuthListMaxLength` key, so the value a CSMS reads via
+        // GetConfiguration matches what `local_list` actually enforces.
+        let config_store = {
+            let mut store = ConfigurationStore::new();
+            store.set_readonly(
+                "LocalAuthListMaxLength",
+                config.local_auth_list_max_length.to_string(),
+            );
+            Arc::new(RwLock::new(store))
+        };
         let mut dispatcher = Self::build_default_dispatcher(
             config_store.clone(),
             auth_cache.clone(),
