@@ -8,6 +8,7 @@
 //! - Real-world charging scenarios simulation
 
 pub mod auth_cache;
+pub mod charging_profiles;
 pub mod connector;
 pub mod error;
 pub mod message_handler;
@@ -17,6 +18,7 @@ pub mod transaction;
 
 use anyhow::Result;
 use auth_cache::AuthCache;
+use charging_profiles::ChargingProfileStore;
 use connector::{Connector, ConnectorConfig};
 use error::ChargePointError;
 use message_handler::ConfigurationStore;
@@ -24,12 +26,13 @@ use ocpp_messages::v16j::{
     AuthorizeRequest, BootNotificationRequest, BootNotificationResponse, CancelReservationRequest,
     CancelReservationResponse, ChangeAvailabilityRequest, ChangeAvailabilityResponse,
     ChangeConfigurationRequest, ChangeConfigurationResponse, ClearCacheRequest, ClearCacheResponse,
-    DataTransferRequest, DataTransferResponse, DiagnosticsStatusNotificationRequest,
-    FirmwareStatusNotificationRequest, GetConfigurationRequest, GetConfigurationResponse,
-    GetDiagnosticsRequest, GetDiagnosticsResponse, HeartbeatRequest, MeterValuesRequest,
-    RegistrationStatus, RemoteStartTransactionRequest, RemoteStartTransactionResponse,
-    RemoteStopTransactionRequest, RemoteStopTransactionResponse, ReserveNowRequest,
-    ReserveNowResponse, ResetRequest, ResetResponse, StartTransactionRequest,
+    ClearChargingProfileRequest, ClearChargingProfileResponse, DataTransferRequest,
+    DataTransferResponse, DiagnosticsStatusNotificationRequest, FirmwareStatusNotificationRequest,
+    GetConfigurationRequest, GetConfigurationResponse, GetDiagnosticsRequest,
+    GetDiagnosticsResponse, HeartbeatRequest, MeterValuesRequest, RegistrationStatus,
+    RemoteStartTransactionRequest, RemoteStartTransactionResponse, RemoteStopTransactionRequest,
+    RemoteStopTransactionResponse, ReserveNowRequest, ReserveNowResponse, ResetRequest,
+    ResetResponse, SetChargingProfileRequest, SetChargingProfileResponse, StartTransactionRequest,
     StatusNotificationRequest, StopTransactionRequest, TriggerMessageRequest,
     TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse, UpdateFirmwareRequest,
     UpdateFirmwareResponse,
@@ -46,9 +49,9 @@ use ocpp_types::common::{
 };
 use ocpp_types::v16j::{
     CancelReservationStatus, ChargePointErrorCode, ChargePointStatus, ChargePointVendorInfo,
-    ClearCacheStatus, ConfigurationStatus, DataTransferStatus, DiagnosticsStatus, FirmwareStatus,
-    MessageTrigger, RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType,
-    TriggerMessageStatus, UnlockStatus,
+    ChargingProfileStatus, ClearCacheStatus, ConfigurationStatus, DataTransferStatus,
+    DiagnosticsStatus, FirmwareStatus, MessageTrigger, RemoteStartStopStatus, ReservationStatus,
+    ResetStatus, ResetType, TriggerMessageStatus, UnlockStatus,
 };
 use ocpp_types::{
     CallErrorCode, CallErrorMessage, CallResultMessage, ConnectorId, OcppError, OcppResult,
@@ -540,6 +543,12 @@ pub struct ChargePoint {
     /// `TriggerMessage(FirmwareStatusNotification)` to report the latest status
     /// without re-running the update.
     firmware_status: Arc<RwLock<FirmwareStatus>>,
+    /// Installed Smart Charging profiles (OCPP 1.6J §5.16 / §5.2). Shared with
+    /// the default `SetChargingProfile` / `ClearChargingProfile` handlers, which
+    /// install and clear profiles per the spec's stacking rules. Read by the
+    /// `GetCompositeSchedule` follow-up (Issue #95) to compute the effective
+    /// schedule.
+    charging_profiles: Arc<ChargingProfileStore>,
 }
 
 impl ChargePoint {
@@ -578,6 +587,8 @@ impl ChargePoint {
 
         let auth_cache = Arc::new(AuthCache::new(Duration::from_secs(config.auth_cache_ttl)));
 
+        let charging_profiles = Arc::new(ChargingProfileStore::new());
+
         let (command_sender, command_receiver) = mpsc::unbounded_channel();
 
         // Wrap the shared state the default handlers need *before* building the
@@ -596,6 +607,7 @@ impl ChargePoint {
             connectors.clone(),
             active_transactions.clone(),
             reservations.clone(),
+            charging_profiles.clone(),
             expiry_timers.clone(),
             config.unlock_connector_outcome,
         );
@@ -625,6 +637,7 @@ impl ChargePoint {
             command_consumer: Arc::new(RwLock::new(None)),
             diagnostics_status: Arc::new(RwLock::new(DiagnosticsStatus::Idle)),
             firmware_status: Arc::new(RwLock::new(FirmwareStatus::Idle)),
+            charging_profiles,
         })
     }
 
@@ -646,6 +659,7 @@ impl ChargePoint {
         connectors: Arc<RwLock<HashMap<ConnectorId, Connector>>>,
         active_transactions: Arc<RwLock<HashMap<i32, ConnectorId>>>,
         reservations: Arc<RwLock<HashMap<i32, ConnectorId>>>,
+        charging_profiles: Arc<ChargingProfileStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
         unlock_outcome: UnlockConnectorOutcome,
     ) -> ActionDispatcher {
@@ -1127,6 +1141,65 @@ impl ChargePoint {
                         None => CancelReservationStatus::Rejected,
                     };
                     Ok(CancelReservationResponse { status })
+                }
+            });
+        }
+
+        // SetChargingProfile — install a Smart Charging profile against a
+        // connector (0 = charge-point-wide) per the 1.6J stacking rules (§5.16).
+        // Placement is validated faithfully first (ChargePointMaxProfile only at
+        // connector 0, TxProfile only at a real connector, unknown connector
+        // rejected); only an Accepted profile is stored, replacing any prior one
+        // with the same id or (purpose, stackLevel) slot. Storing is a local
+        // state change — enforcing the limit on delivered power and computing the
+        // composite schedule are out of scope (the latter is GetCompositeSchedule,
+        // Issue #95). Ports `SetChargingProfile` from the Python reference's
+        // `call.py`/`enums.py`.
+        {
+            let connectors = connectors.clone();
+            let charging_profiles = charging_profiles.clone();
+            d.on(move |req: SetChargingProfileRequest| {
+                let connectors = connectors.clone();
+                let charging_profiles = charging_profiles.clone();
+                async move {
+                    let connector_id = req.connector_id;
+                    // connector 0 is the CP-wide slot (not in the connector map);
+                    // any other id must name a connector this CP exposes.
+                    let connector_known = match ConnectorId::new(connector_id as u32) {
+                        Ok(cid) => connectors.read().await.contains_key(&cid),
+                        Err(_) => false,
+                    };
+                    let status = crate::charging_profiles::set_profile_status(
+                        connector_id,
+                        connector_known,
+                        &req.cs_charging_profiles.charging_profile_purpose,
+                    );
+                    if status == ChargingProfileStatus::Accepted {
+                        charging_profiles.set(connector_id, req.cs_charging_profiles);
+                    }
+                    Ok(SetChargingProfileResponse { status })
+                }
+            });
+        }
+
+        // ClearChargingProfile — clear installed profiles matching the optional
+        // filters (`id`, `connectorId`, `chargingProfilePurpose`, `stackLevel`);
+        // a `None` filter matches anything, so an all-`None` request clears the
+        // whole store (§5.2). `Accepted` if at least one profile matched, else
+        // `Unknown`. Ports `ClearChargingProfile` from the Python reference's
+        // `call.py`/`enums.py`.
+        {
+            let charging_profiles = charging_profiles.clone();
+            d.on(move |req: ClearChargingProfileRequest| {
+                let charging_profiles = charging_profiles.clone();
+                async move {
+                    let status = charging_profiles.clear(
+                        req.id,
+                        req.connector_id,
+                        req.charging_profile_purpose,
+                        req.stack_level,
+                    );
+                    Ok(ClearChargingProfileResponse { status })
                 }
             });
         }
@@ -1814,6 +1887,14 @@ impl ChargePoint {
     /// Get all connectors
     pub async fn get_connectors(&self) -> HashMap<ConnectorId, Connector> {
         self.connectors.read().await.clone()
+    }
+
+    /// The store of Smart Charging profiles installed by `SetChargingProfile`
+    /// (OCPP 1.6J §5.16). The default `SetChargingProfile` / `ClearChargingProfile`
+    /// handlers mutate it; `GetCompositeSchedule` (Issue #95) and tests read it to
+    /// inspect the profiles currently in effect on a connector.
+    pub fn charging_profiles(&self) -> &Arc<ChargingProfileStore> {
+        &self.charging_profiles
     }
 
     /// Plug in connector
@@ -2733,12 +2814,13 @@ mod tests {
     // --- dispatcher wiring tests ---
 
     #[tokio::test]
-    async fn dispatcher_has_14_default_handlers() {
+    async fn dispatcher_has_16_default_handlers() {
         let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
         // 10 Core Profile actions + GetDiagnostics + UpdateFirmware
         // (firmware-management, #69/#70) + ReserveNow + CancelReservation
-        // (§5.14/§5.4, #71).
-        assert_eq!(cp.handler_count().await, 14);
+        // (§5.14/§5.4, #71) + SetChargingProfile + ClearChargingProfile
+        // (Smart Charging, §5.16/§5.2, #94).
+        assert_eq!(cp.handler_count().await, 16);
     }
 
     #[tokio::test]

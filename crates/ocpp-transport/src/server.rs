@@ -19,14 +19,16 @@ use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use ocpp_messages::v16j::{
     CancelReservationRequest, ChangeConfigurationRequest, ClearCacheRequest,
-    GetConfigurationRequest, GetConfigurationResponse, GetDiagnosticsRequest,
-    GetDiagnosticsResponse, RemoteStartTransactionRequest, RemoteStopTransactionRequest,
-    ReserveNowRequest, ResetRequest, StatusNotificationRequest, TriggerMessageRequest,
-    UnlockConnectorRequest, UpdateFirmwareRequest, UpdateFirmwareResponse,
+    ClearChargingProfileRequest, GetConfigurationRequest, GetConfigurationResponse,
+    GetDiagnosticsRequest, GetDiagnosticsResponse, RemoteStartTransactionRequest,
+    RemoteStopTransactionRequest, ReserveNowRequest, ResetRequest, SetChargingProfileRequest,
+    StatusNotificationRequest, TriggerMessageRequest, UnlockConnectorRequest,
+    UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
 use ocpp_types::v16j::{
-    CancelReservationStatus, ClearCacheStatus, ConfigurationStatus, MessageTrigger,
+    CancelReservationStatus, ChargingProfile, ChargingProfilePurposeType, ChargingProfileStatus,
+    ClearCacheStatus, ClearChargingProfileStatus, ConfigurationStatus, MessageTrigger,
     RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus,
     UnlockStatus,
 };
@@ -531,6 +533,66 @@ impl OcppServer {
     ) -> OcppResult<CancelReservationStatus> {
         let resp = self
             .call(cp_id, CancelReservationRequest { reservation_id })
+            .await?;
+        Ok(resp.status)
+    }
+
+    /// Install a Smart Charging profile on a connected charge point.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `SetChargingProfile` command (§5.16), mirroring how the Python reference's
+    /// central system drives it
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    ///
+    /// `connector_id` is the connector the profile targets (`0` =
+    /// charge-point-wide). Returns the CP's [`ChargingProfileStatus`] —
+    /// `Accepted` when the profile is installed, `Rejected` for an invalid
+    /// placement (e.g. a `ChargePointMaxProfile` at a real connector or an
+    /// unknown connector). Errors propagate from [`call`](Self::call).
+    pub async fn set_charging_profile(
+        &self,
+        cp_id: &str,
+        connector_id: i32,
+        cs_charging_profiles: ChargingProfile,
+    ) -> OcppResult<ChargingProfileStatus> {
+        let resp = self
+            .call(
+                cp_id,
+                SetChargingProfileRequest {
+                    connector_id,
+                    cs_charging_profiles,
+                },
+            )
+            .await?;
+        Ok(resp.status)
+    }
+
+    /// Clear Smart Charging profiles on a connected charge point.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `ClearChargingProfile` command (§5.2). Each filter is optional and a
+    /// `None` matches anything, so an all-`None` call clears every installed
+    /// profile. Returns the CP's [`ClearChargingProfileStatus`] — `Accepted` if
+    /// at least one profile matched and was cleared, `Unknown` otherwise. Errors
+    /// propagate from [`call`](Self::call).
+    pub async fn clear_charging_profile(
+        &self,
+        cp_id: &str,
+        id: Option<i32>,
+        connector_id: Option<i32>,
+        charging_profile_purpose: Option<ChargingProfilePurposeType>,
+        stack_level: Option<i32>,
+    ) -> OcppResult<ClearChargingProfileStatus> {
+        let resp = self
+            .call(
+                cp_id,
+                ClearChargingProfileRequest {
+                    id,
+                    connector_id,
+                    charging_profile_purpose,
+                    stack_level,
+                },
+            )
             .await?;
         Ok(resp.status)
     }
