@@ -315,6 +315,23 @@ static SCHEMA_TEXTS_V16J: &[(&str, &str)] = &[
     ),
 ];
 
+/// (schema-name, embedded JSON text) pairs for the bundled OCPP 2.0.1 schemas.
+///
+/// 2.0.1 schemas are JSON Schema **draft-06** (vs. draft-04 for 1.6J); the
+/// draft is detected per-schema at validation time. Keyed by action name for
+/// CALLs and `{action}Response` for CALLRESULTs, matching the v16j convention.
+/// Grows as more 2.0.1 messages are ported (M7).
+static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
+    (
+        "BootNotification",
+        include_str!("../schemas/v201/BootNotification.json"),
+    ),
+    (
+        "BootNotificationResponse",
+        include_str!("../schemas/v201/BootNotificationResponse.json"),
+    ),
+];
+
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
 /// JSON Schemas (Draft 4).
 ///
@@ -351,6 +368,22 @@ impl SchemaValidator {
         for (name, text) in SCHEMA_TEXTS_V16J {
             let value: Value =
                 serde_json::from_str(text).expect("bundled OCPP 1.6J schema is valid JSON");
+            schemas.insert((*name).to_string(), value);
+        }
+        Self { schemas }
+    }
+
+    /// Build a validator pre-loaded with the bundled OCPP 2.0.1 schemas.
+    ///
+    /// 2.0.1 schemas are JSON Schema draft-06; [`Self::run_validation`] detects
+    /// the draft per-schema, so a `v201()` validator and a [`Self::v16j()`]
+    /// validator can coexist without interfering. Currently carries the
+    /// `BootNotification` pair (M7 bootstrap); grows as more messages land.
+    pub fn v201() -> Self {
+        let mut schemas = HashMap::with_capacity(SCHEMA_TEXTS_V201.len());
+        for (name, text) in SCHEMA_TEXTS_V201 {
+            let value: Value =
+                serde_json::from_str(text).expect("bundled OCPP 2.0.1 schema is valid JSON");
             schemas.insert((*name).to_string(), value);
         }
         Self { schemas }
@@ -394,9 +427,23 @@ impl SchemaValidator {
             })
     }
 
+    /// Pick the JSON Schema draft to compile a bundled schema under.
+    ///
+    /// OCPP 1.6J schemas declare draft-04 and OCPP 2.0.1 schemas declare
+    /// draft-06; we honor the schema's own `$schema` so both validators behave
+    /// faithfully. Anything unrecognized (or absent) defaults to draft-04,
+    /// preserving the original 1.6J behavior exactly.
+    fn draft_for(schema: &Value) -> jsonschema::Draft {
+        match schema.get("$schema").and_then(Value::as_str) {
+            Some(s) if s.contains("draft-07") => jsonschema::Draft::Draft7,
+            Some(s) if s.contains("draft-06") => jsonschema::Draft::Draft6,
+            _ => jsonschema::Draft::Draft4,
+        }
+    }
+
     fn run_validation(schema: &Value, payload: &Value) -> OcppResult<()> {
         let compiled = jsonschema::JSONSchema::options()
-            .with_draft(jsonschema::Draft::Draft4)
+            .with_draft(Self::draft_for(schema))
             .compile(schema)
             .map_err(|e| OcppError::Internal {
                 message: format!("failed to compile bundled schema: {}", e),
@@ -1082,5 +1129,96 @@ mod tests {
         assert_eq!(decimal_mantissa_scale(-5.5), Some((-55, 1)));
         assert_eq!(decimal_mantissa_scale(f64::NAN), None);
         assert_eq!(decimal_mantissa_scale(f64::INFINITY), None);
+    }
+
+    // ---- OCPP 2.0.1 (draft-06) schema validation -------------------------
+
+    #[test]
+    fn v201_loads_bundled_boot_notification_schemas() {
+        let v = SchemaValidator::v201();
+        assert_eq!(v.schema_count(), 2);
+        assert!(v.has_schema("BootNotification"));
+        assert!(v.has_schema("BootNotificationResponse"));
+    }
+
+    #[test]
+    fn v201_boot_notification_call_valid_passes() {
+        let v = SchemaValidator::v201();
+        // The reference fixture (tests/v201/conftest.py).
+        let payload = json!({
+            "chargingStation": {
+                "vendorName": "ICU Eve Mini",
+                "model": "ICU Eve Mini",
+                "firmwareVersion": "#1:3.4.0-2990#N:217H;1.0-223"
+            },
+            "reason": "PowerUp"
+        });
+        assert!(v.validate_call("BootNotification", &payload).is_ok());
+    }
+
+    #[test]
+    fn v201_boot_notification_response_valid_passes() {
+        let v = SchemaValidator::v201();
+        // RFC 3339 with offset — the schema asserts `format: date-time`, which
+        // the `jsonschema` crate enforces (unlike Python's default validator).
+        let payload = json!({
+            "currentTime": "2018-05-29T17:37:05.495259Z",
+            "interval": 350,
+            "status": "Accepted"
+        });
+        assert!(v.validate_call_result("BootNotification", &payload).is_ok());
+    }
+
+    #[test]
+    fn v201_boot_notification_missing_required_field_fails() {
+        let v = SchemaValidator::v201();
+        // `chargingStation` is required.
+        let payload = json!({ "reason": "PowerUp" });
+        let err = v.validate_call("BootNotification", &payload).unwrap_err();
+        assert!(matches!(err, OcppError::SchemaViolation { .. }));
+    }
+
+    #[test]
+    fn v201_boot_notification_unknown_enum_value_fails() {
+        let v = SchemaValidator::v201();
+        let payload = json!({
+            "chargingStation": { "vendorName": "V", "model": "M" },
+            "reason": "Bogus"
+        });
+        assert!(v.validate_call("BootNotification", &payload).is_err());
+    }
+
+    #[test]
+    fn v201_boot_notification_rejects_additional_properties() {
+        // The schema's `additionalProperties: false` is enforced (the strict
+        // 2.0.1 contract). Draft selection itself is covered by
+        // `draft_detection_picks_expected_drafts`.
+        let v = SchemaValidator::v201();
+        let payload = json!({
+            "chargingStation": { "vendorName": "V", "model": "M" },
+            "reason": "PowerUp",
+            "bogusExtra": true
+        });
+        assert!(v.validate_call("BootNotification", &payload).is_err());
+    }
+
+    #[test]
+    fn draft_detection_picks_expected_drafts() {
+        let d6 = json!({ "$schema": "http://json-schema.org/draft-06/schema#" });
+        let d4 = json!({ "$schema": "http://json-schema.org/draft-04/schema#" });
+        let none = json!({});
+        assert!(matches!(
+            SchemaValidator::draft_for(&d6),
+            jsonschema::Draft::Draft6
+        ));
+        // 1.6J path is unchanged: draft-04 and unspecified both map to Draft4.
+        assert!(matches!(
+            SchemaValidator::draft_for(&d4),
+            jsonschema::Draft::Draft4
+        ));
+        assert!(matches!(
+            SchemaValidator::draft_for(&none),
+            jsonschema::Draft::Draft4
+        ));
     }
 }

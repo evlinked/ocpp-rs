@@ -7,6 +7,7 @@ pub mod common;
 pub mod error;
 pub mod message;
 pub mod v16j;
+pub mod v201;
 
 pub use error::*;
 pub use message::*;

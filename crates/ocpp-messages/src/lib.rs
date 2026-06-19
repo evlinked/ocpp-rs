@@ -7,6 +7,7 @@ pub mod dispatcher;
 pub mod schema_validation;
 pub mod serialization;
 pub mod v16j;
+pub mod v201;
 pub mod validation;
 
 pub use dispatcher::ActionDispatcher;
