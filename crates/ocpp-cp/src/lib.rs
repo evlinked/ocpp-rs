@@ -13,6 +13,7 @@ pub mod composite;
 pub mod connector;
 pub mod data_transfer;
 pub mod error;
+pub mod local_list;
 pub mod message_handler;
 pub mod meter_sampler;
 pub mod state_machine;
@@ -24,6 +25,7 @@ use charging_profiles::ChargingProfileStore;
 use connector::{Connector, ConnectorConfig};
 use data_transfer::DataTransferRegistry;
 use error::ChargePointError;
+use local_list::LocalAuthList;
 use message_handler::ConfigurationStore;
 use ocpp_messages::v16j::{
     AuthorizeRequest, BootNotificationRequest, BootNotificationResponse, CancelReservationRequest,
@@ -32,13 +34,15 @@ use ocpp_messages::v16j::{
     ClearChargingProfileRequest, ClearChargingProfileResponse, DataTransferRequest,
     DataTransferResponse, DiagnosticsStatusNotificationRequest, FirmwareStatusNotificationRequest,
     GetCompositeScheduleRequest, GetCompositeScheduleResponse, GetConfigurationRequest,
-    GetConfigurationResponse, GetDiagnosticsRequest, GetDiagnosticsResponse, HeartbeatRequest,
-    MeterValuesRequest, RegistrationStatus, RemoteStartTransactionRequest,
-    RemoteStartTransactionResponse, RemoteStopTransactionRequest, RemoteStopTransactionResponse,
-    ReserveNowRequest, ReserveNowResponse, ResetRequest, ResetResponse, SetChargingProfileRequest,
-    SetChargingProfileResponse, StartTransactionRequest, StatusNotificationRequest,
-    StopTransactionRequest, TriggerMessageRequest, TriggerMessageResponse, UnlockConnectorRequest,
-    UnlockConnectorResponse, UpdateFirmwareRequest, UpdateFirmwareResponse,
+    GetConfigurationResponse, GetDiagnosticsRequest, GetDiagnosticsResponse,
+    GetLocalListVersionRequest, GetLocalListVersionResponse, HeartbeatRequest, MeterValuesRequest,
+    RegistrationStatus, RemoteStartTransactionRequest, RemoteStartTransactionResponse,
+    RemoteStopTransactionRequest, RemoteStopTransactionResponse, ReserveNowRequest,
+    ReserveNowResponse, ResetRequest, ResetResponse, SendLocalListRequest, SendLocalListResponse,
+    SetChargingProfileRequest, SetChargingProfileResponse, StartTransactionRequest,
+    StatusNotificationRequest, StopTransactionRequest, TriggerMessageRequest,
+    TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse, UpdateFirmwareRequest,
+    UpdateFirmwareResponse,
 };
 use ocpp_messages::{
     ActionDispatcher, CallMessage, Message, MessageType, OcppAction, SchemaValidator,
@@ -558,6 +562,11 @@ pub struct ChargePoint {
     /// [`ChargePoint::register_data_transfer_handler`]. Empty by default, so an
     /// unimplemented vendor faithfully resolves to `UnknownVendorId`.
     data_transfer: Arc<DataTransferRegistry>,
+    /// CSMS-managed, versioned Local Authorization List (OCPP 1.6J §5.x, Issue
+    /// #93). Shared with the default `GetLocalListVersion` / `SendLocalList`
+    /// handlers; the CSMS queries the version and pushes `Full`/`Differential`
+    /// updates. Empty at version `0` by default.
+    local_list: Arc<LocalAuthList>,
 }
 
 impl ChargePoint {
@@ -600,6 +609,8 @@ impl ChargePoint {
 
         let data_transfer = Arc::new(DataTransferRegistry::new());
 
+        let local_list = Arc::new(LocalAuthList::new());
+
         let (command_sender, command_receiver) = mpsc::unbounded_channel();
 
         // Wrap the shared state the default handlers need *before* building the
@@ -622,6 +633,7 @@ impl ChargePoint {
             expiry_timers.clone(),
             config.unlock_connector_outcome,
             data_transfer.clone(),
+            local_list.clone(),
         );
         if let Some(v) = &validator {
             dispatcher = dispatcher.with_validator(v.clone());
@@ -651,6 +663,7 @@ impl ChargePoint {
             firmware_status: Arc::new(RwLock::new(FirmwareStatus::Idle)),
             charging_profiles,
             data_transfer,
+            local_list,
         })
     }
 
@@ -676,6 +689,7 @@ impl ChargePoint {
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
         unlock_outcome: UnlockConnectorOutcome,
         data_transfer: Arc<DataTransferRegistry>,
+        local_list: Arc<LocalAuthList>,
     ) -> ActionDispatcher {
         let mut d = ActionDispatcher::new();
 
@@ -1316,6 +1330,37 @@ impl ChargePoint {
             d.on(move |req: DataTransferRequest| {
                 let data_transfer = data_transfer.clone();
                 async move { Ok(data_transfer.dispatch(&req)) }
+            });
+        }
+
+        // GetLocalListVersion — report the version of the Local Authorization
+        // List (OCPP 1.6J §5.x, Issue #93). `0` for an empty list; the CP never
+        // returns `-1` because it implements the profile.
+        {
+            let local_list = local_list.clone();
+            d.on(move |_req: GetLocalListVersionRequest| {
+                let local_list = local_list.clone();
+                async move {
+                    Ok(GetLocalListVersionResponse {
+                        list_version: local_list.version(),
+                    })
+                }
+            });
+        }
+
+        // SendLocalList — apply a Full or Differential update to the Local
+        // Authorization List (OCPP 1.6J §5.x, Issue #93). The list itself
+        // enforces version ordering, duplicate rejection, and Full/Differential
+        // semantics, returning the faithful UpdateStatus.
+        {
+            let local_list = local_list.clone();
+            d.on(move |req: SendLocalListRequest| {
+                let local_list = local_list.clone();
+                async move {
+                    Ok(SendLocalListResponse {
+                        status: local_list.apply(&req),
+                    })
+                }
             });
         }
 
@@ -1986,6 +2031,14 @@ impl ChargePoint {
     /// inspect the profiles currently in effect on a connector.
     pub fn charging_profiles(&self) -> &Arc<ChargingProfileStore> {
         &self.charging_profiles
+    }
+
+    /// The CSMS-managed Local Authorization List (OCPP 1.6J §5.x, Issue #93).
+    /// The default `GetLocalListVersion` / `SendLocalList` handlers query and
+    /// mutate it; tests (and a future offline-authorization path) read it to
+    /// inspect the entries the CSMS has pushed.
+    pub fn local_list(&self) -> &Arc<LocalAuthList> {
+        &self.local_list
     }
 
     /// Plug in connector
@@ -2934,14 +2987,15 @@ mod tests {
     // --- dispatcher wiring tests ---
 
     #[tokio::test]
-    async fn dispatcher_has_17_default_handlers() {
+    async fn dispatcher_has_19_default_handlers() {
         let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
         // 10 Core Profile actions + GetDiagnostics + UpdateFirmware
         // (firmware-management, #69/#70) + ReserveNow + CancelReservation
         // (§5.14/§5.4, #71) + SetChargingProfile + ClearChargingProfile
         // (Smart Charging, §5.16/§5.2, #94) + GetCompositeSchedule
-        // (Smart Charging, §5.x, #95).
-        assert_eq!(cp.handler_count().await, 17);
+        // (Smart Charging, §5.x, #95) + GetLocalListVersion + SendLocalList
+        // (Local Authorization List, §5.x, #93).
+        assert_eq!(cp.handler_count().await, 19);
     }
 
     #[tokio::test]
