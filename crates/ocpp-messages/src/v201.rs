@@ -7,13 +7,14 @@
 //! into the same framing and dispatch machinery.
 //!
 //! This is the foundation slice for **M7 — OCPP 2.0.1** and currently covers
-//! the core lifecycle messages `BootNotification`, `Heartbeat`, and
-//! `StatusNotification`.
+//! the core lifecycle messages `BootNotification`, `Heartbeat`,
+//! `StatusNotification`, and the `GetVariables` device-model read (its
+//! `SetVariables` counterpart is a planned follow-up).
 
 use crate::{OcppAction, OcppResponse};
 use ocpp_types::v201::{
     BootReasonEnumType, ChargingStationType, ConnectorStatusEnumType, CustomDataType,
-    RegistrationStatusEnumType, StatusInfoType,
+    GetVariableDataType, GetVariableResultType, RegistrationStatusEnumType, StatusInfoType,
 };
 use serde::{Deserialize, Serialize};
 
@@ -147,6 +148,49 @@ impl OcppAction for StatusNotificationResponse {
 }
 
 impl OcppResponse for StatusNotificationResponse {}
+
+/// `GetVariables.req` — sent by the CSMS to read one or more
+/// component-variable attributes from a Charging Station.
+///
+/// Ports `ocpp.v201.call.GetVariables`. The 2.0.1 device-model replacement for
+/// 1.6J `GetConfiguration`: instead of flat string keys, each entry names a
+/// `component`/`variable` pair (see [`GetVariableDataType`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetVariablesRequest {
+    /// The variables (and attributes) to read. Per the schema at least one
+    /// entry must be present.
+    #[serde(rename = "getVariableData")]
+    pub get_variable_data: Vec<GetVariableDataType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+impl OcppAction for GetVariablesRequest {
+    const ACTION_NAME: &'static str = "GetVariables";
+    type Response = GetVariablesResponse;
+}
+
+/// `GetVariables.conf` — the Charging Station's reply, one result per requested
+/// variable (order corresponds to the request).
+///
+/// Ports `ocpp.v201.call_result.GetVariables`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetVariablesResponse {
+    /// One result per requested variable.
+    #[serde(rename = "getVariableResult")]
+    pub get_variable_result: Vec<GetVariableResultType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+impl OcppAction for GetVariablesResponse {
+    const ACTION_NAME: &'static str = "GetVariablesResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for GetVariablesResponse {}
 
 #[cfg(test)]
 mod tests {
@@ -334,5 +378,89 @@ mod tests {
         assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
         let back: StatusNotificationRequest = serde_json::from_value(wire).unwrap();
         assert_eq!(back, req);
+    }
+
+    #[test]
+    fn get_variables_request_round_trips() {
+        use ocpp_types::v201::{ComponentType, EvseType, VariableType};
+
+        let req = GetVariablesRequest {
+            get_variable_data: vec![GetVariableDataType {
+                component: ComponentType {
+                    name: "SampledDataCtrlr".to_string(),
+                    instance: None,
+                    evse: Some(EvseType {
+                        id: 1,
+                        connector_id: None,
+                        custom_data: None,
+                    }),
+                    custom_data: None,
+                },
+                variable: VariableType {
+                    name: "TxEndedMeasurands".to_string(),
+                    instance: None,
+                    custom_data: None,
+                },
+                attribute_type: None,
+                custom_data: None,
+            }],
+            custom_data: None,
+        };
+        let expected = json!({
+            "getVariableData": [{
+                "component": { "name": "SampledDataCtrlr", "evse": { "id": 1 } },
+                "variable": { "name": "TxEndedMeasurands" }
+            }]
+        });
+        assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+        let back: GetVariablesRequest = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn get_variables_response_round_trips() {
+        use ocpp_types::v201::{
+            AttributeEnumType, ComponentType, GetVariableStatusEnumType, VariableType,
+        };
+
+        let resp = GetVariablesResponse {
+            get_variable_result: vec![GetVariableResultType {
+                attribute_status: GetVariableStatusEnumType::Accepted,
+                component: ComponentType {
+                    name: "OCPPCommCtrlr".to_string(),
+                    instance: None,
+                    evse: None,
+                    custom_data: None,
+                },
+                variable: VariableType {
+                    name: "HeartbeatInterval".to_string(),
+                    instance: None,
+                    custom_data: None,
+                },
+                attribute_type: Some(AttributeEnumType::Actual),
+                attribute_value: Some("300".to_string()),
+                attribute_status_info: None,
+                custom_data: None,
+            }],
+            custom_data: None,
+        };
+        let expected = json!({
+            "getVariableResult": [{
+                "attributeStatus": "Accepted",
+                "component": { "name": "OCPPCommCtrlr" },
+                "variable": { "name": "HeartbeatInterval" },
+                "attributeType": "Actual",
+                "attributeValue": "300"
+            }]
+        });
+        assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+        let back: GetVariablesResponse = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn get_variables_action_names() {
+        assert_eq!(GetVariablesRequest::ACTION_NAME, "GetVariables");
+        assert_eq!(GetVariablesResponse::ACTION_NAME, "GetVariablesResponse");
     }
 }

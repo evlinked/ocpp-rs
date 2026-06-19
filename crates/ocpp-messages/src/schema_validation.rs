@@ -330,6 +330,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "BootNotificationResponse",
         include_str!("../schemas/v201/BootNotificationResponse.json"),
     ),
+    (
+        "GetVariables",
+        include_str!("../schemas/v201/GetVariables.json"),
+    ),
+    (
+        "GetVariablesResponse",
+        include_str!("../schemas/v201/GetVariablesResponse.json"),
+    ),
     ("Heartbeat", include_str!("../schemas/v201/Heartbeat.json")),
     (
         "HeartbeatResponse",
@@ -391,7 +399,8 @@ impl SchemaValidator {
     /// 2.0.1 schemas are JSON Schema draft-06; `run_validation` detects
     /// the draft per-schema, so a `v201()` validator and a [`Self::v16j()`]
     /// validator can coexist without interfering. Currently carries the
-    /// `BootNotification` pair (M7 bootstrap); grows as more messages land.
+    /// `BootNotification`, `Heartbeat`, `StatusNotification`, and
+    /// `GetVariables` schemas (M7); grows as more messages land.
     pub fn v201() -> Self {
         let mut schemas = HashMap::with_capacity(SCHEMA_TEXTS_V201.len());
         for (name, text) in SCHEMA_TEXTS_V201 {
@@ -1149,9 +1158,11 @@ mod tests {
     #[test]
     fn v201_loads_bundled_boot_notification_schemas() {
         let v = SchemaValidator::v201();
-        assert_eq!(v.schema_count(), 6);
+        assert_eq!(v.schema_count(), 8);
         assert!(v.has_schema("BootNotification"));
         assert!(v.has_schema("BootNotificationResponse"));
+        assert!(v.has_schema("GetVariables"));
+        assert!(v.has_schema("GetVariablesResponse"));
         assert!(v.has_schema("Heartbeat"));
         assert!(v.has_schema("HeartbeatResponse"));
         assert!(v.has_schema("StatusNotification"));
@@ -1290,6 +1301,65 @@ mod tests {
             "bogusExtra": true
         });
         assert!(v.validate_call("BootNotification", &payload).is_err());
+    }
+
+    #[test]
+    fn v201_get_variables_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        let call = json!({
+            "getVariableData": [{
+                "component": { "name": "OCPPCommCtrlr" },
+                "variable": { "name": "HeartbeatInterval" }
+            }]
+        });
+        assert!(v.validate_call("GetVariables", &call).is_ok());
+        let result = json!({
+            "getVariableResult": [{
+                "attributeStatus": "Accepted",
+                "component": { "name": "OCPPCommCtrlr" },
+                "variable": { "name": "HeartbeatInterval" },
+                "attributeValue": "300"
+            }]
+        });
+        assert!(v.validate_call_result("GetVariables", &result).is_ok());
+    }
+
+    #[test]
+    fn v201_get_variables_missing_required_field_fails() {
+        let v = SchemaValidator::v201();
+        // Each entry requires both `component` and `variable`.
+        let payload = json!({
+            "getVariableData": [{ "component": { "name": "OCPPCommCtrlr" } }]
+        });
+        let err = v.validate_call("GetVariables", &payload).unwrap_err();
+        assert!(matches!(err, OcppError::SchemaViolation { .. }));
+    }
+
+    #[test]
+    fn v201_get_variables_unknown_enum_value_fails() {
+        let v = SchemaValidator::v201();
+        // `Maybe` is not a member of GetVariableStatusEnumType.
+        let payload = json!({
+            "getVariableResult": [{
+                "attributeStatus": "Maybe",
+                "component": { "name": "OCPPCommCtrlr" },
+                "variable": { "name": "HeartbeatInterval" }
+            }]
+        });
+        assert!(v.validate_call_result("GetVariables", &payload).is_err());
+    }
+
+    #[test]
+    fn v201_get_variables_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        let payload = json!({
+            "getVariableData": [{
+                "component": { "name": "OCPPCommCtrlr" },
+                "variable": { "name": "HeartbeatInterval" }
+            }],
+            "bogusExtra": true
+        });
+        assert!(v.validate_call("GetVariables", &payload).is_err());
     }
 
     #[test]
