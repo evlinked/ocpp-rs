@@ -12,7 +12,7 @@
 
 use crate::{OcppAction, OcppResponse};
 use ocpp_types::v201::{
-    BootReasonEnumType, ChargingStationType, ConnectorStatusEnumType, CustomDataType, EVSEType,
+    BootReasonEnumType, ChargingStationType, ConnectorStatusEnumType, CustomDataType, EvseType,
     IdTokenInfoType, IdTokenType, MessageContentType, RegistrationStatusEnumType, StatusInfoType,
     TransactionEventEnumType, TransactionType, TriggerReasonEnumType,
 };
@@ -192,7 +192,7 @@ pub struct TransactionEventRequest {
     pub reservation_id: Option<i32>,
     /// The EVSE (and optionally connector) for which the event is reported.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub evse: Option<EVSEType>,
+    pub evse: Option<EvseType>,
     /// The identifier that authorized the transaction.
     #[serde(rename = "idToken", skip_serializing_if = "Option::is_none")]
     pub id_token: Option<IdTokenType>,
@@ -458,14 +458,14 @@ mod tests {
                 number_of_phases_used: None,
                 cable_max_current: None,
                 reservation_id: None,
-                evse: Some(EVSEType {
+                evse: Some(EvseType {
                     id: 1,
                     connector_id: Some(1),
                     custom_data: None,
                 }),
                 id_token: Some(IdTokenType {
                     id_token: "045918E24B5380".to_string(),
-                    type_: IdTokenEnumType::Iso14443,
+                    kind: IdTokenEnumType::Iso14443,
                     additional_info: None,
                     custom_data: None,
                 }),

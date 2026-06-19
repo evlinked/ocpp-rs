@@ -167,7 +167,8 @@ pub enum AuthorizationStatusEnumType {
     Expired,
     Invalid,
     NoCredit,
-    NotAllowedTypeEVSE,
+    #[serde(rename = "NotAllowedTypeEVSE")]
+    NotAllowedTypeEvse,
     NotAtThisLocation,
     NotAtThisTime,
     Unknown,
@@ -271,7 +272,7 @@ pub struct ChargingStationType {
 ///
 /// Ports `EVSEType`. Only `id` is required.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EVSEType {
+pub struct EvseType {
     /// EVSE identifier within the Charging Station (≥ 1).
     pub id: i32,
     /// Connector within the EVSE, if the message refers to a specific one.
@@ -285,7 +286,7 @@ pub struct EVSEType {
 /// One additional identifier carried alongside a primary [`IdTokenType`].
 ///
 /// Ports `AdditionalInfoType`. Both fields are required by the schema; `type`
-/// here is a free-form string (unlike [`IdTokenType::type_`]).
+/// here is a free-form string (unlike [`IdTokenType::kind`]).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AdditionalInfoType {
     /// The additional identifier (max length 36).
@@ -293,7 +294,7 @@ pub struct AdditionalInfoType {
     pub additional_id_token: String,
     /// Type of the additional identifier (max length 50).
     #[serde(rename = "type")]
-    pub type_: String,
+    pub kind: String,
     /// Vendor extension.
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
@@ -310,7 +311,7 @@ pub struct IdTokenType {
     pub id_token: String,
     /// How to interpret `id_token`.
     #[serde(rename = "type")]
-    pub type_: IdTokenEnumType,
+    pub kind: IdTokenEnumType,
     /// Additional identifiers carried with this token.
     #[serde(rename = "additionalInfo", skip_serializing_if = "Option::is_none")]
     pub additional_info: Option<Vec<AdditionalInfoType>>,
@@ -593,10 +594,10 @@ mod tests {
     fn id_token_round_trips_with_additional_info() {
         let token = IdTokenType {
             id_token: "045918E24B5380".to_string(),
-            type_: IdTokenEnumType::Iso14443,
+            kind: IdTokenEnumType::Iso14443,
             additional_info: Some(vec![AdditionalInfoType {
                 additional_id_token: "VID:0815".to_string(),
-                type_: "vendorId".to_string(),
+                kind: "vendorId".to_string(),
                 custom_data: None,
             }]),
             custom_data: None,
@@ -610,7 +611,7 @@ mod tests {
 
     #[test]
     fn evse_omits_none_connector() {
-        let evse = EVSEType {
+        let evse = EvseType {
             id: 1,
             connector_id: None,
             custom_data: None,
