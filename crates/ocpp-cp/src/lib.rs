@@ -11,6 +11,7 @@ pub mod auth_cache;
 pub mod charging_profiles;
 pub mod composite;
 pub mod connector;
+pub mod data_transfer;
 pub mod error;
 pub mod message_handler;
 pub mod meter_sampler;
@@ -21,6 +22,7 @@ use anyhow::Result;
 use auth_cache::AuthCache;
 use charging_profiles::ChargingProfileStore;
 use connector::{Connector, ConnectorConfig};
+use data_transfer::DataTransferRegistry;
 use error::ChargePointError;
 use message_handler::ConfigurationStore;
 use ocpp_messages::v16j::{
@@ -50,10 +52,9 @@ use ocpp_types::common::{
 };
 use ocpp_types::v16j::{
     CancelReservationStatus, ChargePointErrorCode, ChargePointStatus, ChargePointVendorInfo,
-    ChargingProfileStatus, ClearCacheStatus, ConfigurationStatus, DataTransferStatus,
-    DiagnosticsStatus, FirmwareStatus, GetCompositeScheduleStatus, MessageTrigger,
-    RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus,
-    UnlockStatus,
+    ChargingProfileStatus, ClearCacheStatus, ConfigurationStatus, DiagnosticsStatus,
+    FirmwareStatus, GetCompositeScheduleStatus, MessageTrigger, RemoteStartStopStatus,
+    ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus, UnlockStatus,
 };
 use ocpp_types::{
     CallErrorCode, CallErrorMessage, CallResultMessage, ConnectorId, OcppError, OcppResult,
@@ -551,6 +552,12 @@ pub struct ChargePoint {
     /// `GetCompositeSchedule` follow-up (Issue #95) to compute the effective
     /// schedule.
     charging_profiles: Arc<ChargingProfileStore>,
+    /// Vendor-scoped routing table for inbound `DataTransfer` requests (OCPP
+    /// 1.6J §6.x, Issue #101). Shared with the default `DataTransfer` handler;
+    /// embedders opt into vendors/messages via
+    /// [`ChargePoint::register_data_transfer_handler`]. Empty by default, so an
+    /// unimplemented vendor faithfully resolves to `UnknownVendorId`.
+    data_transfer: Arc<DataTransferRegistry>,
 }
 
 impl ChargePoint {
@@ -591,6 +598,8 @@ impl ChargePoint {
 
         let charging_profiles = Arc::new(ChargingProfileStore::new());
 
+        let data_transfer = Arc::new(DataTransferRegistry::new());
+
         let (command_sender, command_receiver) = mpsc::unbounded_channel();
 
         // Wrap the shared state the default handlers need *before* building the
@@ -612,6 +621,7 @@ impl ChargePoint {
             charging_profiles.clone(),
             expiry_timers.clone(),
             config.unlock_connector_outcome,
+            data_transfer.clone(),
         );
         if let Some(v) = &validator {
             dispatcher = dispatcher.with_validator(v.clone());
@@ -640,6 +650,7 @@ impl ChargePoint {
             diagnostics_status: Arc::new(RwLock::new(DiagnosticsStatus::Idle)),
             firmware_status: Arc::new(RwLock::new(FirmwareStatus::Idle)),
             charging_profiles,
+            data_transfer,
         })
     }
 
@@ -664,6 +675,7 @@ impl ChargePoint {
         charging_profiles: Arc<ChargingProfileStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
         unlock_outcome: UnlockConnectorOutcome,
+        data_transfer: Arc<DataTransferRegistry>,
     ) -> ActionDispatcher {
         let mut d = ActionDispatcher::new();
 
@@ -1294,13 +1306,18 @@ impl ChargePoint {
             });
         }
 
-        // DataTransfer — accept and echo data back
-        d.on(|req: DataTransferRequest| async move {
-            Ok(DataTransferResponse {
-                status: DataTransferStatus::Accepted,
-                data: req.data,
-            })
-        });
+        // DataTransfer — route by (vendorId, messageId) through the registry
+        // (OCPP 1.6J §6.x, Issue #101). An unimplemented vendor/message yields
+        // the faithful UnknownVendorId / UnknownMessageId; a registered handler
+        // decides Accepted/Rejected (+ optional data). With no handlers
+        // registered the registry answers UnknownVendorId for every request.
+        {
+            let data_transfer = data_transfer.clone();
+            d.on(move |req: DataTransferRequest| {
+                let data_transfer = data_transfer.clone();
+                async move { Ok(data_transfer.dispatch(&req)) }
+            });
+        }
 
         d
     }
@@ -1987,6 +2004,35 @@ impl ChargePoint {
             connector.plug_out().await?;
         }
         Ok(())
+    }
+
+    /// Register a handler for inbound `DataTransfer` requests carrying a given
+    /// `(vendorId, messageId)` (OCPP 1.6J §6.x, Issue #101).
+    ///
+    /// `message_id = Some(id)` handles requests with that exact `messageId`;
+    /// `message_id = None` handles requests from this vendor that carry **no**
+    /// `messageId`. The handler receives the full [`DataTransferRequest`] and
+    /// returns the [`DataTransferResponse`] (status plus optional `data`), so it
+    /// may answer `Accepted` or `Rejected` and echo data as the vendor protocol
+    /// requires.
+    ///
+    /// Anything left unregistered resolves to the spec-faithful `UnknownVendorId`
+    /// (unknown vendor) or `UnknownMessageId` (known vendor, unknown message);
+    /// with no handlers registered at all, every `DataTransfer` is answered
+    /// `UnknownVendorId`. May be called before or after [`connect`](Self::connect)
+    /// — the registry is shared with the live handler.
+    ///
+    /// The handler is invoked while a registry read-lock is held, so it must not
+    /// call this method re-entrantly.
+    pub fn register_data_transfer_handler<F>(
+        &self,
+        vendor_id: impl Into<String>,
+        message_id: Option<String>,
+        handler: F,
+    ) where
+        F: Fn(&DataTransferRequest) -> DataTransferResponse + Send + Sync + 'static,
+    {
+        self.data_transfer.register(vendor_id, message_id, handler);
     }
 
     /// Authorize an id tag, consulting the local authorization cache first.

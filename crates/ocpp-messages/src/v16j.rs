@@ -387,7 +387,10 @@ pub struct DataTransferRequest {
     /// Message identifier (optional)
     #[serde(rename = "messageId", skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
-    /// Data (optional)
+    /// Data (optional). Omitted from the wire when absent — the OCPP 1.6J
+    /// DataTransfer.req schema types `data` as an optional `string`, so a
+    /// serialized `null` is non-conformant and is rejected by schema validation.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
 }
 
