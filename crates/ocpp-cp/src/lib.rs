@@ -86,6 +86,29 @@ pub enum FirmwareUpdateOutcome {
     InstallationFailed,
 }
 
+/// Opt-in outcome of `UnlockConnector` (OCPP 1.6J §5.21), modeling whether this
+/// charge point's connector locks are controllable. Lets a CSMS / back office be
+/// exercised against all three `UnlockStatus` values, not just the happy path.
+///
+/// Global to the CP — every connector behaves the same; a per-connector lock
+/// capability is a future refinement. The happy path
+/// ([`UnlockConnectorOutcome::Unlock`]) is the default so existing behavior is
+/// unchanged. Independent of the unknown/out-of-range-connector case, which is
+/// always `UnlockFailed` regardless of this knob (the CP cannot unlock a
+/// connector it does not have).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum UnlockConnectorOutcome {
+    /// Happy path: the lock is controllable. A valid connector unlocks
+    /// (`Unlocked`); any active transaction on it is stopped first (reason
+    /// `UnlockCommand`) and the connector freed.
+    #[default]
+    Unlock,
+    /// Mechanical fault: the lock will not release → `UnlockFailed`.
+    UnlockFailed,
+    /// The connector has no controllable lock → `NotSupported`.
+    NotSupported,
+}
+
 /// Charge point configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChargePointConfig {
@@ -146,6 +169,15 @@ pub struct ChargePointConfig {
     /// succeeds. The failure path is strictly opt-in so existing behavior is
     /// unchanged.
     pub firmware_update_outcome: FirmwareUpdateOutcome,
+    /// Connector-lock behavior for `UnlockConnector` (OCPP 1.6J §5.21). Defaults
+    /// to [`UnlockConnectorOutcome::Unlock`] (happy path: a valid connector
+    /// unlocks, stopping any active transaction first). Set
+    /// [`UnlockConnectorOutcome::NotSupported`] to model a connector with no
+    /// controllable lock, or [`UnlockConnectorOutcome::UnlockFailed`] to model a
+    /// mechanical unlock failure, so a CSMS can be exercised against all three
+    /// `UnlockStatus` outcomes. The failure paths are strictly opt-in so existing
+    /// behavior is unchanged.
+    pub unlock_connector_outcome: UnlockConnectorOutcome,
     /// Transport configuration (not serialized; uses Default on deserialization)
     #[serde(skip)]
     pub transport_config: TransportConfig,
@@ -181,6 +213,7 @@ impl Default for ChargePointConfig {
             offline_auth_stale_ok: false,
             diagnostics_upload_should_fail: false,
             firmware_update_outcome: FirmwareUpdateOutcome::Succeed,
+            unlock_connector_outcome: UnlockConnectorOutcome::Unlock,
             transport_config: TransportConfig::default(),
         }
     }
@@ -274,6 +307,17 @@ enum RemoteCommand {
     EmitConnectorStatus {
         connector_id: ConnectorId,
         status: ChargePointStatus,
+    },
+    /// Stop the active transaction on a connector being unlocked by an `Accepted`
+    /// `UnlockConnector` (OCPP 1.6J §5.21). Per the spec the CP stops an ongoing
+    /// transaction (`StopTransaction`, reason `UnlockCommand`) before releasing
+    /// the cable; `stop_transaction` also frees the connector (→ `Available`) and
+    /// emits the `StatusNotification`. Queued off the inbound-CALL path like the
+    /// other side effects so the `UnlockConnector` CALLRESULT is flushed before
+    /// the outbound `StopTransaction` CALL (no receive-loop re-entrancy).
+    UnlockConnector {
+        connector_id: ConnectorId,
+        transaction_id: i32,
     },
 }
 
@@ -541,6 +585,7 @@ impl ChargePoint {
             connectors.clone(),
             active_transactions.clone(),
             reservations.clone(),
+            config.unlock_connector_outcome,
         );
         if let Some(v) = &validator {
             dispatcher = dispatcher.with_validator(v.clone());
@@ -583,6 +628,7 @@ impl ChargePoint {
         connectors: Arc<RwLock<HashMap<ConnectorId, Connector>>>,
         active_transactions: Arc<RwLock<HashMap<i32, ConnectorId>>>,
         reservations: Arc<RwLock<HashMap<i32, ConnectorId>>>,
+        unlock_outcome: UnlockConnectorOutcome,
     ) -> ActionDispatcher {
         let mut d = ActionDispatcher::new();
 
@@ -850,12 +896,73 @@ impl ChargePoint {
             });
         }
 
-        // UnlockConnector — always succeed (real connector unlock is Issue #21)
-        d.on(|_req: UnlockConnectorRequest| async move {
-            Ok(UnlockConnectorResponse {
-                status: UnlockStatus::Unlocked,
-            })
-        });
+        // UnlockConnector — faithfully unlock a connector's cable (OCPP 1.6J
+        // §5.21). The status is keyed off the connector and this CP's lock
+        // capability ([`UnlockConnectorOutcome`]):
+        //
+        // - unknown / out-of-range `connectorId` (incl. 0) → `UnlockFailed`: the
+        //   CP cannot unlock a connector it does not have, and the spec response
+        //   has no "Rejected" — `UnlockFailed` is the faithful answer;
+        // - `NotSupported` lock capability → `NotSupported`;
+        // - `UnlockFailed` lock capability (mechanical fault) → `UnlockFailed`;
+        // - otherwise → `Unlocked`. If a transaction is live on the connector it
+        //   is stopped first (`StopTransaction`, reason `UnlockCommand`) and the
+        //   connector freed — queued on the command channel and run by the
+        //   consumer task off the inbound-CALL path so the `UnlockConnector`
+        //   CALLRESULT is flushed before the outbound `StopTransaction` CALL (no
+        //   receive-loop re-entrancy, same pattern as Reset/RemoteStop). An idle
+        //   connector just releases the cable — a purely local action with no
+        //   OCPP side effect. If the consumer has gone away (CP shutting down) the
+        //   transaction cannot be stopped, so we report `UnlockFailed` rather than
+        //   falsely claim `Unlocked`. Ports `@on('UnlockConnector')` from the
+        //   Python reference's example charge point.
+        {
+            let connectors = connectors.clone();
+            let active_transactions = active_transactions.clone();
+            let command_sender = command_sender.clone();
+            d.on(move |req: UnlockConnectorRequest| {
+                let connectors = connectors.clone();
+                let active_transactions = active_transactions.clone();
+                let command_sender = command_sender.clone();
+                async move {
+                    let status = match ConnectorId::new(req.connector_id) {
+                        // connectorId 0 / out of range, or a connector this CP
+                        // does not have → not unlockable.
+                        Err(_) => UnlockStatus::UnlockFailed,
+                        Ok(cid) if !connectors.read().await.contains_key(&cid) => {
+                            UnlockStatus::UnlockFailed
+                        }
+                        Ok(cid) => match unlock_outcome {
+                            UnlockConnectorOutcome::NotSupported => UnlockStatus::NotSupported,
+                            UnlockConnectorOutcome::UnlockFailed => UnlockStatus::UnlockFailed,
+                            UnlockConnectorOutcome::Unlock => {
+                                // Find the active transaction (if any) on this
+                                // connector; the map is keyed by transaction id, so
+                                // scan for the matching connector.
+                                let txn = active_transactions
+                                    .read()
+                                    .await
+                                    .iter()
+                                    .find_map(|(tid, c)| (*c == cid).then_some(*tid));
+                                match txn {
+                                    Some(transaction_id) => {
+                                        match command_sender.send(RemoteCommand::UnlockConnector {
+                                            connector_id: cid,
+                                            transaction_id,
+                                        }) {
+                                            Ok(()) => UnlockStatus::Unlocked,
+                                            Err(_) => UnlockStatus::UnlockFailed,
+                                        }
+                                    }
+                                    None => UnlockStatus::Unlocked,
+                                }
+                            }
+                        },
+                    };
+                    Ok(UnlockConnectorResponse { status })
+                }
+            });
+        }
 
         // ReserveNow — reserve a connector for an idTag until expiryDate (OCPP
         // 1.6J §5.14). Faithful status semantics keyed off the connector's live
@@ -1146,6 +1253,25 @@ impl ChargePoint {
                                 warn!(
                                     "reservation StatusNotification({status:?}) for connector \
                                      {} failed: {e}",
+                                    connector_id.value()
+                                );
+                            }
+                        }
+                        RemoteCommand::UnlockConnector {
+                            connector_id,
+                            transaction_id,
+                        } => {
+                            // meter_stop is unknown for an unlock-triggered stop;
+                            // report 0 like the reset / remote-stop paths.
+                            // stop_transaction frees the connector (→ Available)
+                            // and emits the StatusNotification.
+                            if let Err(e) = cp
+                                .stop_transaction(transaction_id, 0, Reason::UnlockCommand)
+                                .await
+                            {
+                                warn!(
+                                    "unlock: failed to stop transaction {transaction_id} on \
+                                     connector {}: {e}",
                                     connector_id.value()
                                 );
                             }
