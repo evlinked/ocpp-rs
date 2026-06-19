@@ -322,6 +322,11 @@ static SCHEMA_TEXTS_V16J: &[(&str, &str)] = &[
 /// CALLs and `{action}Response` for CALLRESULTs, matching the v16j convention.
 /// Grows as more 2.0.1 messages are ported (M7).
 static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
+    ("Authorize", include_str!("../schemas/v201/Authorize.json")),
+    (
+        "AuthorizeResponse",
+        include_str!("../schemas/v201/AuthorizeResponse.json"),
+    ),
     (
         "BootNotification",
         include_str!("../schemas/v201/BootNotification.json"),
@@ -391,7 +396,8 @@ impl SchemaValidator {
     /// 2.0.1 schemas are JSON Schema draft-06; `run_validation` detects
     /// the draft per-schema, so a `v201()` validator and a [`Self::v16j()`]
     /// validator can coexist without interfering. Currently carries the
-    /// `BootNotification` pair (M7 bootstrap); grows as more messages land.
+    /// `Authorize`, `BootNotification`, `Heartbeat`, and `StatusNotification`
+    /// pairs (M7); grows as more messages land.
     pub fn v201() -> Self {
         let mut schemas = HashMap::with_capacity(SCHEMA_TEXTS_V201.len());
         for (name, text) in SCHEMA_TEXTS_V201 {
@@ -1149,13 +1155,82 @@ mod tests {
     #[test]
     fn v201_loads_bundled_boot_notification_schemas() {
         let v = SchemaValidator::v201();
-        assert_eq!(v.schema_count(), 6);
+        assert_eq!(v.schema_count(), 8);
         assert!(v.has_schema("BootNotification"));
         assert!(v.has_schema("BootNotificationResponse"));
         assert!(v.has_schema("Heartbeat"));
         assert!(v.has_schema("HeartbeatResponse"));
         assert!(v.has_schema("StatusNotification"));
         assert!(v.has_schema("StatusNotificationResponse"));
+        assert!(v.has_schema("Authorize"));
+        assert!(v.has_schema("AuthorizeResponse"));
+    }
+
+    #[test]
+    fn v201_authorize_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        let req = json!({
+            "idToken": { "idToken": "045918D2", "type": "ISO14443" }
+        });
+        assert!(v.validate_call("Authorize", &req).is_ok());
+        let resp = json!({ "idTokenInfo": { "status": "Accepted" } });
+        assert!(v.validate_call_result("Authorize", &resp).is_ok());
+    }
+
+    #[test]
+    fn v201_authorize_call_missing_required_field_fails() {
+        let v = SchemaValidator::v201();
+        // `idToken` is required on the request.
+        let err = v.validate_call("Authorize", &json!({})).unwrap_err();
+        assert!(matches!(err, OcppError::SchemaViolation { .. }));
+        // Within the nested IdToken, `type` is required.
+        let err = v
+            .validate_call("Authorize", &json!({ "idToken": { "idToken": "X" } }))
+            .unwrap_err();
+        assert!(matches!(err, OcppError::SchemaViolation { .. }));
+    }
+
+    #[test]
+    fn v201_authorize_unknown_enum_value_fails() {
+        let v = SchemaValidator::v201();
+        // "EMAID" is the 1.6J-style spelling; the 2.0.1 wire value is "eMAID".
+        let req = json!({
+            "idToken": { "idToken": "X", "type": "EMAID" }
+        });
+        assert!(v.validate_call("Authorize", &req).is_err());
+        // An unknown AuthorizationStatus on the response is likewise rejected.
+        let resp = json!({ "idTokenInfo": { "status": "Bogus" } });
+        assert!(v.validate_call_result("Authorize", &resp).is_err());
+    }
+
+    #[test]
+    fn v201_authorize_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        let req = json!({
+            "idToken": { "idToken": "X", "type": "ISO14443" },
+            "bogusExtra": true
+        });
+        assert!(v.validate_call("Authorize", &req).is_err());
+    }
+
+    #[test]
+    fn v201_authorize_accepts_iso15118_certificate_fields() {
+        // The bundled schema still carries the deferred ISO 15118 certificate
+        // fields, so a full payload using them validates even though the typed
+        // struct does not yet model them.
+        let v = SchemaValidator::v201();
+        let req = json!({
+            "idToken": { "idToken": "X", "type": "eMAID" },
+            "certificate": "-----BEGIN CERTIFICATE-----",
+            "iso15118CertificateHashData": [{
+                "hashAlgorithm": "SHA256",
+                "issuerNameHash": "abc",
+                "issuerKeyHash": "def",
+                "serialNumber": "01",
+                "responderURL": "https://ca.example/ocsp"
+            }]
+        });
+        assert!(v.validate_call("Authorize", &req).is_ok());
     }
 
     #[test]

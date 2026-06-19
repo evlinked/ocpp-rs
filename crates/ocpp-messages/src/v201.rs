@@ -7,13 +7,13 @@
 //! into the same framing and dispatch machinery.
 //!
 //! This is the foundation slice for **M7 — OCPP 2.0.1** and currently covers
-//! the core lifecycle messages `BootNotification`, `Heartbeat`, and
-//! `StatusNotification`.
+//! the core lifecycle messages `BootNotification`, `Heartbeat`,
+//! `StatusNotification`, and `Authorize`.
 
 use crate::{OcppAction, OcppResponse};
 use ocpp_types::v201::{
     BootReasonEnumType, ChargingStationType, ConnectorStatusEnumType, CustomDataType,
-    RegistrationStatusEnumType, StatusInfoType,
+    IdTokenInfoType, IdTokenType, RegistrationStatusEnumType, StatusInfoType,
 };
 use serde::{Deserialize, Serialize};
 
@@ -147,6 +147,57 @@ impl OcppAction for StatusNotificationResponse {
 }
 
 impl OcppResponse for StatusNotificationResponse {}
+
+/// `Authorize.req` — a Charging Station asks the CSMS whether an `idToken` is
+/// authorized to start or stop charging.
+///
+/// Ports `ocpp.v201.call.Authorize`. The 2.0.1 replacement for the 1.6J
+/// `Authorize` (which carried a bare `idTag` string): the identifier is now a
+/// structured [`IdTokenType`].
+///
+/// **Scope note:** the optional ISO 15118 certificate fields of the spec
+/// message — `certificate` and `iso15118CertificateHashData`
+/// (`OCSPRequestDataType`) — are deferred to a follow-up to keep this slice
+/// reviewable. The bundled `Authorize.json` schema still carries those
+/// definitions, so on-the-wire validation of full payloads stays faithful;
+/// only the typed struct omits them for now.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthorizeRequest {
+    /// The identifier the Charging Station wants authorized.
+    #[serde(rename = "idToken")]
+    pub id_token: IdTokenType,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+impl OcppAction for AuthorizeRequest {
+    const ACTION_NAME: &'static str = "Authorize";
+    type Response = AuthorizeResponse;
+}
+
+/// `Authorize.conf` — the CSMS's authorization decision.
+///
+/// Ports `ocpp.v201.call_result.Authorize`. The response's optional
+/// `certificateStatus` field (`AuthorizeCertificateStatusEnumType`) belongs to
+/// the same deferred ISO 15118 certificate handshake as
+/// [`AuthorizeRequest`] and is omitted from this slice.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthorizeResponse {
+    /// Status information about the identifier (at minimum, its `status`).
+    #[serde(rename = "idTokenInfo")]
+    pub id_token_info: IdTokenInfoType,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+impl OcppAction for AuthorizeResponse {
+    const ACTION_NAME: &'static str = "AuthorizeResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for AuthorizeResponse {}
 
 #[cfg(test)]
 mod tests {
@@ -316,6 +367,77 @@ mod tests {
             StatusNotificationResponse::ACTION_NAME,
             "StatusNotificationResponse"
         );
+        assert_eq!(AuthorizeRequest::ACTION_NAME, "Authorize");
+        assert_eq!(AuthorizeResponse::ACTION_NAME, "AuthorizeResponse");
+    }
+
+    #[test]
+    fn authorize_request_matches_reference_wire_json() {
+        use ocpp_types::v201::IdTokenEnumType;
+        let req = AuthorizeRequest {
+            id_token: IdTokenType {
+                id_token: "045918D2".to_string(),
+                id_token_type: IdTokenEnumType::ISO14443,
+                additional_info: None,
+                custom_data: None,
+            },
+            custom_data: None,
+        };
+        let expected = json!({
+            "idToken": { "idToken": "045918D2", "type": "ISO14443" }
+        });
+        assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+        let back: AuthorizeRequest = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn authorize_response_matches_reference_wire_json() {
+        use ocpp_types::v201::AuthorizationStatusEnumType;
+        let resp = AuthorizeResponse {
+            id_token_info: IdTokenInfoType {
+                status: AuthorizationStatusEnumType::Accepted,
+                cache_expiry_date_time: None,
+                charging_priority: None,
+                language1: None,
+                evse_id: None,
+                language2: None,
+                group_id_token: None,
+                personal_message: None,
+                custom_data: None,
+            },
+            custom_data: None,
+        };
+        let expected = json!({ "idTokenInfo": { "status": "Accepted" } });
+        assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+        let back: AuthorizeResponse = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn authorize_round_trips_with_custom_data_and_full_token() {
+        use ocpp_types::v201::{AdditionalInfoType, IdTokenEnumType};
+        let req = AuthorizeRequest {
+            id_token: IdTokenType {
+                id_token: "ABCDEF".to_string(),
+                id_token_type: IdTokenEnumType::EMAID,
+                additional_info: Some(vec![AdditionalInfoType {
+                    additional_id_token: "extra".to_string(),
+                    additional_token_type: "vendorX".to_string(),
+                    custom_data: None,
+                }]),
+                custom_data: None,
+            },
+            custom_data: Some(CustomDataType {
+                vendor_id: "com.example".to_string(),
+                extra: Default::default(),
+            }),
+        };
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(wire["idToken"]["type"], json!("eMAID"));
+        assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+        let back: AuthorizeRequest = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, req);
     }
 
     #[test]
