@@ -29,12 +29,21 @@
 //! periods, honoring `validFrom`/`validTo`, the schedule `duration`, and the
 //! profile kind.
 //!
+//! ## Recurring profiles
+//!
+//! `ChargingProfileKindType::Recurring` profiles repeat their schedule every
+//! `Daily` (86 400 s) or `Weekly` (604 800 s) period, phased off `startSchedule`
+//! (the recurrence base — only its time-of-day / time-of-week matters). An
+//! absolute instant is mapped into the recurrence period and the schedule's
+//! periods are evaluated against that wrapped offset; the schedule `duration`,
+//! when present, bounds the *active span* of each occurrence (the remainder of
+//! the period is an unconstrained gap). Boundaries are emitted for every
+//! occurrence overlapping the requested window, so multi-day/-week windows step
+//! correctly. `Absolute`/`Relative` profiles are evaluated as a single,
+//! non-repeating schedule.
+//!
 //! ## Known gaps (tracked as follow-ups)
 //!
-//! * **Recurring profiles** (`ChargingProfileKindType::Recurring`,
-//!   `Daily`/`Weekly`) are anchored at their `startSchedule` and evaluated as a
-//!   single (non-repeating) schedule — the recurrence is **not** unrolled across
-//!   the window. Continuous `Absolute`/`Relative` profiles are fully supported.
 //! * Phase-aware power/current conversion uses a nominal voltage (see
 //!   [`NOMINAL_VOLTAGE`]); 1.6J carries no voltage, so an exact W↔A conversion is
 //!   not possible.
@@ -43,7 +52,7 @@
 
 use ocpp_types::v16j::{
     ChargingProfile, ChargingProfileKindType, ChargingProfilePurposeType, ChargingRateUnitType,
-    ChargingSchedule, ChargingSchedulePeriod,
+    ChargingSchedule, ChargingSchedulePeriod, RecurrencyKindType,
 };
 use ocpp_types::{DateTime, Utc};
 
@@ -91,9 +100,10 @@ fn convert(limit: f64, from: &ChargingRateUnitType, to: &ChargingRateUnitType, p
 
 /// The absolute time a profile's schedule is anchored to.
 ///
-/// `Absolute` (and the `Recurring` fallback) anchor at `startSchedule` when
-/// present, otherwise at the composite window start. `Relative` profiles are
-/// relative to the start of the reported window.
+/// `Absolute` and `Recurring` profiles anchor at `startSchedule` when present,
+/// otherwise at the composite window start; for `Recurring` this anchor is the
+/// recurrence base (its time-of-day / time-of-week phase). `Relative` profiles
+/// are relative to the start of the reported window.
 fn anchor(profile: &ChargingProfile, window_start: DateTime<Utc>) -> DateTime<Utc> {
     match profile.charging_profile_kind {
         ChargingProfileKindType::Relative => window_start,
@@ -101,6 +111,21 @@ fn anchor(profile: &ChargingProfile, window_start: DateTime<Utc>) -> DateTime<Ut
             .charging_schedule
             .start_schedule
             .unwrap_or(window_start),
+    }
+}
+
+/// The recurrence period in seconds for a `Recurring` profile, or `None` for
+/// non-recurring profiles (and for a malformed `Recurring` profile with no
+/// `recurrencyKind`, which cannot be unrolled and so falls back to a single,
+/// non-repeating evaluation).
+fn recurrence_period(profile: &ChargingProfile) -> Option<i64> {
+    if profile.charging_profile_kind != ChargingProfileKindType::Recurring {
+        return None;
+    }
+    match profile.recurrency_kind {
+        Some(RecurrencyKindType::Daily) => Some(86_400),
+        Some(RecurrencyKindType::Weekly) => Some(604_800),
+        None => None,
     }
 }
 
@@ -124,10 +149,24 @@ fn profile_limit_at(
     }
 
     let sched = &profile.charging_schedule;
-    let offset = (at - anchor(profile, window_start)).num_seconds();
-    if offset < 0 {
-        return None;
-    }
+    let raw_offset = (at - anchor(profile, window_start)).num_seconds();
+    // For `Recurring` profiles the schedule repeats every period, so map the
+    // instant into `[0, period)` phased off the recurrence base; the pattern is
+    // fully periodic (only the anchor's time-of-day/-week matters), with
+    // `validFrom`/`validTo` bounding the calendar range. Non-recurring profiles
+    // evaluate once and do not apply before their anchor.
+    let offset = match recurrence_period(profile) {
+        Some(period) => raw_offset.rem_euclid(period),
+        None => {
+            if raw_offset < 0 {
+                return None;
+            }
+            raw_offset
+        }
+    };
+    // `duration` bounds the active span — of the single schedule for a
+    // non-recurring profile, or of each occurrence for a recurring one (the rest
+    // of the recurrence period is an unconstrained gap).
     if let Some(duration) = sched.duration {
         if offset >= duration as i64 {
             return None;
@@ -244,11 +283,36 @@ fn boundary_offsets(
     for c in candidates {
         let base = (anchor(&c.profile, window_start) - window_start).num_seconds();
         let sched = &c.profile.charging_schedule;
-        for period in &sched.charging_schedule_period {
-            push(&mut offsets, base + period.start_period as i64);
-        }
-        if let Some(d) = sched.duration {
-            push(&mut offsets, base + d as i64);
+        match recurrence_period(&c.profile) {
+            // Recurring: emit boundaries for every occurrence overlapping the
+            // window. Start one occurrence at or before offset 0 (so an active
+            // span ending inside the window is captured) and step until the next
+            // occurrence begins at or after the window end.
+            Some(period) => {
+                let mut k = (-base).div_euclid(period);
+                loop {
+                    let start = base + k * period;
+                    if start >= duration as i64 {
+                        break;
+                    }
+                    for p in &sched.charging_schedule_period {
+                        push(&mut offsets, start + p.start_period as i64);
+                    }
+                    if let Some(d) = sched.duration {
+                        push(&mut offsets, start + d as i64);
+                    }
+                    k += 1;
+                }
+            }
+            // Non-recurring: a single schedule anchored at `base`.
+            None => {
+                for period in &sched.charging_schedule_period {
+                    push(&mut offsets, base + period.start_period as i64);
+                }
+                if let Some(d) = sched.duration {
+                    push(&mut offsets, base + d as i64);
+                }
+            }
         }
         if let Some(vf) = c.profile.valid_from {
             push(&mut offsets, (vf - window_start).num_seconds());
@@ -261,6 +325,41 @@ fn boundary_offsets(
     offsets.sort_unstable();
     offsets.dedup();
     offsets
+}
+
+/// The effective (most restrictive) limit and phase count at absolute time
+/// `at`, expressed in `unit`, or `None` when no profile constrains this instant.
+///
+/// Converts every present contribution (the winning override and the ceiling)
+/// into `unit` and takes the minimum.
+fn effective_limit_at(
+    candidates: &[ScopedProfile],
+    at: DateTime<Utc>,
+    window_start: DateTime<Utc>,
+    unit: &ChargingRateUnitType,
+) -> Option<(f64, Option<i32>)> {
+    let mut limit: Option<f64> = None;
+    let mut phases: Option<i32> = None;
+    for contrib in [
+        override_limit_at(candidates, at, window_start),
+        ceiling_limit_at(candidates, at, window_start),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        // Default to single-phase, and treat a malformed non-positive phase
+        // count (untrusted CSMS input) as single-phase to avoid a div-by-zero.
+        let phase_count = contrib.phases.filter(|p| *p > 0).unwrap_or(1);
+        let value = convert(contrib.limit, &contrib.unit, unit, phase_count);
+        match limit {
+            Some(current) if current <= value => {}
+            _ => {
+                limit = Some(value);
+                phases = contrib.phases;
+            }
+        }
+    }
+    limit.map(|l| (l, phases))
 }
 
 /// Compute the composite [`ChargingSchedule`] for a connector over
@@ -282,49 +381,33 @@ pub fn compute_composite(
     let unit = output_unit(candidates, requested_unit);
 
     let mut periods: Vec<ChargingSchedulePeriod> = Vec::new();
+    // The effective limit/phases at the *previous* boundary, or `None` if that
+    // boundary was a gap (no constraint). Coalescing compares against this rather
+    // than the last emitted period, so a limit that disappears into a gap and
+    // later returns at the same value is re-emitted — the gap in between carried
+    // a different (unconstrained) limit. This matters for recurring profiles
+    // whose `duration` leaves a daily/weekly gap.
+    let mut prev: Option<(f64, Option<i32>)> = None;
     for offset in boundary_offsets(candidates, start, duration_secs) {
         let at = start + chrono::Duration::seconds(offset as i64);
+        let current = effective_limit_at(candidates, at, start, &unit);
 
-        // Convert every present contribution into the output unit, then take the
-        // minimum — the effective (most restrictive) limit at this instant.
-        let mut limit: Option<f64> = None;
-        let mut phases: Option<i32> = None;
-        for contrib in [
-            override_limit_at(candidates, at, start),
-            ceiling_limit_at(candidates, at, start),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            // Default to single-phase, and treat a malformed non-positive phase
-            // count (untrusted CSMS input) as single-phase to avoid a div-by-zero.
-            let phase_count = contrib.phases.filter(|p| *p > 0).unwrap_or(1);
-            let value = convert(contrib.limit, &contrib.unit, &unit, phase_count);
-            match limit {
-                Some(current) if current <= value => {}
-                _ => {
-                    limit = Some(value);
-                    phases = contrib.phases;
-                }
+        // A `None` here is a gap (no profile constrains this instant); the next
+        // present limit is always emitted because `prev` becomes `None`.
+        if let Some((limit, phases)) = current {
+            let unchanged = matches!(
+                prev,
+                Some((pl, pp)) if (pl - limit).abs() < f64::EPSILON && pp == phases
+            );
+            if !unchanged {
+                periods.push(ChargingSchedulePeriod {
+                    start_period: offset,
+                    limit,
+                    number_phases: phases,
+                });
             }
         }
-
-        let Some(limit) = limit else {
-            // No profile constrains this instant — leave a gap.
-            continue;
-        };
-
-        // Coalesce: skip a boundary that does not change the limit/phases.
-        if let Some(last) = periods.last() {
-            if (last.limit - limit).abs() < f64::EPSILON && last.number_phases == phases {
-                continue;
-            }
-        }
-        periods.push(ChargingSchedulePeriod {
-            start_period: offset,
-            limit,
-            number_phases: phases,
-        });
+        prev = current;
     }
 
     if periods.is_empty() {
@@ -585,5 +668,151 @@ mod tests {
         );
         p.valid_to = Some(Utc::now() - chrono::Duration::hours(1));
         assert!(compute_composite(&[scoped(true, p)], Utc::now(), 3600, None).is_none());
+    }
+
+    /// Turn an (Absolute) test `profile` into a recurring one anchored at `start`.
+    fn make_recurring(
+        mut p: ChargingProfile,
+        kind: RecurrencyKindType,
+        start: DateTime<Utc>,
+        duration: Option<i32>,
+    ) -> ChargingProfile {
+        p.charging_profile_kind = ChargingProfileKindType::Recurring;
+        p.recurrency_kind = Some(kind);
+        p.charging_schedule.start_schedule = Some(start);
+        p.charging_schedule.duration = duration;
+        p
+    }
+
+    #[test]
+    fn daily_recurrence_steps_each_day() {
+        // 16 A for the first 8 h of each day, 8 A for the rest — repeated daily.
+        let start = Utc::now();
+        let p = make_recurring(
+            profile(
+                1,
+                0,
+                ChargingProfilePurposeType::TxDefaultProfile,
+                vec![period(0, 16.0), period(28_800, 8.0)],
+                ChargingRateUnitType::A,
+            ),
+            RecurrencyKindType::Daily,
+            start,
+            None,
+        );
+        // Two full days.
+        let sched = compute_composite(&[scoped(true, p)], start, 172_800, None).expect("sched");
+        let ps = &sched.charging_schedule_period;
+        assert_eq!(ps.len(), 4, "two days × two periods");
+        assert_eq!((ps[0].start_period, ps[0].limit), (0, 16.0));
+        assert_eq!((ps[1].start_period, ps[1].limit), (28_800, 8.0));
+        // The second day repeats the pattern, stepped by one period (86 400 s).
+        assert_eq!((ps[2].start_period, ps[2].limit), (86_400, 16.0));
+        assert_eq!((ps[3].start_period, ps[3].limit), (115_200, 8.0));
+    }
+
+    #[test]
+    fn daily_recurrence_duration_leaves_a_daily_gap() {
+        // A 10 A cap active only for the first hour of each day; the rest of the
+        // day is an unconstrained gap. The cap must be re-emitted on day two even
+        // though the value is unchanged — the gap between carried no limit.
+        let start = Utc::now();
+        let p = make_recurring(
+            profile(
+                2,
+                0,
+                ChargingProfilePurposeType::TxDefaultProfile,
+                vec![period(0, 10.0)],
+                ChargingRateUnitType::A,
+            ),
+            RecurrencyKindType::Daily,
+            start,
+            Some(3600),
+        );
+        let sched = compute_composite(&[scoped(true, p)], start, 172_800, None).expect("sched");
+        let ps = &sched.charging_schedule_period;
+        assert_eq!(
+            ps.len(),
+            2,
+            "one active span per day, re-emitted across the gap"
+        );
+        assert_eq!((ps[0].start_period, ps[0].limit), (0, 10.0));
+        assert_eq!((ps[1].start_period, ps[1].limit), (86_400, 10.0));
+    }
+
+    #[test]
+    fn weekly_recurrence_steps_each_week() {
+        // 32 A on the first day of the week, 16 A for the remaining six — weekly.
+        let start = Utc::now();
+        let p = make_recurring(
+            profile(
+                3,
+                0,
+                ChargingProfilePurposeType::TxDefaultProfile,
+                vec![period(0, 32.0), period(86_400, 16.0)],
+                ChargingRateUnitType::A,
+            ),
+            RecurrencyKindType::Weekly,
+            start,
+            None,
+        );
+        // Two full weeks.
+        let sched = compute_composite(&[scoped(true, p)], start, 1_209_600, None).expect("sched");
+        let ps = &sched.charging_schedule_period;
+        assert_eq!(ps.len(), 4, "two weeks × two periods");
+        assert_eq!((ps[0].start_period, ps[0].limit), (0, 32.0));
+        assert_eq!((ps[1].start_period, ps[1].limit), (86_400, 16.0));
+        assert_eq!((ps[2].start_period, ps[2].limit), (604_800, 32.0));
+        assert_eq!((ps[3].start_period, ps[3].limit), (691_200, 16.0));
+    }
+
+    #[test]
+    fn recurrence_phase_follows_start_schedule() {
+        // The recurrence is phased off `startSchedule`, not the window start: the
+        // anchor sits 1 h before the window, with a 30-min active span. So the
+        // first occurrence inside the window opens at 23 h (86 400 − 3 600) and
+        // closes 30 min later; the window opens mid-gap.
+        let start = Utc::now();
+        let anchor = start - chrono::Duration::seconds(3600);
+        let p = make_recurring(
+            profile(
+                4,
+                0,
+                ChargingProfilePurposeType::TxDefaultProfile,
+                vec![period(0, 16.0)],
+                ChargingRateUnitType::A,
+            ),
+            RecurrencyKindType::Daily,
+            anchor,
+            Some(1800),
+        );
+        // 25 h — long enough to contain exactly one occurrence.
+        let sched = compute_composite(&[scoped(true, p)], start, 90_000, None).expect("sched");
+        let ps = &sched.charging_schedule_period;
+        assert_eq!(ps.len(), 1, "exactly one active span within the window");
+        assert_eq!((ps[0].start_period, ps[0].limit), (82_800, 16.0));
+    }
+
+    #[test]
+    fn recurring_without_recurrency_kind_falls_back_to_single_schedule() {
+        // A malformed Recurring profile with no recurrencyKind cannot be unrolled;
+        // it is evaluated once (like Absolute), not repeated.
+        let start = Utc::now();
+        let mut p = profile(
+            5,
+            0,
+            ChargingProfilePurposeType::TxDefaultProfile,
+            vec![period(0, 16.0)],
+            ChargingRateUnitType::A,
+        );
+        p.charging_profile_kind = ChargingProfileKindType::Recurring;
+        p.recurrency_kind = None;
+        p.charging_schedule.start_schedule = Some(start);
+        p.charging_schedule.duration = Some(3600);
+        let sched = compute_composite(&[scoped(true, p)], start, 172_800, None).expect("sched");
+        let ps = &sched.charging_schedule_period;
+        // Single occurrence only: one period at offset 0, no day-two repeat.
+        assert_eq!(ps.len(), 1);
+        assert_eq!((ps[0].start_period, ps[0].limit), (0, 16.0));
     }
 }
