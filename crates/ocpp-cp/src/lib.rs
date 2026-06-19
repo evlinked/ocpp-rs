@@ -163,6 +163,14 @@ pub struct ChargePointConfig {
     /// stale-but-previously-`Accepted` cached entry instead of failing safe.
     /// Defaults to `false` (fail-safe: an unreachable CSMS yields `Invalid`).
     pub offline_auth_stale_ok: bool,
+    /// Whether [`ChargePoint::authorize`] consults the CSMS-managed Local
+    /// Authorization List before the Authorization Cache and a CSMS round-trip
+    /// (OCPP 1.6J §4.1.3, the `LocalAuthListEnabled` standard configuration
+    /// key). Defaults to `true`, matching the spec default and the fact that the
+    /// CP implements the Local Authorization List Management profile. Set to
+    /// `false` to make the list management-only (populated by `SendLocalList`
+    /// but never used for offline authorization decisions).
+    pub local_auth_list_enabled: bool,
     /// Fault injection: when `true`, the simulated diagnostics upload
     /// (`GetDiagnostics`, OCPP 1.6J §4.x) takes the failure branch —
     /// `Uploading → UploadFailed` instead of `Uploading → Uploaded` — so a
@@ -221,6 +229,7 @@ impl Default for ChargePointConfig {
             validate_payloads: true,
             auth_cache_ttl: 24 * 60 * 60, // 24 hours
             offline_auth_stale_ok: false,
+            local_auth_list_enabled: true,
             diagnostics_upload_should_fail: false,
             firmware_update_outcome: FirmwareUpdateOutcome::Succeed,
             unlock_connector_outcome: UnlockConnectorOutcome::Unlock,
@@ -2088,18 +2097,29 @@ impl ChargePoint {
         self.data_transfer.register(vendor_id, message_id, handler);
     }
 
-    /// Authorize an id tag, consulting the local authorization cache first.
+    /// Authorize an id tag, consulting the Local Authorization List and the
+    /// authorization cache before any CSMS round-trip.
     ///
     /// Ports `_send_authorize()` from
     /// [`ocpp/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py)
-    /// and adds the OCPP 1.6J §3.1 Authorization Cache behavior (Issue #23):
+    /// and layers the OCPP 1.6J offline-authorization precedence (§4.1.3) on top
+    /// of the §3.1 Authorization Cache behavior (Issue #23 / #104):
     ///
-    /// 1. **Cache hit (`Accepted`)** → return the cached `IdTagInfo` without a
+    /// 1. **Local Authorization List hit** (when
+    ///    [`ChargePointConfig::local_auth_list_enabled`]) → return the CSMS-pushed
+    ///    `IdTagInfo` without a CALL. The list is **authoritative**: a present,
+    ///    non-expired entry is honored *as-is*, including a non-`Accepted` status
+    ///    (`Blocked`/`Expired`/`Invalid`), which the CSMS explicitly set. This is
+    ///    the key difference from the cache (step 2). An entry whose `expiryDate`
+    ///    has passed is **not** honored — it falls through to the cache / CSMS.
+    /// 2. **Cache hit (`Accepted`)** → return the cached `IdTagInfo` without a
     ///    CALL. Non-`Accepted` cached results are *not* short-circuited; the CP
     ///    re-checks with the CSMS in case authorization has since been granted.
-    /// 2. **Miss / expired / non-accepted** → send `AuthorizeRequest` via
+    ///    The cache is opportunistic (CP-populated), so unlike the list it is not
+    ///    treated as authoritative for a rejection.
+    /// 3. **Miss / expired / non-accepted** → send `AuthorizeRequest` via
     ///    [`ChargePoint::call`] and cache the fresh result.
-    /// 3. **CSMS unreachable (CALL times out)** → if
+    /// 4. **CSMS unreachable (CALL times out)** → if
     ///    [`ChargePointConfig::offline_auth_stale_ok`] is set and a (possibly
     ///    stale) cached entry exists, honor it; otherwise fail safe with
     ///    `AuthorizationStatus::Invalid`.
@@ -2107,14 +2127,27 @@ impl ChargePoint {
     /// The caller is responsible for acting on the returned `status`; this
     /// method does not block the transaction flow by itself.
     pub async fn authorize(&self, id_tag: &str) -> OcppResult<IdTagInfo> {
-        // 1. Cache-first: a fresh, previously-accepted tag needs no round-trip.
+        // 1. Local Authorization List first: the CSMS-managed list takes
+        //    precedence over the cache and the network (§4.1.3). A present,
+        //    non-expired entry is authoritative — honored verbatim, even when its
+        //    status is a rejection — so a known tag is decided with no round-trip.
+        //    An entry past its `expiryDate` is stale and ignored (fall through).
+        if self.config.local_auth_list_enabled {
+            if let Some(info) = self.local_list.get(id_tag) {
+                if !id_tag_info_expired(&info) {
+                    return Ok(info);
+                }
+            }
+        }
+
+        // 2. Cache next: a fresh, previously-accepted tag needs no round-trip.
         if let Some(cached) = self.auth_cache.get(id_tag) {
             if cached.status == AuthorizationStatus::Accepted {
                 return Ok(cached);
             }
         }
 
-        // 2. Miss (or a cached non-accepted result): ask the CSMS.
+        // 3. Miss (or a cached non-accepted result): ask the CSMS.
         match self
             .call(AuthorizeRequest {
                 id_tag: id_tag.to_string(),
@@ -2125,7 +2158,7 @@ impl ChargePoint {
                 self.auth_cache.insert(id_tag, response.id_tag_info.clone());
                 Ok(response.id_tag_info)
             }
-            // 3. CSMS unreachable: offline authorization decision.
+            // 4. CSMS unreachable: offline authorization decision.
             Err(OcppError::Timeout { .. }) => {
                 if self.config.offline_auth_stale_ok {
                     if let Some(stale) = self.auth_cache.get_stale(id_tag) {
@@ -2887,6 +2920,16 @@ impl TransportMessageHandler for ChargePoint {
     }
 }
 
+/// Whether an `IdTagInfo` has passed its `expiryDate` and so is stale.
+///
+/// Used by [`ChargePoint::authorize`] to decide whether a Local Authorization
+/// List entry is still fresh enough to honor (OCPP 1.6J §4.1.3): an entry with
+/// no `expiryDate` never expires on its own, while one whose `expiryDate` is at
+/// or before now is ignored so authorization falls through to the cache / CSMS.
+fn id_tag_info_expired(info: &IdTagInfo) -> bool {
+    matches!(info.expiry_date, Some(expiry) if chrono::Utc::now() >= expiry)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3389,6 +3432,33 @@ mod tests {
         });
 
         addr
+    }
+
+    // --- id_tag_info_expired() helper (Issue #104) ---
+
+    fn id_tag_info(expiry: Option<chrono::DateTime<chrono::Utc>>) -> IdTagInfo {
+        IdTagInfo {
+            status: AuthorizationStatus::Accepted,
+            parent_id_tag: None,
+            expiry_date: expiry,
+        }
+    }
+
+    #[test]
+    fn id_tag_info_without_expiry_never_expires() {
+        assert!(!id_tag_info_expired(&id_tag_info(None)));
+    }
+
+    #[test]
+    fn id_tag_info_with_future_expiry_is_fresh() {
+        let future = chrono::Utc::now() + chrono::Duration::seconds(3600);
+        assert!(!id_tag_info_expired(&id_tag_info(Some(future))));
+    }
+
+    #[test]
+    fn id_tag_info_with_past_expiry_is_stale() {
+        let past = chrono::Utc::now() - chrono::Duration::seconds(10);
+        assert!(id_tag_info_expired(&id_tag_info(Some(past))));
     }
 
     // --- authorize() tests (Issue #21) ---
