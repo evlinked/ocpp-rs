@@ -5,7 +5,7 @@
 //! charging schedule for a connector over a requested window, by combining all
 //! installed [`ChargingProfile`]s (see [`crate::charging_profiles`]) according
 //! to the 1.6J stacking/priority rules. This module is the pure, side-effect
-//! free core of that computation; the CP handler in [`crate::lib`] gathers the
+//! free core of that computation; the CP handler in `lib.rs` gathers the
 //! candidate profiles from the store and calls [`compute_composite`].
 //!
 //! The Python reference (`mobilityhouse/ocpp`) ships only the `GetCompositeSchedule`
