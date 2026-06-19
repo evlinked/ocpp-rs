@@ -9,6 +9,7 @@
 
 pub mod auth_cache;
 pub mod charging_profiles;
+pub mod composite;
 pub mod connector;
 pub mod error;
 pub mod message_handler;
@@ -28,14 +29,14 @@ use ocpp_messages::v16j::{
     ChangeConfigurationRequest, ChangeConfigurationResponse, ClearCacheRequest, ClearCacheResponse,
     ClearChargingProfileRequest, ClearChargingProfileResponse, DataTransferRequest,
     DataTransferResponse, DiagnosticsStatusNotificationRequest, FirmwareStatusNotificationRequest,
-    GetConfigurationRequest, GetConfigurationResponse, GetDiagnosticsRequest,
-    GetDiagnosticsResponse, HeartbeatRequest, MeterValuesRequest, RegistrationStatus,
-    RemoteStartTransactionRequest, RemoteStartTransactionResponse, RemoteStopTransactionRequest,
-    RemoteStopTransactionResponse, ReserveNowRequest, ReserveNowResponse, ResetRequest,
-    ResetResponse, SetChargingProfileRequest, SetChargingProfileResponse, StartTransactionRequest,
-    StatusNotificationRequest, StopTransactionRequest, TriggerMessageRequest,
-    TriggerMessageResponse, UnlockConnectorRequest, UnlockConnectorResponse, UpdateFirmwareRequest,
-    UpdateFirmwareResponse,
+    GetCompositeScheduleRequest, GetCompositeScheduleResponse, GetConfigurationRequest,
+    GetConfigurationResponse, GetDiagnosticsRequest, GetDiagnosticsResponse, HeartbeatRequest,
+    MeterValuesRequest, RegistrationStatus, RemoteStartTransactionRequest,
+    RemoteStartTransactionResponse, RemoteStopTransactionRequest, RemoteStopTransactionResponse,
+    ReserveNowRequest, ReserveNowResponse, ResetRequest, ResetResponse, SetChargingProfileRequest,
+    SetChargingProfileResponse, StartTransactionRequest, StatusNotificationRequest,
+    StopTransactionRequest, TriggerMessageRequest, TriggerMessageResponse, UnlockConnectorRequest,
+    UnlockConnectorResponse, UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 use ocpp_messages::{
     ActionDispatcher, CallMessage, Message, MessageType, OcppAction, SchemaValidator,
@@ -50,8 +51,9 @@ use ocpp_types::common::{
 use ocpp_types::v16j::{
     CancelReservationStatus, ChargePointErrorCode, ChargePointStatus, ChargePointVendorInfo,
     ChargingProfileStatus, ClearCacheStatus, ConfigurationStatus, DataTransferStatus,
-    DiagnosticsStatus, FirmwareStatus, MessageTrigger, RemoteStartStopStatus, ReservationStatus,
-    ResetStatus, ResetType, TriggerMessageStatus, UnlockStatus,
+    DiagnosticsStatus, FirmwareStatus, GetCompositeScheduleStatus, MessageTrigger,
+    RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus,
+    UnlockStatus,
 };
 use ocpp_types::{
     CallErrorCode, CallErrorMessage, CallResultMessage, ConnectorId, OcppError, OcppResult,
@@ -1200,6 +1202,78 @@ impl ChargePoint {
                         req.stack_level,
                     );
                     Ok(ClearChargingProfileResponse { status })
+                }
+            });
+        }
+
+        // GetCompositeSchedule — report the effective charging schedule for a
+        // connector over the requested window by combining the installed profiles
+        // per the 1.6J stacking rules (§5.x). The candidate set is the requested
+        // connector's own profiles (more specific) plus the charge-point-wide
+        // connector-0 profiles (the ChargePointMaxProfile ceiling and any default
+        // inherited from connector 0). An unknown connector, a non-positive
+        // duration, or no applicable profile yields `Rejected`; otherwise the
+        // composite schedule is computed by `crate::composite`. The Python
+        // reference ships only the wire types (its example CP returns a canned
+        // response), so the computation follows the 1.6J spec (Issue #95).
+        {
+            let connectors = connectors.clone();
+            let charging_profiles = charging_profiles.clone();
+            d.on(move |req: GetCompositeScheduleRequest| {
+                let connectors = connectors.clone();
+                let charging_profiles = charging_profiles.clone();
+                async move {
+                    let connector_id = req.connector_id;
+                    let connector_known = match ConnectorId::new(connector_id as u32) {
+                        Ok(cid) => connectors.read().await.contains_key(&cid),
+                        Err(_) => false,
+                    };
+                    // connector 0 is the CP-wide slot; any other id must exist.
+                    let rejected = GetCompositeScheduleResponse {
+                        status: GetCompositeScheduleStatus::Rejected,
+                        connector_id: None,
+                        schedule_start: None,
+                        charging_schedule: None,
+                    };
+                    if connector_id != 0 && !connector_known {
+                        return Ok(rejected);
+                    }
+
+                    // Gather candidates: the connector's own profiles (specific)
+                    // plus connector-0 profiles (inherited), avoiding a double
+                    // count when the request *is* connector 0.
+                    let mut candidates: Vec<composite::ScopedProfile> = charging_profiles
+                        .profiles_for(connector_id)
+                        .into_iter()
+                        .map(|profile| composite::ScopedProfile {
+                            specific: true,
+                            profile,
+                        })
+                        .collect();
+                    if connector_id != 0 {
+                        candidates.extend(charging_profiles.profiles_for(0).into_iter().map(
+                            |profile| composite::ScopedProfile {
+                                specific: false,
+                                profile,
+                            },
+                        ));
+                    }
+
+                    let start = chrono::Utc::now();
+                    match composite::compute_composite(
+                        &candidates,
+                        start,
+                        req.duration,
+                        req.charging_rate_unit,
+                    ) {
+                        Some(schedule) => Ok(GetCompositeScheduleResponse {
+                            status: GetCompositeScheduleStatus::Accepted,
+                            connector_id: Some(connector_id),
+                            schedule_start: Some(start),
+                            charging_schedule: Some(schedule),
+                        }),
+                        None => Ok(rejected),
+                    }
                 }
             });
         }
@@ -2814,13 +2888,14 @@ mod tests {
     // --- dispatcher wiring tests ---
 
     #[tokio::test]
-    async fn dispatcher_has_16_default_handlers() {
+    async fn dispatcher_has_17_default_handlers() {
         let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
         // 10 Core Profile actions + GetDiagnostics + UpdateFirmware
         // (firmware-management, #69/#70) + ReserveNow + CancelReservation
         // (§5.14/§5.4, #71) + SetChargingProfile + ClearChargingProfile
-        // (Smart Charging, §5.16/§5.2, #94).
-        assert_eq!(cp.handler_count().await, 16);
+        // (Smart Charging, §5.16/§5.2, #94) + GetCompositeSchedule
+        // (Smart Charging, §5.x, #95).
+        assert_eq!(cp.handler_count().await, 17);
     }
 
     #[tokio::test]

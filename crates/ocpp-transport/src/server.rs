@@ -19,18 +19,18 @@ use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use ocpp_messages::v16j::{
     CancelReservationRequest, ChangeConfigurationRequest, ClearCacheRequest,
-    ClearChargingProfileRequest, GetConfigurationRequest, GetConfigurationResponse,
-    GetDiagnosticsRequest, GetDiagnosticsResponse, RemoteStartTransactionRequest,
-    RemoteStopTransactionRequest, ReserveNowRequest, ResetRequest, SetChargingProfileRequest,
-    StatusNotificationRequest, TriggerMessageRequest, UnlockConnectorRequest,
-    UpdateFirmwareRequest, UpdateFirmwareResponse,
+    ClearChargingProfileRequest, GetCompositeScheduleRequest, GetCompositeScheduleResponse,
+    GetConfigurationRequest, GetConfigurationResponse, GetDiagnosticsRequest,
+    GetDiagnosticsResponse, RemoteStartTransactionRequest, RemoteStopTransactionRequest,
+    ReserveNowRequest, ResetRequest, SetChargingProfileRequest, StatusNotificationRequest,
+    TriggerMessageRequest, UnlockConnectorRequest, UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
 use ocpp_types::v16j::{
     CancelReservationStatus, ChargingProfile, ChargingProfilePurposeType, ChargingProfileStatus,
-    ClearCacheStatus, ClearChargingProfileStatus, ConfigurationStatus, MessageTrigger,
-    RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus,
-    UnlockStatus,
+    ChargingRateUnitType, ClearCacheStatus, ClearChargingProfileStatus, ConfigurationStatus,
+    MessageTrigger, RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType,
+    TriggerMessageStatus, UnlockStatus,
 };
 use ocpp_types::{CallErrorCode, DateTime, OcppError, OcppResult, Utc};
 use std::{net::SocketAddr, sync::Arc};
@@ -595,6 +595,35 @@ impl OcppServer {
             )
             .await?;
         Ok(resp.status)
+    }
+
+    /// Ask a connected charge point for the composite charging schedule of a
+    /// connector.
+    ///
+    /// A typed convenience wrapper over [`call`](Self::call) for the OCPP 1.6J
+    /// `GetCompositeSchedule` command (§5.x). `connector_id` is the connector the
+    /// schedule is requested for (`0` = entire charge point); `duration` is the
+    /// length of the reported window in seconds; `charging_rate_unit` optionally
+    /// requests the unit (`W`/`A`) of the returned schedule. The full
+    /// [`GetCompositeScheduleResponse`] is returned because the caller needs the
+    /// `status`, the `connectorId`, the `scheduleStart`, and the computed
+    /// `chargingSchedule` together. Errors propagate from [`call`](Self::call).
+    pub async fn get_composite_schedule(
+        &self,
+        cp_id: &str,
+        connector_id: i32,
+        duration: i32,
+        charging_rate_unit: Option<ChargingRateUnitType>,
+    ) -> OcppResult<GetCompositeScheduleResponse> {
+        self.call(
+            cp_id,
+            GetCompositeScheduleRequest {
+                connector_id,
+                duration,
+                charging_rate_unit,
+            },
+        )
+        .await
     }
 
     /// Ask a connected charge point to upload a diagnostics archive to `location`.
