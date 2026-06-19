@@ -375,7 +375,7 @@ impl SchemaValidator {
 
     /// Build a validator pre-loaded with the bundled OCPP 2.0.1 schemas.
     ///
-    /// 2.0.1 schemas are JSON Schema draft-06; [`Self::run_validation`] detects
+    /// 2.0.1 schemas are JSON Schema draft-06; `run_validation` detects
     /// the draft per-schema, so a `v201()` validator and a [`Self::v16j()`]
     /// validator can coexist without interfering. Currently carries the
     /// `BootNotification` pair (M7 bootstrap); grows as more messages land.
