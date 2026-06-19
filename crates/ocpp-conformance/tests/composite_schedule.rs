@@ -25,7 +25,7 @@ use ocpp_transport::server::OcppServer;
 use ocpp_transport::{DispatchHandler, TransportConfig};
 use ocpp_types::v16j::{
     ChargingProfile, ChargingProfileKindType, ChargingProfilePurposeType, ChargingRateUnitType,
-    ChargingSchedule, ChargingSchedulePeriod, GetCompositeScheduleStatus,
+    ChargingSchedule, ChargingSchedulePeriod, GetCompositeScheduleStatus, RecurrencyKindType,
 };
 
 /// A minimal CSMS dispatcher — the Smart Charging commands flow CSMS→CP, so the
@@ -93,6 +93,33 @@ fn profile(
                 limit,
                 number_phases: None,
             }],
+            min_charging_rate: None,
+        },
+    }
+}
+
+/// A `Recurring` (Daily) profile with the given periods, anchored at the window
+/// start (no `startSchedule`) so the composite is deterministic regardless of
+/// the wall-clock time at which the test runs.
+fn daily_profile(
+    id: i32,
+    purpose: ChargingProfilePurposeType,
+    periods: Vec<ChargingSchedulePeriod>,
+) -> ChargingProfile {
+    ChargingProfile {
+        charging_profile_id: id,
+        transaction_id: None,
+        stack_level: 0,
+        charging_profile_purpose: purpose,
+        charging_profile_kind: ChargingProfileKindType::Recurring,
+        recurrency_kind: Some(RecurrencyKindType::Daily),
+        valid_from: None,
+        valid_to: None,
+        charging_schedule: ChargingSchedule {
+            duration: None,
+            start_schedule: None,
+            charging_rate_unit: ChargingRateUnitType::A,
+            charging_schedule_period: periods,
             min_charging_rate: None,
         },
     }
@@ -271,6 +298,63 @@ async fn composite_reports_cp_wide_schedule_for_connector_zero() {
     let sched = resp.charging_schedule.expect("schedule present");
     assert_eq!(sched.charging_schedule_period[0].limit, 20.0);
     assert_eq!(sched.duration, Some(1800));
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+/// A `Recurring` (Daily) profile is unrolled across a multi-day window: the
+/// CP repeats the daily pattern for every occurrence overlapping the request,
+/// not just the first.
+#[tokio::test]
+async fn composite_unrolls_daily_recurring_profile() {
+    let cp_id = "CP_GCS_05";
+    let (mut server, addr) = start_csms().await;
+    let cp = ChargePoint::new(cp_config(addr, cp_id)).expect("build charge point");
+    cp.connect().await.expect("connect + boot sequence");
+
+    // 16 A for the first 8 h of each day, 8 A for the rest — repeated daily.
+    server
+        .set_charging_profile(
+            cp_id,
+            1,
+            daily_profile(
+                20,
+                ChargingProfilePurposeType::TxDefaultProfile,
+                vec![
+                    ChargingSchedulePeriod {
+                        start_period: 0,
+                        limit: 16.0,
+                        number_phases: None,
+                    },
+                    ChargingSchedulePeriod {
+                        start_period: 28_800,
+                        limit: 8.0,
+                        number_phases: None,
+                    },
+                ],
+            ),
+        )
+        .await
+        .expect("set recurring default");
+
+    // Two full days: the daily pattern must appear twice, stepped by 86 400 s.
+    let resp = tokio::time::timeout(
+        TIMEOUT,
+        server.get_composite_schedule(cp_id, 1, 172_800, None),
+    )
+    .await
+    .expect("resolves in time")
+    .expect("resolves");
+
+    assert_eq!(resp.status, GetCompositeScheduleStatus::Accepted);
+    let sched = resp.charging_schedule.expect("schedule present");
+    let ps = &sched.charging_schedule_period;
+    assert_eq!(ps.len(), 4, "the daily pattern repeats across both days");
+    assert_eq!((ps[0].start_period, ps[0].limit), (0, 16.0));
+    assert_eq!((ps[1].start_period, ps[1].limit), (28_800, 8.0));
+    assert_eq!((ps[2].start_period, ps[2].limit), (86_400, 16.0));
+    assert_eq!((ps[3].start_period, ps[3].limit), (115_200, 8.0));
 
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");
