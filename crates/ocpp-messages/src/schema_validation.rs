@@ -330,6 +330,19 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "BootNotificationResponse",
         include_str!("../schemas/v201/BootNotificationResponse.json"),
     ),
+    ("Heartbeat", include_str!("../schemas/v201/Heartbeat.json")),
+    (
+        "HeartbeatResponse",
+        include_str!("../schemas/v201/HeartbeatResponse.json"),
+    ),
+    (
+        "StatusNotification",
+        include_str!("../schemas/v201/StatusNotification.json"),
+    ),
+    (
+        "StatusNotificationResponse",
+        include_str!("../schemas/v201/StatusNotificationResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -1136,9 +1149,86 @@ mod tests {
     #[test]
     fn v201_loads_bundled_boot_notification_schemas() {
         let v = SchemaValidator::v201();
-        assert_eq!(v.schema_count(), 2);
+        assert_eq!(v.schema_count(), 6);
         assert!(v.has_schema("BootNotification"));
         assert!(v.has_schema("BootNotificationResponse"));
+        assert!(v.has_schema("Heartbeat"));
+        assert!(v.has_schema("HeartbeatResponse"));
+        assert!(v.has_schema("StatusNotification"));
+        assert!(v.has_schema("StatusNotificationResponse"));
+    }
+
+    #[test]
+    fn v201_heartbeat_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        // Heartbeat.req carries no fields.
+        assert!(v.validate_call("Heartbeat", &json!({})).is_ok());
+        // Heartbeat.conf requires a date-time `currentTime`.
+        let payload = json!({ "currentTime": "2018-05-29T17:37:05.495259Z" });
+        assert!(v.validate_call_result("Heartbeat", &payload).is_ok());
+    }
+
+    #[test]
+    fn v201_heartbeat_response_missing_required_field_fails() {
+        let v = SchemaValidator::v201();
+        // `currentTime` is required on the response.
+        let err = v.validate_call_result("Heartbeat", &json!({})).unwrap_err();
+        assert!(matches!(err, OcppError::SchemaViolation { .. }));
+    }
+
+    #[test]
+    fn v201_status_notification_call_valid_passes() {
+        let v = SchemaValidator::v201();
+        let payload = json!({
+            "timestamp": "2018-05-29T17:37:05.495259Z",
+            "connectorStatus": "Available",
+            "evseId": 1,
+            "connectorId": 2
+        });
+        assert!(v.validate_call("StatusNotification", &payload).is_ok());
+        // The response is an empty object.
+        assert!(v
+            .validate_call_result("StatusNotification", &json!({}))
+            .is_ok());
+    }
+
+    #[test]
+    fn v201_status_notification_missing_required_field_fails() {
+        let v = SchemaValidator::v201();
+        // `connectorId` is required.
+        let payload = json!({
+            "timestamp": "2018-05-29T17:37:05.495259Z",
+            "connectorStatus": "Available",
+            "evseId": 1
+        });
+        let err = v.validate_call("StatusNotification", &payload).unwrap_err();
+        assert!(matches!(err, OcppError::SchemaViolation { .. }));
+    }
+
+    #[test]
+    fn v201_status_notification_unknown_enum_value_fails() {
+        let v = SchemaValidator::v201();
+        // `Charging` is a 1.6J-only state, not part of the 2.0.1 enum.
+        let payload = json!({
+            "timestamp": "2018-05-29T17:37:05.495259Z",
+            "connectorStatus": "Charging",
+            "evseId": 1,
+            "connectorId": 2
+        });
+        assert!(v.validate_call("StatusNotification", &payload).is_err());
+    }
+
+    #[test]
+    fn v201_status_notification_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        let payload = json!({
+            "timestamp": "2018-05-29T17:37:05.495259Z",
+            "connectorStatus": "Available",
+            "evseId": 1,
+            "connectorId": 2,
+            "errorCode": "NoError"
+        });
+        assert!(v.validate_call("StatusNotification", &payload).is_err());
     }
 
     #[test]

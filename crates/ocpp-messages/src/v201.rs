@@ -7,12 +7,13 @@
 //! into the same framing and dispatch machinery.
 //!
 //! This is the foundation slice for **M7 — OCPP 2.0.1** and currently covers
-//! `BootNotification` only.
+//! the core lifecycle messages `BootNotification`, `Heartbeat`, and
+//! `StatusNotification`.
 
 use crate::{OcppAction, OcppResponse};
 use ocpp_types::v201::{
-    BootReasonEnumType, ChargingStationType, CustomDataType, RegistrationStatusEnumType,
-    StatusInfoType,
+    BootReasonEnumType, ChargingStationType, ConnectorStatusEnumType, CustomDataType,
+    RegistrationStatusEnumType, StatusInfoType,
 };
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +64,89 @@ impl OcppAction for BootNotificationResponse {
 }
 
 impl OcppResponse for BootNotificationResponse {}
+
+/// `Heartbeat.req` — sent by a Charging Station to keep the connection alive
+/// and to learn the CSMS's current time.
+///
+/// Ports `ocpp.v201.call.Heartbeat`. The request carries no fields beyond the
+/// optional vendor extension, so it serializes to `{}` on the wire.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct HeartbeatRequest {
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+impl OcppAction for HeartbeatRequest {
+    const ACTION_NAME: &'static str = "Heartbeat";
+    type Response = HeartbeatResponse;
+}
+
+/// `Heartbeat.conf` — the CSMS's reply, carrying its current time.
+///
+/// Ports `ocpp.v201.call_result.Heartbeat`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HeartbeatResponse {
+    /// The CSMS's current time (RFC 3339 / ISO 8601).
+    #[serde(rename = "currentTime")]
+    pub current_time: String,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+impl OcppAction for HeartbeatResponse {
+    const ACTION_NAME: &'static str = "HeartbeatResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for HeartbeatResponse {}
+
+/// `StatusNotification.req` — reports the status of a single connector.
+///
+/// Ports `ocpp.v201.call.StatusNotification`. Unlike 1.6J, status is reported
+/// per `(evseId, connectorId)` pair using [`ConnectorStatusEnumType`], and
+/// there is no `errorCode` field.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StatusNotificationRequest {
+    /// The time for which the status is reported (RFC 3339 / ISO 8601).
+    pub timestamp: String,
+    /// The reported status of the connector.
+    #[serde(rename = "connectorStatus")]
+    pub connector_status: ConnectorStatusEnumType,
+    /// The id of the EVSE to which the connector belongs.
+    #[serde(rename = "evseId")]
+    pub evse_id: i32,
+    /// The id of the connector within the EVSE.
+    #[serde(rename = "connectorId")]
+    pub connector_id: i32,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+impl OcppAction for StatusNotificationRequest {
+    const ACTION_NAME: &'static str = "StatusNotification";
+    type Response = StatusNotificationResponse;
+}
+
+/// `StatusNotification.conf` — the CSMS's acknowledgement.
+///
+/// Ports `ocpp.v201.call_result.StatusNotification`. The response carries no
+/// fields beyond the optional vendor extension, so it serializes to `{}`.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct StatusNotificationResponse {
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+impl OcppAction for StatusNotificationResponse {
+    const ACTION_NAME: &'static str = "StatusNotificationResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for StatusNotificationResponse {}
 
 #[cfg(test)]
 mod tests {
@@ -168,5 +252,87 @@ mod tests {
         assert_eq!(wire["statusInfo"]["reasonCode"], json!("PendingConfig"));
         let back: BootNotificationResponse = serde_json::from_value(wire).unwrap();
         assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn heartbeat_request_is_empty_object_on_wire() {
+        // Ported from tests/v201/test_charge_point.py — Heartbeat.req has no
+        // payload fields, so it serializes to an empty object.
+        let req = HeartbeatRequest::default();
+        assert_eq!(serde_json::to_value(&req).unwrap(), json!({}));
+        let back: HeartbeatRequest = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn heartbeat_response_matches_reference_wire_json() {
+        let resp = HeartbeatResponse {
+            current_time: "2020-01-01T00:00:00Z".to_string(),
+            custom_data: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&resp).unwrap(),
+            json!({ "currentTime": "2020-01-01T00:00:00Z" })
+        );
+        let back: HeartbeatResponse =
+            serde_json::from_value(json!({ "currentTime": "2020-01-01T00:00:00Z" })).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn status_notification_request_matches_reference_wire_json() {
+        let req = StatusNotificationRequest {
+            timestamp: "2020-01-01T00:00:00Z".to_string(),
+            connector_status: ConnectorStatusEnumType::Available,
+            evse_id: 1,
+            connector_id: 2,
+            custom_data: None,
+        };
+        let expected = json!({
+            "timestamp": "2020-01-01T00:00:00Z",
+            "connectorStatus": "Available",
+            "evseId": 1,
+            "connectorId": 2
+        });
+        assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+        let back: StatusNotificationRequest = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn status_notification_response_is_empty_object_on_wire() {
+        let resp = StatusNotificationResponse::default();
+        assert_eq!(serde_json::to_value(&resp).unwrap(), json!({}));
+        let back: StatusNotificationResponse = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn new_v201_action_names_are_stable() {
+        assert_eq!(HeartbeatRequest::ACTION_NAME, "Heartbeat");
+        assert_eq!(HeartbeatResponse::ACTION_NAME, "HeartbeatResponse");
+        assert_eq!(StatusNotificationRequest::ACTION_NAME, "StatusNotification");
+        assert_eq!(
+            StatusNotificationResponse::ACTION_NAME,
+            "StatusNotificationResponse"
+        );
+    }
+
+    #[test]
+    fn status_notification_round_trips_with_custom_data() {
+        let req = StatusNotificationRequest {
+            timestamp: "2020-01-01T00:00:00Z".to_string(),
+            connector_status: ConnectorStatusEnumType::Faulted,
+            evse_id: 0,
+            connector_id: 1,
+            custom_data: Some(CustomDataType {
+                vendor_id: "com.example".to_string(),
+                extra: Default::default(),
+            }),
+        };
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+        let back: StatusNotificationRequest = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, req);
     }
 }

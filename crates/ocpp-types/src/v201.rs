@@ -6,8 +6,9 @@
 //! serde with explicit camelCase renames and `skip_serializing_if` on every
 //! optional field so absent values never appear on the wire.
 //!
-//! It is the foundation slice for **M7 — OCPP 2.0.1**; today it carries just
-//! what `BootNotification` needs. Subsequent 2.0.1 messages extend it.
+//! It is the foundation slice for **M7 — OCPP 2.0.1**; today it carries what
+//! the core lifecycle messages (`BootNotification`, `Heartbeat`,
+//! `StatusNotification`) need. Subsequent 2.0.1 messages extend it.
 
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +41,21 @@ pub enum RegistrationStatusEnumType {
     Accepted,
     Pending,
     Rejected,
+}
+
+/// Current status of a connector, reported in a `StatusNotification`.
+///
+/// Ports `ConnectorStatusEnumType` (`ocpp/v201/enums.py`). The 2.0.1 set is the
+/// schema's five values — `Available`, `Occupied`, `Reserved`, `Unavailable`,
+/// `Faulted` — a different (smaller) vocabulary than the 1.6J
+/// `ChargePointStatus`. Wire values are PascalCase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectorStatusEnumType {
+    Available,
+    Occupied,
+    Reserved,
+    Unavailable,
+    Faulted,
 }
 
 // =============================================================================
@@ -155,6 +171,23 @@ mod tests {
     fn unknown_enum_value_is_rejected() {
         let err = serde_json::from_value::<RegistrationStatusEnumType>(json!("Bogus"));
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn connector_status_serializes_pascal_case() {
+        for (variant, wire) in [
+            (ConnectorStatusEnumType::Available, "Available"),
+            (ConnectorStatusEnumType::Occupied, "Occupied"),
+            (ConnectorStatusEnumType::Reserved, "Reserved"),
+            (ConnectorStatusEnumType::Unavailable, "Unavailable"),
+            (ConnectorStatusEnumType::Faulted, "Faulted"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            let back: ConnectorStatusEnumType = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, variant);
+        }
+        // The 1.6J-only states are not part of the 2.0.1 vocabulary.
+        assert!(serde_json::from_value::<ConnectorStatusEnumType>(json!("Charging")).is_err());
     }
 
     #[test]
