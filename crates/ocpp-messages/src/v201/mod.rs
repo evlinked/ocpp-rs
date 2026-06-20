@@ -9,7 +9,8 @@
 //!
 //! This is the foundation for **M7 — OCPP 2.0.1** and currently covers the core
 //! lifecycle messages `BootNotification`, `Heartbeat`, `StatusNotification`,
-//! `Authorize`, the `GetVariables` device-model read, and `TransactionEvent`.
+//! `Authorize`, the `GetVariables` device-model read, `TransactionEvent`, and
+//! the `Reset` remote command.
 //!
 //! ## Layout
 //!
@@ -23,6 +24,7 @@ mod authorize;
 mod boot_notification;
 mod get_variables;
 mod heartbeat;
+mod reset;
 mod status_notification;
 mod transaction_event;
 
@@ -30,6 +32,7 @@ pub use authorize::{AuthorizeRequest, AuthorizeResponse};
 pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
 pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
 pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
+pub use reset::{ResetRequest, ResetResponse};
 pub use status_notification::{StatusNotificationRequest, StatusNotificationResponse};
 pub use transaction_event::{TransactionEventRequest, TransactionEventResponse};
 
@@ -607,6 +610,106 @@ mod tests {
                 .is_err());
             // And serde rejects it too.
             assert!(serde_json::from_value::<TransactionEventRequest>(bad).is_err());
+        }
+    }
+
+    mod reset {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{ResetEnumType, ResetStatusEnumType, StatusInfoType};
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // The CSMS asks the whole station to reset immediately — only the
+            // required `type` is present (named `kind` in Rust).
+            let req = ResetRequest {
+                kind: ResetEnumType::Immediate,
+                evse_id: None,
+                custom_data: None,
+            };
+            let expected = json!({ "type": "Immediate" });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let back: ResetRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("Reset", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_targets_single_evse_and_validates() {
+            let req = ResetRequest {
+                kind: ResetEnumType::OnIdle,
+                evse_id: Some(2),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire, json!({ "type": "OnIdle", "evseId": 2 }));
+            assert!(SchemaValidator::v201()
+                .validate_call("Reset", &wire)
+                .is_ok());
+            let back: ResetRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = ResetResponse {
+                status: ResetStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("Reset", &expected)
+                .is_ok());
+            let back: ResetResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_scheduled_with_status_info_round_trips() {
+            let resp = ResetResponse {
+                status: ResetStatusEnumType::Scheduled,
+                status_info: Some(StatusInfoType {
+                    reason_code: "TxOngoing".to_string(),
+                    additional_info: Some("reset deferred until idle".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Scheduled"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("TxOngoing"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("Reset", &wire)
+                .is_ok());
+            let back: ResetResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(ResetRequest::ACTION_NAME, "Reset");
+            assert_eq!(ResetResponse::ACTION_NAME, "ResetResponse");
+        }
+
+        #[test]
+        fn schema_rejects_missing_required_type() {
+            assert!(SchemaValidator::v201()
+                .validate_call("Reset", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_unknown_reset_type() {
+            // `Hard` is a 1.6J value, not a member of the 2.0.1 ResetEnumType.
+            let bad = json!({ "type": "Hard" });
+            assert!(SchemaValidator::v201()
+                .validate_call("Reset", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<ResetRequest>(bad).is_err());
         }
     }
 }

@@ -456,4 +456,32 @@ mod tests {
             json!({ "transactionId": "tx-001" })
         );
     }
+
+    #[test]
+    fn reset_enum_round_trips() {
+        for (variant, wire) in [
+            (ResetEnumType::Immediate, "Immediate"),
+            (ResetEnumType::OnIdle, "OnIdle"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            let back: ResetEnumType = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, variant);
+        }
+        // The 1.6J vocabulary (`Hard`/`Soft`) is not part of the 2.0.1 enum.
+        assert!(serde_json::from_value::<ResetEnumType>(json!("Hard")).is_err());
+    }
+
+    #[test]
+    fn reset_status_enum_round_trips() {
+        for (variant, wire) in [
+            (ResetStatusEnumType::Accepted, "Accepted"),
+            (ResetStatusEnumType::Rejected, "Rejected"),
+            (ResetStatusEnumType::Scheduled, "Scheduled"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            let back: ResetStatusEnumType = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, variant);
+        }
+        assert!(serde_json::from_value::<ResetStatusEnumType>(json!("Bogus")).is_err());
+    }
 }

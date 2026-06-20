@@ -364,6 +364,11 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "TransactionEventResponse",
         include_str!("../schemas/v201/TransactionEventResponse.json"),
     ),
+    ("Reset", include_str!("../schemas/v201/Reset.json")),
+    (
+        "ResetResponse",
+        include_str!("../schemas/v201/ResetResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -1192,6 +1197,8 @@ mod tests {
         assert!(v.has_schema("AuthorizeResponse"));
         assert!(v.has_schema("TransactionEvent"));
         assert!(v.has_schema("TransactionEventResponse"));
+        assert!(v.has_schema("Reset"));
+        assert!(v.has_schema("ResetResponse"));
     }
 
     #[test]
