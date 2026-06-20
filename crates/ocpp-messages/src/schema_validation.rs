@@ -649,7 +649,11 @@ mod tests {
     #[test]
     fn v16j_loads_all_78_schemas() {
         let v = SchemaValidator::v16j();
-        assert_eq!(v.schema_count(), 78);
+        // Derive the expected count from the registry rather than a hard-coded
+        // literal: the count then tracks `SCHEMA_TEXTS_V16J` automatically and a
+        // new schema never needs to bump this assertion. A mismatch here also
+        // catches an accidental duplicate action key (HashMap would dedupe it).
+        assert_eq!(v.schema_count(), SCHEMA_TEXTS_V16J.len());
     }
 
     #[test]
@@ -1171,7 +1175,11 @@ mod tests {
     #[test]
     fn v201_loads_bundled_boot_notification_schemas() {
         let v = SchemaValidator::v201();
-        assert_eq!(v.schema_count(), 12);
+        // Derive from the registry length so adding a 2.0.1 message never
+        // requires bumping a hard-coded count literal here — this assertion was
+        // the guaranteed textual conflict between stacked v201 PRs (see #124).
+        // The `has_schema` checks below still pin the specific actions present.
+        assert_eq!(v.schema_count(), SCHEMA_TEXTS_V201.len());
         assert!(v.has_schema("BootNotification"));
         assert!(v.has_schema("BootNotificationResponse"));
         assert!(v.has_schema("GetVariables"));
