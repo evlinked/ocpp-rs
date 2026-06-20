@@ -209,3 +209,36 @@ pub enum ReasonEnumType {
     TimeLimitReached,
     Timeout,
 }
+
+/// Hash algorithm used for the OCSP request data in the ISO 15118
+/// plug-and-charge certificate path.
+///
+/// Ports `HashAlgorithmEnumType` (`ocpp/v201/enums.py`). All wire values are
+/// all-caps acronyms, so each variant is renamed from its idiomatic Rust
+/// spelling. Used by [`super::OCSPRequestDataType`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HashAlgorithmEnumType {
+    #[serde(rename = "SHA256")]
+    Sha256,
+    #[serde(rename = "SHA384")]
+    Sha384,
+    #[serde(rename = "SHA512")]
+    Sha512,
+}
+
+/// Outcome of validating the ISO 15118 contract certificate presented in an
+/// `Authorize` request, returned in the `AuthorizeResponse`.
+///
+/// Ports `AuthorizeCertificateStatusEnumType` (`ocpp/v201/enums.py`). Wire
+/// values are PascalCase. `Accepted` means the certificate is valid; every
+/// other value is a distinct rejection reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthorizeCertificateStatusEnumType {
+    Accepted,
+    SignatureError,
+    CertificateExpired,
+    CertificateRevoked,
+    NoCertificateAvailable,
+    CertChainError,
+    ContractCancelled,
+}

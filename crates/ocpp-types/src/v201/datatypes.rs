@@ -165,6 +165,33 @@ pub struct IdTokenType {
     pub custom_data: Option<CustomDataType>,
 }
 
+/// OCSP request data identifying a single certificate to be checked along the
+/// ISO 15118 plug-and-charge path, carried by an `Authorize` request's
+/// `iso15118CertificateHashData`.
+///
+/// Ports `OCSPRequestDataType`. Every field except `custom_data` is required.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OCSPRequestDataType {
+    /// Hash algorithm used for `issuer_name_hash` and `issuer_key_hash`.
+    #[serde(rename = "hashAlgorithm")]
+    pub hash_algorithm: HashAlgorithmEnumType,
+    /// Hashed value of the issuer Distinguished Name (max length 128).
+    #[serde(rename = "issuerNameHash")]
+    pub issuer_name_hash: String,
+    /// Hashed value of the issuer's public key (max length 128).
+    #[serde(rename = "issuerKeyHash")]
+    pub issuer_key_hash: String,
+    /// Serial number of the certificate (max length 40).
+    #[serde(rename = "serialNumber")]
+    pub serial_number: String,
+    /// Case-insensitive responder URL of the OCSP server (max length 512).
+    #[serde(rename = "responderURL")]
+    pub responder_url: String,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 /// Message details for a message to be displayed on a Charging Station.
 ///
 /// Ports `MessageContentType`. `format` and `content` are required. Carried by
