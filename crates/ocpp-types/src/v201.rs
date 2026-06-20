@@ -115,6 +115,39 @@ pub enum MessageFormatEnumType {
     Utf8,
 }
 
+/// Hash algorithm used for the OCSP request data in the ISO 15118
+/// plug-and-charge certificate path.
+///
+/// Ports `HashAlgorithmEnumType` (`ocpp/v201/enums.py`). All wire values are
+/// all-caps acronyms, so each variant is renamed from its idiomatic Rust
+/// spelling. Used by [`OCSPRequestDataType`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HashAlgorithmEnumType {
+    #[serde(rename = "SHA256")]
+    Sha256,
+    #[serde(rename = "SHA384")]
+    Sha384,
+    #[serde(rename = "SHA512")]
+    Sha512,
+}
+
+/// Outcome of validating the ISO 15118 contract certificate presented in an
+/// `Authorize` request, returned in the `AuthorizeResponse`.
+///
+/// Ports `AuthorizeCertificateStatusEnumType` (`ocpp/v201/enums.py`). Wire
+/// values are PascalCase. `Accepted` means the certificate is valid; every
+/// other value is a distinct rejection reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthorizeCertificateStatusEnumType {
+    Accepted,
+    SignatureError,
+    CertificateExpired,
+    CertificateRevoked,
+    NoCertificateAvailable,
+    CertChainError,
+    ContractCancelled,
+}
+
 // =============================================================================
 // Datatypes
 // =============================================================================
@@ -293,6 +326,33 @@ pub struct IdTokenType {
     /// when absent; the schema requires at least one item when present.
     #[serde(rename = "additionalInfo", skip_serializing_if = "Option::is_none")]
     pub additional_info: Option<Vec<AdditionalInfoType>>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// OCSP request data identifying a single certificate to be checked along the
+/// ISO 15118 plug-and-charge path, carried by an `Authorize` request's
+/// `iso15118CertificateHashData`.
+///
+/// Ports `OCSPRequestDataType`. Every field except `custom_data` is required.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OCSPRequestDataType {
+    /// Hash algorithm used for `issuer_name_hash` and `issuer_key_hash`.
+    #[serde(rename = "hashAlgorithm")]
+    pub hash_algorithm: HashAlgorithmEnumType,
+    /// Hashed value of the issuer Distinguished Name (max length 128).
+    #[serde(rename = "issuerNameHash")]
+    pub issuer_name_hash: String,
+    /// Hashed value of the issuer's public key (max length 128).
+    #[serde(rename = "issuerKeyHash")]
+    pub issuer_key_hash: String,
+    /// Serial number of the certificate (max length 40).
+    #[serde(rename = "serialNumber")]
+    pub serial_number: String,
+    /// Case-insensitive responder URL of the OCSP server (max length 512).
+    #[serde(rename = "responderURL")]
+    pub responder_url: String,
     /// Vendor extension.
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,

@@ -13,8 +13,9 @@
 
 use crate::{OcppAction, OcppResponse};
 use ocpp_types::v201::{
-    BootReasonEnumType, ChargingStationType, ConnectorStatusEnumType, CustomDataType, EvseType,
-    GetVariableDataType, GetVariableResultType, IdTokenInfoType, IdTokenType, MessageContentType,
+    AuthorizeCertificateStatusEnumType, BootReasonEnumType, ChargingStationType,
+    ConnectorStatusEnumType, CustomDataType, EvseType, GetVariableDataType, GetVariableResultType,
+    IdTokenInfoType, IdTokenType, MessageContentType, OCSPRequestDataType,
     RegistrationStatusEnumType, StatusInfoType, TransactionEventEnumType, TransactionType,
     TriggerReasonEnumType,
 };
@@ -200,16 +201,27 @@ impl OcppResponse for GetVariablesResponse {}
 /// Ports `ocpp.v201.call.Authorize`. Unlike 1.6J (a bare `idTag` string), 2.0.1
 /// carries the richer [`IdTokenType`].
 ///
-/// **Deferred:** the ISO 15118 plug-and-charge certificate path — the request's
-/// optional `certificate` (PEM) and `iso15118CertificateHashData`
-/// (`OCSPRequestDataType` list) — is not yet modelled here; it is tracked as a
-/// follow-up. The bundled `Authorize.json` schema still validates those fields
-/// when present.
+/// The optional ISO 15118 plug-and-charge certificate path is modelled here:
+/// `certificate` carries the EV's contract certificate (PEM, max length 5500)
+/// and `iso15118_certificate_hash_data` carries 1..=4 [`OCSPRequestDataType`]
+/// entries for OCSP status checking. Both are omitted from the wire when absent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthorizeRequest {
     /// The identifier being authorized.
     #[serde(rename = "idToken")]
     pub id_token: IdTokenType,
+    /// The X.509 contract certificate presented by the EV, PEM-encoded
+    /// (max length 5500). Part of the ISO 15118 plug-and-charge path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<String>,
+    /// OCSP request data for the contract certificate chain (1..=4 entries).
+    /// Omitted entirely when absent; the schema requires at least one item and
+    /// at most four when present.
+    #[serde(
+        rename = "iso15118CertificateHashData",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub iso15118_certificate_hash_data: Option<Vec<OCSPRequestDataType>>,
     /// Vendor extension.
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
@@ -225,15 +237,18 @@ impl OcppAction for AuthorizeRequest {
 /// Ports `ocpp.v201.call_result.Authorize`. The [`IdTokenInfoType`] payload is
 /// reused by the 2.0.1 transaction model.
 ///
-/// **Deferred:** the optional `certificateStatus`
-/// (`AuthorizeCertificateStatusEnumType`) field, part of the same ISO 15118
-/// certificate path as the request-side certificate fields, is not yet
-/// modelled. The bundled schema still validates it when present.
+/// The optional `certificate_status` reports the outcome of validating the
+/// contract certificate supplied along the ISO 15118 plug-and-charge path; it
+/// is omitted from the wire when absent.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AuthorizeResponse {
     /// Status information about the identifier.
     #[serde(rename = "idTokenInfo")]
     pub id_token_info: IdTokenInfoType,
+    /// Result of validating the ISO 15118 contract certificate, when one was
+    /// presented in the request.
+    #[serde(rename = "certificateStatus", skip_serializing_if = "Option::is_none")]
+    pub certificate_status: Option<AuthorizeCertificateStatusEnumType>,
     /// Vendor extension.
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
@@ -519,6 +534,8 @@ mod tests {
                 additional_info: None,
                 custom_data: None,
             },
+            certificate: None,
+            iso15118_certificate_hash_data: None,
             custom_data: None,
         };
         let expected = json!({
@@ -547,6 +564,7 @@ mod tests {
                 personal_message: None,
                 custom_data: None,
             },
+            certificate_status: None,
             custom_data: None,
         };
         let expected = json!({
@@ -566,6 +584,8 @@ mod tests {
                 additional_info: None,
                 custom_data: None,
             },
+            certificate: None,
+            iso15118_certificate_hash_data: None,
             custom_data: Some(CustomDataType {
                 vendor_id: "com.example".to_string(),
                 extra: Default::default(),
@@ -589,6 +609,7 @@ mod tests {
                 personal_message: None,
                 custom_data: None,
             },
+            certificate_status: None,
             custom_data: None,
         };
         let wire = serde_json::to_value(&resp).unwrap();
@@ -905,6 +926,201 @@ mod tests {
                 .is_err());
             // And serde rejects it too.
             assert!(serde_json::from_value::<TransactionEventRequest>(bad).is_err());
+        }
+    }
+
+    /// ISO 15118 plug-and-charge certificate path on `Authorize`
+    /// (issue #117): the request's `certificate` / `iso15118CertificateHashData`
+    /// and the response's `certificateStatus`.
+    mod authorize_certificate {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            AuthorizeCertificateStatusEnumType, HashAlgorithmEnumType, IdTokenEnumType,
+            IdTokenType, OCSPRequestDataType,
+        };
+
+        fn sample_ocsp() -> OCSPRequestDataType {
+            OCSPRequestDataType {
+                hash_algorithm: HashAlgorithmEnumType::Sha256,
+                issuer_name_hash: "a4f8...".to_string(),
+                issuer_key_hash: "b91c...".to_string(),
+                serial_number: "12AB34CD".to_string(),
+                responder_url: "https://ocsp.example.com".to_string(),
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn request_with_certificate_path_matches_wire_json_and_validates() {
+            let req = AuthorizeRequest {
+                id_token: IdTokenType {
+                    id_token: "DEADBEEF".to_string(),
+                    kind: IdTokenEnumType::EMaid,
+                    additional_info: None,
+                    custom_data: None,
+                },
+                certificate: Some(
+                    "-----BEGIN CERTIFICATE-----\nMII...\n-----END CERTIFICATE-----".to_string(),
+                ),
+                iso15118_certificate_hash_data: Some(vec![sample_ocsp()]),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(
+                wire["iso15118CertificateHashData"][0]["hashAlgorithm"],
+                json!("SHA256")
+            );
+            assert_eq!(
+                wire["iso15118CertificateHashData"][0]["responderURL"],
+                json!("https://ocsp.example.com")
+            );
+            assert!(wire["certificate"].is_string());
+            assert!(SchemaValidator::v201()
+                .validate_call("Authorize", &wire)
+                .is_ok());
+            let back: AuthorizeRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_omits_certificate_fields_when_absent() {
+            let req = AuthorizeRequest {
+                id_token: IdTokenType {
+                    id_token: "DEADBEEF".to_string(),
+                    kind: IdTokenEnumType::Iso14443,
+                    additional_info: None,
+                    custom_data: None,
+                },
+                certificate: None,
+                iso15118_certificate_hash_data: None,
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            let obj = wire.as_object().unwrap();
+            assert!(!obj.contains_key("certificate"));
+            assert!(!obj.contains_key("iso15118CertificateHashData"));
+        }
+
+        #[test]
+        fn response_with_certificate_status_round_trips_and_validates() {
+            let resp = AuthorizeResponse {
+                id_token_info: IdTokenInfoType {
+                    status: AuthorizationStatusEnumType::Accepted,
+                    cache_expiry_date_time: None,
+                    charging_priority: None,
+                    language1: None,
+                    evse_id: None,
+                    language2: None,
+                    group_id_token: None,
+                    personal_message: None,
+                    custom_data: None,
+                },
+                certificate_status: Some(AuthorizeCertificateStatusEnumType::CertChainError),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["certificateStatus"], json!("CertChainError"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("Authorize", &wire)
+                .is_ok());
+            let back: AuthorizeResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn hash_algorithm_enum_serializes_to_wire_values() {
+            assert_eq!(
+                serde_json::to_value(HashAlgorithmEnumType::Sha256).unwrap(),
+                json!("SHA256")
+            );
+            assert_eq!(
+                serde_json::to_value(HashAlgorithmEnumType::Sha384).unwrap(),
+                json!("SHA384")
+            );
+            assert_eq!(
+                serde_json::to_value(HashAlgorithmEnumType::Sha512).unwrap(),
+                json!("SHA512")
+            );
+            // Unknown values are rejected.
+            assert!(serde_json::from_value::<HashAlgorithmEnumType>(json!("MD5")).is_err());
+            assert!(serde_json::from_value::<HashAlgorithmEnumType>(json!("sha256")).is_err());
+        }
+
+        #[test]
+        fn certificate_status_enum_serializes_to_wire_values() {
+            for (variant, wire) in [
+                (AuthorizeCertificateStatusEnumType::Accepted, "Accepted"),
+                (
+                    AuthorizeCertificateStatusEnumType::SignatureError,
+                    "SignatureError",
+                ),
+                (
+                    AuthorizeCertificateStatusEnumType::CertificateExpired,
+                    "CertificateExpired",
+                ),
+                (
+                    AuthorizeCertificateStatusEnumType::CertificateRevoked,
+                    "CertificateRevoked",
+                ),
+                (
+                    AuthorizeCertificateStatusEnumType::NoCertificateAvailable,
+                    "NoCertificateAvailable",
+                ),
+                (
+                    AuthorizeCertificateStatusEnumType::CertChainError,
+                    "CertChainError",
+                ),
+                (
+                    AuthorizeCertificateStatusEnumType::ContractCancelled,
+                    "ContractCancelled",
+                ),
+            ] {
+                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            }
+            assert!(
+                serde_json::from_value::<AuthorizeCertificateStatusEnumType>(json!("Bogus"))
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn schema_rejects_ocsp_entry_missing_required_field() {
+            // `serialNumber` is required on every OCSPRequestDataType entry.
+            let bad = json!({
+                "idToken": { "idToken": "DEADBEEF", "type": "eMAID" },
+                "iso15118CertificateHashData": [{
+                    "hashAlgorithm": "SHA256",
+                    "issuerNameHash": "a4f8",
+                    "issuerKeyHash": "b91c",
+                    "responderURL": "https://ocsp.example.com"
+                }]
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("Authorize", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<AuthorizeRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_more_than_four_hash_data_entries() {
+            // The schema caps `iso15118CertificateHashData` at maxItems = 4.
+            let entry = json!({
+                "hashAlgorithm": "SHA256",
+                "issuerNameHash": "a4f8",
+                "issuerKeyHash": "b91c",
+                "serialNumber": "12AB",
+                "responderURL": "https://ocsp.example.com"
+            });
+            let bad = json!({
+                "idToken": { "idToken": "DEADBEEF", "type": "eMAID" },
+                "iso15118CertificateHashData": [
+                    entry, entry, entry, entry, entry
+                ]
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("Authorize", &bad)
+                .is_err());
         }
     }
 }
