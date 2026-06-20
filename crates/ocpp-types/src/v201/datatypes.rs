@@ -399,3 +399,97 @@ pub struct TransactionType {
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
 }
+
+/// A cryptographically signed version of a meter reading, carried inside a
+/// [`SampledValueType`].
+///
+/// Ports `SignedMeterValueType`. All four fields are required by the schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SignedMeterValueType {
+    /// Base64-encoded signed data, which may contain more than the meter value
+    /// (timestamps, customer reference, …) (max length 2500).
+    #[serde(rename = "signedMeterData")]
+    pub signed_meter_data: String,
+    /// Method used to create the digital signature (max length 50).
+    #[serde(rename = "signingMethod")]
+    pub signing_method: String,
+    /// Method used to encode the meter values before signing (max length 50).
+    #[serde(rename = "encodingMethod")]
+    pub encoding_method: String,
+    /// Base64-encoded public key (max length 2500).
+    #[serde(rename = "publicKey")]
+    pub public_key: String,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// The unit and decimal multiplier qualifying a [`SampledValueType`] value.
+///
+/// Ports `UnitOfMeasureType`. Both fields are optional; when absent the value
+/// defaults to `"Wh"` with multiplier `0`. `unit` is modelled as a free
+/// `String` because the reference allows either a standardized unit or a
+/// custom one (`Union[StandardizedUnitsOfMeasureType, str]`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UnitOfMeasureType {
+    /// Unit of the value (default `"Wh"`; max length 20).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Exponent to base 10 applied to the value (default `0`). A multiplier of
+    /// `3` means the value is scaled by 10³.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub multiplier: Option<i32>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// A single sampled measurement within a [`MeterValueType`].
+///
+/// Ports `SampledValueType`. Only `value` is required; with every optional
+/// field absent the reading is interpreted as active-import energy in Wh, per
+/// the spec's documented defaults.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SampledValueType {
+    /// The measured value.
+    pub value: f64,
+    /// What the reading represents (start/end/sample/…); default
+    /// `Sample.Periodic`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context: Option<ReadingContextEnumType>,
+    /// Kind of measurement; default `Energy.Active.Import.Register`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub measurand: Option<MeasurandEnumType>,
+    /// Electrical phase the value applies to, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub phase: Option<PhaseEnumType>,
+    /// Where the value was sampled; default `Outlet`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub location: Option<LocationEnumType>,
+    /// Signed representation of this meter value, if provided.
+    #[serde(rename = "signedMeterValue", skip_serializing_if = "Option::is_none")]
+    pub signed_meter_value: Option<SignedMeterValueType>,
+    /// Unit and multiplier qualifying `value`, if provided.
+    #[serde(rename = "unitOfMeasure", skip_serializing_if = "Option::is_none")]
+    pub unit_of_measure: Option<UnitOfMeasureType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// A collection of one or more [`SampledValueType`]s captured at the same
+/// instant, as reported in `MeterValues` and `TransactionEvent`.
+///
+/// Ports `MeterValueType`. Both `timestamp` and a non-empty `sampledValue`
+/// list are required by the schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MeterValueType {
+    /// Time at which all of `sampledValue` were sampled (RFC 3339 / ISO 8601).
+    pub timestamp: String,
+    /// The sampled values; the schema requires at least one.
+    #[serde(rename = "sampledValue")]
+    pub sampled_value: Vec<SampledValueType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}

@@ -415,8 +415,9 @@ mod tests {
         use crate::schema_validation::SchemaValidator;
         use ocpp_types::v201::{
             AuthorizationStatusEnumType, ChargingStateEnumType, IdTokenEnumType, IdTokenInfoType,
-            IdTokenType, MessageContentType, MessageFormatEnumType, ReasonEnumType,
-            TransactionType,
+            IdTokenType, LocationEnumType, MeasurandEnumType, MessageContentType,
+            MessageFormatEnumType, MeterValueType, PhaseEnumType, ReadingContextEnumType,
+            ReasonEnumType, SampledValueType, TransactionType, UnitOfMeasureType,
         };
 
         #[test]
@@ -444,6 +445,7 @@ mod tests {
                     connector_id: Some(1),
                     custom_data: None,
                 }),
+                meter_value: None,
                 id_token: Some(IdTokenType {
                     id_token: "045918E24B5380".to_string(),
                     kind: IdTokenEnumType::Iso14443,
@@ -493,6 +495,7 @@ mod tests {
                 cable_max_current: Some(32),
                 reservation_id: None,
                 evse: None,
+                meter_value: None,
                 id_token: None,
                 custom_data: None,
             };
@@ -526,6 +529,7 @@ mod tests {
                 cable_max_current: None,
                 reservation_id: None,
                 evse: None,
+                meter_value: None,
                 id_token: None,
                 custom_data: None,
             };
@@ -536,6 +540,120 @@ mod tests {
                 .is_ok());
             let back: TransactionEventRequest = serde_json::from_value(wire).unwrap();
             assert_eq!(back, req);
+        }
+
+        #[test]
+        fn updated_event_with_meter_value_matches_wire_json_and_validates() {
+            // An `Updated` event carrying a periodic meter reading: the value
+            // plus several qualifying fields and a per-phase current sample.
+            let req = TransactionEventRequest {
+                event_type: TransactionEventEnumType::Updated,
+                timestamp: "2022-01-01T10:05:00Z".to_string(),
+                trigger_reason: TriggerReasonEnumType::MeterValuePeriodic,
+                seq_no: 1,
+                transaction_info: TransactionType {
+                    transaction_id: "tx-42".to_string(),
+                    charging_state: Some(ChargingStateEnumType::Charging),
+                    time_spent_charging: Some(300),
+                    stopped_reason: None,
+                    remote_start_id: None,
+                    custom_data: None,
+                },
+                offline: None,
+                number_of_phases_used: None,
+                cable_max_current: None,
+                reservation_id: None,
+                evse: None,
+                meter_value: Some(vec![MeterValueType {
+                    timestamp: "2022-01-01T10:05:00Z".to_string(),
+                    sampled_value: vec![
+                        SampledValueType {
+                            value: 1234.5,
+                            context: Some(ReadingContextEnumType::SamplePeriodic),
+                            measurand: Some(MeasurandEnumType::EnergyActiveImportRegister),
+                            phase: None,
+                            location: None,
+                            signed_meter_value: None,
+                            unit_of_measure: Some(UnitOfMeasureType {
+                                unit: Some("Wh".to_string()),
+                                multiplier: None,
+                                custom_data: None,
+                            }),
+                            custom_data: None,
+                        },
+                        SampledValueType {
+                            value: 16.0,
+                            context: Some(ReadingContextEnumType::SamplePeriodic),
+                            measurand: Some(MeasurandEnumType::CurrentImport),
+                            phase: Some(PhaseEnumType::L1N),
+                            location: Some(LocationEnumType::Outlet),
+                            signed_meter_value: None,
+                            unit_of_measure: None,
+                            custom_data: None,
+                        },
+                    ],
+                    custom_data: None,
+                }]),
+                id_token: None,
+                custom_data: None,
+            };
+            let expected = json!({
+                "eventType": "Updated",
+                "timestamp": "2022-01-01T10:05:00Z",
+                "triggerReason": "MeterValuePeriodic",
+                "seqNo": 1,
+                "transactionInfo": {
+                    "transactionId": "tx-42",
+                    "chargingState": "Charging",
+                    "timeSpentCharging": 300
+                },
+                "meterValue": [{
+                    "timestamp": "2022-01-01T10:05:00Z",
+                    "sampledValue": [
+                        {
+                            "value": 1234.5,
+                            "context": "Sample.Periodic",
+                            "measurand": "Energy.Active.Import.Register",
+                            "unitOfMeasure": { "unit": "Wh" }
+                        },
+                        {
+                            "value": 16.0,
+                            "context": "Sample.Periodic",
+                            "measurand": "Current.Import",
+                            "phase": "L1-N",
+                            "location": "Outlet"
+                        }
+                    ]
+                }]
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let back: TransactionEventRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            // The dotted/hyphenated measurement enums and nested meter objects
+            // all satisfy the bundled 2.0.1 schema.
+            assert!(SchemaValidator::v201()
+                .validate_call("TransactionEvent", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn meter_value_requires_non_empty_sampled_value() {
+            // The schema sets `minItems: 1` on `sampledValue`; an empty list
+            // must be rejected even though the Rust type would allow it.
+            let bad = json!({
+                "eventType": "Updated",
+                "timestamp": "2022-01-01T10:05:00Z",
+                "triggerReason": "MeterValuePeriodic",
+                "seqNo": 1,
+                "transactionInfo": { "transactionId": "tx-42" },
+                "meterValue": [{
+                    "timestamp": "2022-01-01T10:05:00Z",
+                    "sampledValue": []
+                }]
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("TransactionEvent", &bad)
+                .is_err());
         }
 
         #[test]

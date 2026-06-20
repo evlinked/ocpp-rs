@@ -548,4 +548,188 @@ mod tests {
         let back: SetVariableResultType = serde_json::from_value(wire).unwrap();
         assert_eq!(back, result);
     }
+
+    #[test]
+    fn reading_context_enum_serializes_exact_wire_values() {
+        for (variant, wire) in [
+            (
+                ReadingContextEnumType::InterruptionBegin,
+                "Interruption.Begin",
+            ),
+            (ReadingContextEnumType::InterruptionEnd, "Interruption.End"),
+            (ReadingContextEnumType::Other, "Other"),
+            (ReadingContextEnumType::SampleClock, "Sample.Clock"),
+            (ReadingContextEnumType::SamplePeriodic, "Sample.Periodic"),
+            (
+                ReadingContextEnumType::TransactionBegin,
+                "Transaction.Begin",
+            ),
+            (ReadingContextEnumType::TransactionEnd, "Transaction.End"),
+            (ReadingContextEnumType::Trigger, "Trigger"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            let back: ReadingContextEnumType = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, variant);
+        }
+        // The dotted spelling is significant — the bare segment is not a value.
+        assert!(serde_json::from_value::<ReadingContextEnumType>(json!("Periodic")).is_err());
+        assert!(serde_json::from_value::<ReadingContextEnumType>(json!("Bogus")).is_err());
+    }
+
+    #[test]
+    fn measurand_enum_serializes_exact_wire_values() {
+        for (variant, wire) in [
+            (MeasurandEnumType::CurrentExport, "Current.Export"),
+            (MeasurandEnumType::CurrentImport, "Current.Import"),
+            (
+                MeasurandEnumType::EnergyActiveImportRegister,
+                "Energy.Active.Import.Register",
+            ),
+            (MeasurandEnumType::EnergyApparentNet, "Energy.Apparent.Net"),
+            (MeasurandEnumType::Frequency, "Frequency"),
+            (MeasurandEnumType::PowerActiveImport, "Power.Active.Import"),
+            (MeasurandEnumType::PowerFactor, "Power.Factor"),
+            (MeasurandEnumType::SoC, "SoC"),
+            (MeasurandEnumType::Voltage, "Voltage"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            let back: MeasurandEnumType = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, variant);
+        }
+        // Case matters: `SoC` is the only correct spelling.
+        assert!(serde_json::from_value::<MeasurandEnumType>(json!("Soc")).is_err());
+        assert!(serde_json::from_value::<MeasurandEnumType>(json!("Bogus")).is_err());
+    }
+
+    #[test]
+    fn phase_enum_serializes_exact_wire_values() {
+        for (variant, wire) in [
+            (PhaseEnumType::L1, "L1"),
+            (PhaseEnumType::L2, "L2"),
+            (PhaseEnumType::L3, "L3"),
+            (PhaseEnumType::N, "N"),
+            (PhaseEnumType::L1N, "L1-N"),
+            (PhaseEnumType::L2N, "L2-N"),
+            (PhaseEnumType::L3N, "L3-N"),
+            (PhaseEnumType::L1L2, "L1-L2"),
+            (PhaseEnumType::L2L3, "L2-L3"),
+            (PhaseEnumType::L3L1, "L3-L1"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            let back: PhaseEnumType = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, variant);
+        }
+        assert!(serde_json::from_value::<PhaseEnumType>(json!("L1N")).is_err());
+    }
+
+    #[test]
+    fn location_enum_serializes_exact_wire_values() {
+        for (variant, wire) in [
+            (LocationEnumType::Body, "Body"),
+            (LocationEnumType::Cable, "Cable"),
+            (LocationEnumType::Ev, "EV"),
+            (LocationEnumType::Inlet, "Inlet"),
+            (LocationEnumType::Outlet, "Outlet"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            let back: LocationEnumType = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, variant);
+        }
+        // `EV` is upper-case on the wire; the Rust spelling is not accepted.
+        assert!(serde_json::from_value::<LocationEnumType>(json!("Ev")).is_err());
+    }
+
+    #[test]
+    fn sampled_value_minimal_is_just_value() {
+        // With every optional field absent, only `value` appears — the spec's
+        // "active import energy in Wh" default reading.
+        let sv = SampledValueType {
+            value: 1234.5,
+            context: None,
+            measurand: None,
+            phase: None,
+            location: None,
+            signed_meter_value: None,
+            unit_of_measure: None,
+            custom_data: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&sv).unwrap(),
+            json!({ "value": 1234.5 })
+        );
+        let back: SampledValueType = serde_json::from_value(json!({ "value": 1234.5 })).unwrap();
+        assert_eq!(back, sv);
+    }
+
+    #[test]
+    fn sampled_value_full_round_trips_with_nested_objects() {
+        let sv = SampledValueType {
+            value: 230.0,
+            context: Some(ReadingContextEnumType::TransactionEnd),
+            measurand: Some(MeasurandEnumType::Voltage),
+            phase: Some(PhaseEnumType::L2N),
+            location: Some(LocationEnumType::Ev),
+            signed_meter_value: Some(SignedMeterValueType {
+                signed_meter_data: "c2lnbmVk".to_string(),
+                signing_method: "ECDSA".to_string(),
+                encoding_method: "DLMS Message".to_string(),
+                public_key: "cHVibGlj".to_string(),
+                custom_data: None,
+            }),
+            unit_of_measure: Some(UnitOfMeasureType {
+                unit: Some("V".to_string()),
+                multiplier: Some(0),
+                custom_data: None,
+            }),
+            custom_data: None,
+        };
+        let wire = serde_json::to_value(&sv).unwrap();
+        assert_eq!(wire["context"], json!("Transaction.End"));
+        assert_eq!(wire["phase"], json!("L2-N"));
+        assert_eq!(wire["location"], json!("EV"));
+        assert_eq!(wire["signedMeterValue"]["signingMethod"], json!("ECDSA"));
+        assert_eq!(wire["unitOfMeasure"]["multiplier"], json!(0));
+        let back: SampledValueType = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, sv);
+    }
+
+    #[test]
+    fn meter_value_matches_wire_json() {
+        let mv = MeterValueType {
+            timestamp: "2022-01-01T10:05:00Z".to_string(),
+            sampled_value: vec![SampledValueType {
+                value: 1234.5,
+                context: None,
+                measurand: Some(MeasurandEnumType::EnergyActiveImportRegister),
+                phase: None,
+                location: None,
+                signed_meter_value: None,
+                unit_of_measure: None,
+                custom_data: None,
+            }],
+            custom_data: None,
+        };
+        let expected = json!({
+            "timestamp": "2022-01-01T10:05:00Z",
+            "sampledValue": [{
+                "value": 1234.5,
+                "measurand": "Energy.Active.Import.Register"
+            }]
+        });
+        assert_eq!(serde_json::to_value(&mv).unwrap(), expected);
+        let back: MeterValueType = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, mv);
+    }
+
+    #[test]
+    fn unit_of_measure_omits_none_optionals() {
+        let uom = UnitOfMeasureType {
+            unit: None,
+            multiplier: None,
+            custom_data: None,
+        };
+        // Both fields default on the wire, so an all-absent unit serializes to
+        // an empty object.
+        assert_eq!(serde_json::to_value(&uom).unwrap(), json!({}));
+    }
 }

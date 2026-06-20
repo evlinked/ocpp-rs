@@ -5,7 +5,7 @@
 
 use crate::{OcppAction, OcppResponse};
 use ocpp_types::v201::{
-    CustomDataType, EvseType, IdTokenInfoType, IdTokenType, MessageContentType,
+    CustomDataType, EvseType, IdTokenInfoType, IdTokenType, MessageContentType, MeterValueType,
     TransactionEventEnumType, TransactionType, TriggerReasonEnumType,
 };
 use serde::{Deserialize, Serialize};
@@ -17,11 +17,6 @@ use serde::{Deserialize, Serialize};
 /// sequence of events: one `Started`, zero or more `Updated`, and one `Ended`
 /// (see [`TransactionEventEnumType`]).
 ///
-/// **Scope:** this slice omits the optional `meterValue` field (the
-/// `MeterValueType` / `SampledValueType` sub-objects and their measurement
-/// enums); it is deferred to a follow-up (tracked on the issue). The bundled
-/// schema still validates `meterValue` when present, so adding it later is
-/// purely additive.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TransactionEventRequest {
     /// Which event in the transaction's lifecycle this is.
@@ -54,6 +49,10 @@ pub struct TransactionEventRequest {
     /// The EVSE (and optionally connector) for which the event is reported.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evse: Option<EvseType>,
+    /// Sampled meter readings captured for this event. Each [`MeterValueType`]
+    /// groups one or more values taken at the same instant.
+    #[serde(rename = "meterValue", skip_serializing_if = "Option::is_none")]
+    pub meter_value: Option<Vec<MeterValueType>>,
     /// The identifier that authorized the transaction.
     #[serde(rename = "idToken", skip_serializing_if = "Option::is_none")]
     pub id_token: Option<IdTokenType>,
