@@ -356,6 +356,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "AuthorizeResponse",
         include_str!("../schemas/v201/AuthorizeResponse.json"),
     ),
+    (
+        "TransactionEvent",
+        include_str!("../schemas/v201/TransactionEvent.json"),
+    ),
+    (
+        "TransactionEventResponse",
+        include_str!("../schemas/v201/TransactionEventResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -1163,7 +1171,7 @@ mod tests {
     #[test]
     fn v201_loads_bundled_boot_notification_schemas() {
         let v = SchemaValidator::v201();
-        assert_eq!(v.schema_count(), 10);
+        assert_eq!(v.schema_count(), 12);
         assert!(v.has_schema("BootNotification"));
         assert!(v.has_schema("BootNotificationResponse"));
         assert!(v.has_schema("GetVariables"));
@@ -1174,6 +1182,8 @@ mod tests {
         assert!(v.has_schema("StatusNotificationResponse"));
         assert!(v.has_schema("Authorize"));
         assert!(v.has_schema("AuthorizeResponse"));
+        assert!(v.has_schema("TransactionEvent"));
+        assert!(v.has_schema("TransactionEventResponse"));
     }
 
     #[test]

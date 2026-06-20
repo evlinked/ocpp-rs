@@ -425,6 +425,111 @@ pub struct IdTokenInfoType {
     pub custom_data: Option<CustomDataType>,
 }
 
+/// Type of a `TransactionEvent` message.
+///
+/// Ports `TransactionEventEnumType` (`ocpp/v201/enums.py`). A transaction is a
+/// sequence of one `Started`, zero or more `Updated`, and one `Ended` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransactionEventEnumType {
+    Ended,
+    Started,
+    Updated,
+}
+
+/// Reason that triggered a `TransactionEvent`.
+///
+/// Ports `TriggerReasonEnumType` (`ocpp/v201/enums.py`). Wire values are
+/// PascalCase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TriggerReasonEnumType {
+    Authorized,
+    CablePluggedIn,
+    ChargingRateChanged,
+    ChargingStateChanged,
+    Deauthorized,
+    EnergyLimitReached,
+    EVCommunicationLost,
+    EVConnectTimeout,
+    MeterValueClock,
+    MeterValuePeriodic,
+    TimeLimitReached,
+    Trigger,
+    UnlockCommand,
+    StopAuthorized,
+    EVDeparted,
+    EVDetected,
+    RemoteStop,
+    RemoteStart,
+    AbnormalCondition,
+    SignedDataReceived,
+    ResetCommand,
+}
+
+/// Current charging state of an EVSE during a transaction.
+///
+/// Ports `ChargingStateEnumType` (`ocpp/v201/enums.py`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChargingStateEnumType {
+    Charging,
+    EVConnected,
+    SuspendedEV,
+    SuspendedEVSE,
+    Idle,
+}
+
+/// Reason a transaction was stopped, reported on the `Ended` event.
+///
+/// Ports `ReasonEnumType` (`ocpp/v201/enums.py`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReasonEnumType {
+    DeAuthorized,
+    EmergencyStop,
+    EnergyLimitReached,
+    EVDisconnected,
+    GroundFault,
+    ImmediateReset,
+    Local,
+    LocalOutOfCredit,
+    MasterPass,
+    Other,
+    OvercurrentFault,
+    PowerLoss,
+    PowerQuality,
+    Reboot,
+    Remote,
+    SOCLimitReached,
+    StoppedByEV,
+    TimeLimitReached,
+    Timeout,
+}
+
+/// State of an ongoing or finished transaction.
+///
+/// Ports `TransactionType`. Only `transactionId` is required; the remaining
+/// fields describe the charging state and (on the `Ended` event) the stop
+/// reason.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TransactionType {
+    /// Unique identifier of the transaction (max length 36).
+    #[serde(rename = "transactionId")]
+    pub transaction_id: String,
+    /// Current charging state.
+    #[serde(rename = "chargingState", skip_serializing_if = "Option::is_none")]
+    pub charging_state: Option<ChargingStateEnumType>,
+    /// Cumulative seconds the EV has actually been charging (excludes pauses).
+    #[serde(rename = "timeSpentCharging", skip_serializing_if = "Option::is_none")]
+    pub time_spent_charging: Option<i32>,
+    /// Why the transaction was stopped (present on the `Ended` event).
+    #[serde(rename = "stoppedReason", skip_serializing_if = "Option::is_none")]
+    pub stopped_reason: Option<ReasonEnumType>,
+    /// `RequestStartTransaction` id that started this transaction remotely.
+    #[serde(rename = "remoteStartId", skip_serializing_if = "Option::is_none")]
+    pub remote_start_id: Option<i32>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -823,5 +928,41 @@ mod tests {
         assert_eq!(wire["evseId"], json!([1, 2]));
         let back: IdTokenInfoType = serde_json::from_value(wire).unwrap();
         assert_eq!(back, info);
+    }
+
+    #[test]
+    fn transaction_event_enums_serialize_pascal_case() {
+        assert_eq!(
+            serde_json::to_value(TransactionEventEnumType::Started).unwrap(),
+            json!("Started")
+        );
+        assert_eq!(
+            serde_json::to_value(TriggerReasonEnumType::EVCommunicationLost).unwrap(),
+            json!("EVCommunicationLost")
+        );
+        assert_eq!(
+            serde_json::to_value(ChargingStateEnumType::SuspendedEVSE).unwrap(),
+            json!("SuspendedEVSE")
+        );
+        assert_eq!(
+            serde_json::to_value(ReasonEnumType::SOCLimitReached).unwrap(),
+            json!("SOCLimitReached")
+        );
+    }
+
+    #[test]
+    fn transaction_type_omits_none_optionals() {
+        let tx = TransactionType {
+            transaction_id: "tx-001".to_string(),
+            charging_state: None,
+            time_spent_charging: None,
+            stopped_reason: None,
+            remote_start_id: None,
+            custom_data: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&tx).unwrap(),
+            json!({ "transactionId": "tx-001" })
+        );
     }
 }
