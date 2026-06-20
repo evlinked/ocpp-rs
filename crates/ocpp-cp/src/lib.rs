@@ -1215,9 +1215,11 @@ impl ChargePoint {
         {
             let connectors = connectors.clone();
             let charging_profiles = charging_profiles.clone();
+            let active_transactions = active_transactions.clone();
             d.on(move |req: SetChargingProfileRequest| {
                 let connectors = connectors.clone();
                 let charging_profiles = charging_profiles.clone();
+                let active_transactions = active_transactions.clone();
                 async move {
                     let connector_id = req.connector_id;
                     // connector 0 is the CP-wide slot (not in the connector map);
@@ -1226,9 +1228,20 @@ impl ChargePoint {
                         Ok(cid) => connectors.read().await.contains_key(&cid),
                         Err(_) => false,
                     };
+                    // A TxProfile is transaction-scoped (§5.16.1): it is only
+                    // valid on a connector that currently has an ongoing
+                    // transaction. `active_transactions` maps transactionId →
+                    // ConnectorId, so the connector is busy iff it appears as a
+                    // value. (Connector 0 never has a transaction; its TxProfile
+                    // rejection is handled by `set_profile_status`.)
+                    let transaction_active = match ConnectorId::new(connector_id as u32) {
+                        Ok(cid) => active_transactions.read().await.values().any(|c| *c == cid),
+                        Err(_) => false,
+                    };
                     let status = crate::charging_profiles::set_profile_status(
                         connector_id,
                         connector_known,
+                        transaction_active,
                         &req.cs_charging_profiles.charging_profile_purpose,
                     );
                     if status == ChargingProfileStatus::Accepted {

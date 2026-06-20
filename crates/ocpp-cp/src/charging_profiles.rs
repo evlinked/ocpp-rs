@@ -25,23 +25,28 @@ use ocpp_types::v16j::{
 /// Decide the [`ChargingProfileStatus`] for a `SetChargingProfile` purely from
 /// the spec's placement rules, independent of any stored state.
 ///
-/// Faithful to OCPP 1.6J §5.16 / the `ChargingProfilePurposeType` documentation:
+/// Faithful to OCPP 1.6J §5.16 / §5.16.1 / the `ChargingProfilePurposeType`
+/// documentation:
 ///
 /// * `ChargePointMaxProfile` MAY only be installed at connector 0 (the
 ///   charge-point-wide profile) — at any real connector it is `Rejected`.
-/// * `TxProfile` is transaction-scoped and SHALL only target a real connector
-///   (`> 0`) — at connector 0 it is `Rejected`.
+/// * `TxProfile` is transaction-scoped (§5.16.1) and SHALL only target a real
+///   connector (`> 0`) that **currently has an ongoing transaction** — at
+///   connector 0, or at a real connector with no active transaction, it is
+///   `Rejected`.
 /// * `TxDefaultProfile` is valid at connector 0 (applies to all connectors) or
 ///   at a specific connector.
 /// * An unknown connector id (neither 0 nor a connector this CP exposes) is
 ///   `Rejected`.
 ///
 /// `connector_known` tells the function whether `connector_id` (when `> 0`)
-/// names a connector that exists on this charge point; the caller supplies it
-/// from the live connector map.
+/// names a connector that exists on this charge point; `transaction_active`
+/// tells it whether that connector currently has an ongoing transaction. Both
+/// are supplied by the caller from live charge-point state.
 pub fn set_profile_status(
     connector_id: i32,
     connector_known: bool,
+    transaction_active: bool,
     purpose: &ChargingProfilePurposeType,
 ) -> ChargingProfileStatus {
     // Connector 0 = charge-point-wide; any other id must be a real connector.
@@ -53,8 +58,10 @@ pub fn set_profile_status(
         ChargingProfilePurposeType::ChargePointMaxProfile if connector_id != 0 => {
             ChargingProfileStatus::Rejected
         }
-        // Transaction profile: a real connector only.
-        ChargingProfilePurposeType::TxProfile if connector_id == 0 => {
+        // Transaction profile: a real connector with an ongoing transaction
+        // (§5.16.1). Rejected at connector 0, or when the target connector has
+        // no active transaction.
+        ChargingProfilePurposeType::TxProfile if connector_id == 0 || !transaction_active => {
             ChargingProfileStatus::Rejected
         }
         _ => ChargingProfileStatus::Accepted,
@@ -220,23 +227,40 @@ mod tests {
     #[test]
     fn cp_max_profile_only_at_connector_zero() {
         assert_eq!(
-            set_profile_status(0, false, &ChargingProfilePurposeType::ChargePointMaxProfile),
+            set_profile_status(
+                0,
+                false,
+                false,
+                &ChargingProfilePurposeType::ChargePointMaxProfile
+            ),
             ChargingProfileStatus::Accepted
         );
         assert_eq!(
-            set_profile_status(1, true, &ChargingProfilePurposeType::ChargePointMaxProfile),
+            set_profile_status(
+                1,
+                true,
+                false,
+                &ChargingProfilePurposeType::ChargePointMaxProfile
+            ),
             ChargingProfileStatus::Rejected
         );
     }
 
     #[test]
-    fn tx_profile_only_at_real_connector() {
+    fn tx_profile_requires_real_connector_with_active_transaction() {
+        // Connector 0 is never valid for a TxProfile, transaction or not.
         assert_eq!(
-            set_profile_status(0, false, &ChargingProfilePurposeType::TxProfile),
+            set_profile_status(0, false, true, &ChargingProfilePurposeType::TxProfile),
             ChargingProfileStatus::Rejected
         );
+        // A real connector with no ongoing transaction → Rejected (§5.16.1).
         assert_eq!(
-            set_profile_status(1, true, &ChargingProfilePurposeType::TxProfile),
+            set_profile_status(1, true, false, &ChargingProfilePurposeType::TxProfile),
+            ChargingProfileStatus::Rejected
+        );
+        // A real connector with an ongoing transaction → Accepted.
+        assert_eq!(
+            set_profile_status(1, true, true, &ChargingProfilePurposeType::TxProfile),
             ChargingProfileStatus::Accepted
         );
     }
@@ -244,19 +268,36 @@ mod tests {
     #[test]
     fn unknown_connector_is_rejected() {
         assert_eq!(
-            set_profile_status(7, false, &ChargingProfilePurposeType::TxDefaultProfile),
+            set_profile_status(
+                7,
+                false,
+                false,
+                &ChargingProfilePurposeType::TxDefaultProfile
+            ),
             ChargingProfileStatus::Rejected
         );
     }
 
     #[test]
     fn tx_default_profile_valid_at_zero_and_real_connector() {
+        // TxDefaultProfile is not transaction-scoped: valid regardless of
+        // whether a transaction is active.
         assert_eq!(
-            set_profile_status(0, false, &ChargingProfilePurposeType::TxDefaultProfile),
+            set_profile_status(
+                0,
+                false,
+                false,
+                &ChargingProfilePurposeType::TxDefaultProfile
+            ),
             ChargingProfileStatus::Accepted
         );
         assert_eq!(
-            set_profile_status(2, true, &ChargingProfilePurposeType::TxDefaultProfile),
+            set_profile_status(
+                2,
+                true,
+                false,
+                &ChargingProfilePurposeType::TxDefaultProfile
+            ),
             ChargingProfileStatus::Accepted
         );
     }
