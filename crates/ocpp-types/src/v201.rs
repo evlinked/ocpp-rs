@@ -8,7 +8,7 @@
 //!
 //! It is the foundation slice for **M7 — OCPP 2.0.1**; today it carries what
 //! the core lifecycle messages (`BootNotification`, `Heartbeat`,
-//! `StatusNotification`) need. Subsequent 2.0.1 messages extend it.
+//! `StatusNotification`, `Authorize`) need. Subsequent 2.0.1 messages extend it.
 
 use serde::{Deserialize, Serialize};
 
@@ -56,6 +56,63 @@ pub enum ConnectorStatusEnumType {
     Reserved,
     Unavailable,
     Faulted,
+}
+
+/// Enumeration of possible `idToken` types.
+///
+/// Ports `IdTokenEnumType` (`ocpp/v201/enums.py`). Wire values are the verbatim
+/// spec strings; several are not idiomatic Rust identifiers (`eMAID`, the
+/// `ISO*` acronyms), so those variants carry an explicit `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IdTokenEnumType {
+    Central,
+    #[serde(rename = "eMAID")]
+    EMaid,
+    #[serde(rename = "ISO14443")]
+    Iso14443,
+    #[serde(rename = "ISO15693")]
+    Iso15693,
+    KeyCode,
+    Local,
+    MacAddress,
+    NoAuthorization,
+}
+
+/// Current authorization status of an `idToken`.
+///
+/// Ports `AuthorizationStatusEnumType` (`ocpp/v201/enums.py`). A richer set than
+/// the 1.6J `AuthorizationStatus` (which has only `Accepted`/`Blocked`/
+/// `Expired`/`Invalid`/`ConcurrentTx`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AuthorizationStatusEnumType {
+    Accepted,
+    Blocked,
+    ConcurrentTx,
+    Expired,
+    Invalid,
+    NoCredit,
+    #[serde(rename = "NotAllowedTypeEVSE")]
+    NotAllowedTypeEvse,
+    NotAtThisLocation,
+    NotAtThisTime,
+    Unknown,
+}
+
+/// Format of a message to be displayed on a Charging Station.
+///
+/// Ports `MessageFormatEnumType` (`ocpp/v201/enums.py`). All four wire values
+/// are all-caps acronyms, so each variant is renamed from its idiomatic Rust
+/// spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageFormatEnumType {
+    #[serde(rename = "ASCII")]
+    Ascii,
+    #[serde(rename = "HTML")]
+    Html,
+    #[serde(rename = "URI")]
+    Uri,
+    #[serde(rename = "UTF8")]
+    Utf8,
 }
 
 // =============================================================================
@@ -179,6 +236,24 @@ pub struct EvseType {
     pub custom_data: Option<CustomDataType>,
 }
 
+/// A case-insensitive additional identifier, paired with its type, used to
+/// support multiple forms of identifiers alongside the primary `idToken`.
+///
+/// Ports `AdditionalInfoType`. Both fields are required.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdditionalInfoType {
+    /// The additional identifier (max length 36).
+    #[serde(rename = "additionalIdToken")]
+    pub additional_id_token: String,
+    /// The type of the additional identifier; a custom, party-agreed string
+    /// (max length 50) — *not* an [`IdTokenEnumType`].
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 /// A physical or logical component of the device model.
 ///
 /// Ports `ComponentType`. Only `name` is required; `instance` disambiguates
@@ -195,6 +270,47 @@ pub struct ComponentType {
     /// EVSE the component belongs to, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub evse: Option<EvseType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// A case-insensitive identifier used for authorization, plus the type of
+/// authorization it represents.
+///
+/// Ports `IdTokenType`. `id_token` and `kind` are required; the schema also
+/// caps `additional_info` at a minimum of one item when present.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IdTokenType {
+    /// The identifier itself — case-insensitive; may hold an RFID tag's hidden
+    /// id, a UUID, etc. (max length 36).
+    #[serde(rename = "idToken")]
+    pub id_token: String,
+    /// The kind of identifier this is.
+    #[serde(rename = "type")]
+    pub kind: IdTokenEnumType,
+    /// Additional identifiers (e.g. a linked parent token). Omitted entirely
+    /// when absent; the schema requires at least one item when present.
+    #[serde(rename = "additionalInfo", skip_serializing_if = "Option::is_none")]
+    pub additional_info: Option<Vec<AdditionalInfoType>>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// Message details for a message to be displayed on a Charging Station.
+///
+/// Ports `MessageContentType`. `format` and `content` are required. Carried by
+/// [`IdTokenInfoType::personal_message`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageContentType {
+    /// Format of the message contents.
+    pub format: MessageFormatEnumType,
+    /// The message contents (max length 512).
+    pub content: String,
+    /// Message language identifier (RFC 5646 code; max length 8).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     /// Vendor extension.
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
@@ -263,6 +379,47 @@ pub struct GetVariableResultType {
         skip_serializing_if = "Option::is_none"
     )]
     pub attribute_status_info: Option<StatusInfoType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// Status information about an identifier, returned in an `AuthorizeResponse`
+/// (and reused by the 2.0.1 transaction model).
+///
+/// Ports `IdTokenInfoType`. Only `status` is required; `cache_expiry_date_time`
+/// is for caching only and (per the spec) should not by itself stop an active
+/// charging session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct IdTokenInfoType {
+    /// Current status of the identifier.
+    pub status: AuthorizationStatusEnumType,
+    /// Date/time after which the cached token must be considered invalid
+    /// (RFC 3339 / ISO 8601). Caching hint only.
+    #[serde(
+        rename = "cacheExpiryDateTime",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cache_expiry_date_time: Option<String>,
+    /// Business priority, -9..=9 (default 0); higher is more important.
+    #[serde(rename = "chargingPriority", skip_serializing_if = "Option::is_none")]
+    pub charging_priority: Option<i32>,
+    /// Preferred UI language of the identifier's user (RFC 5646; max length 8).
+    #[serde(rename = "language1", skip_serializing_if = "Option::is_none")]
+    pub language1: Option<String>,
+    /// EVSE ids the token is restricted to; absent means the whole station.
+    /// The schema requires at least one item when present.
+    #[serde(rename = "evseId", skip_serializing_if = "Option::is_none")]
+    pub evse_id: Option<Vec<i32>>,
+    /// Second preferred UI language (RFC 5646; max length 8).
+    #[serde(rename = "language2", skip_serializing_if = "Option::is_none")]
+    pub language2: Option<String>,
+    /// A parent/group token this identifier belongs to.
+    #[serde(rename = "groupIdToken", skip_serializing_if = "Option::is_none")]
+    pub group_id_token: Option<IdTokenType>,
+    /// A personal message to display for this identifier.
+    #[serde(rename = "personalMessage", skip_serializing_if = "Option::is_none")]
+    pub personal_message: Option<MessageContentType>,
     /// Vendor extension.
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
@@ -403,6 +560,68 @@ mod tests {
     }
 
     #[test]
+    fn id_token_enum_serializes_exact_wire_values() {
+        for (variant, wire) in [
+            (IdTokenEnumType::Central, "Central"),
+            (IdTokenEnumType::EMaid, "eMAID"),
+            (IdTokenEnumType::Iso14443, "ISO14443"),
+            (IdTokenEnumType::Iso15693, "ISO15693"),
+            (IdTokenEnumType::KeyCode, "KeyCode"),
+            (IdTokenEnumType::Local, "Local"),
+            (IdTokenEnumType::MacAddress, "MacAddress"),
+            (IdTokenEnumType::NoAuthorization, "NoAuthorization"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            let back: IdTokenEnumType = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, variant);
+        }
+        // Unknown / mis-cased values are rejected.
+        assert!(serde_json::from_value::<IdTokenEnumType>(json!("emaid")).is_err());
+        assert!(serde_json::from_value::<IdTokenEnumType>(json!("Bogus")).is_err());
+    }
+
+    #[test]
+    fn authorization_status_enum_serializes_exact_wire_values() {
+        for (variant, wire) in [
+            (AuthorizationStatusEnumType::Accepted, "Accepted"),
+            (AuthorizationStatusEnumType::Blocked, "Blocked"),
+            (AuthorizationStatusEnumType::ConcurrentTx, "ConcurrentTx"),
+            (AuthorizationStatusEnumType::Expired, "Expired"),
+            (AuthorizationStatusEnumType::Invalid, "Invalid"),
+            (AuthorizationStatusEnumType::NoCredit, "NoCredit"),
+            (
+                AuthorizationStatusEnumType::NotAllowedTypeEvse,
+                "NotAllowedTypeEVSE",
+            ),
+            (
+                AuthorizationStatusEnumType::NotAtThisLocation,
+                "NotAtThisLocation",
+            ),
+            (AuthorizationStatusEnumType::NotAtThisTime, "NotAtThisTime"),
+            (AuthorizationStatusEnumType::Unknown, "Unknown"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            let back: AuthorizationStatusEnumType = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, variant);
+        }
+        assert!(serde_json::from_value::<AuthorizationStatusEnumType>(json!("Bogus")).is_err());
+    }
+
+    #[test]
+    fn message_format_enum_round_trips() {
+        for (variant, wire) in [
+            (MessageFormatEnumType::Ascii, "ASCII"),
+            (MessageFormatEnumType::Html, "HTML"),
+            (MessageFormatEnumType::Uri, "URI"),
+            (MessageFormatEnumType::Utf8, "UTF8"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            let back: MessageFormatEnumType = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
     fn get_variable_status_serializes_pascal_case() {
         for (variant, wire) in [
             (GetVariableStatusEnumType::Accepted, "Accepted"),
@@ -512,5 +731,97 @@ mod tests {
         assert_eq!(wire["attributeType"], json!("Actual"));
         let back: GetVariableResultType = serde_json::from_value(wire).unwrap();
         assert_eq!(back, result);
+    }
+
+    #[test]
+    fn id_token_minimal_matches_wire_json() {
+        // Reference: tests/v201/conftest.py — a bare RFID token.
+        let token = IdTokenType {
+            id_token: "045918E24B6D80".to_string(),
+            kind: IdTokenEnumType::Iso14443,
+            additional_info: None,
+            custom_data: None,
+        };
+        let expected = json!({
+            "idToken": "045918E24B6D80",
+            "type": "ISO14443"
+        });
+        assert_eq!(serde_json::to_value(&token).unwrap(), expected);
+        let back: IdTokenType = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, token);
+    }
+
+    #[test]
+    fn id_token_with_additional_info_round_trips() {
+        let token = IdTokenType {
+            id_token: "primary".to_string(),
+            kind: IdTokenEnumType::Central,
+            additional_info: Some(vec![AdditionalInfoType {
+                additional_id_token: "linked".to_string(),
+                kind: "VendorScheme".to_string(),
+                custom_data: None,
+            }]),
+            custom_data: None,
+        };
+        let wire = serde_json::to_value(&token).unwrap();
+        assert_eq!(
+            wire["additionalInfo"][0]["additionalIdToken"],
+            json!("linked")
+        );
+        assert_eq!(wire["additionalInfo"][0]["type"], json!("VendorScheme"));
+        let back: IdTokenType = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, token);
+    }
+
+    #[test]
+    fn id_token_info_minimal_matches_wire_json() {
+        let info = IdTokenInfoType {
+            status: AuthorizationStatusEnumType::Accepted,
+            cache_expiry_date_time: None,
+            charging_priority: None,
+            language1: None,
+            evse_id: None,
+            language2: None,
+            group_id_token: None,
+            personal_message: None,
+            custom_data: None,
+        };
+        // Only the required `status` field appears — no nulls.
+        assert_eq!(
+            serde_json::to_value(&info).unwrap(),
+            json!({ "status": "Accepted" })
+        );
+    }
+
+    #[test]
+    fn id_token_info_full_round_trips_with_nested_objects() {
+        let info = IdTokenInfoType {
+            status: AuthorizationStatusEnumType::Accepted,
+            cache_expiry_date_time: Some("2030-01-01T00:00:00Z".to_string()),
+            charging_priority: Some(5),
+            language1: Some("en".to_string()),
+            evse_id: Some(vec![1, 2]),
+            language2: Some("nl".to_string()),
+            group_id_token: Some(IdTokenType {
+                id_token: "group-1".to_string(),
+                kind: IdTokenEnumType::Central,
+                additional_info: None,
+                custom_data: None,
+            }),
+            personal_message: Some(MessageContentType {
+                format: MessageFormatEnumType::Utf8,
+                content: "Welcome".to_string(),
+                language: Some("en".to_string()),
+                custom_data: None,
+            }),
+            custom_data: None,
+        };
+        let wire = serde_json::to_value(&info).unwrap();
+        assert_eq!(wire["chargingPriority"], json!(5));
+        assert_eq!(wire["groupIdToken"]["idToken"], json!("group-1"));
+        assert_eq!(wire["personalMessage"]["format"], json!("UTF8"));
+        assert_eq!(wire["evseId"], json!([1, 2]));
+        let back: IdTokenInfoType = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, info);
     }
 }

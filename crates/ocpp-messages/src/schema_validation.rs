@@ -351,6 +351,11 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "StatusNotificationResponse",
         include_str!("../schemas/v201/StatusNotificationResponse.json"),
     ),
+    ("Authorize", include_str!("../schemas/v201/Authorize.json")),
+    (
+        "AuthorizeResponse",
+        include_str!("../schemas/v201/AuthorizeResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -1158,7 +1163,7 @@ mod tests {
     #[test]
     fn v201_loads_bundled_boot_notification_schemas() {
         let v = SchemaValidator::v201();
-        assert_eq!(v.schema_count(), 8);
+        assert_eq!(v.schema_count(), 10);
         assert!(v.has_schema("BootNotification"));
         assert!(v.has_schema("BootNotificationResponse"));
         assert!(v.has_schema("GetVariables"));
@@ -1167,6 +1172,76 @@ mod tests {
         assert!(v.has_schema("HeartbeatResponse"));
         assert!(v.has_schema("StatusNotification"));
         assert!(v.has_schema("StatusNotificationResponse"));
+        assert!(v.has_schema("Authorize"));
+        assert!(v.has_schema("AuthorizeResponse"));
+    }
+
+    #[test]
+    fn v201_authorize_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        // Reference: tests/v201/conftest.py.
+        let call = json!({
+            "idToken": { "idToken": "045918E24B6D80", "type": "ISO14443" }
+        });
+        assert!(v.validate_call("Authorize", &call).is_ok());
+        let result = json!({ "idTokenInfo": { "status": "Accepted" } });
+        assert!(v.validate_call_result("Authorize", &result).is_ok());
+    }
+
+    #[test]
+    fn v201_authorize_call_missing_required_id_token_fails() {
+        let v = SchemaValidator::v201();
+        // `idToken` is the one required property.
+        let err = v.validate_call("Authorize", &json!({})).unwrap_err();
+        assert!(matches!(err, OcppError::SchemaViolation { .. }));
+    }
+
+    #[test]
+    fn v201_authorize_call_unknown_id_token_type_fails() {
+        let v = SchemaValidator::v201();
+        let call = json!({
+            "idToken": { "idToken": "abc", "type": "RFID" }
+        });
+        assert!(v.validate_call("Authorize", &call).is_err());
+    }
+
+    #[test]
+    fn v201_authorize_call_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        let call = json!({
+            "idToken": { "idToken": "abc", "type": "ISO14443" },
+            "bogusExtra": true
+        });
+        assert!(v.validate_call("Authorize", &call).is_err());
+    }
+
+    #[test]
+    fn v201_authorize_result_missing_status_fails() {
+        let v = SchemaValidator::v201();
+        // `status` is required inside `idTokenInfo`.
+        let result = json!({ "idTokenInfo": {} });
+        let err = v.validate_call_result("Authorize", &result).unwrap_err();
+        assert!(matches!(err, OcppError::SchemaViolation { .. }));
+    }
+
+    #[test]
+    fn v201_authorize_result_unknown_status_fails() {
+        let v = SchemaValidator::v201();
+        let result = json!({ "idTokenInfo": { "status": "Maybe" } });
+        assert!(v.validate_call_result("Authorize", &result).is_err());
+    }
+
+    #[test]
+    fn v201_authorize_call_accepts_deferred_certificate_fields() {
+        // The Rust `AuthorizeRequest` defers the ISO 15118 certificate path, but
+        // the bundled schema is verbatim and still validates those fields when a
+        // peer sends them.
+        let v = SchemaValidator::v201();
+        let call = json!({
+            "idToken": { "idToken": "abc", "type": "eMAID" },
+            "certificate": "-----BEGIN CERTIFICATE-----\nMIIB...\n-----END CERTIFICATE-----"
+        });
+        assert!(v.validate_call("Authorize", &call).is_ok());
     }
 
     #[test]
