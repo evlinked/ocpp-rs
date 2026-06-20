@@ -829,9 +829,10 @@ mod tests {
 
         #[test]
         fn response_empty_is_object_and_full_round_trips() {
+            let v = SchemaValidator::v201();
             let empty = TransactionEventResponse::default();
             assert_eq!(serde_json::to_value(&empty).unwrap(), json!({}));
-            assert!(SchemaValidator::v201()
+            assert!(v
                 .validate_call_result("TransactionEvent", &json!({}))
                 .is_ok());
 
