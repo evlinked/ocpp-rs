@@ -10,8 +10,8 @@
 //! the core lifecycle messages (`BootNotification`, `Heartbeat`,
 //! `StatusNotification`, `Authorize`) need. Subsequent 2.0.1 messages extend it.
 //!
-//! The definitions are split by *kind* — [`enums`] for the `*EnumType`s and
-//! [`datatypes`] for the shared struct datatypes — and re-exported here so the
+//! The definitions are split by *kind* — `enums` for the `*EnumType`s and
+//! `datatypes` for the shared struct datatypes — and re-exported here so the
 //! public path stays `ocpp_types::v201::*`. New messages add enum variants and
 //! datatypes to the two well-separated files instead of one monolith.
 
