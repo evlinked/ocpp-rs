@@ -456,4 +456,96 @@ mod tests {
             json!({ "transactionId": "tx-001" })
         );
     }
+
+    #[test]
+    fn set_variable_status_serializes_pascal_case() {
+        for (variant, wire) in [
+            (SetVariableStatusEnumType::Accepted, "Accepted"),
+            (SetVariableStatusEnumType::Rejected, "Rejected"),
+            (
+                SetVariableStatusEnumType::UnknownComponent,
+                "UnknownComponent",
+            ),
+            (
+                SetVariableStatusEnumType::UnknownVariable,
+                "UnknownVariable",
+            ),
+            (
+                SetVariableStatusEnumType::NotSupportedAttributeType,
+                "NotSupportedAttributeType",
+            ),
+            (SetVariableStatusEnumType::RebootRequired, "RebootRequired"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            let back: SetVariableStatusEnumType = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, variant);
+        }
+        // `RebootRequired` is write-path only; the read-path status enum never
+        // carries it, and unknown values are rejected.
+        assert!(serde_json::from_value::<SetVariableStatusEnumType>(json!("Bogus")).is_err());
+        assert!(
+            serde_json::from_value::<GetVariableStatusEnumType>(json!("RebootRequired")).is_err()
+        );
+    }
+
+    #[test]
+    fn set_variable_data_omits_none_optionals() {
+        let data = SetVariableDataType {
+            attribute_value: "300".to_string(),
+            component: ComponentType {
+                name: "OCPPCommCtrlr".to_string(),
+                instance: None,
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: "HeartbeatInterval".to_string(),
+                instance: None,
+                custom_data: None,
+            },
+            attribute_type: None,
+            custom_data: None,
+        };
+        let expected = json!({
+            "attributeValue": "300",
+            "component": { "name": "OCPPCommCtrlr" },
+            "variable": { "name": "HeartbeatInterval" }
+        });
+        assert_eq!(serde_json::to_value(&data).unwrap(), expected);
+        let back: SetVariableDataType = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, data);
+    }
+
+    #[test]
+    fn set_variable_result_round_trips_with_status_info() {
+        let result = SetVariableResultType {
+            attribute_status: SetVariableStatusEnumType::RebootRequired,
+            component: ComponentType {
+                name: "OCPPCommCtrlr".to_string(),
+                instance: None,
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: "HeartbeatInterval".to_string(),
+                instance: None,
+                custom_data: None,
+            },
+            attribute_type: Some(AttributeEnumType::Actual),
+            attribute_status_info: Some(StatusInfoType {
+                reason_code: "Queued".to_string(),
+                additional_info: Some("applies after reboot".to_string()),
+                custom_data: None,
+            }),
+            custom_data: None,
+        };
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(wire["attributeStatus"], json!("RebootRequired"));
+        assert_eq!(wire["attributeType"], json!("Actual"));
+        assert_eq!(wire["attributeStatusInfo"]["reasonCode"], json!("Queued"));
+        // The result echoes no value back, unlike its read-path counterpart.
+        assert!(wire.get("attributeValue").is_none());
+        let back: SetVariableResultType = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, result);
+    }
 }
