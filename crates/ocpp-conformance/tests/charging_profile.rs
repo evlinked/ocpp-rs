@@ -20,18 +20,24 @@ use std::time::Duration;
 use ocpp_cp::{ChargePoint, ChargePointConfig};
 use ocpp_messages::v16j::{
     BootNotificationRequest, BootNotificationResponse, HeartbeatRequest, HeartbeatResponse,
-    RegistrationStatus, StatusNotificationRequest, StatusNotificationResponse,
+    MeterValuesRequest, MeterValuesResponse, RegistrationStatus, StartTransactionRequest,
+    StartTransactionResponse, StatusNotificationRequest, StatusNotificationResponse,
 };
 use ocpp_messages::ActionDispatcher;
 use ocpp_transport::server::OcppServer;
 use ocpp_transport::{DispatchHandler, TransportConfig};
+use ocpp_types::common::{AuthorizationStatus, IdTagInfo};
 use ocpp_types::v16j::{
     ChargingProfile, ChargingProfileKindType, ChargingProfilePurposeType, ChargingProfileStatus,
     ChargingRateUnitType, ChargingSchedule, ChargingSchedulePeriod, ClearChargingProfileStatus,
 };
+use ocpp_types::ConnectorId;
 
 /// A minimal CSMS dispatcher — the profile commands flow CSMS→CP, so the CSMS
-/// needs no Smart Charging handlers, only enough to let the CP boot.
+/// needs only enough to let the CP boot and to drive a transaction (so a
+/// `TxProfile`'s transaction-scoped acceptance can be exercised). It assigns a
+/// fixed `transactionId` and acknowledges the periodic `MeterValues` the CP
+/// emits while charging.
 fn csms_dispatcher() -> ActionDispatcher {
     let mut d = ActionDispatcher::new();
     d.on(|_req: BootNotificationRequest| async move {
@@ -47,6 +53,17 @@ fn csms_dispatcher() -> ActionDispatcher {
         })
     });
     d.on(|_req: StatusNotificationRequest| async move { Ok(StatusNotificationResponse {}) });
+    d.on(|_req: StartTransactionRequest| async move {
+        Ok(StartTransactionResponse {
+            id_tag_info: IdTagInfo {
+                status: AuthorizationStatus::Accepted,
+                parent_id_tag: None,
+                expiry_date: None,
+            },
+            transaction_id: 4242,
+        })
+    });
+    d.on(|_req: MeterValuesRequest| async move { Ok(MeterValuesResponse {}) });
     d
 }
 
@@ -193,6 +210,70 @@ async fn set_charging_profile_installs_and_validates() {
     server.stop().await.expect("server stop");
 }
 
+/// A `TxProfile` is transaction-scoped (OCPP 1.6J §5.16.1): the CP SHALL reject
+/// it on a connector with no ongoing transaction, and accept it once a
+/// transaction is running there.
+#[tokio::test]
+async fn set_tx_profile_requires_active_transaction() {
+    let cp_id = "CP_SCP_03";
+    let (mut server, addr) = start_csms().await;
+    let cp = ChargePoint::new(cp_config(addr, cp_id)).expect("build charge point");
+    cp.connect().await.expect("connect + boot sequence");
+    assert!(server.is_cp_connected(cp_id), "CSMS must route to the CP");
+
+    // 1. TxProfile on idle connector 1 (no transaction) → Rejected, not stored.
+    let status = tokio::time::timeout(
+        TIMEOUT,
+        server.set_charging_profile(
+            cp_id,
+            1,
+            profile(20, 0, ChargingProfilePurposeType::TxProfile, 16.0),
+        ),
+    )
+    .await
+    .expect("set resolves in time")
+    .expect("set resolves");
+    assert_eq!(
+        status,
+        ChargingProfileStatus::Rejected,
+        "a TxProfile on a connector with no active transaction is rejected"
+    );
+    assert!(
+        cp.charging_profiles().profiles_for(1).is_empty(),
+        "the rejected TxProfile is not stored"
+    );
+
+    // Start a transaction on connector 1 (the CSMS accepts it, assigning a
+    // transactionId), so the connector now has an ongoing transaction.
+    let connector = ConnectorId::new(1).expect("connector 1");
+    let transaction_id = cp
+        .start_transaction(connector, "TAG_SCP_03", 0)
+        .await
+        .expect("transaction starts");
+    assert_eq!(transaction_id, 4242);
+
+    // 2. TxProfile on connector 1 with an active transaction → Accepted, stored.
+    let status = server
+        .set_charging_profile(
+            cp_id,
+            1,
+            profile(21, 0, ChargingProfilePurposeType::TxProfile, 8.0),
+        )
+        .await
+        .expect("set resolves");
+    assert_eq!(
+        status,
+        ChargingProfileStatus::Accepted,
+        "a TxProfile on a connector with an active transaction is accepted"
+    );
+    let installed = cp.charging_profiles().profiles_for(1);
+    assert_eq!(installed.len(), 1, "the accepted TxProfile is stored");
+    assert_eq!(installed[0].charging_profile_id, 21);
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
 /// ClearChargingProfile removes profiles matching the filters (→ Accepted) and
 /// reports Unknown when nothing matches.
 #[tokio::test]
@@ -202,7 +283,11 @@ async fn clear_charging_profile_filters_and_unknown() {
     let cp = ChargePoint::new(cp_config(addr, cp_id)).expect("build charge point");
     cp.connect().await.expect("connect + boot sequence");
 
-    // Install a CP-wide max profile and two connector-1 profiles.
+    // Install a CP-wide max profile and two connector-1 profiles. Both
+    // connector-1 profiles are TxDefaultProfiles (at distinct stack levels) so
+    // they are legitimately Accepted on an idle connector — a TxProfile would be
+    // Rejected here since no transaction is active (§5.16.1; see the dedicated
+    // `set_tx_profile_requires_active_transaction` test).
     for (cid, p) in [
         (
             0,
@@ -219,7 +304,7 @@ async fn clear_charging_profile_filters_and_unknown() {
         ),
         (
             1,
-            profile(11, 1, ChargingProfilePurposeType::TxProfile, 8.0),
+            profile(11, 1, ChargingProfilePurposeType::TxDefaultProfile, 8.0),
         ),
     ] {
         let status = server
