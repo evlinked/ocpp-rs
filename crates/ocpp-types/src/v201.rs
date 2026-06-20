@@ -192,6 +192,50 @@ pub struct ChargingStationType {
     pub custom_data: Option<CustomDataType>,
 }
 
+// =============================================================================
+// Device model: components, variables, and the GetVariables enums
+// =============================================================================
+
+/// Which attribute of a variable a request reads or a result reports.
+///
+/// Ports `AttributeEnumType` (`ocpp/v201/enums.py`). When omitted on the wire
+/// the 2.0.1 default is `Actual`. Wire values are PascalCase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttributeEnumType {
+    Actual,
+    Target,
+    MinSet,
+    MaxSet,
+}
+
+/// Result of reading a single component-variable attribute.
+///
+/// Ports `GetVariableStatusEnumType` (`ocpp/v201/enums.py`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GetVariableStatusEnumType {
+    Accepted,
+    Rejected,
+    UnknownComponent,
+    UnknownVariable,
+    NotSupportedAttributeType,
+}
+
+/// Electric Vehicle Supply Equipment — an EVSE (and optionally a connector
+/// within it) that scopes a [`ComponentType`].
+///
+/// Ports `EVSEType`. Only `id` is required.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EvseType {
+    /// EVSE identifier within the Charging Station (≥ 1).
+    pub id: i32,
+    /// Connector within the EVSE, if the component is connector-scoped.
+    #[serde(rename = "connectorId", skip_serializing_if = "Option::is_none")]
+    pub connector_id: Option<i32>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 /// A case-insensitive additional identifier, paired with its type, used to
 /// support multiple forms of identifiers alongside the primary `idToken`.
 ///
@@ -205,6 +249,27 @@ pub struct AdditionalInfoType {
     /// (max length 50) — *not* an [`IdTokenEnumType`].
     #[serde(rename = "type")]
     pub kind: String,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// A physical or logical component of the device model.
+///
+/// Ports `ComponentType`. Only `name` is required; `instance` disambiguates
+/// multiple instances of the same component and `evse` scopes it to a
+/// particular EVSE/connector.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComponentType {
+    /// Name of the component (case-insensitive; max length 50).
+    pub name: String,
+    /// Name of the instance in case the component exists as multiple instances
+    /// (max length 50).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    /// EVSE the component belongs to, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evse: Option<EvseType>,
     /// Vendor extension.
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
@@ -246,6 +311,74 @@ pub struct MessageContentType {
     /// Message language identifier (RFC 5646 code; max length 8).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// Reference key to a variable within a [`ComponentType`].
+///
+/// Ports `VariableType`. Only `name` is required.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariableType {
+    /// Name of the variable (case-insensitive; max length 50).
+    pub name: String,
+    /// Name of the instance in case the variable exists as multiple instances
+    /// (max length 50).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// One entry in a `GetVariables` request: which attribute of which
+/// component-variable to read.
+///
+/// Ports `GetVariableDataType`. `component` and `variable` are required;
+/// `attribute_type` defaults to [`AttributeEnumType::Actual`] when omitted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetVariableDataType {
+    /// Component for which the variable is requested.
+    pub component: ComponentType,
+    /// Variable for which the attribute value is requested.
+    pub variable: VariableType,
+    /// Attribute to read; absent means `Actual`.
+    #[serde(rename = "attributeType", skip_serializing_if = "Option::is_none")]
+    pub attribute_type: Option<AttributeEnumType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// One entry in a `GetVariables` response: the outcome of reading a single
+/// component-variable attribute.
+///
+/// Ports `GetVariableResultType`. `attribute_status`, `component`, and
+/// `variable` are required; `attribute_value` is present only when the read
+/// was `Accepted`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetVariableResultType {
+    /// Result status of getting the variable.
+    #[serde(rename = "attributeStatus")]
+    pub attribute_status: GetVariableStatusEnumType,
+    /// Component for which the variable was requested.
+    pub component: ComponentType,
+    /// Variable for which the attribute value was requested.
+    pub variable: VariableType,
+    /// Attribute that was read; absent means `Actual`.
+    #[serde(rename = "attributeType", skip_serializing_if = "Option::is_none")]
+    pub attribute_type: Option<AttributeEnumType>,
+    /// Value of the attribute (max length 2500); only meaningful when
+    /// `attribute_status` is `Accepted`.
+    #[serde(rename = "attributeValue", skip_serializing_if = "Option::is_none")]
+    pub attribute_value: Option<String>,
+    /// Detail about the `attribute_status`.
+    #[serde(
+        rename = "attributeStatusInfo",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub attribute_status_info: Option<StatusInfoType>,
     /// Vendor extension.
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
@@ -413,6 +546,20 @@ mod tests {
     }
 
     #[test]
+    fn attribute_enum_serializes_pascal_case() {
+        for (variant, wire) in [
+            (AttributeEnumType::Actual, "Actual"),
+            (AttributeEnumType::Target, "Target"),
+            (AttributeEnumType::MinSet, "MinSet"),
+            (AttributeEnumType::MaxSet, "MaxSet"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            let back: AttributeEnumType = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
     fn id_token_enum_serializes_exact_wire_values() {
         for (variant, wire) in [
             (IdTokenEnumType::Central, "Central"),
@@ -472,6 +619,118 @@ mod tests {
             let back: MessageFormatEnumType = serde_json::from_value(json!(wire)).unwrap();
             assert_eq!(back, variant);
         }
+    }
+
+    #[test]
+    fn get_variable_status_serializes_pascal_case() {
+        for (variant, wire) in [
+            (GetVariableStatusEnumType::Accepted, "Accepted"),
+            (GetVariableStatusEnumType::Rejected, "Rejected"),
+            (
+                GetVariableStatusEnumType::UnknownComponent,
+                "UnknownComponent",
+            ),
+            (
+                GetVariableStatusEnumType::UnknownVariable,
+                "UnknownVariable",
+            ),
+            (
+                GetVariableStatusEnumType::NotSupportedAttributeType,
+                "NotSupportedAttributeType",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            let back: GetVariableStatusEnumType = serde_json::from_value(json!(wire)).unwrap();
+            assert_eq!(back, variant);
+        }
+    }
+
+    #[test]
+    fn enums_reject_unknown_wire_values() {
+        assert!(serde_json::from_value::<AttributeEnumType>(json!("Bogus")).is_err());
+        assert!(serde_json::from_value::<GetVariableStatusEnumType>(json!("Nope")).is_err());
+    }
+
+    #[test]
+    fn component_omits_none_optionals() {
+        let c = ComponentType {
+            name: "EVSE".to_string(),
+            instance: None,
+            evse: None,
+            custom_data: None,
+        };
+        assert_eq!(serde_json::to_value(&c).unwrap(), json!({ "name": "EVSE" }));
+    }
+
+    #[test]
+    fn evse_round_trips_with_connector() {
+        let evse = EvseType {
+            id: 1,
+            connector_id: Some(2),
+            custom_data: None,
+        };
+        let wire = serde_json::to_value(&evse).unwrap();
+        assert_eq!(wire, json!({ "id": 1, "connectorId": 2 }));
+        let back: EvseType = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, evse);
+    }
+
+    #[test]
+    fn get_variable_data_defaults_attribute_type_to_absent() {
+        let data = GetVariableDataType {
+            component: ComponentType {
+                name: "SampledDataCtrlr".to_string(),
+                instance: None,
+                evse: Some(EvseType {
+                    id: 1,
+                    connector_id: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: "TxEndedMeasurands".to_string(),
+                instance: None,
+                custom_data: None,
+            },
+            attribute_type: None,
+            custom_data: None,
+        };
+        let expected = json!({
+            "component": { "name": "SampledDataCtrlr", "evse": { "id": 1 } },
+            "variable": { "name": "TxEndedMeasurands" }
+        });
+        assert_eq!(serde_json::to_value(&data).unwrap(), expected);
+        let back: GetVariableDataType = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, data);
+    }
+
+    #[test]
+    fn get_variable_result_round_trips() {
+        let result = GetVariableResultType {
+            attribute_status: GetVariableStatusEnumType::Accepted,
+            component: ComponentType {
+                name: "OCPPCommCtrlr".to_string(),
+                instance: None,
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: "HeartbeatInterval".to_string(),
+                instance: None,
+                custom_data: None,
+            },
+            attribute_type: Some(AttributeEnumType::Actual),
+            attribute_value: Some("300".to_string()),
+            attribute_status_info: None,
+            custom_data: None,
+        };
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(wire["attributeStatus"], json!("Accepted"));
+        assert_eq!(wire["attributeValue"], json!("300"));
+        assert_eq!(wire["attributeType"], json!("Actual"));
+        let back: GetVariableResultType = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, result);
     }
 
     #[test]
