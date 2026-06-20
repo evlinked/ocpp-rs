@@ -132,6 +132,22 @@ pub enum GetVariableStatusEnumType {
     NotSupportedAttributeType,
 }
 
+/// Result of writing a single component-variable attribute.
+///
+/// Ports `SetVariableStatusEnumType` (`ocpp/v201/enums.py`). The write-path
+/// counterpart to [`GetVariableStatusEnumType`]: the same statuses plus
+/// `RebootRequired` (the value was accepted but only takes effect after a
+/// reboot). Wire values are PascalCase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetVariableStatusEnumType {
+    Accepted,
+    Rejected,
+    UnknownComponent,
+    UnknownVariable,
+    NotSupportedAttributeType,
+    RebootRequired,
+}
+
 /// Type of a `TransactionEvent` message.
 ///
 /// Ports `TransactionEventEnumType` (`ocpp/v201/enums.py`). A transaction is a

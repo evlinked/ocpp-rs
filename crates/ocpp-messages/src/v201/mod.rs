@@ -9,7 +9,8 @@
 //!
 //! This is the foundation for **M7 — OCPP 2.0.1** and currently covers the core
 //! lifecycle messages `BootNotification`, `Heartbeat`, `StatusNotification`,
-//! `Authorize`, the `GetVariables` device-model read, and `TransactionEvent`.
+//! `Authorize`, the `GetVariables`/`SetVariables` device-model read/write pair,
+//! and `TransactionEvent`.
 //!
 //! ## Layout
 //!
@@ -23,6 +24,7 @@ mod authorize;
 mod boot_notification;
 mod get_variables;
 mod heartbeat;
+mod set_variables;
 mod status_notification;
 mod transaction_event;
 
@@ -30,6 +32,7 @@ pub use authorize::{AuthorizeRequest, AuthorizeResponse};
 pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
 pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
 pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
+pub use set_variables::{SetVariablesRequest, SetVariablesResponse};
 pub use status_notification::{StatusNotificationRequest, StatusNotificationResponse};
 pub use transaction_event::{TransactionEventRequest, TransactionEventResponse};
 
@@ -613,6 +616,230 @@ mod tests {
                 .is_err());
             // And serde rejects it too.
             assert!(serde_json::from_value::<TransactionEventRequest>(bad).is_err());
+        }
+    }
+
+    mod set_variables {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            AttributeEnumType, ComponentType, EvseType, SetVariableDataType, SetVariableResultType,
+            SetVariableStatusEnumType, StatusInfoType, VariableType,
+        };
+
+        #[test]
+        fn request_matches_reference_wire_json_and_validates() {
+            // Set HeartbeatInterval to 300 on the OCPPCommCtrlr component.
+            let req = SetVariablesRequest {
+                set_variable_data: vec![SetVariableDataType {
+                    attribute_value: "300".to_string(),
+                    component: ComponentType {
+                        name: "OCPPCommCtrlr".to_string(),
+                        instance: None,
+                        evse: None,
+                        custom_data: None,
+                    },
+                    variable: VariableType {
+                        name: "HeartbeatInterval".to_string(),
+                        instance: None,
+                        custom_data: None,
+                    },
+                    attribute_type: None,
+                    custom_data: None,
+                }],
+                custom_data: None,
+            };
+            let expected = json!({
+                "setVariableData": [{
+                    "attributeValue": "300",
+                    "component": { "name": "OCPPCommCtrlr" },
+                    "variable": { "name": "HeartbeatInterval" }
+                }]
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let back: SetVariablesRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            // The CALL payload satisfies the bundled 2.0.1 schema.
+            assert!(SchemaValidator::v201()
+                .validate_call("SetVariables", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_round_trips_with_all_optionals() {
+            let req = SetVariablesRequest {
+                set_variable_data: vec![SetVariableDataType {
+                    attribute_value: "true".to_string(),
+                    component: ComponentType {
+                        name: "AuthCtrlr".to_string(),
+                        instance: Some("Main".to_string()),
+                        evse: Some(EvseType {
+                            id: 1,
+                            connector_id: Some(1),
+                            custom_data: None,
+                        }),
+                        custom_data: None,
+                    },
+                    variable: VariableType {
+                        name: "Enabled".to_string(),
+                        instance: None,
+                        custom_data: None,
+                    },
+                    attribute_type: Some(AttributeEnumType::Target),
+                    custom_data: None,
+                }],
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["setVariableData"][0]["attributeType"], json!("Target"));
+            assert_eq!(
+                wire["setVariableData"][0]["component"]["evse"]["connectorId"],
+                json!(1)
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call("SetVariables", &wire)
+                .is_ok());
+            let back: SetVariablesRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_matches_reference_wire_json_and_validates() {
+            let resp = SetVariablesResponse {
+                set_variable_result: vec![SetVariableResultType {
+                    attribute_status: SetVariableStatusEnumType::Accepted,
+                    component: ComponentType {
+                        name: "OCPPCommCtrlr".to_string(),
+                        instance: None,
+                        evse: None,
+                        custom_data: None,
+                    },
+                    variable: VariableType {
+                        name: "HeartbeatInterval".to_string(),
+                        instance: None,
+                        custom_data: None,
+                    },
+                    attribute_type: None,
+                    attribute_status_info: None,
+                    custom_data: None,
+                }],
+                custom_data: None,
+            };
+            let expected = json!({
+                "setVariableResult": [{
+                    "attributeStatus": "Accepted",
+                    "component": { "name": "OCPPCommCtrlr" },
+                    "variable": { "name": "HeartbeatInterval" }
+                }]
+            });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let back: SetVariablesResponse = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, resp);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetVariables", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn response_reboot_required_carries_status_info_and_validates() {
+            let resp = SetVariablesResponse {
+                set_variable_result: vec![SetVariableResultType {
+                    attribute_status: SetVariableStatusEnumType::RebootRequired,
+                    component: ComponentType {
+                        name: "OCPPCommCtrlr".to_string(),
+                        instance: None,
+                        evse: None,
+                        custom_data: None,
+                    },
+                    variable: VariableType {
+                        name: "HeartbeatInterval".to_string(),
+                        instance: None,
+                        custom_data: None,
+                    },
+                    attribute_type: Some(AttributeEnumType::Actual),
+                    attribute_status_info: Some(StatusInfoType {
+                        reason_code: "Queued".to_string(),
+                        additional_info: Some("applies after reboot".to_string()),
+                        custom_data: None,
+                    }),
+                    custom_data: None,
+                }],
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(
+                wire["setVariableResult"][0]["attributeStatus"],
+                json!("RebootRequired")
+            );
+            assert_eq!(
+                wire["setVariableResult"][0]["attributeStatusInfo"]["reasonCode"],
+                json!("Queued")
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetVariables", &wire)
+                .is_ok());
+            let back: SetVariablesResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(SetVariablesRequest::ACTION_NAME, "SetVariables");
+            assert_eq!(SetVariablesResponse::ACTION_NAME, "SetVariablesResponse");
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_attribute_value() {
+            // `attributeValue` is required on each SetVariableData entry.
+            let bad = json!({
+                "setVariableData": [{
+                    "component": { "name": "OCPPCommCtrlr" },
+                    "variable": { "name": "HeartbeatInterval" }
+                }]
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("SetVariables", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_empty_data_array() {
+            // The schema requires `minItems: 1` on `setVariableData`.
+            let bad = json!({ "setVariableData": [] });
+            assert!(SchemaValidator::v201()
+                .validate_call("SetVariables", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let bad = json!({
+                "setVariableData": [{
+                    "attributeValue": "300",
+                    "component": { "name": "OCPPCommCtrlr" },
+                    "variable": { "name": "HeartbeatInterval" }
+                }],
+                "unexpected": true
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("SetVariables", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_unknown_status_value() {
+            let bad = json!({
+                "setVariableResult": [{
+                    "attributeStatus": "Maybe",
+                    "component": { "name": "OCPPCommCtrlr" },
+                    "variable": { "name": "HeartbeatInterval" }
+                }]
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetVariables", &bad)
+                .is_err());
+            // And serde rejects the unknown enum value too.
+            assert!(serde_json::from_value::<SetVariableStatusEnumType>(json!("Maybe")).is_err());
         }
     }
 

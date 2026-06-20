@@ -338,6 +338,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "GetVariablesResponse",
         include_str!("../schemas/v201/GetVariablesResponse.json"),
     ),
+    (
+        "SetVariables",
+        include_str!("../schemas/v201/SetVariables.json"),
+    ),
+    (
+        "SetVariablesResponse",
+        include_str!("../schemas/v201/SetVariablesResponse.json"),
+    ),
     ("Heartbeat", include_str!("../schemas/v201/Heartbeat.json")),
     (
         "HeartbeatResponse",
