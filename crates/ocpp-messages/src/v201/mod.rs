@@ -3,358 +3,45 @@
 //! Ports the CALL / CALLRESULT payload structs from mobilityhouse/ocpp
 //! (`ocpp/v201/call.py`, `ocpp/v201/call_result.py`), built on the shared
 //! datatypes in [`ocpp_types::v201`]. Mirrors the [`crate::v16j`] module: each
-//! request/response implements [`OcppAction`] / [`OcppResponse`] so it slots
-//! into the same framing and dispatch machinery.
+//! request/response implements [`OcppAction`](crate::OcppAction) /
+//! [`OcppResponse`](crate::OcppResponse) so it slots into the same framing and
+//! dispatch machinery.
 //!
-//! This is the foundation slice for **M7 — OCPP 2.0.1** and currently covers
-//! the core lifecycle messages `BootNotification`, `Heartbeat`,
-//! `StatusNotification`, `Authorize`, and the `GetVariables` device-model read
-//! (its `SetVariables` counterpart is a planned follow-up).
+//! This is the foundation for **M7 — OCPP 2.0.1** and currently covers the core
+//! lifecycle messages `BootNotification`, `Heartbeat`, `StatusNotification`,
+//! `Authorize`, the `GetVariables` device-model read, and `TransactionEvent`.
+//!
+//! ## Layout
+//!
+//! Each message lives in its own submodule and is re-exported here, so the
+//! public path is unchanged (`ocpp_messages::v201::BootNotificationRequest`,
+//! …). Adding a new 2.0.1 message is a new file plus one `mod` + one `pub use`
+//! line below — it no longer grows a single monolithic file, which previously
+//! made concurrent v201 PRs conflict by construction (see #124).
 
-use crate::{OcppAction, OcppResponse};
-use ocpp_types::v201::{
-    AuthorizeCertificateStatusEnumType, BootReasonEnumType, ChargingStationType,
-    ConnectorStatusEnumType, CustomDataType, EvseType, GetVariableDataType, GetVariableResultType,
-    IdTokenInfoType, IdTokenType, MessageContentType, OCSPRequestDataType,
-    RegistrationStatusEnumType, StatusInfoType, TransactionEventEnumType, TransactionType,
-    TriggerReasonEnumType,
-};
-use serde::{Deserialize, Serialize};
+mod authorize;
+mod boot_notification;
+mod get_variables;
+mod heartbeat;
+mod status_notification;
+mod transaction_event;
 
-/// `BootNotification.req` — sent by a Charging Station to the CSMS on boot.
-///
-/// Ports `ocpp.v201.call.BootNotification`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BootNotificationRequest {
-    /// Identity and capabilities of the booting Charging Station.
-    #[serde(rename = "chargingStation")]
-    pub charging_station: ChargingStationType,
-    /// Why the Charging Station is sending this message.
-    pub reason: BootReasonEnumType,
-    /// Vendor extension.
-    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
-    pub custom_data: Option<CustomDataType>,
-}
-
-impl OcppAction for BootNotificationRequest {
-    const ACTION_NAME: &'static str = "BootNotification";
-    type Response = BootNotificationResponse;
-}
-
-/// `BootNotification.conf` — the CSMS's reply.
-///
-/// Ports `ocpp.v201.call_result.BootNotification`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BootNotificationResponse {
-    /// The CSMS's current time (RFC 3339 / ISO 8601).
-    #[serde(rename = "currentTime")]
-    pub current_time: String,
-    /// Heartbeat interval in seconds when `status` is `Accepted`; otherwise the
-    /// minimum wait before the next `BootNotification`.
-    pub interval: i32,
-    /// Whether the Charging Station was accepted by the CSMS.
-    pub status: RegistrationStatusEnumType,
-    /// Optional detail about the registration result.
-    #[serde(rename = "statusInfo", skip_serializing_if = "Option::is_none")]
-    pub status_info: Option<StatusInfoType>,
-    /// Vendor extension.
-    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
-    pub custom_data: Option<CustomDataType>,
-}
-
-impl OcppAction for BootNotificationResponse {
-    const ACTION_NAME: &'static str = "BootNotificationResponse";
-    type Response = Self;
-}
-
-impl OcppResponse for BootNotificationResponse {}
-
-/// `Heartbeat.req` — sent by a Charging Station to keep the connection alive
-/// and to learn the CSMS's current time.
-///
-/// Ports `ocpp.v201.call.Heartbeat`. The request carries no fields beyond the
-/// optional vendor extension, so it serializes to `{}` on the wire.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct HeartbeatRequest {
-    /// Vendor extension.
-    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
-    pub custom_data: Option<CustomDataType>,
-}
-
-impl OcppAction for HeartbeatRequest {
-    const ACTION_NAME: &'static str = "Heartbeat";
-    type Response = HeartbeatResponse;
-}
-
-/// `Heartbeat.conf` — the CSMS's reply, carrying its current time.
-///
-/// Ports `ocpp.v201.call_result.Heartbeat`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct HeartbeatResponse {
-    /// The CSMS's current time (RFC 3339 / ISO 8601).
-    #[serde(rename = "currentTime")]
-    pub current_time: String,
-    /// Vendor extension.
-    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
-    pub custom_data: Option<CustomDataType>,
-}
-
-impl OcppAction for HeartbeatResponse {
-    const ACTION_NAME: &'static str = "HeartbeatResponse";
-    type Response = Self;
-}
-
-impl OcppResponse for HeartbeatResponse {}
-
-/// `StatusNotification.req` — reports the status of a single connector.
-///
-/// Ports `ocpp.v201.call.StatusNotification`. Unlike 1.6J, status is reported
-/// per `(evseId, connectorId)` pair using [`ConnectorStatusEnumType`], and
-/// there is no `errorCode` field.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct StatusNotificationRequest {
-    /// The time for which the status is reported (RFC 3339 / ISO 8601).
-    pub timestamp: String,
-    /// The reported status of the connector.
-    #[serde(rename = "connectorStatus")]
-    pub connector_status: ConnectorStatusEnumType,
-    /// The id of the EVSE to which the connector belongs.
-    #[serde(rename = "evseId")]
-    pub evse_id: i32,
-    /// The id of the connector within the EVSE.
-    #[serde(rename = "connectorId")]
-    pub connector_id: i32,
-    /// Vendor extension.
-    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
-    pub custom_data: Option<CustomDataType>,
-}
-
-impl OcppAction for StatusNotificationRequest {
-    const ACTION_NAME: &'static str = "StatusNotification";
-    type Response = StatusNotificationResponse;
-}
-
-/// `StatusNotification.conf` — the CSMS's acknowledgement.
-///
-/// Ports `ocpp.v201.call_result.StatusNotification`. The response carries no
-/// fields beyond the optional vendor extension, so it serializes to `{}`.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct StatusNotificationResponse {
-    /// Vendor extension.
-    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
-    pub custom_data: Option<CustomDataType>,
-}
-
-impl OcppAction for StatusNotificationResponse {
-    const ACTION_NAME: &'static str = "StatusNotificationResponse";
-    type Response = Self;
-}
-
-impl OcppResponse for StatusNotificationResponse {}
-
-/// `GetVariables.req` — sent by the CSMS to read one or more
-/// component-variable attributes from a Charging Station.
-///
-/// Ports `ocpp.v201.call.GetVariables`. The 2.0.1 device-model replacement for
-/// 1.6J `GetConfiguration`: instead of flat string keys, each entry names a
-/// `component`/`variable` pair (see [`GetVariableDataType`]).
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GetVariablesRequest {
-    /// The variables (and attributes) to read. Per the schema at least one
-    /// entry must be present.
-    #[serde(rename = "getVariableData")]
-    pub get_variable_data: Vec<GetVariableDataType>,
-    /// Vendor extension.
-    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
-    pub custom_data: Option<CustomDataType>,
-}
-
-impl OcppAction for GetVariablesRequest {
-    const ACTION_NAME: &'static str = "GetVariables";
-    type Response = GetVariablesResponse;
-}
-
-/// `GetVariables.conf` — the Charging Station's reply, one result per requested
-/// variable (order corresponds to the request).
-///
-/// Ports `ocpp.v201.call_result.GetVariables`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GetVariablesResponse {
-    /// One result per requested variable.
-    #[serde(rename = "getVariableResult")]
-    pub get_variable_result: Vec<GetVariableResultType>,
-    /// Vendor extension.
-    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
-    pub custom_data: Option<CustomDataType>,
-}
-
-impl OcppAction for GetVariablesResponse {
-    const ACTION_NAME: &'static str = "GetVariablesResponse";
-    type Response = Self;
-}
-
-impl OcppResponse for GetVariablesResponse {}
-
-/// `Authorize.req` — a Charging Station asks the CSMS whether an `idToken` is
-/// authorized to start/stop charging.
-///
-/// Ports `ocpp.v201.call.Authorize`. Unlike 1.6J (a bare `idTag` string), 2.0.1
-/// carries the richer [`IdTokenType`].
-///
-/// The optional ISO 15118 plug-and-charge certificate path is modelled here:
-/// `certificate` carries the EV's contract certificate (PEM, max length 5500)
-/// and `iso15118_certificate_hash_data` carries 1..=4 [`OCSPRequestDataType`]
-/// entries for OCSP status checking. Both are omitted from the wire when absent.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AuthorizeRequest {
-    /// The identifier being authorized.
-    #[serde(rename = "idToken")]
-    pub id_token: IdTokenType,
-    /// The X.509 contract certificate presented by the EV, PEM-encoded
-    /// (max length 5500). Part of the ISO 15118 plug-and-charge path.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub certificate: Option<String>,
-    /// OCSP request data for the contract certificate chain (1..=4 entries).
-    /// Omitted entirely when absent; the schema requires at least one item and
-    /// at most four when present.
-    #[serde(
-        rename = "iso15118CertificateHashData",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub iso15118_certificate_hash_data: Option<Vec<OCSPRequestDataType>>,
-    /// Vendor extension.
-    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
-    pub custom_data: Option<CustomDataType>,
-}
-
-impl OcppAction for AuthorizeRequest {
-    const ACTION_NAME: &'static str = "Authorize";
-    type Response = AuthorizeResponse;
-}
-
-/// `Authorize.conf` — the CSMS's authorization decision.
-///
-/// Ports `ocpp.v201.call_result.Authorize`. The [`IdTokenInfoType`] payload is
-/// reused by the 2.0.1 transaction model.
-///
-/// The optional `certificate_status` reports the outcome of validating the
-/// contract certificate supplied along the ISO 15118 plug-and-charge path; it
-/// is omitted from the wire when absent.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct AuthorizeResponse {
-    /// Status information about the identifier.
-    #[serde(rename = "idTokenInfo")]
-    pub id_token_info: IdTokenInfoType,
-    /// Result of validating the ISO 15118 contract certificate, when one was
-    /// presented in the request.
-    #[serde(rename = "certificateStatus", skip_serializing_if = "Option::is_none")]
-    pub certificate_status: Option<AuthorizeCertificateStatusEnumType>,
-    /// Vendor extension.
-    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
-    pub custom_data: Option<CustomDataType>,
-}
-
-impl OcppAction for AuthorizeResponse {
-    const ACTION_NAME: &'static str = "AuthorizeResponse";
-    type Response = Self;
-}
-
-impl OcppResponse for AuthorizeResponse {}
-
-/// `TransactionEvent.req` — the unified 2.0.1 transaction message that replaces
-/// the 1.6J `StartTransaction` / `StopTransaction` / `MeterValues` triad.
-///
-/// Ports `ocpp.v201.call.TransactionEvent`. A transaction is reported as a
-/// sequence of events: one `Started`, zero or more `Updated`, and one `Ended`
-/// (see [`TransactionEventEnumType`]).
-///
-/// **Scope:** this slice omits the optional `meterValue` field (the
-/// `MeterValueType` / `SampledValueType` sub-objects and their measurement
-/// enums); it is deferred to a follow-up (tracked on the issue). The bundled
-/// schema still validates `meterValue` when present, so adding it later is
-/// purely additive.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct TransactionEventRequest {
-    /// Which event in the transaction's lifecycle this is.
-    #[serde(rename = "eventType")]
-    pub event_type: TransactionEventEnumType,
-    /// The time at which the event occurred (RFC 3339 / ISO 8601).
-    pub timestamp: String,
-    /// What triggered this event.
-    #[serde(rename = "triggerReason")]
-    pub trigger_reason: TriggerReasonEnumType,
-    /// Sequence number, incrementing per event within the transaction so the
-    /// CSMS can detect gaps and order events received out of sequence.
-    #[serde(rename = "seqNo")]
-    pub seq_no: i32,
-    /// State of the transaction this event belongs to.
-    #[serde(rename = "transactionInfo")]
-    pub transaction_info: TransactionType,
-    /// Whether the Charging Station was offline when the event occurred.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub offline: Option<bool>,
-    /// Number of electrical phases used, if relevant.
-    #[serde(rename = "numberOfPhasesUsed", skip_serializing_if = "Option::is_none")]
-    pub number_of_phases_used: Option<i32>,
-    /// Maximum current of the cable in amperes, if reported.
-    #[serde(rename = "cableMaxCurrent", skip_serializing_if = "Option::is_none")]
-    pub cable_max_current: Option<i32>,
-    /// Reservation this transaction terminated, if any.
-    #[serde(rename = "reservationId", skip_serializing_if = "Option::is_none")]
-    pub reservation_id: Option<i32>,
-    /// The EVSE (and optionally connector) for which the event is reported.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub evse: Option<EvseType>,
-    /// The identifier that authorized the transaction.
-    #[serde(rename = "idToken", skip_serializing_if = "Option::is_none")]
-    pub id_token: Option<IdTokenType>,
-    /// Vendor extension.
-    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
-    pub custom_data: Option<CustomDataType>,
-}
-
-impl OcppAction for TransactionEventRequest {
-    const ACTION_NAME: &'static str = "TransactionEvent";
-    type Response = TransactionEventResponse;
-}
-
-/// `TransactionEvent.conf` — the CSMS's reply.
-///
-/// Ports `ocpp.v201.call_result.TransactionEvent`. Every field is optional, so
-/// an empty acknowledgement serializes to `{}`.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-pub struct TransactionEventResponse {
-    /// Running total cost of the transaction in the configured currency.
-    #[serde(rename = "totalCost", skip_serializing_if = "Option::is_none")]
-    pub total_cost: Option<f64>,
-    /// Charging priority granted to this transaction (-9..=9).
-    #[serde(rename = "chargingPriority", skip_serializing_if = "Option::is_none")]
-    pub charging_priority: Option<i32>,
-    /// Updated authorization status for the transaction's identifier.
-    #[serde(rename = "idTokenInfo", skip_serializing_if = "Option::is_none")]
-    pub id_token_info: Option<IdTokenInfoType>,
-    /// Personal message to display on the Charging Station.
-    #[serde(
-        rename = "updatedPersonalMessage",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub updated_personal_message: Option<MessageContentType>,
-    /// Vendor extension.
-    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
-    pub custom_data: Option<CustomDataType>,
-}
-
-impl OcppAction for TransactionEventResponse {
-    const ACTION_NAME: &'static str = "TransactionEventResponse";
-    type Response = Self;
-}
-
-impl OcppResponse for TransactionEventResponse {}
+pub use authorize::{AuthorizeRequest, AuthorizeResponse};
+pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
+pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
+pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
+pub use status_notification::{StatusNotificationRequest, StatusNotificationResponse};
+pub use transaction_event::{TransactionEventRequest, TransactionEventResponse};
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ocpp_types::v201::{AuthorizationStatusEnumType, IdTokenEnumType, ModemType};
+    // The message structs are re-exported via `super::*`; pull the trait that
+    // provides `ACTION_NAME` and the shared 2.0.1 datatypes/enums in directly,
+    // since they now live in the per-message submodules rather than at module
+    // scope. A glob keeps this stable as new messages add datatypes.
+    use crate::OcppAction;
+    use ocpp_types::v201::*;
     use serde_json::json;
 
     #[test]
