@@ -278,6 +278,60 @@ pub struct GetVariableResultType {
     pub custom_data: Option<CustomDataType>,
 }
 
+/// One entry in a `SetVariables` request: the value to write to a single
+/// component-variable attribute.
+///
+/// Ports `SetVariableDataType`. `attribute_value`, `component`, and `variable`
+/// are required; `attribute_type` defaults to [`AttributeEnumType::Actual`]
+/// when omitted. The write-path counterpart to [`GetVariableDataType`], which
+/// carries no value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetVariableDataType {
+    /// Value to assign to the attribute (max length 1000 per schema).
+    #[serde(rename = "attributeValue")]
+    pub attribute_value: String,
+    /// Component for which the variable is set.
+    pub component: ComponentType,
+    /// Variable whose attribute value is set.
+    pub variable: VariableType,
+    /// Attribute to write; absent means `Actual`.
+    #[serde(rename = "attributeType", skip_serializing_if = "Option::is_none")]
+    pub attribute_type: Option<AttributeEnumType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// One entry in a `SetVariables` response: the outcome of writing a single
+/// component-variable attribute.
+///
+/// Ports `SetVariableResultType`. `attribute_status`, `component`, and
+/// `variable` are required; `attribute_status_info` carries detail about a
+/// non-`Accepted` status. The write-path counterpart to
+/// [`GetVariableResultType`] — it echoes no value, only a status.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetVariableResultType {
+    /// Result status of setting the variable.
+    #[serde(rename = "attributeStatus")]
+    pub attribute_status: SetVariableStatusEnumType,
+    /// Component for which the variable was set.
+    pub component: ComponentType,
+    /// Variable whose attribute value was set.
+    pub variable: VariableType,
+    /// Attribute that was written; absent means `Actual`.
+    #[serde(rename = "attributeType", skip_serializing_if = "Option::is_none")]
+    pub attribute_type: Option<AttributeEnumType>,
+    /// Detail about the `attribute_status`.
+    #[serde(
+        rename = "attributeStatusInfo",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub attribute_status_info: Option<StatusInfoType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 /// Status information about an identifier, returned in an `AuthorizeResponse`
 /// (and reused by the 2.0.1 transaction model).
 ///
