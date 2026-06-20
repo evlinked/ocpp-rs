@@ -8,13 +8,15 @@
 //!
 //! This is the foundation slice for **M7 — OCPP 2.0.1** and currently covers
 //! the core lifecycle messages `BootNotification`, `Heartbeat`,
-//! `StatusNotification`, and the transaction model message `TransactionEvent`.
+//! `StatusNotification`, `Authorize`, and the `GetVariables` device-model read
+//! (its `SetVariables` counterpart is a planned follow-up).
 
 use crate::{OcppAction, OcppResponse};
 use ocpp_types::v201::{
     BootReasonEnumType, ChargingStationType, ConnectorStatusEnumType, CustomDataType, EvseType,
-    IdTokenInfoType, IdTokenType, MessageContentType, RegistrationStatusEnumType, StatusInfoType,
-    TransactionEventEnumType, TransactionType, TriggerReasonEnumType,
+    GetVariableDataType, GetVariableResultType, IdTokenInfoType, IdTokenType, MessageContentType,
+    RegistrationStatusEnumType, StatusInfoType, TransactionEventEnumType, TransactionType,
+    TriggerReasonEnumType,
 };
 use serde::{Deserialize, Serialize};
 
@@ -149,6 +151,101 @@ impl OcppAction for StatusNotificationResponse {
 
 impl OcppResponse for StatusNotificationResponse {}
 
+/// `GetVariables.req` — sent by the CSMS to read one or more
+/// component-variable attributes from a Charging Station.
+///
+/// Ports `ocpp.v201.call.GetVariables`. The 2.0.1 device-model replacement for
+/// 1.6J `GetConfiguration`: instead of flat string keys, each entry names a
+/// `component`/`variable` pair (see [`GetVariableDataType`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetVariablesRequest {
+    /// The variables (and attributes) to read. Per the schema at least one
+    /// entry must be present.
+    #[serde(rename = "getVariableData")]
+    pub get_variable_data: Vec<GetVariableDataType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+impl OcppAction for GetVariablesRequest {
+    const ACTION_NAME: &'static str = "GetVariables";
+    type Response = GetVariablesResponse;
+}
+
+/// `GetVariables.conf` — the Charging Station's reply, one result per requested
+/// variable (order corresponds to the request).
+///
+/// Ports `ocpp.v201.call_result.GetVariables`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetVariablesResponse {
+    /// One result per requested variable.
+    #[serde(rename = "getVariableResult")]
+    pub get_variable_result: Vec<GetVariableResultType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+impl OcppAction for GetVariablesResponse {
+    const ACTION_NAME: &'static str = "GetVariablesResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for GetVariablesResponse {}
+
+/// `Authorize.req` — a Charging Station asks the CSMS whether an `idToken` is
+/// authorized to start/stop charging.
+///
+/// Ports `ocpp.v201.call.Authorize`. Unlike 1.6J (a bare `idTag` string), 2.0.1
+/// carries the richer [`IdTokenType`].
+///
+/// **Deferred:** the ISO 15118 plug-and-charge certificate path — the request's
+/// optional `certificate` (PEM) and `iso15118CertificateHashData`
+/// (`OCSPRequestDataType` list) — is not yet modelled here; it is tracked as a
+/// follow-up. The bundled `Authorize.json` schema still validates those fields
+/// when present.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthorizeRequest {
+    /// The identifier being authorized.
+    #[serde(rename = "idToken")]
+    pub id_token: IdTokenType,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+impl OcppAction for AuthorizeRequest {
+    const ACTION_NAME: &'static str = "Authorize";
+    type Response = AuthorizeResponse;
+}
+
+/// `Authorize.conf` — the CSMS's authorization decision.
+///
+/// Ports `ocpp.v201.call_result.Authorize`. The [`IdTokenInfoType`] payload is
+/// reused by the 2.0.1 transaction model.
+///
+/// **Deferred:** the optional `certificateStatus`
+/// (`AuthorizeCertificateStatusEnumType`) field, part of the same ISO 15118
+/// certificate path as the request-side certificate fields, is not yet
+/// modelled. The bundled schema still validates it when present.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthorizeResponse {
+    /// Status information about the identifier.
+    #[serde(rename = "idTokenInfo")]
+    pub id_token_info: IdTokenInfoType,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+impl OcppAction for AuthorizeResponse {
+    const ACTION_NAME: &'static str = "AuthorizeResponse";
+    type Response = Self;
+}
+
+impl OcppResponse for AuthorizeResponse {}
+
 /// `TransactionEvent.req` — the unified 2.0.1 transaction message that replaces
 /// the 1.6J `StartTransaction` / `StopTransaction` / `MeterValues` triad.
 ///
@@ -242,7 +339,7 @@ impl OcppResponse for TransactionEventResponse {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ocpp_types::v201::ModemType;
+    use ocpp_types::v201::{AuthorizationStatusEnumType, IdTokenEnumType, ModemType};
     use serde_json::json;
 
     #[test]
@@ -407,6 +504,97 @@ mod tests {
             StatusNotificationResponse::ACTION_NAME,
             "StatusNotificationResponse"
         );
+        assert_eq!(AuthorizeRequest::ACTION_NAME, "Authorize");
+        assert_eq!(AuthorizeResponse::ACTION_NAME, "AuthorizeResponse");
+    }
+
+    #[test]
+    fn authorize_request_matches_reference_wire_json() {
+        // Reference: tests/v201/conftest.py — Authorize.req with a bare RFID
+        // idToken and nothing else.
+        let req = AuthorizeRequest {
+            id_token: IdTokenType {
+                id_token: "045918E24B6D80".to_string(),
+                kind: IdTokenEnumType::Iso14443,
+                additional_info: None,
+                custom_data: None,
+            },
+            custom_data: None,
+        };
+        let expected = json!({
+            "idToken": {
+                "idToken": "045918E24B6D80",
+                "type": "ISO14443"
+            }
+        });
+        assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+        let back: AuthorizeRequest = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn authorize_response_matches_reference_wire_json() {
+        // Reference: tests/v201/conftest.py — Authorize.conf, status Accepted.
+        let resp = AuthorizeResponse {
+            id_token_info: IdTokenInfoType {
+                status: AuthorizationStatusEnumType::Accepted,
+                cache_expiry_date_time: None,
+                charging_priority: None,
+                language1: None,
+                evse_id: None,
+                language2: None,
+                group_id_token: None,
+                personal_message: None,
+                custom_data: None,
+            },
+            custom_data: None,
+        };
+        let expected = json!({
+            "idTokenInfo": { "status": "Accepted" }
+        });
+        assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+        let back: AuthorizeResponse = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn authorize_round_trips_with_all_optionals() {
+        let req = AuthorizeRequest {
+            id_token: IdTokenType {
+                id_token: "abc".to_string(),
+                kind: IdTokenEnumType::EMaid,
+                additional_info: None,
+                custom_data: None,
+            },
+            custom_data: Some(CustomDataType {
+                vendor_id: "com.example".to_string(),
+                extra: Default::default(),
+            }),
+        };
+        let wire = serde_json::to_value(&req).unwrap();
+        assert_eq!(wire["idToken"]["type"], json!("eMAID"));
+        assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+        let back: AuthorizeRequest = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, req);
+
+        let resp = AuthorizeResponse {
+            id_token_info: IdTokenInfoType {
+                status: AuthorizationStatusEnumType::Blocked,
+                cache_expiry_date_time: Some("2030-01-01T00:00:00Z".to_string()),
+                charging_priority: None,
+                language1: Some("en".to_string()),
+                evse_id: None,
+                language2: None,
+                group_id_token: None,
+                personal_message: None,
+                custom_data: None,
+            },
+            custom_data: None,
+        };
+        let wire = serde_json::to_value(&resp).unwrap();
+        assert_eq!(wire["idTokenInfo"]["status"], json!("Blocked"));
+        let back: AuthorizeResponse = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, resp);
     }
 
     #[test]
@@ -427,7 +615,89 @@ mod tests {
         assert_eq!(back, req);
     }
 
-    // --- TransactionEvent -------------------------------------------------
+    #[test]
+    fn get_variables_request_round_trips() {
+        use ocpp_types::v201::{ComponentType, EvseType, VariableType};
+
+        let req = GetVariablesRequest {
+            get_variable_data: vec![GetVariableDataType {
+                component: ComponentType {
+                    name: "SampledDataCtrlr".to_string(),
+                    instance: None,
+                    evse: Some(EvseType {
+                        id: 1,
+                        connector_id: None,
+                        custom_data: None,
+                    }),
+                    custom_data: None,
+                },
+                variable: VariableType {
+                    name: "TxEndedMeasurands".to_string(),
+                    instance: None,
+                    custom_data: None,
+                },
+                attribute_type: None,
+                custom_data: None,
+            }],
+            custom_data: None,
+        };
+        let expected = json!({
+            "getVariableData": [{
+                "component": { "name": "SampledDataCtrlr", "evse": { "id": 1 } },
+                "variable": { "name": "TxEndedMeasurands" }
+            }]
+        });
+        assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+        let back: GetVariablesRequest = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn get_variables_response_round_trips() {
+        use ocpp_types::v201::{
+            AttributeEnumType, ComponentType, GetVariableStatusEnumType, VariableType,
+        };
+
+        let resp = GetVariablesResponse {
+            get_variable_result: vec![GetVariableResultType {
+                attribute_status: GetVariableStatusEnumType::Accepted,
+                component: ComponentType {
+                    name: "OCPPCommCtrlr".to_string(),
+                    instance: None,
+                    evse: None,
+                    custom_data: None,
+                },
+                variable: VariableType {
+                    name: "HeartbeatInterval".to_string(),
+                    instance: None,
+                    custom_data: None,
+                },
+                attribute_type: Some(AttributeEnumType::Actual),
+                attribute_value: Some("300".to_string()),
+                attribute_status_info: None,
+                custom_data: None,
+            }],
+            custom_data: None,
+        };
+        let expected = json!({
+            "getVariableResult": [{
+                "attributeStatus": "Accepted",
+                "component": { "name": "OCPPCommCtrlr" },
+                "variable": { "name": "HeartbeatInterval" },
+                "attributeType": "Actual",
+                "attributeValue": "300"
+            }]
+        });
+        assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+        let back: GetVariablesResponse = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, resp);
+    }
+
+    #[test]
+    fn get_variables_action_names() {
+        assert_eq!(GetVariablesRequest::ACTION_NAME, "GetVariables");
+        assert_eq!(GetVariablesResponse::ACTION_NAME, "GetVariablesResponse");
+    }
 
     mod transaction_event {
         use super::*;
