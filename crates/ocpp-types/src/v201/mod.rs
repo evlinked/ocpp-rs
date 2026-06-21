@@ -248,6 +248,31 @@ mod tests {
     }
 
     #[test]
+    fn change_availability_enums_serialize_exact_wire_values() {
+        assert_eq!(
+            serde_json::to_value(OperationalStatusEnumType::Inoperative).unwrap(),
+            json!("Inoperative")
+        );
+        assert_eq!(
+            serde_json::to_value(OperationalStatusEnumType::Operative).unwrap(),
+            json!("Operative")
+        );
+        for (variant, wire) in [
+            (ChangeAvailabilityStatusEnumType::Accepted, "Accepted"),
+            (ChangeAvailabilityStatusEnumType::Rejected, "Rejected"),
+            (ChangeAvailabilityStatusEnumType::Scheduled, "Scheduled"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<ChangeAvailabilityStatusEnumType>(json!(wire)).unwrap(),
+                variant
+            );
+        }
+        // The two enums share no overlap on the wire: `Scheduled` is response-only.
+        assert!(serde_json::from_value::<OperationalStatusEnumType>(json!("Scheduled")).is_err());
+    }
+
+    #[test]
     fn component_omits_none_optionals() {
         let c = ComponentType {
             name: "EVSE".to_string(),
