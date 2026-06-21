@@ -393,6 +393,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "MeterValuesResponse",
         include_str!("../schemas/v201/MeterValuesResponse.json"),
     ),
+    (
+        "RequestStopTransaction",
+        include_str!("../schemas/v201/RequestStopTransaction.json"),
+    ),
+    (
+        "RequestStopTransactionResponse",
+        include_str!("../schemas/v201/RequestStopTransactionResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -1484,6 +1492,70 @@ mod tests {
             "bogusExtra": true
         });
         assert!(v.validate_call("GetVariables", &payload).is_err());
+    }
+
+    #[test]
+    fn v201_request_stop_transaction_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        let call = json!({ "transactionId": "txn-0001" });
+        assert!(v.validate_call("RequestStopTransaction", &call).is_ok());
+        let result = json!({ "status": "Accepted" });
+        assert!(v
+            .validate_call_result("RequestStopTransaction", &result)
+            .is_ok());
+        // `statusInfo` is optional but validates when present.
+        let result_full = json!({
+            "status": "Rejected",
+            "statusInfo": { "reasonCode": "NoTransaction" }
+        });
+        assert!(v
+            .validate_call_result("RequestStopTransaction", &result_full)
+            .is_ok());
+    }
+
+    #[test]
+    fn v201_request_stop_transaction_call_missing_transaction_id_fails() {
+        let v = SchemaValidator::v201();
+        // `transactionId` is the one required property.
+        let err = v
+            .validate_call("RequestStopTransaction", &json!({}))
+            .unwrap_err();
+        assert!(matches!(err, OcppError::SchemaViolation { .. }));
+    }
+
+    #[test]
+    fn v201_request_stop_transaction_call_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        let call = json!({ "transactionId": "txn-0001", "bogusExtra": true });
+        assert!(v.validate_call("RequestStopTransaction", &call).is_err());
+    }
+
+    #[test]
+    fn v201_request_stop_transaction_result_missing_status_fails() {
+        let v = SchemaValidator::v201();
+        let err = v
+            .validate_call_result("RequestStopTransaction", &json!({}))
+            .unwrap_err();
+        assert!(matches!(err, OcppError::SchemaViolation { .. }));
+    }
+
+    #[test]
+    fn v201_request_stop_transaction_result_unknown_status_fails() {
+        let v = SchemaValidator::v201();
+        // `Scheduled` is a valid ResetStatus but NOT a RequestStartStopStatus.
+        let result = json!({ "status": "Scheduled" });
+        assert!(v
+            .validate_call_result("RequestStopTransaction", &result)
+            .is_err());
+    }
+
+    #[test]
+    fn v201_request_stop_transaction_result_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        let result = json!({ "status": "Accepted", "bogusExtra": true });
+        assert!(v
+            .validate_call_result("RequestStopTransaction", &result)
+            .is_err());
     }
 
     #[test]

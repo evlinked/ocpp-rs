@@ -27,6 +27,7 @@ mod get_variables;
 mod heartbeat;
 mod meter_values;
 mod request_start_transaction;
+mod request_stop_transaction;
 mod reset;
 mod set_variables;
 mod status_notification;
@@ -40,6 +41,7 @@ pub use meter_values::{MeterValuesRequest, MeterValuesResponse};
 pub use request_start_transaction::{
     RequestStartTransactionRequest, RequestStartTransactionResponse,
 };
+pub use request_stop_transaction::{RequestStopTransactionRequest, RequestStopTransactionResponse};
 pub use reset::{ResetRequest, ResetResponse};
 pub use set_variables::{SetVariablesRequest, SetVariablesResponse};
 pub use status_notification::{StatusNotificationRequest, StatusNotificationResponse};
