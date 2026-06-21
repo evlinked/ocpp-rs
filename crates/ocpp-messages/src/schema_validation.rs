@@ -417,6 +417,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "GetLocalListVersionResponse",
         include_str!("../schemas/v201/GetLocalListVersionResponse.json"),
     ),
+    (
+        "ChangeAvailability",
+        include_str!("../schemas/v201/ChangeAvailability.json"),
+    ),
+    (
+        "ChangeAvailabilityResponse",
+        include_str!("../schemas/v201/ChangeAvailabilityResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -1659,6 +1667,73 @@ mod tests {
             .validate_call_result(
                 "GetLocalListVersion",
                 &json!({ "versionNumber": 1, "bogusExtra": true })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_change_availability_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        // Whole-station target: only the required operationalStatus.
+        assert!(v
+            .validate_call(
+                "ChangeAvailability",
+                &json!({ "operationalStatus": "Operative" })
+            )
+            .is_ok());
+        // EVSE-scoped target.
+        assert!(v
+            .validate_call(
+                "ChangeAvailability",
+                &json!({ "operationalStatus": "Inoperative", "evse": { "id": 1 } })
+            )
+            .is_ok());
+        // All three response statuses, incl. the schema-only `Scheduled`.
+        for status in ["Accepted", "Rejected", "Scheduled"] {
+            assert!(v
+                .validate_call_result("ChangeAvailability", &json!({ "status": status }))
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn v201_change_availability_missing_required_fields_fail() {
+        let v = SchemaValidator::v201();
+        assert!(v.validate_call("ChangeAvailability", &json!({})).is_err());
+        assert!(v
+            .validate_call_result("ChangeAvailability", &json!({}))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_change_availability_rejects_unknown_enum_values() {
+        let v = SchemaValidator::v201();
+        // `Scheduled` is a valid response status but NOT an operationalStatus.
+        assert!(v
+            .validate_call(
+                "ChangeAvailability",
+                &json!({ "operationalStatus": "Scheduled" })
+            )
+            .is_err());
+        // `Operative` is a request value, not a ChangeAvailabilityStatus.
+        assert!(v
+            .validate_call_result("ChangeAvailability", &json!({ "status": "Operative" }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_change_availability_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call(
+                "ChangeAvailability",
+                &json!({ "operationalStatus": "Operative", "bogusExtra": true })
+            )
+            .is_err());
+        assert!(v
+            .validate_call_result(
+                "ChangeAvailability",
+                &json!({ "status": "Accepted", "bogusExtra": true })
             )
             .is_err());
     }

@@ -23,6 +23,7 @@
 
 mod authorize;
 mod boot_notification;
+mod change_availability;
 mod clear_cache;
 mod get_local_list_version;
 mod get_variables;
@@ -37,6 +38,7 @@ mod transaction_event;
 
 pub use authorize::{AuthorizeRequest, AuthorizeResponse};
 pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
+pub use change_availability::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
 pub use clear_cache::{ClearCacheRequest, ClearCacheResponse};
 pub use get_local_list_version::{GetLocalListVersionRequest, GetLocalListVersionResponse};
 pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
@@ -953,6 +955,148 @@ mod tests {
             let bad = json!({ "status": "Accepted", "bogus": true });
             assert!(SchemaValidator::v201()
                 .validate_call_result("ClearCache", &bad)
+                .is_err());
+        }
+    }
+
+    /// `ChangeAvailability` — the 2.0.1 operational-status command (#146).
+    /// Targets the whole station when `evse` is omitted, or a single EVSE when
+    /// present; reuses `EvseType` and `StatusInfoType`.
+    mod change_availability {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            ChangeAvailabilityStatusEnumType, EvseType, OperationalStatusEnumType, StatusInfoType,
+        };
+
+        #[test]
+        fn request_targets_whole_station_and_validates() {
+            // No `evse` → the change applies to the entire Charging Station.
+            let req = ChangeAvailabilityRequest {
+                operational_status: OperationalStatusEnumType::Inoperative,
+                evse: None,
+                custom_data: None,
+            };
+            let expected = json!({ "operationalStatus": "Inoperative" });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let back: ChangeAvailabilityRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("ChangeAvailability", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_targets_single_evse_and_validates() {
+            let req = ChangeAvailabilityRequest {
+                operational_status: OperationalStatusEnumType::Operative,
+                evse: Some(EvseType {
+                    id: 1,
+                    connector_id: Some(2),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(
+                wire,
+                json!({
+                    "operationalStatus": "Operative",
+                    "evse": { "id": 1, "connectorId": 2 }
+                })
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call("ChangeAvailability", &wire)
+                .is_ok());
+            let back: ChangeAvailabilityRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = ChangeAvailabilityResponse {
+                status: ChangeAvailabilityStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ChangeAvailability", &expected)
+                .is_ok());
+            let back: ChangeAvailabilityResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_scheduled_with_status_info_round_trips() {
+            // `Scheduled` is rejected by the reference dataclass enum but valid
+            // per the FINAL schema — the change is deferred until idle.
+            let resp = ChangeAvailabilityResponse {
+                status: ChangeAvailabilityStatusEnumType::Scheduled,
+                status_info: Some(StatusInfoType {
+                    reason_code: "TxOngoing".to_string(),
+                    additional_info: Some("change deferred until idle".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Scheduled"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("TxOngoing"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ChangeAvailability", &wire)
+                .is_ok());
+            let back: ChangeAvailabilityResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(ChangeAvailabilityRequest::ACTION_NAME, "ChangeAvailability");
+            assert_eq!(
+                ChangeAvailabilityResponse::ACTION_NAME,
+                "ChangeAvailabilityResponse"
+            );
+        }
+
+        #[test]
+        fn operational_status_serializes_pascal_case() {
+            assert_eq!(
+                serde_json::to_value(OperationalStatusEnumType::Inoperative).unwrap(),
+                json!("Inoperative")
+            );
+            assert_eq!(
+                serde_json::to_value(OperationalStatusEnumType::Operative).unwrap(),
+                json!("Operative")
+            );
+        }
+
+        #[test]
+        fn schema_and_serde_reject_unknown_operational_status() {
+            // `Scheduled` is a response status, not a valid operationalStatus.
+            let bad = json!({ "operationalStatus": "Scheduled" });
+            assert!(SchemaValidator::v201()
+                .validate_call("ChangeAvailability", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<ChangeAvailabilityRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_missing_required_fields() {
+            assert!(SchemaValidator::v201()
+                .validate_call("ChangeAvailability", &json!({}))
+                .is_err());
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ChangeAvailability", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let bad = json!({ "operationalStatus": "Operative", "bogusExtra": true });
+            assert!(SchemaValidator::v201()
+                .validate_call("ChangeAvailability", &bad)
                 .is_err());
         }
     }
