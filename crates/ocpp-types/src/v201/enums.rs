@@ -473,8 +473,8 @@ pub enum LocationEnumType {
     Outlet,
 }
 
-/// Outcome of a [`super::DataTransferType`]-style vendor exchange: whether the
-/// receiver accepted the `DataTransfer`, and if not, why.
+/// Outcome of a `DataTransfer` vendor exchange: whether the receiver accepted
+/// the transfer, and if not, why.
 ///
 /// Ports `DataTransferStatusEnumType` (`ocpp/v201/enums.py`). `Accepted` /
 /// `Rejected` mirror the generic outcome; `UnknownMessageId` and
