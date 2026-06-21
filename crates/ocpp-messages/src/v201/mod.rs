@@ -10,7 +10,8 @@
 //! This is the foundation for **M7 — OCPP 2.0.1** and currently covers the core
 //! lifecycle messages `BootNotification`, `Heartbeat`, `StatusNotification`,
 //! `Authorize`, the `GetVariables`/`SetVariables` device-model read/write pair,
-//! `TransactionEvent`, and the `Reset` remote command.
+//! `TransactionEvent`, the standalone `MeterValues` push, and the `Reset`
+//! remote command.
 //!
 //! ## Layout
 //!
@@ -24,6 +25,7 @@ mod authorize;
 mod boot_notification;
 mod get_variables;
 mod heartbeat;
+mod meter_values;
 mod reset;
 mod set_variables;
 mod status_notification;
@@ -33,6 +35,7 @@ pub use authorize::{AuthorizeRequest, AuthorizeResponse};
 pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
 pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
 pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
+pub use meter_values::{MeterValuesRequest, MeterValuesResponse};
 pub use reset::{ResetRequest, ResetResponse};
 pub use set_variables::{SetVariablesRequest, SetVariablesResponse};
 pub use status_notification::{StatusNotificationRequest, StatusNotificationResponse};
@@ -1254,6 +1257,167 @@ mod tests {
             });
             assert!(SchemaValidator::v201()
                 .validate_call("Authorize", &bad)
+                .is_err());
+        }
+    }
+
+    /// Standalone `MeterValues` push (issue #141): the request wraps the
+    /// existing `MeterValueType` tree; the response is an empty ack.
+    mod meter_values {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            CustomDataType, MeasurandEnumType, MeterValueType, ReadingContextEnumType,
+            SampledValueType, UnitOfMeasureType,
+        };
+
+        fn sample_meter_value() -> MeterValueType {
+            MeterValueType {
+                timestamp: "2022-01-01T10:05:00Z".to_string(),
+                sampled_value: vec![SampledValueType {
+                    value: 1234.5,
+                    context: Some(ReadingContextEnumType::SamplePeriodic),
+                    measurand: Some(MeasurandEnumType::EnergyActiveImportRegister),
+                    phase: None,
+                    location: None,
+                    signed_meter_value: None,
+                    unit_of_measure: Some(UnitOfMeasureType {
+                        unit: Some("Wh".to_string()),
+                        multiplier: None,
+                        custom_data: None,
+                    }),
+                    custom_data: None,
+                }],
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn request_matches_reference_wire_json_and_validates() {
+            let req = MeterValuesRequest {
+                evse_id: 1,
+                meter_value: vec![sample_meter_value()],
+                custom_data: None,
+            };
+            let expected = json!({
+                "evseId": 1,
+                "meterValue": [{
+                    "timestamp": "2022-01-01T10:05:00Z",
+                    "sampledValue": [{
+                        "value": 1234.5,
+                        "context": "Sample.Periodic",
+                        "measurand": "Energy.Active.Import.Register",
+                        "unitOfMeasure": { "unit": "Wh" }
+                    }]
+                }]
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            // `customData` is omitted when `None`.
+            assert!(!expected.as_object().unwrap().contains_key("customData"));
+            let back: MeterValuesRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("MeterValues", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_round_trips_with_custom_data() {
+            let req = MeterValuesRequest {
+                evse_id: 0, // 0 = the station's main power meter.
+                meter_value: vec![sample_meter_value()],
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["evseId"], json!(0));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("MeterValues", &wire)
+                .is_ok());
+            let back: MeterValuesRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_empty_is_object_and_full_round_trips() {
+            let empty = MeterValuesResponse::default();
+            assert_eq!(serde_json::to_value(&empty).unwrap(), json!({}));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("MeterValues", &json!({}))
+                .is_ok());
+
+            let full = MeterValuesResponse {
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&full).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("MeterValues", &wire)
+                .is_ok());
+            let back: MeterValuesResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, full);
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(MeterValuesRequest::ACTION_NAME, "MeterValues");
+            assert_eq!(MeterValuesResponse::ACTION_NAME, "MeterValuesResponse");
+        }
+
+        #[test]
+        fn schema_rejects_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            // `evseId` and `meterValue` are both required.
+            assert!(v
+                .validate_call("MeterValues", &json!({ "meterValue": [] }))
+                .is_err());
+            assert!(v
+                .validate_call("MeterValues", &json!({ "evseId": 1 }))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_empty_meter_value_array() {
+            // `meterValue` has `minItems: 1`.
+            let bad = json!({ "evseId": 1, "meterValue": [] });
+            assert!(SchemaValidator::v201()
+                .validate_call("MeterValues", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_empty_sampled_value_array() {
+            // Each `MeterValueType.sampledValue` also has `minItems: 1`.
+            let bad = json!({
+                "evseId": 1,
+                "meterValue": [{
+                    "timestamp": "2022-01-01T10:05:00Z",
+                    "sampledValue": []
+                }]
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("MeterValues", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let bad = json!({
+                "evseId": 1,
+                "meterValue": [{
+                    "timestamp": "2022-01-01T10:05:00Z",
+                    "sampledValue": [{ "value": 1.0 }]
+                }],
+                "unexpected": true
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("MeterValues", &bad)
                 .is_err());
         }
     }

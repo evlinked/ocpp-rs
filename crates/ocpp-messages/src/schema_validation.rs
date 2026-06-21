@@ -377,6 +377,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "ResetResponse",
         include_str!("../schemas/v201/ResetResponse.json"),
     ),
+    (
+        "MeterValues",
+        include_str!("../schemas/v201/MeterValues.json"),
+    ),
+    (
+        "MeterValuesResponse",
+        include_str!("../schemas/v201/MeterValuesResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
