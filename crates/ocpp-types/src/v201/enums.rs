@@ -302,6 +302,22 @@ pub enum RequestStartStopStatusEnumType {
     Rejected,
 }
 
+/// Whether a Charging Station managed to unlock a connector in response to an
+/// `UnlockConnector.req`.
+///
+/// Ports `UnlockStatusEnumType` (`ocpp/v201/enums.py`). `OngoingAuthorizedTransaction`
+/// means the connector is in use by an authorized transaction and so cannot be
+/// unlocked; `UnknownConnector` means the requested EVSE/connector does not
+/// exist. Wire values are PascalCase, identical to the bundled OCPP 2.0.1 FINAL
+/// JSON Schema's `enum`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnlockStatusEnumType {
+    Unlocked,
+    UnlockFailed,
+    OngoingAuthorizedTransaction,
+    UnknownConnector,
+}
+
 /// Hash algorithm used for the OCSP request data in the ISO 15118
 /// plug-and-charge certificate path.
 ///

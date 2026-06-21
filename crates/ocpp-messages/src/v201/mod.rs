@@ -35,6 +35,7 @@ mod reset;
 mod set_variables;
 mod status_notification;
 mod transaction_event;
+mod unlock_connector;
 
 pub use authorize::{AuthorizeRequest, AuthorizeResponse};
 pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
@@ -52,6 +53,7 @@ pub use reset::{ResetRequest, ResetResponse};
 pub use set_variables::{SetVariablesRequest, SetVariablesResponse};
 pub use status_notification::{StatusNotificationRequest, StatusNotificationResponse};
 pub use transaction_event::{TransactionEventRequest, TransactionEventResponse};
+pub use unlock_connector::{UnlockConnectorRequest, UnlockConnectorResponse};
 
 #[cfg(test)]
 mod tests {
@@ -1097,6 +1099,163 @@ mod tests {
             let bad = json!({ "operationalStatus": "Operative", "bogusExtra": true });
             assert!(SchemaValidator::v201()
                 .validate_call("ChangeAvailability", &bad)
+                .is_err());
+        }
+    }
+
+    /// `UnlockConnector` — the 2.0.1 connector-unlock command (#147). Two
+    /// required ids in, an [`UnlockStatusEnumType`] out; reuses `StatusInfoType`.
+    mod unlock_connector {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{CustomDataType, StatusInfoType, UnlockStatusEnumType};
+
+        #[test]
+        fn request_matches_wire_json_and_validates() {
+            let req = UnlockConnectorRequest {
+                evse_id: 1,
+                connector_id: 2,
+                custom_data: None,
+            };
+            let expected = json!({ "evseId": 1, "connectorId": 2 });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let back: UnlockConnectorRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("UnlockConnector", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_round_trips_with_custom_data() {
+            let req = UnlockConnectorRequest {
+                evse_id: 3,
+                connector_id: 1,
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("UnlockConnector", &wire)
+                .is_ok());
+            let back: UnlockConnectorRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = UnlockConnectorResponse {
+                status: UnlockStatusEnumType::Unlocked,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Unlocked" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("UnlockConnector", &expected)
+                .is_ok());
+            let back: UnlockConnectorResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_failed_with_status_info_round_trips() {
+            let resp = UnlockConnectorResponse {
+                status: UnlockStatusEnumType::UnlockFailed,
+                status_info: Some(StatusInfoType {
+                    reason_code: "Jammed".to_string(),
+                    additional_info: Some("connector lock motor stalled".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("UnlockFailed"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("Jammed"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("UnlockConnector", &wire)
+                .is_ok());
+            let back: UnlockConnectorResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_enum_serializes_to_wire_values_and_rejects_unknown() {
+            for (variant, wire) in [
+                (UnlockStatusEnumType::Unlocked, "Unlocked"),
+                (UnlockStatusEnumType::UnlockFailed, "UnlockFailed"),
+                (
+                    UnlockStatusEnumType::OngoingAuthorizedTransaction,
+                    "OngoingAuthorizedTransaction",
+                ),
+                (UnlockStatusEnumType::UnknownConnector, "UnknownConnector"),
+            ] {
+                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            }
+            // `NotSupported` is a 1.6J UnlockStatus value, not valid in 2.0.1.
+            assert!(serde_json::from_value::<UnlockStatusEnumType>(json!("NotSupported")).is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(UnlockConnectorRequest::ACTION_NAME, "UnlockConnector");
+            assert_eq!(
+                UnlockConnectorResponse::ACTION_NAME,
+                "UnlockConnectorResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_required_ids() {
+            let v = SchemaValidator::v201();
+            // Missing connectorId.
+            assert!(v
+                .validate_call("UnlockConnector", &json!({ "evseId": 1 }))
+                .is_err());
+            // Missing evseId.
+            assert!(v
+                .validate_call("UnlockConnector", &json!({ "connectorId": 1 }))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_non_integer_ids() {
+            assert!(SchemaValidator::v201()
+                .validate_call(
+                    "UnlockConnector",
+                    &json!({ "evseId": "1", "connectorId": 2 })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status_and_unknown_value() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("UnlockConnector", &json!({}))
+                .is_err());
+            assert!(v
+                .validate_call_result("UnlockConnector", &json!({ "status": "Maybe" }))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "UnlockConnector",
+                    &json!({ "evseId": 1, "connectorId": 2, "bogusExtra": true })
+                )
+                .is_err());
+            assert!(v
+                .validate_call_result(
+                    "UnlockConnector",
+                    &json!({ "status": "Unlocked", "bogusExtra": true })
+                )
                 .is_err());
         }
     }

@@ -425,6 +425,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "ChangeAvailabilityResponse",
         include_str!("../schemas/v201/ChangeAvailabilityResponse.json"),
     ),
+    (
+        "UnlockConnector",
+        include_str!("../schemas/v201/UnlockConnector.json"),
+    ),
+    (
+        "UnlockConnectorResponse",
+        include_str!("../schemas/v201/UnlockConnectorResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -1734,6 +1742,75 @@ mod tests {
             .validate_call_result(
                 "ChangeAvailability",
                 &json!({ "status": "Accepted", "bogusExtra": true })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_unlock_connector_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call("UnlockConnector", &json!({ "evseId": 1, "connectorId": 2 }))
+            .is_ok());
+        for status in [
+            "Unlocked",
+            "UnlockFailed",
+            "OngoingAuthorizedTransaction",
+            "UnknownConnector",
+        ] {
+            assert!(v
+                .validate_call_result("UnlockConnector", &json!({ "status": status }))
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn v201_unlock_connector_call_missing_required_ids_fail() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call("UnlockConnector", &json!({ "evseId": 1 }))
+            .is_err());
+        assert!(v
+            .validate_call("UnlockConnector", &json!({ "connectorId": 2 }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_unlock_connector_call_rejects_non_integer_ids() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call(
+                "UnlockConnector",
+                &json!({ "evseId": "1", "connectorId": 2 })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_unlock_connector_result_missing_or_unknown_status_fails() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call_result("UnlockConnector", &json!({}))
+            .is_err());
+        // `NotSupported` is a 1.6J UnlockStatus value, not valid in 2.0.1.
+        assert!(v
+            .validate_call_result("UnlockConnector", &json!({ "status": "NotSupported" }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_unlock_connector_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call(
+                "UnlockConnector",
+                &json!({ "evseId": 1, "connectorId": 2, "bogusExtra": true })
+            )
+            .is_err());
+        assert!(v
+            .validate_call_result(
+                "UnlockConnector",
+                &json!({ "status": "Unlocked", "bogusExtra": true })
             )
             .is_err());
     }
