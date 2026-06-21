@@ -433,6 +433,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "UnlockConnectorResponse",
         include_str!("../schemas/v201/UnlockConnectorResponse.json"),
     ),
+    (
+        "TriggerMessage",
+        include_str!("../schemas/v201/TriggerMessage.json"),
+    ),
+    (
+        "TriggerMessageResponse",
+        include_str!("../schemas/v201/TriggerMessageResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
