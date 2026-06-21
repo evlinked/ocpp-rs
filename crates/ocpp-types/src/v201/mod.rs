@@ -273,6 +273,69 @@ mod tests {
     }
 
     #[test]
+    fn trigger_message_enums_serialize_exact_wire_values() {
+        // The full trigger set round-trips to its exact PascalCase wire value.
+        for (variant, wire) in [
+            (MessageTriggerEnumType::BootNotification, "BootNotification"),
+            (
+                MessageTriggerEnumType::LogStatusNotification,
+                "LogStatusNotification",
+            ),
+            (
+                MessageTriggerEnumType::FirmwareStatusNotification,
+                "FirmwareStatusNotification",
+            ),
+            (MessageTriggerEnumType::Heartbeat, "Heartbeat"),
+            (MessageTriggerEnumType::MeterValues, "MeterValues"),
+            (
+                MessageTriggerEnumType::SignChargingStationCertificate,
+                "SignChargingStationCertificate",
+            ),
+            (
+                MessageTriggerEnumType::SignV2GCertificate,
+                "SignV2GCertificate",
+            ),
+            (
+                MessageTriggerEnumType::StatusNotification,
+                "StatusNotification",
+            ),
+            (MessageTriggerEnumType::TransactionEvent, "TransactionEvent"),
+            (
+                MessageTriggerEnumType::SignCombinedCertificate,
+                "SignCombinedCertificate",
+            ),
+            (
+                MessageTriggerEnumType::PublishFirmwareStatusNotification,
+                "PublishFirmwareStatusNotification",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<MessageTriggerEnumType>(json!(wire)).unwrap(),
+                variant
+            );
+        }
+        for (variant, wire) in [
+            (TriggerMessageStatusEnumType::Accepted, "Accepted"),
+            (TriggerMessageStatusEnumType::Rejected, "Rejected"),
+            (
+                TriggerMessageStatusEnumType::NotImplemented,
+                "NotImplemented",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<TriggerMessageStatusEnumType>(json!(wire)).unwrap(),
+                variant
+            );
+        }
+        // `Resumed` is a TransactionEvent trigger reason, not a message trigger.
+        assert!(serde_json::from_value::<MessageTriggerEnumType>(json!("Resumed")).is_err());
+        // `NotImplemented` is response-only; not a valid requestedMessage.
+        assert!(serde_json::from_value::<MessageTriggerEnumType>(json!("NotImplemented")).is_err());
+    }
+
+    #[test]
     fn component_omits_none_optionals() {
         let c = ComponentType {
             name: "EVSE".to_string(),

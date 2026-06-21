@@ -318,6 +318,41 @@ pub enum UnlockStatusEnumType {
     UnknownConnector,
 }
 
+/// Which message a `TriggerMessage.req` asks the Charging Station to send next.
+///
+/// Ports `MessageTriggerEnumType` (`ocpp/v201/enums.py`). Each variant names a
+/// message (or certificate-signing flow) the CSMS can prompt the station to emit
+/// proactively. Wire values are PascalCase and identical to the bundled OCPP
+/// 2.0.1 FINAL JSON Schema's `enum`, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageTriggerEnumType {
+    BootNotification,
+    LogStatusNotification,
+    FirmwareStatusNotification,
+    Heartbeat,
+    MeterValues,
+    SignChargingStationCertificate,
+    SignV2GCertificate,
+    StatusNotification,
+    TransactionEvent,
+    SignCombinedCertificate,
+    PublishFirmwareStatusNotification,
+}
+
+/// Whether the Charging Station will honor a `TriggerMessage.req`, reported in
+/// `TriggerMessage.conf`.
+///
+/// Ports `TriggerMessageStatusEnumType` (`ocpp/v201/enums.py`). `NotImplemented`
+/// means the requested message is recognized but the station does not support
+/// triggering it. Wire values are PascalCase, identical to the bundled OCPP
+/// 2.0.1 FINAL JSON Schema's `enum`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TriggerMessageStatusEnumType {
+    Accepted,
+    Rejected,
+    NotImplemented,
+}
+
 /// Hash algorithm used for the OCSP request data in the ISO 15118
 /// plug-and-charge certificate path.
 ///

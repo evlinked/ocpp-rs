@@ -36,6 +36,7 @@ mod reset;
 mod set_variables;
 mod status_notification;
 mod transaction_event;
+mod trigger_message;
 mod unlock_connector;
 
 pub use authorize::{AuthorizeRequest, AuthorizeResponse};
@@ -55,6 +56,7 @@ pub use reset::{ResetRequest, ResetResponse};
 pub use set_variables::{SetVariablesRequest, SetVariablesResponse};
 pub use status_notification::{StatusNotificationRequest, StatusNotificationResponse};
 pub use transaction_event::{TransactionEventRequest, TransactionEventResponse};
+pub use trigger_message::{TriggerMessageRequest, TriggerMessageResponse};
 pub use unlock_connector::{UnlockConnectorRequest, UnlockConnectorResponse};
 
 #[cfg(test)]
@@ -2403,6 +2405,188 @@ mod tests {
             let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
             assert!(SchemaValidator::v201()
                 .validate_call_result("DataTransfer", &bad_resp)
+                .is_err());
+        }
+    }
+
+    /// `TriggerMessage` — the 2.0.1 message-trigger command (#152). A required
+    /// [`MessageTriggerEnumType`] in (optionally scoped to one `evse`), a
+    /// [`TriggerMessageStatusEnumType`] out; reuses `EvseType`/`StatusInfoType`.
+    mod trigger_message {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            CustomDataType, EvseType, MessageTriggerEnumType, StatusInfoType,
+            TriggerMessageStatusEnumType,
+        };
+
+        #[test]
+        fn request_targets_whole_station_and_validates() {
+            // No `evse` → trigger a fresh BootNotification from the whole station.
+            let req = TriggerMessageRequest {
+                requested_message: MessageTriggerEnumType::BootNotification,
+                evse: None,
+                custom_data: None,
+            };
+            let expected = json!({ "requestedMessage": "BootNotification" });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            // `evse`/`customData` are omitted when `None`.
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("evse"));
+            assert!(!obj.contains_key("customData"));
+            let back: TriggerMessageRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("TriggerMessage", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_scoped_to_single_evse_and_validates() {
+            let req = TriggerMessageRequest {
+                requested_message: MessageTriggerEnumType::StatusNotification,
+                evse: Some(EvseType {
+                    id: 1,
+                    connector_id: Some(2),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(
+                wire,
+                json!({
+                    "requestedMessage": "StatusNotification",
+                    "evse": { "id": 1, "connectorId": 2 }
+                })
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call("TriggerMessage", &wire)
+                .is_ok());
+            let back: TriggerMessageRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_round_trips_with_custom_data() {
+            let req = TriggerMessageRequest {
+                requested_message: MessageTriggerEnumType::MeterValues,
+                evse: None,
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("TriggerMessage", &wire)
+                .is_ok());
+            let back: TriggerMessageRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = TriggerMessageResponse {
+                status: TriggerMessageStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("TriggerMessage", &expected)
+                .is_ok());
+            let back: TriggerMessageResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_not_implemented_with_status_info_round_trips() {
+            let resp = TriggerMessageResponse {
+                status: TriggerMessageStatusEnumType::NotImplemented,
+                status_info: Some(StatusInfoType {
+                    reason_code: "NotSupported".to_string(),
+                    additional_info: Some("station cannot trigger this message".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("NotImplemented"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("NotSupported"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("TriggerMessage", &wire)
+                .is_ok());
+            let back: TriggerMessageResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_enum_serializes_to_wire_values_and_rejects_unknown() {
+            for (variant, wire) in [
+                (TriggerMessageStatusEnumType::Accepted, "Accepted"),
+                (TriggerMessageStatusEnumType::Rejected, "Rejected"),
+                (
+                    TriggerMessageStatusEnumType::NotImplemented,
+                    "NotImplemented",
+                ),
+            ] {
+                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            }
+            // `NotSupported` is a 1.6J TriggerMessageStatus value, not valid in
+            // 2.0.1 (the spec renamed it `NotImplemented`).
+            assert!(
+                serde_json::from_value::<TriggerMessageStatusEnumType>(json!("NotSupported"))
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(TriggerMessageRequest::ACTION_NAME, "TriggerMessage");
+            assert_eq!(
+                TriggerMessageResponse::ACTION_NAME,
+                "TriggerMessageResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            // `requestedMessage` is the sole required request field.
+            assert!(v.validate_call("TriggerMessage", &json!({})).is_err());
+            // `status` is required on the response.
+            assert!(v
+                .validate_call_result("TriggerMessage", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_unknown_requested_message() {
+            // `DiagnosticsStatusNotification` is a 1.6J trigger, dropped in 2.0.1.
+            let bad = json!({ "requestedMessage": "DiagnosticsStatusNotification" });
+            assert!(SchemaValidator::v201()
+                .validate_call("TriggerMessage", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<TriggerMessageRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "TriggerMessage",
+                    &json!({ "requestedMessage": "Heartbeat", "bogusExtra": true })
+                )
+                .is_err());
+            assert!(v
+                .validate_call_result(
+                    "TriggerMessage",
+                    &json!({ "status": "Accepted", "bogusExtra": true })
+                )
                 .is_err());
         }
     }

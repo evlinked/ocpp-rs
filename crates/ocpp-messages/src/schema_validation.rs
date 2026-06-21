@@ -434,6 +434,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/UnlockConnectorResponse.json"),
     ),
     (
+        "TriggerMessage",
+        include_str!("../schemas/v201/TriggerMessage.json"),
+    ),
+    (
+        "TriggerMessageResponse",
+        include_str!("../schemas/v201/TriggerMessageResponse.json"),
+    ),
+    (
         "DataTransfer",
         include_str!("../schemas/v201/DataTransfer.json"),
     ),
