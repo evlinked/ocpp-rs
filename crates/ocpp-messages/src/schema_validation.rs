@@ -377,6 +377,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "ResetResponse",
         include_str!("../schemas/v201/ResetResponse.json"),
     ),
+    (
+        "RequestStartTransaction",
+        include_str!("../schemas/v201/RequestStartTransaction.json"),
+    ),
+    (
+        "RequestStartTransactionResponse",
+        include_str!("../schemas/v201/RequestStartTransactionResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
