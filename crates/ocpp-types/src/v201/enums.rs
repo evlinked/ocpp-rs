@@ -250,6 +250,19 @@ pub enum ResetStatusEnumType {
     Scheduled,
 }
 
+/// Whether a Charging Station accepts a request to remotely start or stop a
+/// transaction.
+///
+/// Ports `RequestStartStopStatusEnumType` (`ocpp/v201/enums.py`). Shared by the
+/// `RequestStartTransaction` and `RequestStopTransaction` command replies; the
+/// 2.0.1 successor to the 1.6J `RemoteStartStopStatus`. Wire values are
+/// PascalCase (`"Accepted"`, `"Rejected"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RequestStartStopStatusEnumType {
+    Accepted,
+    Rejected,
+}
+
 /// Hash algorithm used for the OCSP request data in the ISO 15118
 /// plug-and-charge certificate path.
 ///
@@ -403,15 +416,4 @@ pub enum LocationEnumType {
     Ev,
     Inlet,
     Outlet,
-}
-
-/// Whether the Charging Station accepts a `RequestStartTransaction.req` or
-/// `RequestStopTransaction.req`.
-///
-/// Ports `RequestStartStopStatusEnumType` (`ocpp/v201/enums.py`). Shared by the
-/// remote-start and remote-stop command pair; wire values are PascalCase.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RequestStartStopStatusEnumType {
-    Accepted,
-    Rejected,
 }
