@@ -2352,22 +2352,20 @@ mod tests {
 
         #[test]
         fn status_enum_serializes_to_wire_values_and_rejects_unknown() {
-            assert_eq!(
-                serde_json::to_value(DataTransferStatusEnumType::Accepted).unwrap(),
-                json!("Accepted")
-            );
-            assert_eq!(
-                serde_json::to_value(DataTransferStatusEnumType::Rejected).unwrap(),
-                json!("Rejected")
-            );
-            assert_eq!(
-                serde_json::to_value(DataTransferStatusEnumType::UnknownMessageId).unwrap(),
-                json!("UnknownMessageId")
-            );
-            assert_eq!(
-                serde_json::to_value(DataTransferStatusEnumType::UnknownVendorId).unwrap(),
-                json!("UnknownVendorId")
-            );
+            for (variant, wire) in [
+                (DataTransferStatusEnumType::Accepted, "Accepted"),
+                (DataTransferStatusEnumType::Rejected, "Rejected"),
+                (
+                    DataTransferStatusEnumType::UnknownMessageId,
+                    "UnknownMessageId",
+                ),
+                (
+                    DataTransferStatusEnumType::UnknownVendorId,
+                    "UnknownVendorId",
+                ),
+            ] {
+                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            }
             assert!(serde_json::from_value::<DataTransferStatusEnumType>(json!("Bogus")).is_err());
         }
 
