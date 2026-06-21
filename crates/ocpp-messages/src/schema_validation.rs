@@ -386,6 +386,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/RequestStartTransactionResponse.json"),
     ),
     (
+        "MeterValues",
+        include_str!("../schemas/v201/MeterValues.json"),
+    ),
+    (
+        "MeterValuesResponse",
+        include_str!("../schemas/v201/MeterValuesResponse.json"),
+    ),
+    (
         "RequestStopTransaction",
         include_str!("../schemas/v201/RequestStopTransaction.json"),
     ),
