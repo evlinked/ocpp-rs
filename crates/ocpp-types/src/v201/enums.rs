@@ -282,3 +282,125 @@ pub enum AuthorizeCertificateStatusEnumType {
     CertChainError,
     ContractCancelled,
 }
+
+/// Type of detail value carried in a [`super::SampledValueType`]: where in a
+/// transaction's lifecycle, or under what circumstances, the value was read.
+///
+/// Ports `ReadingContextEnumType` (`ocpp/v201/enums.py`). Several wire values
+/// are dotted (`"Sample.Periodic"`, the spec default) and so carry an explicit
+/// `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReadingContextEnumType {
+    #[serde(rename = "Interruption.Begin")]
+    InterruptionBegin,
+    #[serde(rename = "Interruption.End")]
+    InterruptionEnd,
+    Other,
+    #[serde(rename = "Sample.Clock")]
+    SampleClock,
+    #[serde(rename = "Sample.Periodic")]
+    SamplePeriodic,
+    #[serde(rename = "Transaction.Begin")]
+    TransactionBegin,
+    #[serde(rename = "Transaction.End")]
+    TransactionEnd,
+    Trigger,
+}
+
+/// The kind of measurement a [`super::SampledValueType`] reports.
+///
+/// Ports `MeasurandEnumType` (`ocpp/v201/enums.py`). The default when the field
+/// is absent is `Energy.Active.Import.Register`. Most wire values are dotted
+/// and carry an explicit `#[serde(rename)]`; `Frequency`, `Voltage` and `SoC`
+/// match their Rust spelling directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MeasurandEnumType {
+    #[serde(rename = "Current.Export")]
+    CurrentExport,
+    #[serde(rename = "Current.Import")]
+    CurrentImport,
+    #[serde(rename = "Current.Offered")]
+    CurrentOffered,
+    #[serde(rename = "Energy.Active.Export.Register")]
+    EnergyActiveExportRegister,
+    #[serde(rename = "Energy.Active.Import.Register")]
+    EnergyActiveImportRegister,
+    #[serde(rename = "Energy.Reactive.Export.Register")]
+    EnergyReactiveExportRegister,
+    #[serde(rename = "Energy.Reactive.Import.Register")]
+    EnergyReactiveImportRegister,
+    #[serde(rename = "Energy.Active.Export.Interval")]
+    EnergyActiveExportInterval,
+    #[serde(rename = "Energy.Active.Import.Interval")]
+    EnergyActiveImportInterval,
+    #[serde(rename = "Energy.Active.Net")]
+    EnergyActiveNet,
+    #[serde(rename = "Energy.Reactive.Export.Interval")]
+    EnergyReactiveExportInterval,
+    #[serde(rename = "Energy.Reactive.Import.Interval")]
+    EnergyReactiveImportInterval,
+    #[serde(rename = "Energy.Reactive.Net")]
+    EnergyReactiveNet,
+    #[serde(rename = "Energy.Apparent.Net")]
+    EnergyApparentNet,
+    #[serde(rename = "Energy.Apparent.Import")]
+    EnergyApparentImport,
+    #[serde(rename = "Energy.Apparent.Export")]
+    EnergyApparentExport,
+    Frequency,
+    #[serde(rename = "Power.Active.Export")]
+    PowerActiveExport,
+    #[serde(rename = "Power.Active.Import")]
+    PowerActiveImport,
+    #[serde(rename = "Power.Factor")]
+    PowerFactor,
+    #[serde(rename = "Power.Offered")]
+    PowerOffered,
+    #[serde(rename = "Power.Reactive.Export")]
+    PowerReactiveExport,
+    #[serde(rename = "Power.Reactive.Import")]
+    PowerReactiveImport,
+    SoC,
+    Voltage,
+}
+
+/// Electrical phase a [`super::SampledValueType`] applies to; absent means the
+/// measured value is an overall value.
+///
+/// Ports `PhaseEnumType` (`ocpp/v201/enums.py`). The hyphenated phase-to-phase
+/// and phase-to-neutral values (`"L1-N"`, `"L1-L2"`, …) carry an explicit
+/// `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PhaseEnumType {
+    L1,
+    L2,
+    L3,
+    N,
+    #[serde(rename = "L1-N")]
+    L1N,
+    #[serde(rename = "L2-N")]
+    L2N,
+    #[serde(rename = "L3-N")]
+    L3N,
+    #[serde(rename = "L1-L2")]
+    L1L2,
+    #[serde(rename = "L2-L3")]
+    L2L3,
+    #[serde(rename = "L3-L1")]
+    L3L1,
+}
+
+/// Where a [`super::SampledValueType`] was sampled; the spec default is
+/// `Outlet`.
+///
+/// Ports `LocationEnumType` (`ocpp/v201/enums.py`). All wire values are
+/// PascalCase except `EV`, which carries an explicit `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocationEnumType {
+    Body,
+    Cable,
+    #[serde(rename = "EV")]
+    Ev,
+    Inlet,
+    Outlet,
+}
