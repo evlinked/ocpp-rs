@@ -472,3 +472,18 @@ pub enum LocationEnumType {
     Inlet,
     Outlet,
 }
+
+/// Outcome of a [`super::DataTransferType`]-style vendor exchange: whether the
+/// receiver accepted the `DataTransfer`, and if not, why.
+///
+/// Ports `DataTransferStatusEnumType` (`ocpp/v201/enums.py`). `Accepted` /
+/// `Rejected` mirror the generic outcome; `UnknownMessageId` and
+/// `UnknownVendorId` let the receiver signal *which* part of the request it
+/// did not recognise. Wire values are PascalCase, verbatim variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DataTransferStatusEnumType {
+    Accepted,
+    Rejected,
+    UnknownMessageId,
+    UnknownVendorId,
+}
