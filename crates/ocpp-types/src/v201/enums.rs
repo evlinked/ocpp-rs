@@ -619,3 +619,17 @@ pub enum ConnectorEnumType {
     /// Unknown / not supported.
     Unknown,
 }
+
+/// Whether the CSMS succeeded in cancelling a previously made reservation,
+/// reported in `CancelReservation.conf`.
+///
+/// Ports `CancelReservationStatusEnumType` (`ocpp/v201/enums.py`). `Accepted`
+/// if the reservation was cancelled, otherwise `Rejected` (e.g. no reservation
+/// with that id exists). Wire values are PascalCase (`"Accepted"`,
+/// `"Rejected"`); the reference dataclass enum and the FINAL JSON Schema agree
+/// exactly on these two values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CancelReservationStatusEnumType {
+    Accepted,
+    Rejected,
+}

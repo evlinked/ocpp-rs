@@ -23,6 +23,7 @@
 
 mod authorize;
 mod boot_notification;
+mod cancel_reservation;
 mod change_availability;
 mod clear_cache;
 mod data_transfer;
@@ -42,6 +43,7 @@ mod unlock_connector;
 
 pub use authorize::{AuthorizeRequest, AuthorizeResponse};
 pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
+pub use cancel_reservation::{CancelReservationRequest, CancelReservationResponse};
 pub use change_availability::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
 pub use clear_cache::{ClearCacheRequest, ClearCacheResponse};
 pub use data_transfer::{DataTransferRequest, DataTransferResponse};
@@ -963,6 +965,141 @@ mod tests {
             let bad = json!({ "status": "Accepted", "bogus": true });
             assert!(SchemaValidator::v201()
                 .validate_call_result("ClearCache", &bad)
+                .is_err());
+        }
+    }
+
+    mod cancel_reservation {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{CancelReservationStatusEnumType, CustomDataType, StatusInfoType};
+
+        #[test]
+        fn request_matches_wire_json_and_validates() {
+            let req = CancelReservationRequest {
+                reservation_id: 42,
+                custom_data: None,
+            };
+            let expected = json!({ "reservationId": 42 });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call("CancelReservation", &expected)
+                .is_ok());
+            let back: CancelReservationRequest = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_with_custom_data_round_trips() {
+            let req = CancelReservationRequest {
+                reservation_id: -1,
+                custom_data: Some(CustomDataType {
+                    vendor_id: "ACME".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["reservationId"], json!(-1));
+            assert_eq!(wire["customData"]["vendorId"], json!("ACME"));
+            assert!(SchemaValidator::v201()
+                .validate_call("CancelReservation", &wire)
+                .is_ok());
+            let back: CancelReservationRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = CancelReservationResponse {
+                status: CancelReservationStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("CancelReservation", &expected)
+                .is_ok());
+            let back: CancelReservationResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_rejected_with_status_info_round_trips() {
+            let resp = CancelReservationResponse {
+                status: CancelReservationStatusEnumType::Rejected,
+                status_info: Some(StatusInfoType {
+                    reason_code: "NoReservation".to_string(),
+                    additional_info: Some("unknown reservationId".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Rejected"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("NoReservation"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("CancelReservation", &wire)
+                .is_ok());
+            let back: CancelReservationResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(CancelReservationRequest::ACTION_NAME, "CancelReservation");
+            assert_eq!(
+                CancelReservationResponse::ACTION_NAME,
+                "CancelReservationResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_reservation_id() {
+            assert!(SchemaValidator::v201()
+                .validate_call("CancelReservation", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_non_integer_reservation_id() {
+            let bad = json!({ "reservationId": "42" });
+            assert!(SchemaValidator::v201()
+                .validate_call("CancelReservation", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<CancelReservationRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("CancelReservation", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_unknown_status() {
+            // `Scheduled` is a ResetStatusEnumType value, not valid here.
+            let bad = json!({ "status": "Scheduled" });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("CancelReservation", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<CancelReservationResponse>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            assert!(SchemaValidator::v201()
+                .validate_call(
+                    "CancelReservation",
+                    &json!({ "reservationId": 1, "bogus": true })
+                )
+                .is_err());
+            assert!(SchemaValidator::v201()
+                .validate_call_result(
+                    "CancelReservation",
+                    &json!({ "status": "Accepted", "bogus": true })
+                )
                 .is_err());
         }
     }
