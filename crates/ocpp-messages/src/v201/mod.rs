@@ -23,6 +23,7 @@
 
 mod authorize;
 mod boot_notification;
+mod get_local_list_version;
 mod get_variables;
 mod heartbeat;
 mod meter_values;
@@ -35,6 +36,7 @@ mod transaction_event;
 
 pub use authorize::{AuthorizeRequest, AuthorizeResponse};
 pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
+pub use get_local_list_version::{GetLocalListVersionRequest, GetLocalListVersionResponse};
 pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
 pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
 pub use meter_values::{MeterValuesRequest, MeterValuesResponse};
@@ -1648,6 +1650,130 @@ mod tests {
             });
             assert!(SchemaValidator::v201()
                 .validate_call("MeterValues", &bad)
+                .is_err());
+        }
+    }
+
+    /// `GetLocalListVersion` (issue #145): the smallest 2.0.1 query — an empty
+    /// request, a single integer (`versionNumber`) out. No new enums/datatypes.
+    mod get_local_list_version {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::CustomDataType;
+
+        #[test]
+        fn request_is_empty_object_on_wire_and_validates() {
+            // GetLocalListVersion.req has no payload fields, so it serializes to
+            // an empty object.
+            let req = GetLocalListVersionRequest::default();
+            assert_eq!(serde_json::to_value(&req).unwrap(), json!({}));
+            let back: GetLocalListVersionRequest = serde_json::from_value(json!({})).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("GetLocalListVersion", &json!({}))
+                .is_ok());
+        }
+
+        #[test]
+        fn request_round_trips_with_custom_data() {
+            let req = GetLocalListVersionRequest {
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("GetLocalListVersion", &wire)
+                .is_ok());
+            let back: GetLocalListVersionRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_matches_reference_wire_json_and_validates() {
+            let resp = GetLocalListVersionResponse {
+                version_number: 42,
+                custom_data: None,
+            };
+            let expected = json!({ "versionNumber": 42 });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            // `customData` is omitted when `None`.
+            assert!(!expected.as_object().unwrap().contains_key("customData"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetLocalListVersion", &expected)
+                .is_ok());
+            let back: GetLocalListVersionResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_round_trips_with_custom_data_and_sentinel_version() {
+            // `versionNumber` of 0 means no local list is installed; -1 is the
+            // documented "unknown" sentinel — both are plain integers on the
+            // wire and must round-trip.
+            for version in [0, -1] {
+                let resp = GetLocalListVersionResponse {
+                    version_number: version,
+                    custom_data: Some(CustomDataType {
+                        vendor_id: "com.example".to_string(),
+                        extra: Default::default(),
+                    }),
+                };
+                let wire = serde_json::to_value(&resp).unwrap();
+                assert_eq!(wire["versionNumber"], json!(version));
+                assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+                assert!(SchemaValidator::v201()
+                    .validate_call_result("GetLocalListVersion", &wire)
+                    .is_ok());
+                let back: GetLocalListVersionResponse = serde_json::from_value(wire).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                GetLocalListVersionRequest::ACTION_NAME,
+                "GetLocalListVersion"
+            );
+            assert_eq!(
+                GetLocalListVersionResponse::ACTION_NAME,
+                "GetLocalListVersionResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_version_number() {
+            // `versionNumber` is the sole required field.
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetLocalListVersion", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_wrong_version_number_type() {
+            // `versionNumber` must be an integer, not a string.
+            let bad = json!({ "versionNumber": "42" });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetLocalListVersion", &bad)
+                .is_err());
+            // And serde refuses to coerce the string into the i32 field.
+            assert!(serde_json::from_value::<GetLocalListVersionResponse>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            // The request carries no fields, so any extra key is rejected.
+            let bad_req = json!({ "unexpected": true });
+            assert!(SchemaValidator::v201()
+                .validate_call("GetLocalListVersion", &bad_req)
+                .is_err());
+            // The response only permits `versionNumber` + `customData`.
+            let bad_resp = json!({ "versionNumber": 1, "unexpected": true });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetLocalListVersion", &bad_resp)
                 .is_err());
         }
     }

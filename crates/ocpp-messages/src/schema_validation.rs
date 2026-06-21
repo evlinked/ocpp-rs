@@ -401,6 +401,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "RequestStopTransactionResponse",
         include_str!("../schemas/v201/RequestStopTransactionResponse.json"),
     ),
+    (
+        "GetLocalListVersion",
+        include_str!("../schemas/v201/GetLocalListVersion.json"),
+    ),
+    (
+        "GetLocalListVersionResponse",
+        include_str!("../schemas/v201/GetLocalListVersionResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -1555,6 +1563,47 @@ mod tests {
         let result = json!({ "status": "Accepted", "bogusExtra": true });
         assert!(v
             .validate_call_result("RequestStopTransaction", &result)
+            .is_err());
+    }
+
+    #[test]
+    fn v201_get_local_list_version_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        // The request is an empty object.
+        assert!(v.validate_call("GetLocalListVersion", &json!({})).is_ok());
+        // The response carries a single integer version number.
+        assert!(v
+            .validate_call_result("GetLocalListVersion", &json!({ "versionNumber": 7 }))
+            .is_ok());
+    }
+
+    #[test]
+    fn v201_get_local_list_version_result_missing_version_number_fails() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call_result("GetLocalListVersion", &json!({}))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_get_local_list_version_result_wrong_type_fails() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call_result("GetLocalListVersion", &json!({ "versionNumber": "7" }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_get_local_list_version_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call("GetLocalListVersion", &json!({ "bogusExtra": true }))
+            .is_err());
+        assert!(v
+            .validate_call_result(
+                "GetLocalListVersion",
+                &json!({ "versionNumber": 1, "bogusExtra": true })
+            )
             .is_err());
     }
 
