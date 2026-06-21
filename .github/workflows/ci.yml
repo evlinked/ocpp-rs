@@ -152,19 +152,18 @@ jobs:
     - name: Cache dependencies
       uses: Swatinem/rust-cache@v2
 
+    # Build docs with -D warnings as a CI check. We intentionally do NOT
+    # publish to GitHub Pages here: the peaceiris/actions-gh-pages deploy
+    # required `contents: write` on GITHUB_TOKEN, which the repo does not
+    # grant, so the step failed with a 403 on every push to main and was the
+    # sole reason `main` CI was red (see #41). Building docs still validates
+    # that rustdoc compiles cleanly; re-introduce publishing via the official
+    # actions/deploy-pages pipeline if/when Pages hosting is wanted.
     - name: Build documentation
       run: |
         cargo doc --workspace --all-features --no-deps --document-private-items
       env:
         RUSTDOCFLAGS: "--deny warnings"
-
-    - name: Deploy to GitHub Pages
-      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-      uses: peaceiris/actions-gh-pages@v3
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        publish_dir: ./target/doc
-        force_orphan: true
 
   msrv:
     name: Minimum Supported Rust Version
