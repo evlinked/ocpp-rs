@@ -450,6 +450,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/DataTransferResponse.json"),
     ),
     (
+        "ReserveNow",
+        include_str!("../schemas/v201/ReserveNow.json"),
+    ),
+    (
+        "ReserveNowResponse",
+        include_str!("../schemas/v201/ReserveNowResponse.json"),
+    ),
+    (
         "CancelReservation",
         include_str!("../schemas/v201/CancelReservation.json"),
     ),
