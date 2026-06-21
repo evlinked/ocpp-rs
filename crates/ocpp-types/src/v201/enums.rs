@@ -250,6 +250,33 @@ pub enum ResetStatusEnumType {
     Scheduled,
 }
 
+/// The availability change a `ChangeAvailability.req` asks the Charging Station
+/// (or a single EVSE) to perform.
+///
+/// Ports `OperationalStatusEnumType` (`ocpp/v201/enums.py`). Wire values are
+/// PascalCase (`"Inoperative"`, `"Operative"`); any other value is rejected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OperationalStatusEnumType {
+    Inoperative,
+    Operative,
+}
+
+/// Whether the Charging Station can perform the availability change requested
+/// in `ChangeAvailability.req`, reported in `ChangeAvailability.conf`.
+///
+/// Ports `ChangeAvailabilityStatusEnumType` (`ocpp/v201/enums.py`). `Scheduled`
+/// is returned when the station accepts the change but defers it (e.g. until an
+/// in-progress transaction ends). Note: the reference *dataclass* enum lists
+/// only `Accepted`/`Rejected`, but the bundled OCPP 2.0.1 FINAL JSON Schema —
+/// the authority for the wire — also defines `Scheduled`, so it is included
+/// here. Wire values are PascalCase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChangeAvailabilityStatusEnumType {
+    Accepted,
+    Rejected,
+    Scheduled,
+}
+
 /// Whether a Charging Station accepts a request to remotely start or stop a
 /// transaction.
 ///
