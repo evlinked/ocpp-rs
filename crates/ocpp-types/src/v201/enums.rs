@@ -226,6 +226,30 @@ pub enum ReasonEnumType {
     Timeout,
 }
 
+/// Type of reset requested by `Reset.req`.
+///
+/// Ports `ResetEnumType` (`ocpp/v201/enums.py`). Wire values are PascalCase
+/// (`"Immediate"`, `"OnIdle"`). The 2.0.1 replacement for the 1.6J
+/// `Hard`/`Soft` distinction: `Immediate` resets at once, `OnIdle` defers the
+/// reset until any ongoing transaction has finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResetEnumType {
+    Immediate,
+    OnIdle,
+}
+
+/// Result of a `Reset.req`, reported in `Reset.conf`.
+///
+/// Ports `ResetStatusEnumType` (`ocpp/v201/enums.py`). `Scheduled` is returned
+/// when the Charging Station accepts the reset but will defer it (e.g. an
+/// `OnIdle` reset while a transaction is in progress).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ResetStatusEnumType {
+    Accepted,
+    Rejected,
+    Scheduled,
+}
+
 /// Hash algorithm used for the OCSP request data in the ISO 15118
 /// plug-and-charge certificate path.
 ///
