@@ -402,6 +402,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/RequestStopTransactionResponse.json"),
     ),
     (
+        "ClearCache",
+        include_str!("../schemas/v201/ClearCache.json"),
+    ),
+    (
+        "ClearCacheResponse",
+        include_str!("../schemas/v201/ClearCacheResponse.json"),
+    ),
+    (
         "GetLocalListVersion",
         include_str!("../schemas/v201/GetLocalListVersion.json"),
     ),
@@ -1571,6 +1579,54 @@ mod tests {
         let result = json!({ "status": "Accepted", "bogusExtra": true });
         assert!(v
             .validate_call_result("RequestStopTransaction", &result)
+            .is_err());
+    }
+
+    #[test]
+    fn v201_clear_cache_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        // Empty request is valid.
+        assert!(v.validate_call("ClearCache", &json!({})).is_ok());
+        // And with a vendor extension.
+        assert!(v
+            .validate_call(
+                "ClearCache",
+                &json!({ "customData": { "vendorId": "ACME" } })
+            )
+            .is_ok());
+        assert!(v
+            .validate_call_result("ClearCache", &json!({ "status": "Accepted" }))
+            .is_ok());
+        assert!(v
+            .validate_call_result("ClearCache", &json!({ "status": "Rejected" }))
+            .is_ok());
+    }
+
+    #[test]
+    fn v201_clear_cache_result_missing_status_fails() {
+        let v = SchemaValidator::v201();
+        assert!(v.validate_call_result("ClearCache", &json!({})).is_err());
+    }
+
+    #[test]
+    fn v201_clear_cache_result_unknown_status_fails() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call_result("ClearCache", &json!({ "status": "Scheduled" }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_clear_cache_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call("ClearCache", &json!({ "bogus": true }))
+            .is_err());
+        assert!(v
+            .validate_call_result(
+                "ClearCache",
+                &json!({ "status": "Accepted", "bogus": true })
+            )
             .is_err());
     }
 

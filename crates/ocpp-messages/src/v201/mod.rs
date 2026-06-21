@@ -24,6 +24,7 @@
 mod authorize;
 mod boot_notification;
 mod change_availability;
+mod clear_cache;
 mod get_local_list_version;
 mod get_variables;
 mod heartbeat;
@@ -38,6 +39,7 @@ mod transaction_event;
 pub use authorize::{AuthorizeRequest, AuthorizeResponse};
 pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
 pub use change_availability::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
+pub use clear_cache::{ClearCacheRequest, ClearCacheResponse};
 pub use get_local_list_version::{GetLocalListVersionRequest, GetLocalListVersionResponse};
 pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
 pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
@@ -849,6 +851,111 @@ mod tests {
                 .validate_call("Reset", &bad)
                 .is_err());
             assert!(serde_json::from_value::<ResetRequest>(bad).is_err());
+        }
+    }
+
+    mod clear_cache {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{ClearCacheStatusEnumType, CustomDataType, StatusInfoType};
+
+        #[test]
+        fn empty_request_serializes_to_object_and_validates() {
+            // No vendor extension — the request carries no fields, so it is `{}`
+            // on the wire.
+            let req = ClearCacheRequest::default();
+            let expected = json!({});
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let back: ClearCacheRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("ClearCache", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_custom_data_round_trips() {
+            let req = ClearCacheRequest {
+                custom_data: Some(CustomDataType {
+                    vendor_id: "ACME".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("ACME"));
+            assert!(SchemaValidator::v201()
+                .validate_call("ClearCache", &wire)
+                .is_ok());
+            let back: ClearCacheRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = ClearCacheResponse {
+                status: ClearCacheStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ClearCache", &expected)
+                .is_ok());
+            let back: ClearCacheResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_rejected_with_status_info_round_trips() {
+            let resp = ClearCacheResponse {
+                status: ClearCacheStatusEnumType::Rejected,
+                status_info: Some(StatusInfoType {
+                    reason_code: "NotSupported".to_string(),
+                    additional_info: Some("no local cache".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Rejected"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("NotSupported"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ClearCache", &wire)
+                .is_ok());
+            let back: ClearCacheResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(ClearCacheRequest::ACTION_NAME, "ClearCache");
+            assert_eq!(ClearCacheResponse::ACTION_NAME, "ClearCacheResponse");
+        }
+
+        #[test]
+        fn schema_rejects_missing_required_status() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ClearCache", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_unknown_status() {
+            // `Scheduled` is a ResetStatusEnumType value, not valid here.
+            let bad = json!({ "status": "Scheduled" });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ClearCache", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<ClearCacheResponse>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let bad = json!({ "status": "Accepted", "bogus": true });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ClearCache", &bad)
+                .is_err());
         }
     }
 
