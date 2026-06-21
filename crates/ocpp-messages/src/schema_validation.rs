@@ -449,6 +449,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "DataTransferResponse",
         include_str!("../schemas/v201/DataTransferResponse.json"),
     ),
+    (
+        "ReserveNow",
+        include_str!("../schemas/v201/ReserveNow.json"),
+    ),
+    (
+        "ReserveNowResponse",
+        include_str!("../schemas/v201/ReserveNowResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J

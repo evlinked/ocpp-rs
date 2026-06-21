@@ -522,3 +522,100 @@ pub enum DataTransferStatusEnumType {
     UnknownMessageId,
     UnknownVendorId,
 }
+
+/// Outcome of a `ReserveNow` request: whether the Charging Station accepted the
+/// reservation, and if not, why.
+///
+/// Ports `ReserveNowStatusEnumType` (`ocpp/v201/enums.py`). The reference
+/// dataclass enum and the FINAL JSON Schema agree exactly on these five values.
+/// All wire values are PascalCase, verbatim variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReserveNowStatusEnumType {
+    /// The reservation has been made.
+    Accepted,
+    /// The reservation could not be made because the EVSE/connector is faulted.
+    Faulted,
+    /// The reservation could not be made because the EVSE/connector is occupied.
+    Occupied,
+    /// The reservation has been rejected (generic refusal).
+    Rejected,
+    /// The reservation could not be made because the EVSE/connector is
+    /// unavailable.
+    Unavailable,
+}
+
+/// The connector type an EVSE exposes, used by `ReserveNow` to scope a
+/// reservation to a particular plug standard.
+///
+/// Ports `ConnectorEnumType` (`ocpp/v201/enums.py`). Wire values are matched to
+/// the **FINAL JSON Schema `enum` verbatim**; the `c…`/`s…`/`w…`-prefixed and
+/// hyphenated tokens are not idiomatic Rust identifiers, so they carry explicit
+/// `#[serde(rename)]`. The six PascalCase tokens (`Other…`, `Pan`,
+/// `Undetermined`, `Unknown`) need no rename.
+///
+/// Note: the reference *dataclass* additionally defines `cChaoJi` and `cGBT`,
+/// but these are **absent from the FINAL JSON Schema** — so they are omitted
+/// here to keep serde and schema validation in agreement (both reject them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectorEnumType {
+    /// Combined Charging System 1 (captive cabled) a.k.a. Combo 1.
+    #[serde(rename = "cCCS1")]
+    Ccs1,
+    /// Combined Charging System 2 (captive cabled) a.k.a. Combo 2.
+    #[serde(rename = "cCCS2")]
+    Ccs2,
+    /// JARI G105-1993 (captive cabled) a.k.a. CHAdeMO.
+    #[serde(rename = "cG105")]
+    Cg105,
+    /// Tesla Connector (captive cabled).
+    #[serde(rename = "cTesla")]
+    Ctesla,
+    /// IEC62196-2 Type 1 connector (captive cabled) a.k.a. J1772.
+    #[serde(rename = "cType1")]
+    Ctype1,
+    /// IEC62196-2 Type 2 connector (captive cabled) a.k.a. Mennekes.
+    #[serde(rename = "cType2")]
+    Ctype2,
+    /// 16A 1 phase IEC60309 socket.
+    #[serde(rename = "s309-1P-16A")]
+    S3091P16A,
+    /// 32A 1 phase IEC60309 socket.
+    #[serde(rename = "s309-1P-32A")]
+    S3091P32A,
+    /// 16A 3 phase IEC60309 socket.
+    #[serde(rename = "s309-3P-16A")]
+    S3093P16A,
+    /// 32A 3 phase IEC60309 socket.
+    #[serde(rename = "s309-3P-32A")]
+    S3093P32A,
+    /// UK domestic socket a.k.a. 13Amp (BS1361).
+    #[serde(rename = "sBS1361")]
+    Sbs1361,
+    /// Schuko socket (CEE 7/7).
+    #[serde(rename = "sCEE-7-7")]
+    Scee77,
+    /// IEC62196-2 Type 2 socket (Mennekes).
+    #[serde(rename = "sType2")]
+    Stype2,
+    /// IEC62196-2 Type 3 socket (Scame).
+    #[serde(rename = "sType3")]
+    Stype3,
+    /// Other single-phase (domestic) socket, max 16A.
+    Other1PhMax16A,
+    /// Other single-phase (domestic) socket, over 16A.
+    Other1PhOver16A,
+    /// Other three-phase socket.
+    Other3Ph,
+    /// Pantograph connector.
+    Pan,
+    /// Wireless inductive charging.
+    #[serde(rename = "wInductive")]
+    Winductive,
+    /// Wireless resonant charging.
+    #[serde(rename = "wResonant")]
+    Wresonant,
+    /// Yet to be determined (e.g. before plugged in).
+    Undetermined,
+    /// Unknown / not supported.
+    Unknown,
+}
