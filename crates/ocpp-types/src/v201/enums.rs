@@ -404,3 +404,14 @@ pub enum LocationEnumType {
     Inlet,
     Outlet,
 }
+
+/// Whether the Charging Station accepts a `RequestStartTransaction.req` or
+/// `RequestStopTransaction.req`.
+///
+/// Ports `RequestStartStopStatusEnumType` (`ocpp/v201/enums.py`). Shared by the
+/// remote-start and remote-stop command pair; wire values are PascalCase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RequestStartStopStatusEnumType {
+    Accepted,
+    Rejected,
+}
