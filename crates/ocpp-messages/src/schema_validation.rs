@@ -441,6 +441,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "TriggerMessageResponse",
         include_str!("../schemas/v201/TriggerMessageResponse.json"),
     ),
+    (
+        "DataTransfer",
+        include_str!("../schemas/v201/DataTransfer.json"),
+    ),
+    (
+        "DataTransferResponse",
+        include_str!("../schemas/v201/DataTransferResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -1819,6 +1827,94 @@ mod tests {
             .validate_call_result(
                 "UnlockConnector",
                 &json!({ "status": "Unlocked", "bogusExtra": true })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_data_transfer_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        // Minimal request: just the required vendorId.
+        assert!(v
+            .validate_call("DataTransfer", &json!({ "vendorId": "ACME" }))
+            .is_ok());
+        // Full request with optional messageId and free-form data.
+        assert!(v
+            .validate_call(
+                "DataTransfer",
+                &json!({
+                    "vendorId": "ACME",
+                    "messageId": "diag.run",
+                    "data": { "level": 3, "tags": ["a", "b"] }
+                })
+            )
+            .is_ok());
+        // Minimal response: just the required status.
+        assert!(v
+            .validate_call_result("DataTransfer", &json!({ "status": "Accepted" }))
+            .is_ok());
+        // Response carrying free-form data back.
+        assert!(v
+            .validate_call_result(
+                "DataTransfer",
+                &json!({ "status": "Accepted", "data": [1, 2, 3] })
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn v201_data_transfer_accepts_arbitrary_data_shapes() {
+        let v = SchemaValidator::v201();
+        // `data` is unconstrained: object, array, string, number, bool, null
+        // all validate against the FINAL schema.
+        for data in [
+            json!({ "k": "v" }),
+            json!([1, 2, 3]),
+            json!("a string"),
+            json!(42),
+            json!(true),
+            json!(null),
+        ] {
+            assert!(
+                v.validate_call("DataTransfer", &json!({ "vendorId": "ACME", "data": data }))
+                    .is_ok(),
+                "data shape should validate"
+            );
+        }
+    }
+
+    #[test]
+    fn v201_data_transfer_call_missing_required_vendor_id_fails() {
+        let v = SchemaValidator::v201();
+        // `vendorId` is required even when other fields are present.
+        assert!(v
+            .validate_call("DataTransfer", &json!({ "messageId": "x" }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_data_transfer_result_missing_or_unknown_status_fails() {
+        let v = SchemaValidator::v201();
+        assert!(v.validate_call_result("DataTransfer", &json!({})).is_err());
+        assert!(v
+            .validate_call_result("DataTransfer", &json!({ "status": "Bogus" }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_data_transfer_rejects_additional_properties_at_root() {
+        let v = SchemaValidator::v201();
+        // The freedom lives *inside* `data`; the message root is still closed.
+        assert!(v
+            .validate_call(
+                "DataTransfer",
+                &json!({ "vendorId": "ACME", "bogusExtra": true })
+            )
+            .is_err());
+        assert!(v
+            .validate_call_result(
+                "DataTransfer",
+                &json!({ "status": "Accepted", "bogusExtra": true })
             )
             .is_err());
     }

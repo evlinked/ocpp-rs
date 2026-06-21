@@ -25,6 +25,7 @@ mod authorize;
 mod boot_notification;
 mod change_availability;
 mod clear_cache;
+mod data_transfer;
 mod get_local_list_version;
 mod get_variables;
 mod heartbeat;
@@ -42,6 +43,7 @@ pub use authorize::{AuthorizeRequest, AuthorizeResponse};
 pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
 pub use change_availability::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
 pub use clear_cache::{ClearCacheRequest, ClearCacheResponse};
+pub use data_transfer::{DataTransferRequest, DataTransferResponse};
 pub use get_local_list_version::{GetLocalListVersionRequest, GetLocalListVersionResponse};
 pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
 pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
@@ -2186,6 +2188,221 @@ mod tests {
             let bad_resp = json!({ "versionNumber": 1, "unexpected": true });
             assert!(SchemaValidator::v201()
                 .validate_call_result("GetLocalListVersion", &bad_resp)
+                .is_err());
+        }
+    }
+
+    /// `DataTransfer` — the 2.0.1 bidirectional vendor escape hatch (#154).
+    /// First v201 message to carry a free-form `serde_json::Value` `data`
+    /// field; reuses `StatusInfoType` and the new `DataTransferStatusEnumType`.
+    mod data_transfer {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{DataTransferStatusEnumType, StatusInfoType};
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only the required vendorId; everything else stays off the wire.
+            let req = DataTransferRequest {
+                vendor_id: "ACME".to_string(),
+                message_id: None,
+                data: None,
+                custom_data: None,
+            };
+            let expected = json!({ "vendorId": "ACME" });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call("DataTransfer", &expected)
+                .is_ok());
+            let back: DataTransferRequest = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_round_trips_with_all_optionals_and_validates() {
+            let req = DataTransferRequest {
+                vendor_id: "ACME".to_string(),
+                message_id: Some("diag.run".to_string()),
+                data: Some(json!({ "level": 3, "tags": ["a", "b"] })),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(
+                wire,
+                json!({
+                    "vendorId": "ACME",
+                    "messageId": "diag.run",
+                    "data": { "level": 3, "tags": ["a", "b"] }
+                })
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call("DataTransfer", &wire)
+                .is_ok());
+            let back: DataTransferRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn data_round_trips_arbitrary_json_without_loss() {
+            // Object, array, string, number, bool, and null all survive a
+            // serialize → deserialize round-trip unchanged. A JSON `null`
+            // *inside* a composite (the array below) is preserved; a bare
+            // top-level `null` is the one shape that collapses — see
+            // `bare_null_data_collapses_to_none` for that documented edge.
+            for data in [
+                json!({ "nested": { "k": [1, 2, 3] } }),
+                json!([true, null, "x", 1.5]),
+                json!("plain string"),
+                json!(-7),
+                json!(false),
+            ] {
+                let req = DataTransferRequest {
+                    vendor_id: "ACME".to_string(),
+                    message_id: None,
+                    data: Some(data.clone()),
+                    custom_data: None,
+                };
+                let wire = serde_json::to_value(&req).unwrap();
+                assert_eq!(wire["data"], data);
+                let back: DataTransferRequest = serde_json::from_value(wire).unwrap();
+                assert_eq!(back, req);
+            }
+        }
+
+        #[test]
+        fn bare_null_data_collapses_to_none() {
+            // `Some(Value::Null)` serializes to an explicit `"data": null`, but
+            // serde maps a JSON `null` back to `None` for an `Option` field, so
+            // the two are indistinguishable after a read. That is fine for
+            // OCPP: sending `data: null` and omitting `data` are semantically
+            // equivalent. Composite payloads carrying inner nulls are
+            // unaffected (covered above).
+            let req = DataTransferRequest {
+                vendor_id: "ACME".to_string(),
+                message_id: None,
+                data: Some(json!(null)),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["data"], json!(null));
+            let back: DataTransferRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back.data, None);
+        }
+
+        #[test]
+        fn request_omits_data_field_when_none() {
+            // `None` data must stay off the wire, distinct from `Some(null)`.
+            let absent = DataTransferRequest {
+                vendor_id: "ACME".to_string(),
+                message_id: None,
+                data: None,
+                custom_data: None,
+            };
+            assert!(serde_json::to_value(&absent).unwrap().get("data").is_none());
+            // `Some(Value::Null)` *does* appear on the wire as an explicit null.
+            let explicit_null = DataTransferRequest {
+                data: Some(json!(null)),
+                ..absent.clone()
+            };
+            assert_eq!(
+                serde_json::to_value(&explicit_null).unwrap()["data"],
+                json!(null)
+            );
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = DataTransferResponse {
+                status: DataTransferStatusEnumType::Accepted,
+                status_info: None,
+                data: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("DataTransfer", &expected)
+                .is_ok());
+            let back: DataTransferResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_rejected_with_status_info_and_data_round_trips() {
+            let resp = DataTransferResponse {
+                status: DataTransferStatusEnumType::UnknownMessageId,
+                status_info: Some(StatusInfoType {
+                    reason_code: "NotSupported".to_string(),
+                    additional_info: Some("unknown messageId".to_string()),
+                    custom_data: None,
+                }),
+                data: Some(json!({ "echo": "diag.run" })),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("UnknownMessageId"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("NotSupported"));
+            assert_eq!(wire["data"], json!({ "echo": "diag.run" }));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("DataTransfer", &wire)
+                .is_ok());
+            let back: DataTransferResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_enum_serializes_to_wire_values_and_rejects_unknown() {
+            for (variant, wire) in [
+                (DataTransferStatusEnumType::Accepted, "Accepted"),
+                (DataTransferStatusEnumType::Rejected, "Rejected"),
+                (
+                    DataTransferStatusEnumType::UnknownMessageId,
+                    "UnknownMessageId",
+                ),
+                (
+                    DataTransferStatusEnumType::UnknownVendorId,
+                    "UnknownVendorId",
+                ),
+            ] {
+                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            }
+            assert!(serde_json::from_value::<DataTransferStatusEnumType>(json!("Bogus")).is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(DataTransferRequest::ACTION_NAME, "DataTransfer");
+            assert_eq!(DataTransferResponse::ACTION_NAME, "DataTransferResponse");
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_vendor_id() {
+            // `vendorId` is required even when other fields are supplied.
+            let bad = json!({ "messageId": "x", "data": { "k": "v" } });
+            assert!(SchemaValidator::v201()
+                .validate_call("DataTransfer", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_unknown_status() {
+            let bad = json!({ "status": "Bogus" });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("DataTransfer", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<DataTransferResponse>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties_at_root() {
+            // The freedom is inside `data`; the message root stays closed.
+            let bad_req = json!({ "vendorId": "ACME", "bogusExtra": true });
+            assert!(SchemaValidator::v201()
+                .validate_call("DataTransfer", &bad_req)
+                .is_err());
+            let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("DataTransfer", &bad_resp)
                 .is_err());
         }
     }
