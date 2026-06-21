@@ -7,24 +7,21 @@
 //! with the resulting transaction; it may target a specific `evseId` and supply
 //! a `groupIdToken`.
 //!
-//! The reference's optional `charging_profile: Option<ChargingProfileType>`
-//! field is **deferred** to a follow-up (#136): it pulls in the sizeable
-//! `ChargingProfileType` → `ChargingScheduleType` datatype tree. Omitting it is
-//! wire-correct — the field is optional — and the bundled
-//! `RequestStartTransaction.json` schema still validates a `chargingProfile`
-//! when a peer sends one, so adding the Rust field later is purely additive.
+//! The CSMS may also attach an optional `chargingProfile`
+//! ([`ChargingProfileType`]) to bound the charging power/current of the started
+//! transaction (a `TxProfile`); it is omitted from the wire when `None`.
 
 use crate::{OcppAction, OcppResponse};
 use ocpp_types::v201::{
-    CustomDataType, IdTokenType, RequestStartStopStatusEnumType, StatusInfoType,
+    ChargingProfileType, CustomDataType, IdTokenType, RequestStartStopStatusEnumType,
+    StatusInfoType,
 };
 use serde::{Deserialize, Serialize};
 
 /// `RequestStartTransaction.req` — sent by the CSMS to remotely start a
 /// transaction.
 ///
-/// Ports `ocpp.v201.call.RequestStartTransaction` (minus the deferred
-/// `chargingProfile`, see module docs).
+/// Ports `ocpp.v201.call.RequestStartTransaction`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RequestStartTransactionRequest {
     /// The driver/token the transaction is started for.
@@ -41,6 +38,9 @@ pub struct RequestStartTransactionRequest {
     /// Optional group/parent token associated with the driver token.
     #[serde(rename = "groupIdToken", skip_serializing_if = "Option::is_none")]
     pub group_id_token: Option<IdTokenType>,
+    /// Optional charging profile bounding the started transaction's power/current.
+    #[serde(rename = "chargingProfile", skip_serializing_if = "Option::is_none")]
+    pub charging_profile: Option<ChargingProfileType>,
     /// Vendor extension.
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,

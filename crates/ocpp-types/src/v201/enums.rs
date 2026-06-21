@@ -522,3 +522,64 @@ pub enum DataTransferStatusEnumType {
     UnknownMessageId,
     UnknownVendorId,
 }
+
+/// Purpose of a [`super::ChargingProfileType`]: where in the station's profile
+/// stack it applies.
+///
+/// Ports `ChargingProfilePurposeEnumType` (`ocpp/v201/enums.py`). Wire values
+/// are the verbatim schema strings; all four are idiomatic Rust identifiers, so
+/// no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChargingProfilePurposeEnumType {
+    ChargingStationExternalConstraints,
+    ChargingStationMaxProfile,
+    TxDefaultProfile,
+    TxProfile,
+}
+
+/// Kind of a [`super::ChargingProfileType`] schedule: absolute, relative to the
+/// transaction start, or recurring.
+///
+/// Ports `ChargingProfileKindEnumType` (`ocpp/v201/enums.py`). Wire values are
+/// PascalCase, verbatim variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChargingProfileKindEnumType {
+    Absolute,
+    Recurring,
+    Relative,
+}
+
+/// Recurrence period of a `Recurring` [`super::ChargingProfileType`].
+///
+/// Ports `RecurrencyKindEnumType` (`ocpp/v201/enums.py`). Wire values are
+/// PascalCase, verbatim variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RecurrencyKindEnumType {
+    Daily,
+    Weekly,
+}
+
+/// Unit in which a [`super::ChargingScheduleType`]'s limits are expressed:
+/// watts or amperes.
+///
+/// Ports `ChargingRateUnitEnumType` (`ocpp/v201/enums.py`). The single-letter
+/// wire values `"W"` / `"A"` are valid Rust identifiers and serialize verbatim,
+/// so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChargingRateUnitEnumType {
+    /// Watts.
+    W,
+    /// Amperes.
+    A,
+}
+
+/// Kind of cost carried by a [`super::CostType`] in a sales tariff.
+///
+/// Ports `CostKindEnumType` (`ocpp/v201/enums.py`). Wire values are PascalCase,
+/// verbatim variant names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CostKindEnumType {
+    CarbonDioxideEmission,
+    RelativePricePercentage,
+    RenewableGenerationPercentage,
+}
