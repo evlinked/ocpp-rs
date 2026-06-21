@@ -10,7 +10,8 @@
 //! This is the foundation for **M7 — OCPP 2.0.1** and currently covers the core
 //! lifecycle messages `BootNotification`, `Heartbeat`, `StatusNotification`,
 //! `Authorize`, the `GetVariables`/`SetVariables` device-model read/write pair,
-//! `TransactionEvent`, and the `Reset` remote command.
+//! `TransactionEvent`, the `Reset` remote command, and the
+//! `RequestStartTransaction` remote-start command.
 //!
 //! ## Layout
 //!
@@ -24,6 +25,7 @@ mod authorize;
 mod boot_notification;
 mod get_variables;
 mod heartbeat;
+mod request_start_transaction;
 mod request_stop_transaction;
 mod reset;
 mod set_variables;
@@ -34,6 +36,9 @@ pub use authorize::{AuthorizeRequest, AuthorizeResponse};
 pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
 pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
 pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
+pub use request_start_transaction::{
+    RequestStartTransactionRequest, RequestStartTransactionResponse,
+};
 pub use request_stop_transaction::{RequestStopTransactionRequest, RequestStopTransactionResponse};
 pub use reset::{ResetRequest, ResetResponse};
 pub use set_variables::{SetVariablesRequest, SetVariablesResponse};
@@ -838,6 +843,230 @@ mod tests {
                 .validate_call("Reset", &bad)
                 .is_err());
             assert!(serde_json::from_value::<ResetRequest>(bad).is_err());
+        }
+    }
+
+    /// `RequestStartTransaction` — the 2.0.1 remote-start command (#132). The
+    /// optional `chargingProfile` field is deferred (#136); the bundled schema
+    /// still validates one when present, asserted below for forward-compat.
+    mod request_start_transaction {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            IdTokenEnumType, IdTokenType, RequestStartStopStatusEnumType, StatusInfoType,
+        };
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only the two required fields: idToken + remoteStartId.
+            let req = RequestStartTransactionRequest {
+                id_token: IdTokenType {
+                    id_token: "045918E24B6D80".to_string(),
+                    kind: IdTokenEnumType::Iso14443,
+                    additional_info: None,
+                    custom_data: None,
+                },
+                remote_start_id: 42,
+                evse_id: None,
+                group_id_token: None,
+                custom_data: None,
+            };
+            let expected = json!({
+                "idToken": { "idToken": "045918E24B6D80", "type": "ISO14443" },
+                "remoteStartId": 42
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let back: RequestStartTransactionRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("RequestStartTransaction", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_round_trips_with_all_optionals_and_validates() {
+            let req = RequestStartTransactionRequest {
+                id_token: IdTokenType {
+                    id_token: "DEADBEEF".to_string(),
+                    kind: IdTokenEnumType::EMaid,
+                    additional_info: None,
+                    custom_data: None,
+                },
+                remote_start_id: 7,
+                evse_id: Some(1),
+                group_id_token: Some(IdTokenType {
+                    id_token: "PARENT01".to_string(),
+                    kind: IdTokenEnumType::Central,
+                    additional_info: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["evseId"], json!(1));
+            assert_eq!(wire["groupIdToken"]["idToken"], json!("PARENT01"));
+            assert!(SchemaValidator::v201()
+                .validate_call("RequestStartTransaction", &wire)
+                .is_ok());
+            let back: RequestStartTransactionRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_omits_optional_fields_when_absent() {
+            let req = RequestStartTransactionRequest {
+                id_token: IdTokenType {
+                    id_token: "abc".to_string(),
+                    kind: IdTokenEnumType::Iso14443,
+                    additional_info: None,
+                    custom_data: None,
+                },
+                remote_start_id: 1,
+                evse_id: None,
+                group_id_token: None,
+                custom_data: None,
+            };
+            let obj = serde_json::to_value(&req).unwrap();
+            let obj = obj.as_object().unwrap();
+            assert!(!obj.contains_key("evseId"));
+            assert!(!obj.contains_key("groupIdToken"));
+            assert!(!obj.contains_key("customData"));
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = RequestStartTransactionResponse {
+                status: RequestStartStopStatusEnumType::Accepted,
+                status_info: None,
+                transaction_id: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("RequestStartTransaction", &expected)
+                .is_ok());
+            let back: RequestStartTransactionResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_rejected_with_status_info_and_transaction_id_round_trips() {
+            // The station had already started a transaction (cable plugged in
+            // first), so it reports that transactionId alongside the status.
+            let resp = RequestStartTransactionResponse {
+                status: RequestStartStopStatusEnumType::Rejected,
+                status_info: Some(StatusInfoType {
+                    reason_code: "AlreadyStarted".to_string(),
+                    additional_info: Some("cable plugged in first".to_string()),
+                    custom_data: None,
+                }),
+                transaction_id: Some("tx-99".to_string()),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Rejected"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("AlreadyStarted"));
+            assert_eq!(wire["transactionId"], json!("tx-99"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("RequestStartTransaction", &wire)
+                .is_ok());
+            let back: RequestStartTransactionResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_enum_serializes_to_wire_values_and_rejects_unknown() {
+            assert_eq!(
+                serde_json::to_value(RequestStartStopStatusEnumType::Accepted).unwrap(),
+                json!("Accepted")
+            );
+            assert_eq!(
+                serde_json::to_value(RequestStartStopStatusEnumType::Rejected).unwrap(),
+                json!("Rejected")
+            );
+            assert!(
+                serde_json::from_value::<RequestStartStopStatusEnumType>(json!("Scheduled"))
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                RequestStartTransactionRequest::ACTION_NAME,
+                "RequestStartTransaction"
+            );
+            assert_eq!(
+                RequestStartTransactionResponse::ACTION_NAME,
+                "RequestStartTransactionResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_required_fields() {
+            // `remoteStartId` is required alongside `idToken`.
+            let bad = json!({
+                "idToken": { "idToken": "abc", "type": "ISO14443" }
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("RequestStartTransaction", &bad)
+                .is_err());
+            // And one missing `idToken`.
+            let bad = json!({ "remoteStartId": 1 });
+            assert!(SchemaValidator::v201()
+                .validate_call("RequestStartTransaction", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status_and_additional_properties() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("RequestStartTransaction", &json!({}))
+                .is_err());
+            let bad = json!({ "status": "Accepted", "unexpected": true });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("RequestStartTransaction", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_unknown_status_value() {
+            // `Scheduled` is a ResetStatusEnumType value, not valid here.
+            let bad = json!({ "status": "Scheduled" });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("RequestStartTransaction", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_still_validates_a_charging_profile_when_present() {
+            // Forward-compat for the deferred `chargingProfile` field (#136):
+            // a peer may already send one, and the bundled schema must accept a
+            // well-formed TxProfile. Constructed as raw JSON since the Rust
+            // struct does not yet carry the field.
+            let req = json!({
+                "idToken": { "idToken": "abc", "type": "ISO14443" },
+                "remoteStartId": 1,
+                "chargingProfile": {
+                    "id": 1,
+                    "stackLevel": 0,
+                    "chargingProfilePurpose": "TxProfile",
+                    "chargingProfileKind": "Absolute",
+                    "transactionId": "tx-1",
+                    "chargingSchedule": [{
+                        "id": 1,
+                        "chargingRateUnit": "A",
+                        "chargingSchedulePeriod": [
+                            { "startPeriod": 0, "limit": 16.0 }
+                        ]
+                    }]
+                }
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("RequestStartTransaction", &req)
+                .is_ok());
         }
     }
 

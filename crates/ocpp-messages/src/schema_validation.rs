@@ -378,6 +378,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/ResetResponse.json"),
     ),
     (
+        "RequestStartTransaction",
+        include_str!("../schemas/v201/RequestStartTransaction.json"),
+    ),
+    (
+        "RequestStartTransactionResponse",
+        include_str!("../schemas/v201/RequestStartTransactionResponse.json"),
+    ),
+    (
         "RequestStopTransaction",
         include_str!("../schemas/v201/RequestStopTransaction.json"),
     ),
