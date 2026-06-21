@@ -250,6 +250,18 @@ pub enum ResetStatusEnumType {
     Scheduled,
 }
 
+/// Whether a Charging Station executed a `ClearCache.req` and wiped its local
+/// authorization cache.
+///
+/// Ports `ClearCacheStatusEnumType` (`ocpp/v201/enums.py`). `Accepted` if the
+/// Charging Station executed the request, otherwise `Rejected`. Wire values are
+/// PascalCase (`"Accepted"`, `"Rejected"`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClearCacheStatusEnumType {
+    Accepted,
+    Rejected,
+}
+
 /// Whether a Charging Station accepts a request to remotely start or stop a
 /// transaction.
 ///
