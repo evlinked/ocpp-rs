@@ -585,8 +585,12 @@ mod tests {
                 variant
             );
         }
+        // Unknown values, and the two vocabularies' values, are mutually
+        // rejected: `updateType` is request-only, `status` response-only.
         assert!(serde_json::from_value::<UpdateEnumType>(json!("Partial")).is_err());
+        assert!(serde_json::from_value::<UpdateEnumType>(json!("VersionMismatch")).is_err());
         assert!(serde_json::from_value::<SendLocalListStatusEnumType>(json!("Bogus")).is_err());
+        assert!(serde_json::from_value::<SendLocalListStatusEnumType>(json!("Full")).is_err());
     }
 
     #[test]

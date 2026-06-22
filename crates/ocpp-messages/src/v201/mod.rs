@@ -3247,38 +3247,6 @@ mod tests {
         }
 
         #[test]
-        fn enums_serialize_exact_wire_values_and_reject_unknown() {
-            for (variant, wire) in [
-                (UpdateEnumType::Differential, "Differential"),
-                (UpdateEnumType::Full, "Full"),
-            ] {
-                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
-                assert_eq!(
-                    serde_json::from_value::<UpdateEnumType>(json!(wire)).unwrap(),
-                    variant
-                );
-            }
-            for (variant, wire) in [
-                (SendLocalListStatusEnumType::Accepted, "Accepted"),
-                (SendLocalListStatusEnumType::Failed, "Failed"),
-                (
-                    SendLocalListStatusEnumType::VersionMismatch,
-                    "VersionMismatch",
-                ),
-            ] {
-                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
-                assert_eq!(
-                    serde_json::from_value::<SendLocalListStatusEnumType>(json!(wire)).unwrap(),
-                    variant
-                );
-            }
-            // `Differential`/`Full` are request-only; `VersionMismatch` is
-            // response-only — neither vocabulary accepts the other's values.
-            assert!(serde_json::from_value::<UpdateEnumType>(json!("VersionMismatch")).is_err());
-            assert!(serde_json::from_value::<SendLocalListStatusEnumType>(json!("Full")).is_err());
-        }
-
-        #[test]
         fn action_names_are_stable() {
             assert_eq!(SendLocalListRequest::ACTION_NAME, "SendLocalList");
             assert_eq!(SendLocalListResponse::ACTION_NAME, "SendLocalListResponse");
