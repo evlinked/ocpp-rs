@@ -848,4 +848,143 @@ mod tests {
         // an empty object.
         assert_eq!(serde_json::to_value(&uom).unwrap(), json!({}));
     }
+
+    #[test]
+    fn charging_profile_enums_serialize_to_exact_wire_values() {
+        for (value, wire) in [
+            (
+                ChargingProfilePurposeEnumType::ChargingStationExternalConstraints,
+                "ChargingStationExternalConstraints",
+            ),
+            (
+                ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
+                "ChargingStationMaxProfile",
+            ),
+            (
+                ChargingProfilePurposeEnumType::TxDefaultProfile,
+                "TxDefaultProfile",
+            ),
+            (ChargingProfilePurposeEnumType::TxProfile, "TxProfile"),
+        ] {
+            assert_eq!(serde_json::to_value(value).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<ChargingProfilePurposeEnumType>(json!(wire)).unwrap(),
+                value
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(ChargingProfileKindEnumType::Recurring).unwrap(),
+            json!("Recurring")
+        );
+        assert_eq!(
+            serde_json::to_value(RecurrencyKindEnumType::Weekly).unwrap(),
+            json!("Weekly")
+        );
+        // Single-letter rate units serialize verbatim.
+        assert_eq!(
+            serde_json::to_value(ChargingRateUnitEnumType::W).unwrap(),
+            json!("W")
+        );
+        assert_eq!(
+            serde_json::to_value(ChargingRateUnitEnumType::A).unwrap(),
+            json!("A")
+        );
+        assert_eq!(
+            serde_json::to_value(CostKindEnumType::RenewableGenerationPercentage).unwrap(),
+            json!("RenewableGenerationPercentage")
+        );
+    }
+
+    #[test]
+    fn charging_profile_enums_reject_unknown_values() {
+        assert!(serde_json::from_value::<ChargingProfilePurposeEnumType>(json!("Bogus")).is_err());
+        assert!(serde_json::from_value::<ChargingProfileKindEnumType>(json!("Sometimes")).is_err());
+        assert!(serde_json::from_value::<RecurrencyKindEnumType>(json!("Monthly")).is_err());
+        assert!(serde_json::from_value::<ChargingRateUnitEnumType>(json!("kW")).is_err());
+        assert!(serde_json::from_value::<CostKindEnumType>(json!("Free")).is_err());
+    }
+
+    #[test]
+    fn charging_schedule_period_omits_none_optionals() {
+        let period = ChargingSchedulePeriodType {
+            start_period: 0,
+            limit: 32.0,
+            number_phases: None,
+            phase_to_use: None,
+            custom_data: None,
+        };
+        // Only the two required fields appear on the wire.
+        assert_eq!(
+            serde_json::to_value(&period).unwrap(),
+            json!({ "startPeriod": 0, "limit": 32.0 })
+        );
+    }
+
+    #[test]
+    fn charging_profile_full_tree_round_trips() {
+        // A recurring profile whose schedule carries a full sales-tariff tree,
+        // exercising every nested datatype and optional field.
+        let profile = ChargingProfileType {
+            id: 5,
+            stack_level: 1,
+            charging_profile_purpose: ChargingProfilePurposeEnumType::TxDefaultProfile,
+            charging_profile_kind: ChargingProfileKindEnumType::Recurring,
+            charging_schedule: vec![ChargingScheduleType {
+                id: 2,
+                charging_rate_unit: ChargingRateUnitEnumType::W,
+                charging_schedule_period: vec![ChargingSchedulePeriodType {
+                    start_period: 0,
+                    limit: 11000.0,
+                    number_phases: Some(3),
+                    phase_to_use: Some(1),
+                    custom_data: None,
+                }],
+                start_schedule: Some("2022-01-01T00:00:00Z".to_string()),
+                duration: Some(86400),
+                min_charging_rate: Some(1380.0),
+                sales_tariff: Some(SalesTariffType {
+                    id: 3,
+                    sales_tariff_entry: vec![SalesTariffEntryType {
+                        relative_time_interval: RelativeTimeIntervalType {
+                            start: 0,
+                            duration: Some(3600),
+                            custom_data: None,
+                        },
+                        e_price_level: Some(1),
+                        consumption_cost: Some(vec![ConsumptionCostType {
+                            start_value: 0.0,
+                            cost: vec![CostType {
+                                cost_kind: CostKindEnumType::RelativePricePercentage,
+                                amount: 25,
+                                amount_multiplier: Some(-1),
+                                custom_data: None,
+                            }],
+                            custom_data: None,
+                        }]),
+                        custom_data: None,
+                    }],
+                    sales_tariff_description: Some("peak".to_string()),
+                    num_e_price_levels: Some(2),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            }],
+            recurrency_kind: Some(RecurrencyKindEnumType::Daily),
+            valid_from: Some("2022-01-01T00:00:00Z".to_string()),
+            valid_to: Some("2022-12-31T23:59:59Z".to_string()),
+            transaction_id: None,
+            custom_data: None,
+        };
+        let wire = serde_json::to_value(&profile).unwrap();
+        // Spot-check the deeply-nested cost made it onto the wire with renames.
+        assert_eq!(
+            wire["chargingSchedule"][0]["salesTariff"]["salesTariffEntry"][0]["consumptionCost"][0]
+                ["cost"][0]["costKind"],
+            json!("RelativePricePercentage")
+        );
+        // transactionId is None, so it must be absent.
+        assert!(!wire.as_object().unwrap().contains_key("transactionId"));
+        let back: ChargingProfileType = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, profile);
+    }
 }

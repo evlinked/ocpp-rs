@@ -493,3 +493,202 @@ pub struct MeterValueType {
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
 }
+
+/// A single cost component of a [`ConsumptionCostType`] block in a sales
+/// tariff.
+///
+/// Ports `CostType`. `costKind` and `amount` are required; `amountMultiplier`
+/// (a power-of-ten exponent applied to `amount`, range −3..3) is optional.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CostType {
+    /// The kind of cost this amount represents.
+    #[serde(rename = "costKind")]
+    pub cost_kind: CostKindEnumType,
+    /// The cost amount, scaled by `amountMultiplier` when present.
+    pub amount: i32,
+    /// Power-of-ten multiplier applied to `amount` (e.g. `-2` → amount/100).
+    #[serde(rename = "amountMultiplier", skip_serializing_if = "Option::is_none")]
+    pub amount_multiplier: Option<i32>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// The cost(s) associated with a consumption band of a [`SalesTariffEntryType`].
+///
+/// Ports `ConsumptionCostType`. Both `startValue` and a non-empty `cost` list
+/// are required by the schema.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConsumptionCostType {
+    /// Lower bound of the consumption range this cost applies to.
+    #[serde(rename = "startValue")]
+    pub start_value: f64,
+    /// The cost components for this consumption band; at least one is required.
+    pub cost: Vec<CostType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// A time interval expressed relative to the start of the parent schedule, used
+/// by a [`SalesTariffEntryType`].
+///
+/// Ports `RelativeTimeIntervalType`. `start` (seconds from schedule start) is
+/// required; `duration` (seconds) is optional and, when absent, means the
+/// interval runs until the next entry begins.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RelativeTimeIntervalType {
+    /// Offset in seconds from the start of the schedule.
+    pub start: i32,
+    /// Duration of the interval in seconds, if bounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<i32>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// One entry of a [`SalesTariffType`], pricing a relative time interval.
+///
+/// Ports `SalesTariffEntryType`. Only `relativeTimeInterval` is required;
+/// `ePriceLevel` (a price tier index, 0 = cheapest) and `consumptionCost`
+/// (consumption-banded costs) are optional.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SalesTariffEntryType {
+    /// The time interval, relative to the schedule start, this entry prices.
+    #[serde(rename = "relativeTimeInterval")]
+    pub relative_time_interval: RelativeTimeIntervalType,
+    /// Price level index for this entry (lower = cheaper), if used.
+    #[serde(rename = "ePriceLevel", skip_serializing_if = "Option::is_none")]
+    pub e_price_level: Option<i32>,
+    /// Consumption-banded costs for this entry, if any.
+    #[serde(rename = "consumptionCost", skip_serializing_if = "Option::is_none")]
+    pub consumption_cost: Option<Vec<ConsumptionCostType>>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// A sales tariff attached to a [`ChargingScheduleType`], conveying time- and
+/// consumption-based pricing to the EV (ISO 15118).
+///
+/// Ports `SalesTariffType`. `id` and a non-empty `salesTariffEntry` list are
+/// required; `salesTariffDescription` (≤32 chars) and `numEPriceLevels` are
+/// optional metadata.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SalesTariffType {
+    /// Identifier of this sales tariff, unique within the schedule.
+    pub id: i32,
+    /// The tariff entries; the schema requires at least one.
+    #[serde(rename = "salesTariffEntry")]
+    pub sales_tariff_entry: Vec<SalesTariffEntryType>,
+    /// Human-readable description of the tariff (≤32 chars), if provided.
+    #[serde(
+        rename = "salesTariffDescription",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub sales_tariff_description: Option<String>,
+    /// Number of distinct price levels used across all entries, if provided.
+    #[serde(rename = "numEPriceLevels", skip_serializing_if = "Option::is_none")]
+    pub num_e_price_levels: Option<i32>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// One period of a [`ChargingScheduleType`]: a charging limit that takes effect
+/// at `startPeriod` and holds until the next period begins.
+///
+/// Ports `ChargingSchedulePeriodType`. `startPeriod` (seconds from the schedule
+/// start) and `limit` (in the schedule's `chargingRateUnit`) are required;
+/// `numberPhases` and `phaseToUse` refine which phases the limit applies to.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChargingSchedulePeriodType {
+    /// Offset in seconds from the schedule start at which this limit applies.
+    #[serde(rename = "startPeriod")]
+    pub start_period: i32,
+    /// The charging rate limit, in the schedule's `chargingRateUnit`.
+    pub limit: f64,
+    /// Number of phases the limit applies to (1–3); default 3 when absent.
+    #[serde(rename = "numberPhases", skip_serializing_if = "Option::is_none")]
+    pub number_phases: Option<i32>,
+    /// Which phase to use for a single-phase limit on a 3-phase connection.
+    #[serde(rename = "phaseToUse", skip_serializing_if = "Option::is_none")]
+    pub phase_to_use: Option<i32>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// A charging schedule within a [`ChargingProfileType`]: an ordered set of
+/// limit periods in a given rate unit, optionally with a sales tariff.
+///
+/// Ports `ChargingScheduleType`. `id`, `chargingRateUnit` and a non-empty
+/// `chargingSchedulePeriod` list are required; `startSchedule`, `duration`,
+/// `minChargingRate` and `salesTariff` are optional.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChargingScheduleType {
+    /// Identifier of this schedule, unique within the profile.
+    pub id: i32,
+    /// Unit the period limits are expressed in (watts or amperes).
+    #[serde(rename = "chargingRateUnit")]
+    pub charging_rate_unit: ChargingRateUnitEnumType,
+    /// The limit periods; the schema requires at least one.
+    #[serde(rename = "chargingSchedulePeriod")]
+    pub charging_schedule_period: Vec<ChargingSchedulePeriodType>,
+    /// Absolute start of the schedule (RFC 3339), for `Absolute`/`Recurring`
+    /// profiles.
+    #[serde(rename = "startSchedule", skip_serializing_if = "Option::is_none")]
+    pub start_schedule: Option<String>,
+    /// Duration of the schedule in seconds, if bounded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration: Option<i32>,
+    /// Minimum charging rate the EV may always draw, in `chargingRateUnit`.
+    #[serde(rename = "minChargingRate", skip_serializing_if = "Option::is_none")]
+    pub min_charging_rate: Option<f64>,
+    /// Optional sales tariff conveyed alongside the schedule.
+    #[serde(rename = "salesTariff", skip_serializing_if = "Option::is_none")]
+    pub sales_tariff: Option<SalesTariffType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// A charging profile: the station's limit on charging power/current over time,
+/// carried in `RequestStartTransaction` / `SetChargingProfile`.
+///
+/// Ports `ChargingProfileType`. `id`, `stackLevel`, `chargingProfilePurpose`,
+/// `chargingProfileKind` and a non-empty `chargingSchedule` list are required;
+/// `recurrencyKind`, `validFrom`/`validTo` and `transactionId` are optional.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChargingProfileType {
+    /// Identifier of this profile.
+    pub id: i32,
+    /// Priority within the profile stack; higher levels override lower ones.
+    #[serde(rename = "stackLevel")]
+    pub stack_level: i32,
+    /// Where in the station's stack this profile applies.
+    #[serde(rename = "chargingProfilePurpose")]
+    pub charging_profile_purpose: ChargingProfilePurposeEnumType,
+    /// Whether the schedule is absolute, relative, or recurring.
+    #[serde(rename = "chargingProfileKind")]
+    pub charging_profile_kind: ChargingProfileKindEnumType,
+    /// The schedule(s) making up the profile; the schema requires at least one.
+    #[serde(rename = "chargingSchedule")]
+    pub charging_schedule: Vec<ChargingScheduleType>,
+    /// Recurrence period for a `Recurring` profile, if applicable.
+    #[serde(rename = "recurrencyKind", skip_serializing_if = "Option::is_none")]
+    pub recurrency_kind: Option<RecurrencyKindEnumType>,
+    /// Point in time the profile becomes valid (RFC 3339), if bounded.
+    #[serde(rename = "validFrom", skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<String>,
+    /// Point in time the profile stops being valid (RFC 3339), if bounded.
+    #[serde(rename = "validTo", skip_serializing_if = "Option::is_none")]
+    pub valid_to: Option<String>,
+    /// Transaction this profile is tied to, for `TxProfile` purposes.
+    #[serde(rename = "transactionId", skip_serializing_if = "Option::is_none")]
+    pub transaction_id: Option<String>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}

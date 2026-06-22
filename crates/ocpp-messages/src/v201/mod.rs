@@ -1426,6 +1426,7 @@ mod tests {
                 remote_start_id: 42,
                 evse_id: None,
                 group_id_token: None,
+                charging_profile: None,
                 custom_data: None,
             };
             let expected = json!({
@@ -1458,6 +1459,7 @@ mod tests {
                     additional_info: None,
                     custom_data: None,
                 }),
+                charging_profile: None,
                 custom_data: None,
             };
             let wire = serde_json::to_value(&req).unwrap();
@@ -1482,13 +1484,89 @@ mod tests {
                 remote_start_id: 1,
                 evse_id: None,
                 group_id_token: None,
+                charging_profile: None,
                 custom_data: None,
             };
             let obj = serde_json::to_value(&req).unwrap();
             let obj = obj.as_object().unwrap();
             assert!(!obj.contains_key("evseId"));
             assert!(!obj.contains_key("groupIdToken"));
+            assert!(!obj.contains_key("chargingProfile"));
             assert!(!obj.contains_key("customData"));
+        }
+
+        #[test]
+        fn request_with_charging_profile_round_trips_and_validates() {
+            use ocpp_types::v201::{
+                ChargingProfileKindEnumType, ChargingProfilePurposeEnumType, ChargingProfileType,
+                ChargingRateUnitEnumType, ChargingSchedulePeriodType, ChargingScheduleType,
+            };
+            // A TxProfile carrying a single absolute schedule with one period.
+            let req = RequestStartTransactionRequest {
+                id_token: IdTokenType {
+                    id_token: "045918E24B6D80".to_string(),
+                    kind: IdTokenEnumType::Iso14443,
+                    additional_info: None,
+                    custom_data: None,
+                },
+                remote_start_id: 99,
+                evse_id: None,
+                group_id_token: None,
+                charging_profile: Some(ChargingProfileType {
+                    id: 1,
+                    stack_level: 0,
+                    charging_profile_purpose: ChargingProfilePurposeEnumType::TxProfile,
+                    charging_profile_kind: ChargingProfileKindEnumType::Absolute,
+                    charging_schedule: vec![ChargingScheduleType {
+                        id: 10,
+                        charging_rate_unit: ChargingRateUnitEnumType::A,
+                        charging_schedule_period: vec![ChargingSchedulePeriodType {
+                            start_period: 0,
+                            limit: 16.0,
+                            number_phases: Some(3),
+                            phase_to_use: None,
+                            custom_data: None,
+                        }],
+                        start_schedule: None,
+                        duration: None,
+                        min_charging_rate: None,
+                        sales_tariff: None,
+                        custom_data: None,
+                    }],
+                    recurrency_kind: None,
+                    valid_from: None,
+                    valid_to: None,
+                    transaction_id: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            // The nested profile is present and shaped per the 2.0.1 wire JSON.
+            assert_eq!(
+                wire["chargingProfile"]["chargingProfilePurpose"],
+                json!("TxProfile")
+            );
+            assert_eq!(
+                wire["chargingProfile"]["chargingProfileKind"],
+                json!("Absolute")
+            );
+            assert_eq!(
+                wire["chargingProfile"]["chargingSchedule"][0]["chargingRateUnit"],
+                json!("A")
+            );
+            assert_eq!(
+                wire["chargingProfile"]["chargingSchedule"][0]["chargingSchedulePeriod"][0]
+                    ["limit"],
+                json!(16.0)
+            );
+            // A populated chargingProfile validates against the bundled schema.
+            assert!(SchemaValidator::v201()
+                .validate_call("RequestStartTransaction", &wire)
+                .is_ok());
+            // Full round-trip back to the typed struct.
+            let back: RequestStartTransactionRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
         }
 
         #[test]
@@ -1599,10 +1677,10 @@ mod tests {
 
         #[test]
         fn schema_still_validates_a_charging_profile_when_present() {
-            // Forward-compat for the deferred `chargingProfile` field (#136):
-            // a peer may already send one, and the bundled schema must accept a
-            // well-formed TxProfile. Constructed as raw JSON since the Rust
-            // struct does not yet carry the field.
+            // A well-formed `chargingProfile` (#136) must pass schema
+            // validation independently of the Rust struct. Constructed as raw
+            // JSON so this guards the bundled schema directly, complementing the
+            // typed round-trip in `request_with_charging_profile_*`.
             let req = json!({
                 "idToken": { "idToken": "abc", "type": "ISO14443" },
                 "remoteStartId": 1,
