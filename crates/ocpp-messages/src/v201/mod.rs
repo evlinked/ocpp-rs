@@ -27,6 +27,7 @@ mod cancel_reservation;
 mod change_availability;
 mod clear_cache;
 mod data_transfer;
+mod firmware_status_notification;
 mod get_local_list_version;
 mod get_variables;
 mod heartbeat;
@@ -47,6 +48,9 @@ pub use cancel_reservation::{CancelReservationRequest, CancelReservationResponse
 pub use change_availability::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
 pub use clear_cache::{ClearCacheRequest, ClearCacheResponse};
 pub use data_transfer::{DataTransferRequest, DataTransferResponse};
+pub use firmware_status_notification::{
+    FirmwareStatusNotificationRequest, FirmwareStatusNotificationResponse,
+};
 pub use get_local_list_version::{GetLocalListVersionRequest, GetLocalListVersionResponse};
 pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
 pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
@@ -3072,6 +3076,161 @@ mod tests {
             assert!(v.validate_call("ReserveNow", &bad_req).is_err());
             let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
             assert!(v.validate_call_result("ReserveNow", &bad_resp).is_err());
+        }
+    }
+
+    mod firmware_status_notification {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{CustomDataType, FirmwareStatusEnumType};
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only the required `status`; `requestId` / `customData` stay off the
+            // wire when `None`.
+            let req = FirmwareStatusNotificationRequest {
+                status: FirmwareStatusEnumType::Downloaded,
+                request_id: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Downloaded" });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            for key in ["requestId", "customData"] {
+                assert!(!obj.contains_key(key));
+            }
+            let back: FirmwareStatusNotificationRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("FirmwareStatusNotification", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_request_id_round_trips_and_validates() {
+            let req = FirmwareStatusNotificationRequest {
+                status: FirmwareStatusEnumType::Installing,
+                request_id: Some(1234),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["status"], json!("Installing"));
+            assert_eq!(wire["requestId"], json!(1234));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("FirmwareStatusNotification", &wire)
+                .is_ok());
+            let back: FirmwareStatusNotificationRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_empty_is_object_and_validates() {
+            let resp = FirmwareStatusNotificationResponse::default();
+            assert_eq!(serde_json::to_value(&resp).unwrap(), json!({}));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("FirmwareStatusNotification", &json!({}))
+                .is_ok());
+            let back: FirmwareStatusNotificationResponse =
+                serde_json::from_value(json!({})).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_enum_serializes_to_exact_wire_values_and_schema_accepts() {
+            // Every one of the 14 members round-trips to its FINAL-schema wire
+            // spelling, and the bundled schema accepts a request carrying it.
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (FirmwareStatusEnumType::Downloaded, "Downloaded"),
+                (FirmwareStatusEnumType::DownloadFailed, "DownloadFailed"),
+                (FirmwareStatusEnumType::Downloading, "Downloading"),
+                (
+                    FirmwareStatusEnumType::DownloadScheduled,
+                    "DownloadScheduled",
+                ),
+                (FirmwareStatusEnumType::DownloadPaused, "DownloadPaused"),
+                (FirmwareStatusEnumType::Idle, "Idle"),
+                (
+                    FirmwareStatusEnumType::InstallationFailed,
+                    "InstallationFailed",
+                ),
+                (FirmwareStatusEnumType::Installing, "Installing"),
+                (FirmwareStatusEnumType::Installed, "Installed"),
+                (FirmwareStatusEnumType::InstallRebooting, "InstallRebooting"),
+                (FirmwareStatusEnumType::InstallScheduled, "InstallScheduled"),
+                (
+                    FirmwareStatusEnumType::InstallVerificationFailed,
+                    "InstallVerificationFailed",
+                ),
+                (FirmwareStatusEnumType::InvalidSignature, "InvalidSignature"),
+                (
+                    FirmwareStatusEnumType::SignatureVerified,
+                    "SignatureVerified",
+                ),
+            ] {
+                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+                assert_eq!(
+                    serde_json::from_value::<FirmwareStatusEnumType>(json!(wire)).unwrap(),
+                    variant
+                );
+                assert!(v
+                    .validate_call("FirmwareStatusNotification", &json!({ "status": wire }))
+                    .is_ok());
+            }
+        }
+
+        #[test]
+        fn enum_and_schema_reject_unknown_status() {
+            let v = SchemaValidator::v201();
+            for bad in ["downloaded", "Bogus", "Install"] {
+                assert!(serde_json::from_value::<FirmwareStatusEnumType>(json!(bad)).is_err());
+                assert!(v
+                    .validate_call("FirmwareStatusNotification", &json!({ "status": bad }))
+                    .is_err());
+            }
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                FirmwareStatusNotificationRequest::ACTION_NAME,
+                "FirmwareStatusNotification"
+            );
+            assert_eq!(
+                FirmwareStatusNotificationResponse::ACTION_NAME,
+                "FirmwareStatusNotificationResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_missing_status_and_non_integer_request_id() {
+            let v = SchemaValidator::v201();
+            // `status` is required.
+            assert!(v
+                .validate_call("FirmwareStatusNotification", &json!({}))
+                .is_err());
+            // `requestId` must be an integer — both schema and serde reject a string.
+            let bad = json!({ "status": "Downloaded", "requestId": "1" });
+            assert!(v.validate_call("FirmwareStatusNotification", &bad).is_err());
+            assert!(serde_json::from_value::<FirmwareStatusNotificationRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let bad_req = json!({ "status": "Downloaded", "bogusExtra": true });
+            assert!(v
+                .validate_call("FirmwareStatusNotification", &bad_req)
+                .is_err());
+            let bad_resp = json!({ "bogusExtra": true });
+            assert!(v
+                .validate_call_result("FirmwareStatusNotification", &bad_resp)
+                .is_err());
         }
     }
 }
