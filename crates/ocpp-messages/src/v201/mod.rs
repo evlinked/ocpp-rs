@@ -23,6 +23,7 @@
 
 mod authorize;
 mod boot_notification;
+mod cancel_reservation;
 mod change_availability;
 mod clear_cache;
 mod data_transfer;
@@ -32,6 +33,7 @@ mod heartbeat;
 mod meter_values;
 mod request_start_transaction;
 mod request_stop_transaction;
+mod reserve_now;
 mod reset;
 mod set_variables;
 mod status_notification;
@@ -41,6 +43,7 @@ mod unlock_connector;
 
 pub use authorize::{AuthorizeRequest, AuthorizeResponse};
 pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
+pub use cancel_reservation::{CancelReservationRequest, CancelReservationResponse};
 pub use change_availability::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
 pub use clear_cache::{ClearCacheRequest, ClearCacheResponse};
 pub use data_transfer::{DataTransferRequest, DataTransferResponse};
@@ -52,6 +55,7 @@ pub use request_start_transaction::{
     RequestStartTransactionRequest, RequestStartTransactionResponse,
 };
 pub use request_stop_transaction::{RequestStopTransactionRequest, RequestStopTransactionResponse};
+pub use reserve_now::{ReserveNowRequest, ReserveNowResponse};
 pub use reset::{ResetRequest, ResetResponse};
 pub use set_variables::{SetVariablesRequest, SetVariablesResponse};
 pub use status_notification::{StatusNotificationRequest, StatusNotificationResponse};
@@ -961,6 +965,141 @@ mod tests {
             let bad = json!({ "status": "Accepted", "bogus": true });
             assert!(SchemaValidator::v201()
                 .validate_call_result("ClearCache", &bad)
+                .is_err());
+        }
+    }
+
+    mod cancel_reservation {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{CancelReservationStatusEnumType, CustomDataType, StatusInfoType};
+
+        #[test]
+        fn request_matches_wire_json_and_validates() {
+            let req = CancelReservationRequest {
+                reservation_id: 42,
+                custom_data: None,
+            };
+            let expected = json!({ "reservationId": 42 });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call("CancelReservation", &expected)
+                .is_ok());
+            let back: CancelReservationRequest = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_with_custom_data_round_trips() {
+            let req = CancelReservationRequest {
+                reservation_id: -1,
+                custom_data: Some(CustomDataType {
+                    vendor_id: "ACME".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["reservationId"], json!(-1));
+            assert_eq!(wire["customData"]["vendorId"], json!("ACME"));
+            assert!(SchemaValidator::v201()
+                .validate_call("CancelReservation", &wire)
+                .is_ok());
+            let back: CancelReservationRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = CancelReservationResponse {
+                status: CancelReservationStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("CancelReservation", &expected)
+                .is_ok());
+            let back: CancelReservationResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_rejected_with_status_info_round_trips() {
+            let resp = CancelReservationResponse {
+                status: CancelReservationStatusEnumType::Rejected,
+                status_info: Some(StatusInfoType {
+                    reason_code: "NoReservation".to_string(),
+                    additional_info: Some("unknown reservationId".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Rejected"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("NoReservation"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("CancelReservation", &wire)
+                .is_ok());
+            let back: CancelReservationResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(CancelReservationRequest::ACTION_NAME, "CancelReservation");
+            assert_eq!(
+                CancelReservationResponse::ACTION_NAME,
+                "CancelReservationResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_reservation_id() {
+            assert!(SchemaValidator::v201()
+                .validate_call("CancelReservation", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_non_integer_reservation_id() {
+            let bad = json!({ "reservationId": "42" });
+            assert!(SchemaValidator::v201()
+                .validate_call("CancelReservation", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<CancelReservationRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("CancelReservation", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_unknown_status() {
+            // `Scheduled` is a ResetStatusEnumType value, not valid here.
+            let bad = json!({ "status": "Scheduled" });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("CancelReservation", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<CancelReservationResponse>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            assert!(SchemaValidator::v201()
+                .validate_call(
+                    "CancelReservation",
+                    &json!({ "reservationId": 1, "bogus": true })
+                )
+                .is_err());
+            assert!(SchemaValidator::v201()
+                .validate_call_result(
+                    "CancelReservation",
+                    &json!({ "status": "Accepted", "bogus": true })
+                )
                 .is_err());
         }
     }
@@ -2664,6 +2803,275 @@ mod tests {
                     &json!({ "status": "Accepted", "bogusExtra": true })
                 )
                 .is_err());
+        }
+    }
+
+    /// `ReserveNow` — the 2.0.1 reservation-create command (#158), companion to
+    /// `CancelReservation`. Required `id`/`expiryDateTime`/`idToken` in, a
+    /// [`ReserveNowStatusEnumType`] out; reuses `IdTokenType`/`StatusInfoType`,
+    /// the only new surface being `ReserveNowStatusEnumType` and the
+    /// `#[serde(rename)]`-heavy [`ConnectorEnumType`].
+    mod reserve_now {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            ConnectorEnumType, CustomDataType, IdTokenEnumType, IdTokenType,
+            ReserveNowStatusEnumType, StatusInfoType,
+        };
+
+        fn sample_id_token() -> IdTokenType {
+            IdTokenType {
+                id_token: "045918E24B6D80".to_string(),
+                kind: IdTokenEnumType::Iso14443,
+                additional_info: None,
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only the three required fields: id, expiryDateTime, idToken.
+            let req = ReserveNowRequest {
+                id: 42,
+                expiry_date_time: "2024-01-01T12:00:00Z".to_string(),
+                id_token: sample_id_token(),
+                connector_type: None,
+                evse_id: None,
+                group_id_token: None,
+                custom_data: None,
+            };
+            let expected = json!({
+                "id": 42,
+                "expiryDateTime": "2024-01-01T12:00:00Z",
+                "idToken": { "idToken": "045918E24B6D80", "type": "ISO14443" }
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            // Optional fields stay off the wire when `None`.
+            let obj = expected.as_object().unwrap();
+            for key in ["connectorType", "evseId", "groupIdToken", "customData"] {
+                assert!(!obj.contains_key(key));
+            }
+            let back: ReserveNowRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("ReserveNow", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_round_trips_with_all_optionals_and_validates() {
+            // groupIdToken reuses the nested IdTokenType; connectorType exercises
+            // a `#[serde(rename)]` value.
+            let req = ReserveNowRequest {
+                id: 7,
+                expiry_date_time: "2024-06-01T08:30:00Z".to_string(),
+                id_token: sample_id_token(),
+                connector_type: Some(ConnectorEnumType::Ccs2),
+                evse_id: Some(1),
+                group_id_token: Some(IdTokenType {
+                    id_token: "PARENT01".to_string(),
+                    kind: IdTokenEnumType::Central,
+                    additional_info: None,
+                    custom_data: None,
+                }),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["connectorType"], json!("cCCS2"));
+            assert_eq!(wire["evseId"], json!(1));
+            assert_eq!(wire["groupIdToken"]["idToken"], json!("PARENT01"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("ReserveNow", &wire)
+                .is_ok());
+            let back: ReserveNowRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = ReserveNowResponse {
+                status: ReserveNowStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            // `statusInfo` is omitted when `None`.
+            assert!(!expected.as_object().unwrap().contains_key("statusInfo"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ReserveNow", &expected)
+                .is_ok());
+            let back: ReserveNowResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_occupied_with_status_info_round_trips() {
+            let resp = ReserveNowResponse {
+                status: ReserveNowStatusEnumType::Occupied,
+                status_info: Some(StatusInfoType {
+                    reason_code: "InUse".to_string(),
+                    additional_info: Some("connector currently charging".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Occupied"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("InUse"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ReserveNow", &wire)
+                .is_ok());
+            let back: ReserveNowResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_enum_serializes_to_wire_values_and_rejects_unknown() {
+            for (variant, wire) in [
+                (ReserveNowStatusEnumType::Accepted, "Accepted"),
+                (ReserveNowStatusEnumType::Faulted, "Faulted"),
+                (ReserveNowStatusEnumType::Occupied, "Occupied"),
+                (ReserveNowStatusEnumType::Rejected, "Rejected"),
+                (ReserveNowStatusEnumType::Unavailable, "Unavailable"),
+            ] {
+                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            }
+            // `Scheduled` belongs to other status enums, not ReserveNow.
+            assert!(
+                serde_json::from_value::<ReserveNowStatusEnumType>(json!("Scheduled")).is_err()
+            );
+        }
+
+        #[test]
+        fn connector_enum_serializes_to_exact_wire_values() {
+            // Every member round-trips to its FINAL-schema wire spelling,
+            // including the `#[serde(rename)]` tokens and the bare PascalCase
+            // ones. Each value is also accepted by the bundled schema.
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (ConnectorEnumType::Ccs1, "cCCS1"),
+                (ConnectorEnumType::Ccs2, "cCCS2"),
+                (ConnectorEnumType::Cg105, "cG105"),
+                (ConnectorEnumType::Ctesla, "cTesla"),
+                (ConnectorEnumType::Ctype1, "cType1"),
+                (ConnectorEnumType::Ctype2, "cType2"),
+                (ConnectorEnumType::S3091P16A, "s309-1P-16A"),
+                (ConnectorEnumType::S3091P32A, "s309-1P-32A"),
+                (ConnectorEnumType::S3093P16A, "s309-3P-16A"),
+                (ConnectorEnumType::S3093P32A, "s309-3P-32A"),
+                (ConnectorEnumType::Sbs1361, "sBS1361"),
+                (ConnectorEnumType::Scee77, "sCEE-7-7"),
+                (ConnectorEnumType::Stype2, "sType2"),
+                (ConnectorEnumType::Stype3, "sType3"),
+                (ConnectorEnumType::Other1PhMax16A, "Other1PhMax16A"),
+                (ConnectorEnumType::Other1PhOver16A, "Other1PhOver16A"),
+                (ConnectorEnumType::Other3Ph, "Other3Ph"),
+                (ConnectorEnumType::Pan, "Pan"),
+                (ConnectorEnumType::Winductive, "wInductive"),
+                (ConnectorEnumType::Wresonant, "wResonant"),
+                (ConnectorEnumType::Undetermined, "Undetermined"),
+                (ConnectorEnumType::Unknown, "Unknown"),
+            ] {
+                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+                // Round-trips back from the wire string.
+                assert_eq!(
+                    serde_json::from_value::<ConnectorEnumType>(json!(wire)).unwrap(),
+                    variant
+                );
+                // And the schema accepts a request carrying it.
+                let req = json!({
+                    "id": 1,
+                    "expiryDateTime": "2024-01-01T12:00:00Z",
+                    "idToken": { "idToken": "abc", "type": "ISO14443" },
+                    "connectorType": wire
+                });
+                assert!(v.validate_call("ReserveNow", &req).is_ok());
+            }
+        }
+
+        #[test]
+        fn connector_enum_rejects_dataclass_only_and_unknown_values() {
+            // `cChaoJi` / `cGBT` exist in the reference dataclass but were
+            // dropped from the FINAL schema — both serde and schema reject them,
+            // staying in agreement.
+            let v = SchemaValidator::v201();
+            for bad in ["cChaoJi", "cGBT", "Bogus", "ccs1"] {
+                assert!(serde_json::from_value::<ConnectorEnumType>(json!(bad)).is_err());
+                let req = json!({
+                    "id": 1,
+                    "expiryDateTime": "2024-01-01T12:00:00Z",
+                    "idToken": { "idToken": "abc", "type": "ISO14443" },
+                    "connectorType": bad
+                });
+                assert!(v.validate_call("ReserveNow", &req).is_err());
+            }
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(ReserveNowRequest::ACTION_NAME, "ReserveNow");
+            assert_eq!(ReserveNowResponse::ACTION_NAME, "ReserveNowResponse");
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            let full = json!({
+                "id": 1,
+                "expiryDateTime": "2024-01-01T12:00:00Z",
+                "idToken": { "idToken": "abc", "type": "ISO14443" }
+            });
+            assert!(v.validate_call("ReserveNow", &full).is_ok());
+            // Drop each required field in turn.
+            for missing in ["id", "expiryDateTime", "idToken"] {
+                let mut bad = full.clone();
+                bad.as_object_mut().unwrap().remove(missing);
+                assert!(
+                    v.validate_call("ReserveNow", &bad).is_err(),
+                    "expected rejection when `{missing}` is absent"
+                );
+            }
+        }
+
+        #[test]
+        fn schema_and_serde_reject_non_integer_id() {
+            let bad = json!({
+                "id": "42",
+                "expiryDateTime": "2024-01-01T12:00:00Z",
+                "idToken": { "idToken": "abc", "type": "ISO14443" }
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("ReserveNow", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<ReserveNowRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_or_unknown_status() {
+            let v = SchemaValidator::v201();
+            assert!(v.validate_call_result("ReserveNow", &json!({})).is_err());
+            let bad = json!({ "status": "Scheduled" });
+            assert!(v.validate_call_result("ReserveNow", &bad).is_err());
+            assert!(serde_json::from_value::<ReserveNowResponse>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let bad_req = json!({
+                "id": 1,
+                "expiryDateTime": "2024-01-01T12:00:00Z",
+                "idToken": { "idToken": "abc", "type": "ISO14443" },
+                "bogusExtra": true
+            });
+            assert!(v.validate_call("ReserveNow", &bad_req).is_err());
+            let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
+            assert!(v.validate_call_result("ReserveNow", &bad_resp).is_err());
         }
     }
 }

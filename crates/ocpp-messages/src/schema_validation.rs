@@ -449,6 +449,22 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "DataTransferResponse",
         include_str!("../schemas/v201/DataTransferResponse.json"),
     ),
+    (
+        "ReserveNow",
+        include_str!("../schemas/v201/ReserveNow.json"),
+    ),
+    (
+        "ReserveNowResponse",
+        include_str!("../schemas/v201/ReserveNowResponse.json"),
+    ),
+    (
+        "CancelReservation",
+        include_str!("../schemas/v201/CancelReservation.json"),
+    ),
+    (
+        "CancelReservationResponse",
+        include_str!("../schemas/v201/CancelReservationResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -1649,6 +1665,68 @@ mod tests {
         assert!(v
             .validate_call_result(
                 "ClearCache",
+                &json!({ "status": "Accepted", "bogus": true })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_cancel_reservation_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call("CancelReservation", &json!({ "reservationId": 42 }))
+            .is_ok());
+        assert!(v
+            .validate_call(
+                "CancelReservation",
+                &json!({ "reservationId": 1, "customData": { "vendorId": "ACME" } })
+            )
+            .is_ok());
+        assert!(v
+            .validate_call_result("CancelReservation", &json!({ "status": "Accepted" }))
+            .is_ok());
+        assert!(v
+            .validate_call_result("CancelReservation", &json!({ "status": "Rejected" }))
+            .is_ok());
+    }
+
+    #[test]
+    fn v201_cancel_reservation_call_missing_reservation_id_fails() {
+        let v = SchemaValidator::v201();
+        assert!(v.validate_call("CancelReservation", &json!({})).is_err());
+    }
+
+    #[test]
+    fn v201_cancel_reservation_call_non_integer_reservation_id_fails() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call("CancelReservation", &json!({ "reservationId": "42" }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_cancel_reservation_result_missing_or_unknown_status_fails() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call_result("CancelReservation", &json!({}))
+            .is_err());
+        assert!(v
+            .validate_call_result("CancelReservation", &json!({ "status": "Scheduled" }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_cancel_reservation_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call(
+                "CancelReservation",
+                &json!({ "reservationId": 1, "bogus": true })
+            )
+            .is_err());
+        assert!(v
+            .validate_call_result(
+                "CancelReservation",
                 &json!({ "status": "Accepted", "bogus": true })
             )
             .is_err());
