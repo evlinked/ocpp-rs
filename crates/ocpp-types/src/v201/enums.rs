@@ -695,6 +695,38 @@ pub enum CancelReservationStatusEnumType {
     Rejected,
 }
 
+/// Whether a `SendLocalList.req` carries a full replacement of the Local
+/// Authorization List or a differential update applied on top of the current
+/// one.
+///
+/// Ports `UpdateEnumType` (`ocpp/v201/enums.py`). For a `Differential` update
+/// each entry whose `idTokenInfo` is absent removes that token from the list;
+/// for a `Full` update the list (which may be absent/empty for a clear)
+/// replaces the station's list entirely. Wire values are PascalCase
+/// (`"Differential"`, `"Full"`); the reference dataclass enum and the FINAL
+/// JSON Schema agree exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateEnumType {
+    Differential,
+    Full,
+}
+
+/// Whether the Charging Station successfully received and applied the Local
+/// Authorization List update from a `SendLocalList.req`, reported in
+/// `SendLocalList.conf`.
+///
+/// Ports `SendLocalListStatusEnumType` (`ocpp/v201/enums.py`).
+/// `VersionMismatch` means a differential update was rejected because its
+/// `versionNumber` is not exactly one higher than the list the station holds.
+/// Wire values are PascalCase (`"Accepted"`, `"Failed"`, `"VersionMismatch"`);
+/// the reference dataclass enum and the FINAL JSON Schema agree exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SendLocalListStatusEnumType {
+    Accepted,
+    Failed,
+    VersionMismatch,
+}
+
 /// Progress of a firmware installation, reported in
 /// `FirmwareStatusNotification.req` while an `UpdateFirmware` flow proceeds.
 ///

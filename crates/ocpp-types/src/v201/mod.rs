@@ -510,6 +510,90 @@ mod tests {
     }
 
     #[test]
+    fn authorization_data_omits_id_token_info_when_absent() {
+        // A removal entry in a differential SendLocalList update: only the
+        // required `idToken` appears — no `idTokenInfo`, no nulls.
+        let entry = AuthorizationData {
+            id_token: IdTokenType {
+                id_token: "045918E24B6D80".to_string(),
+                kind: IdTokenEnumType::Iso14443,
+                additional_info: None,
+                custom_data: None,
+            },
+            id_token_info: None,
+            custom_data: None,
+        };
+        let expected = json!({
+            "idToken": { "idToken": "045918E24B6D80", "type": "ISO14443" }
+        });
+        assert_eq!(serde_json::to_value(&entry).unwrap(), expected);
+        let back: AuthorizationData = serde_json::from_value(expected).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn authorization_data_round_trips_with_id_token_info() {
+        let entry = AuthorizationData {
+            id_token: IdTokenType {
+                id_token: "group-1".to_string(),
+                kind: IdTokenEnumType::Central,
+                additional_info: None,
+                custom_data: None,
+            },
+            id_token_info: Some(IdTokenInfoType {
+                status: AuthorizationStatusEnumType::Accepted,
+                cache_expiry_date_time: None,
+                charging_priority: None,
+                language1: None,
+                evse_id: None,
+                language2: None,
+                group_id_token: None,
+                personal_message: None,
+                custom_data: None,
+            }),
+            custom_data: None,
+        };
+        let wire = serde_json::to_value(&entry).unwrap();
+        assert_eq!(wire["idTokenInfo"]["status"], json!("Accepted"));
+        let back: AuthorizationData = serde_json::from_value(wire).unwrap();
+        assert_eq!(back, entry);
+    }
+
+    #[test]
+    fn send_local_list_enums_serialize_exact_wire_values() {
+        for (variant, wire) in [
+            (UpdateEnumType::Differential, "Differential"),
+            (UpdateEnumType::Full, "Full"),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<UpdateEnumType>(json!(wire)).unwrap(),
+                variant
+            );
+        }
+        for (variant, wire) in [
+            (SendLocalListStatusEnumType::Accepted, "Accepted"),
+            (SendLocalListStatusEnumType::Failed, "Failed"),
+            (
+                SendLocalListStatusEnumType::VersionMismatch,
+                "VersionMismatch",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<SendLocalListStatusEnumType>(json!(wire)).unwrap(),
+                variant
+            );
+        }
+        // Unknown values, and the two vocabularies' values, are mutually
+        // rejected: `updateType` is request-only, `status` response-only.
+        assert!(serde_json::from_value::<UpdateEnumType>(json!("Partial")).is_err());
+        assert!(serde_json::from_value::<UpdateEnumType>(json!("VersionMismatch")).is_err());
+        assert!(serde_json::from_value::<SendLocalListStatusEnumType>(json!("Bogus")).is_err());
+        assert!(serde_json::from_value::<SendLocalListStatusEnumType>(json!("Full")).is_err());
+    }
+
+    #[test]
     fn transaction_event_enums_serialize_pascal_case() {
         assert_eq!(
             serde_json::to_value(TransactionEventEnumType::Started).unwrap(),
