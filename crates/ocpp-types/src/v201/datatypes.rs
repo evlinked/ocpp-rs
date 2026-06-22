@@ -692,3 +692,26 @@ pub struct ChargingProfileType {
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
 }
+
+/// A single entry in the Local Authorization List pushed by a
+/// `SendLocalList.req`: the identifier to authorize, plus its (optional)
+/// cached authorization status.
+///
+/// Ports `AuthorizationData`. `id_token` is required; when `id_token_info` is
+/// absent the entry signals deletion of that identifier from the list (only
+/// meaningful in a `Differential` update). Reuses the already-ported
+/// [`IdTokenType`] and [`IdTokenInfoType`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthorizationData {
+    /// The identifier this entry authorizes.
+    #[serde(rename = "idToken")]
+    pub id_token: IdTokenType,
+    /// Cached authorization status for the identifier. Omitted entirely when
+    /// absent; in a differential update an absent value means "remove this
+    /// identifier from the list".
+    #[serde(rename = "idTokenInfo", skip_serializing_if = "Option::is_none")]
+    pub id_token_info: Option<IdTokenInfoType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}

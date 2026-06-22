@@ -694,3 +694,31 @@ pub enum CancelReservationStatusEnumType {
     Accepted,
     Rejected,
 }
+
+/// The kind of update a `SendLocalList.req` carries.
+///
+/// Ports `UpdateEnumType` (`ocpp/v201/enums.py`). A `Full` update replaces the
+/// Charging Station's entire Local Authorization List; a `Differential` update
+/// applies only the changes in `localAuthorizationList` on top of the existing
+/// list. Wire values are PascalCase (`"Differential"`, `"Full"`); the reference
+/// dataclass enum and the FINAL JSON Schema agree exactly on these two values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateEnumType {
+    Differential,
+    Full,
+}
+
+/// The Charging Station's verdict on a `SendLocalList.req`.
+///
+/// Ports `SendLocalListStatusEnumType` (`ocpp/v201/enums.py`). `Accepted` if the
+/// update was received and applied, `Failed` if it could not be applied, and
+/// `VersionMismatch` if the supplied `versionNumber` did not line up with the
+/// station's current list version (typically a stale differential update). Wire
+/// values are PascalCase (`"Accepted"`, `"Failed"`, `"VersionMismatch"`); the
+/// reference dataclass enum and the FINAL JSON Schema agree exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SendLocalListStatusEnumType {
+    Accepted,
+    Failed,
+    VersionMismatch,
+}

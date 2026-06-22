@@ -35,6 +35,7 @@ mod request_start_transaction;
 mod request_stop_transaction;
 mod reserve_now;
 mod reset;
+mod send_local_list;
 mod set_variables;
 mod status_notification;
 mod transaction_event;
@@ -57,6 +58,7 @@ pub use request_start_transaction::{
 pub use request_stop_transaction::{RequestStopTransactionRequest, RequestStopTransactionResponse};
 pub use reserve_now::{ReserveNowRequest, ReserveNowResponse};
 pub use reset::{ResetRequest, ResetResponse};
+pub use send_local_list::{SendLocalListRequest, SendLocalListResponse};
 pub use set_variables::{SetVariablesRequest, SetVariablesResponse};
 pub use status_notification::{StatusNotificationRequest, StatusNotificationResponse};
 pub use transaction_event::{TransactionEventRequest, TransactionEventResponse};
@@ -3072,6 +3074,254 @@ mod tests {
             assert!(v.validate_call("ReserveNow", &bad_req).is_err());
             let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
             assert!(v.validate_call_result("ReserveNow", &bad_resp).is_err());
+        }
+    }
+
+    mod send_local_list {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            AuthorizationData, AuthorizationStatusEnumType, CustomDataType, IdTokenEnumType,
+            IdTokenInfoType, IdTokenType, SendLocalListStatusEnumType, StatusInfoType,
+            UpdateEnumType,
+        };
+
+        // A bare identifier entry (delete marker in a differential update).
+        fn id_token_only_entry() -> AuthorizationData {
+            AuthorizationData {
+                id_token: IdTokenType {
+                    id_token: "ABC123".to_string(),
+                    kind: IdTokenEnumType::Iso14443,
+                    additional_info: None,
+                    custom_data: None,
+                },
+                id_token_info: None,
+                custom_data: None,
+            }
+        }
+
+        // A full entry carrying cached authorization status.
+        fn full_entry() -> AuthorizationData {
+            AuthorizationData {
+                id_token: IdTokenType {
+                    id_token: "DEADBEEF".to_string(),
+                    kind: IdTokenEnumType::Iso14443,
+                    additional_info: None,
+                    custom_data: None,
+                },
+                id_token_info: Some(IdTokenInfoType {
+                    status: AuthorizationStatusEnumType::Accepted,
+                    cache_expiry_date_time: None,
+                    charging_priority: None,
+                    language1: None,
+                    evse_id: None,
+                    language2: None,
+                    group_id_token: None,
+                    personal_message: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn minimal_request_matches_wire_json_and_validates() {
+            // No list: a Full update with no entries clears the list. The
+            // optional list and customData are omitted on the wire.
+            let req = SendLocalListRequest {
+                version_number: 3,
+                update_type: UpdateEnumType::Full,
+                local_authorization_list: None,
+                custom_data: None,
+            };
+            let expected = json!({ "versionNumber": 3, "updateType": "Full" });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call("SendLocalList", &expected)
+                .is_ok());
+            let back: SendLocalListRequest = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn full_request_with_list_round_trips_and_validates() {
+            let req = SendLocalListRequest {
+                version_number: 42,
+                update_type: UpdateEnumType::Full,
+                local_authorization_list: Some(vec![id_token_only_entry(), full_entry()]),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["versionNumber"], json!(42));
+            assert_eq!(wire["updateType"], json!("Full"));
+            assert_eq!(
+                wire["localAuthorizationList"][0]["idToken"]["idToken"],
+                json!("ABC123")
+            );
+            // The bare entry has no idTokenInfo on the wire.
+            assert!(wire["localAuthorizationList"][0]
+                .get("idTokenInfo")
+                .is_none());
+            assert_eq!(
+                wire["localAuthorizationList"][1]["idTokenInfo"]["status"],
+                json!("Accepted")
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call("SendLocalList", &wire)
+                .is_ok());
+            let back: SendLocalListRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn differential_update_with_single_entry_validates() {
+            let req = SendLocalListRequest {
+                version_number: 7,
+                update_type: UpdateEnumType::Differential,
+                local_authorization_list: Some(vec![full_entry()]),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "ACME".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["updateType"], json!("Differential"));
+            assert_eq!(wire["customData"]["vendorId"], json!("ACME"));
+            assert!(SchemaValidator::v201()
+                .validate_call("SendLocalList", &wire)
+                .is_ok());
+            let back: SendLocalListRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn absent_list_validates_but_empty_list_is_rejected() {
+            // Absent list → field omitted → valid.
+            let absent = json!({ "versionNumber": 1, "updateType": "Differential" });
+            assert!(SchemaValidator::v201()
+                .validate_call("SendLocalList", &absent)
+                .is_ok());
+            // The schema requires `minItems: 1`, so an explicit empty list is
+            // rejected — which is why the Rust type omits `None` rather than
+            // serializing `[]`.
+            let empty = json!({
+                "versionNumber": 1,
+                "updateType": "Full",
+                "localAuthorizationList": []
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("SendLocalList", &empty)
+                .is_err());
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = SendLocalListResponse {
+                status: SendLocalListStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SendLocalList", &expected)
+                .is_ok());
+            let back: SendLocalListResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_with_status_info_round_trips() {
+            let resp = SendLocalListResponse {
+                status: SendLocalListStatusEnumType::VersionMismatch,
+                status_info: Some(StatusInfoType {
+                    reason_code: "StaleVersion".to_string(),
+                    additional_info: Some("expected version 5".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("VersionMismatch"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("StaleVersion"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SendLocalList", &wire)
+                .is_ok());
+            let back: SendLocalListResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn update_enum_round_trips_and_rejects_unknown() {
+            for (variant, wire) in [
+                (UpdateEnumType::Differential, "Differential"),
+                (UpdateEnumType::Full, "Full"),
+            ] {
+                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+                let back: UpdateEnumType = serde_json::from_value(json!(wire)).unwrap();
+                assert_eq!(back, variant);
+            }
+            assert!(serde_json::from_value::<UpdateEnumType>(json!("Partial")).is_err());
+            // Schema rejects an unknown updateType too.
+            let bad = json!({ "versionNumber": 1, "updateType": "Partial" });
+            assert!(SchemaValidator::v201()
+                .validate_call("SendLocalList", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn status_enum_round_trips_and_rejects_unknown() {
+            for (variant, wire) in [
+                (SendLocalListStatusEnumType::Accepted, "Accepted"),
+                (SendLocalListStatusEnumType::Failed, "Failed"),
+                (
+                    SendLocalListStatusEnumType::VersionMismatch,
+                    "VersionMismatch",
+                ),
+            ] {
+                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+                let back: SendLocalListStatusEnumType =
+                    serde_json::from_value(json!(wire)).unwrap();
+                assert_eq!(back, variant);
+            }
+            let bad = json!({ "status": "Rejected" });
+            assert!(serde_json::from_value::<SendLocalListResponse>(bad.clone()).is_err());
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SendLocalList", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(SendLocalListRequest::ACTION_NAME, "SendLocalList");
+            assert_eq!(SendLocalListResponse::ACTION_NAME, "SendLocalListResponse");
+        }
+
+        #[test]
+        fn schema_rejects_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            // Request: both versionNumber and updateType are required.
+            assert!(v
+                .validate_call("SendLocalList", &json!({ "updateType": "Full" }))
+                .is_err());
+            assert!(v
+                .validate_call("SendLocalList", &json!({ "versionNumber": 1 }))
+                .is_err());
+            // Response: status is required.
+            assert!(v.validate_call_result("SendLocalList", &json!({})).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let bad_req = json!({
+                "versionNumber": 1,
+                "updateType": "Full",
+                "bogusExtra": true
+            });
+            assert!(v.validate_call("SendLocalList", &bad_req).is_err());
+            let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
+            assert!(v.validate_call_result("SendLocalList", &bad_resp).is_err());
         }
     }
 }
