@@ -373,6 +373,27 @@ pub struct IdTokenInfoType {
     pub custom_data: Option<CustomDataType>,
 }
 
+/// A single entry in a Local Authorization List: the identifier to authorize
+/// plus, optionally, the cached status to associate with it.
+///
+/// Ports `AuthorizationData`. Carried by `SendLocalList.req`. Only `idToken` is
+/// required; in a differential update an entry whose `idTokenInfo` is absent
+/// signals removal of that token from the list (reusing the already-ported
+/// [`IdTokenType`] / [`IdTokenInfoType`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AuthorizationData {
+    /// The identifier this entry authorizes.
+    #[serde(rename = "idToken")]
+    pub id_token: IdTokenType,
+    /// Cached authorization status for the token. Absent in a differential
+    /// update means "remove this token from the list".
+    #[serde(rename = "idTokenInfo", skip_serializing_if = "Option::is_none")]
+    pub id_token_info: Option<IdTokenInfoType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 /// State of an ongoing or finished transaction.
 ///
 /// Ports `TransactionType`. Only `transactionId` is required; the remaining

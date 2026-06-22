@@ -466,6 +466,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/CancelReservationResponse.json"),
     ),
     (
+        "SendLocalList",
+        include_str!("../schemas/v201/SendLocalList.json"),
+    ),
+    (
+        "SendLocalListResponse",
+        include_str!("../schemas/v201/SendLocalListResponse.json"),
+    ),
+    (
         "FirmwareStatusNotification",
         include_str!("../schemas/v201/FirmwareStatusNotification.json"),
     ),
