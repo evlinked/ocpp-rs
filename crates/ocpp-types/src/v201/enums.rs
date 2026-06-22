@@ -726,3 +726,30 @@ pub enum SendLocalListStatusEnumType {
     Failed,
     VersionMismatch,
 }
+
+/// Progress of a firmware installation, reported in
+/// `FirmwareStatusNotification.req` while an `UpdateFirmware` flow proceeds.
+///
+/// Ports `FirmwareStatusEnumType` (`ocpp/v201/enums.py`). The values cover the
+/// full download → install lifecycle, the terminal failure states, and the
+/// `SignatureVerified` / `InvalidSignature` outcomes of the firmware-image
+/// signature check. Every wire value is PascalCase and identical between the
+/// reference dataclass enum and the bundled OCPP 2.0.1 FINAL JSON Schema, so no
+/// `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FirmwareStatusEnumType {
+    Downloaded,
+    DownloadFailed,
+    Downloading,
+    DownloadScheduled,
+    DownloadPaused,
+    Idle,
+    InstallationFailed,
+    Installing,
+    Installed,
+    InstallRebooting,
+    InstallScheduled,
+    InstallVerificationFailed,
+    InvalidSignature,
+    SignatureVerified,
+}
