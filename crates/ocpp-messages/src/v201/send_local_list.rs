@@ -6,7 +6,8 @@
 //! current list version) and `ClearCache` (wipes the authorization cache). The
 //! request carries a `versionNumber`, an `updateType` (`Full`/`Differential`),
 //! and an optional `localAuthorizationList` of [`AuthorizationData`] entries —
-//! which reuse the already-ported [`IdTokenType`] / [`IdTokenInfoType`].
+//! which reuse the already-ported [`IdTokenType`](ocpp_types::v201::IdTokenType)
+//! / [`IdTokenInfoType`](ocpp_types::v201::IdTokenInfoType).
 
 use crate::{OcppAction, OcppResponse};
 use ocpp_types::v201::{
