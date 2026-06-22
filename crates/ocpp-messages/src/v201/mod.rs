@@ -36,6 +36,7 @@ mod request_start_transaction;
 mod request_stop_transaction;
 mod reserve_now;
 mod reset;
+mod security_event_notification;
 mod send_local_list;
 mod set_variables;
 mod status_notification;
@@ -62,6 +63,9 @@ pub use request_start_transaction::{
 pub use request_stop_transaction::{RequestStopTransactionRequest, RequestStopTransactionResponse};
 pub use reserve_now::{ReserveNowRequest, ReserveNowResponse};
 pub use reset::{ResetRequest, ResetResponse};
+pub use security_event_notification::{
+    SecurityEventNotificationRequest, SecurityEventNotificationResponse,
+};
 pub use send_local_list::{SendLocalListRequest, SendLocalListResponse};
 pub use set_variables::{SetVariablesRequest, SetVariablesResponse};
 pub use status_notification::{StatusNotificationRequest, StatusNotificationResponse};
@@ -3466,6 +3470,135 @@ mod tests {
             let bad_resp = json!({ "bogusExtra": true });
             assert!(v
                 .validate_call_result("FirmwareStatusNotification", &bad_resp)
+                .is_err());
+        }
+    }
+
+    mod security_event_notification {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::CustomDataType;
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only the required `type` + `timestamp`; `techInfo` / `customData`
+            // stay off the wire when `None`. The renamed `event_type` field
+            // serializes to the wire key `"type"`.
+            let req = SecurityEventNotificationRequest {
+                event_type: "SettingSystemTime".to_string(),
+                timestamp: "2026-06-22T03:00:00Z".to_string(),
+                tech_info: None,
+                custom_data: None,
+            };
+            let expected = json!({
+                "type": "SettingSystemTime",
+                "timestamp": "2026-06-22T03:00:00Z"
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            for key in ["techInfo", "customData"] {
+                assert!(!obj.contains_key(key));
+            }
+            let back: SecurityEventNotificationRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("SecurityEventNotification", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_all_optionals_round_trips_and_validates() {
+            let req = SecurityEventNotificationRequest {
+                event_type: "InvalidFirmwareSignature".to_string(),
+                timestamp: "2026-06-22T03:01:02Z".to_string(),
+                tech_info: Some("signature mismatch on slot 2".to_string()),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["type"], json!("InvalidFirmwareSignature"));
+            assert_eq!(wire["timestamp"], json!("2026-06-22T03:01:02Z"));
+            assert_eq!(wire["techInfo"], json!("signature mismatch on slot 2"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("SecurityEventNotification", &wire)
+                .is_ok());
+            let back: SecurityEventNotificationRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_empty_is_object_and_validates() {
+            let resp = SecurityEventNotificationResponse::default();
+            assert_eq!(serde_json::to_value(&resp).unwrap(), json!({}));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SecurityEventNotification", &json!({}))
+                .is_ok());
+            let back: SecurityEventNotificationResponse =
+                serde_json::from_value(json!({})).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                SecurityEventNotificationRequest::ACTION_NAME,
+                "SecurityEventNotification"
+            );
+            assert_eq!(
+                SecurityEventNotificationResponse::ACTION_NAME,
+                "SecurityEventNotificationResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_missing_required_and_wrong_types() {
+            let v = SchemaValidator::v201();
+            // `type` and `timestamp` are both required.
+            assert!(v
+                .validate_call("SecurityEventNotification", &json!({}))
+                .is_err());
+            assert!(v
+                .validate_call("SecurityEventNotification", &json!({ "type": "Reboot" }))
+                .is_err());
+            assert!(v
+                .validate_call(
+                    "SecurityEventNotification",
+                    &json!({ "timestamp": "2026-06-22T03:00:00Z" })
+                )
+                .is_err());
+            // `type` must be a string; `timestamp` must be a date-time string.
+            assert!(v
+                .validate_call(
+                    "SecurityEventNotification",
+                    &json!({ "type": 42, "timestamp": "2026-06-22T03:00:00Z" })
+                )
+                .is_err());
+            assert!(v
+                .validate_call(
+                    "SecurityEventNotification",
+                    &json!({ "type": "Reboot", "timestamp": "not-a-date" })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let bad_req = json!({
+                "type": "Reboot",
+                "timestamp": "2026-06-22T03:00:00Z",
+                "bogusExtra": true
+            });
+            assert!(v
+                .validate_call("SecurityEventNotification", &bad_req)
+                .is_err());
+            let bad_resp = json!({ "bogusExtra": true });
+            assert!(v
+                .validate_call_result("SecurityEventNotification", &bad_resp)
                 .is_err());
         }
     }
