@@ -721,3 +721,19 @@ pub enum FirmwareStatusEnumType {
     InvalidSignature,
     SignatureVerified,
 }
+
+/// Whether the Charging Station accepted an installed charging profile,
+/// reported in `SetChargingProfile.conf`.
+///
+/// Ports `ChargingProfileStatusEnumType` (`ocpp/v201/enums.py`). `Accepted` if
+/// the station was able to process the profile, otherwise `Rejected`. As the
+/// FINAL schema notes, `Accepted` does not guarantee the schedule will be
+/// followed to the letter — other local constraints may still apply. Wire
+/// values are PascalCase (`"Accepted"`, `"Rejected"`); the reference dataclass
+/// enum and the bundled OCPP 2.0.1 FINAL JSON Schema agree exactly on these two
+/// values, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChargingProfileStatusEnumType {
+    Accepted,
+    Rejected,
+}
