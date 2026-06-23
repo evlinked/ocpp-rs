@@ -29,6 +29,7 @@ mod clear_cache;
 mod data_transfer;
 mod firmware_status_notification;
 mod get_local_list_version;
+mod get_transaction_status;
 mod get_variables;
 mod heartbeat;
 mod log_status_notification;
@@ -56,6 +57,7 @@ pub use firmware_status_notification::{
     FirmwareStatusNotificationRequest, FirmwareStatusNotificationResponse,
 };
 pub use get_local_list_version::{GetLocalListVersionRequest, GetLocalListVersionResponse};
+pub use get_transaction_status::{GetTransactionStatusRequest, GetTransactionStatusResponse};
 pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
 pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
 pub use log_status_notification::{LogStatusNotificationRequest, LogStatusNotificationResponse};
@@ -2419,6 +2421,164 @@ mod tests {
             let bad_resp = json!({ "versionNumber": 1, "unexpected": true });
             assert!(SchemaValidator::v201()
                 .validate_call_result("GetLocalListVersion", &bad_resp)
+                .is_err());
+        }
+    }
+
+    /// `GetTransactionStatus` — the 2.0.1 transaction-status / queued-message
+    /// query (#164). Optional `transactionId` in; required `messagesInQueue`
+    /// bool plus optional `ongoingIndicator` bool out. No new enums/datatypes.
+    mod get_transaction_status {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::CustomDataType;
+
+        #[test]
+        fn request_empty_is_empty_object_on_wire_and_validates() {
+            // With no transactionId the request queries station-wide state and
+            // serializes to an empty object.
+            let req = GetTransactionStatusRequest::default();
+            assert_eq!(serde_json::to_value(&req).unwrap(), json!({}));
+            let back: GetTransactionStatusRequest = serde_json::from_value(json!({})).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("GetTransactionStatus", &json!({}))
+                .is_ok());
+        }
+
+        #[test]
+        fn request_round_trips_with_transaction_id() {
+            let req = GetTransactionStatusRequest {
+                transaction_id: Some("txn-42".to_string()),
+                custom_data: None,
+            };
+            let expected = json!({ "transactionId": "txn-42" });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call("GetTransactionStatus", &expected)
+                .is_ok());
+            let back: GetTransactionStatusRequest = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_round_trips_with_custom_data() {
+            let req = GetTransactionStatusRequest {
+                transaction_id: Some("txn-7".to_string()),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["transactionId"], json!("txn-7"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("GetTransactionStatus", &wire)
+                .is_ok());
+            let back: GetTransactionStatusRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            // `messagesInQueue` is the sole required field; `ongoingIndicator`
+            // is omitted when `None`.
+            let resp = GetTransactionStatusResponse {
+                messages_in_queue: false,
+                ongoing_indicator: None,
+                custom_data: None,
+            };
+            let expected = json!({ "messagesInQueue": false });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(!expected
+                .as_object()
+                .unwrap()
+                .contains_key("ongoingIndicator"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetTransactionStatus", &expected)
+                .is_ok());
+            let back: GetTransactionStatusResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_round_trips_with_both_booleans_and_custom_data() {
+            for (queued, ongoing) in [(true, true), (false, false), (true, false)] {
+                let resp = GetTransactionStatusResponse {
+                    messages_in_queue: queued,
+                    ongoing_indicator: Some(ongoing),
+                    custom_data: Some(CustomDataType {
+                        vendor_id: "com.example".to_string(),
+                        extra: Default::default(),
+                    }),
+                };
+                let wire = serde_json::to_value(&resp).unwrap();
+                assert_eq!(wire["messagesInQueue"], json!(queued));
+                assert_eq!(wire["ongoingIndicator"], json!(ongoing));
+                assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+                assert!(SchemaValidator::v201()
+                    .validate_call_result("GetTransactionStatus", &wire)
+                    .is_ok());
+                let back: GetTransactionStatusResponse = serde_json::from_value(wire).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                GetTransactionStatusRequest::ACTION_NAME,
+                "GetTransactionStatus"
+            );
+            assert_eq!(
+                GetTransactionStatusResponse::ACTION_NAME,
+                "GetTransactionStatusResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_messages_in_queue() {
+            // `messagesInQueue` is required.
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetTransactionStatus", &json!({}))
+                .is_err());
+            // ...even when only the optional field is present.
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetTransactionStatus", &json!({ "ongoingIndicator": true }))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_wrong_field_types() {
+            // `messagesInQueue` must be a bool, not a string.
+            let bad_queue = json!({ "messagesInQueue": "true" });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetTransactionStatus", &bad_queue)
+                .is_err());
+            assert!(serde_json::from_value::<GetTransactionStatusResponse>(bad_queue).is_err());
+            // `ongoingIndicator` must be a bool when present.
+            assert!(SchemaValidator::v201()
+                .validate_call_result(
+                    "GetTransactionStatus",
+                    &json!({ "messagesInQueue": true, "ongoingIndicator": 1 })
+                )
+                .is_err());
+            // `transactionId` must be a string on the request.
+            assert!(SchemaValidator::v201()
+                .validate_call("GetTransactionStatus", &json!({ "transactionId": 42 }))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let bad_req = json!({ "unexpected": true });
+            assert!(SchemaValidator::v201()
+                .validate_call("GetTransactionStatus", &bad_req)
+                .is_err());
+            let bad_resp = json!({ "messagesInQueue": true, "unexpected": true });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetTransactionStatus", &bad_resp)
                 .is_err());
         }
     }

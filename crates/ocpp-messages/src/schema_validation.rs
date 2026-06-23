@@ -505,6 +505,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "SetChargingProfileResponse",
         include_str!("../schemas/v201/SetChargingProfileResponse.json"),
     ),
+    (
+        "GetTransactionStatus",
+        include_str!("../schemas/v201/GetTransactionStatus.json"),
+    ),
+    (
+        "GetTransactionStatusResponse",
+        include_str!("../schemas/v201/GetTransactionStatusResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
