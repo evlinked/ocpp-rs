@@ -37,6 +37,7 @@ mod request_stop_transaction;
 mod reserve_now;
 mod reset;
 mod send_local_list;
+mod set_charging_profile;
 mod set_variables;
 mod status_notification;
 mod transaction_event;
@@ -63,6 +64,7 @@ pub use request_stop_transaction::{RequestStopTransactionRequest, RequestStopTra
 pub use reserve_now::{ReserveNowRequest, ReserveNowResponse};
 pub use reset::{ResetRequest, ResetResponse};
 pub use send_local_list::{SendLocalListRequest, SendLocalListResponse};
+pub use set_charging_profile::{SetChargingProfileRequest, SetChargingProfileResponse};
 pub use set_variables::{SetVariablesRequest, SetVariablesResponse};
 pub use status_notification::{StatusNotificationRequest, StatusNotificationResponse};
 pub use transaction_event::{TransactionEventRequest, TransactionEventResponse};
@@ -3466,6 +3468,328 @@ mod tests {
             let bad_resp = json!({ "bogusExtra": true });
             assert!(v
                 .validate_call_result("FirmwareStatusNotification", &bad_resp)
+                .is_err());
+        }
+    }
+
+    mod set_charging_profile {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            ChargingProfileKindEnumType, ChargingProfilePurposeEnumType,
+            ChargingProfileStatusEnumType, ChargingProfileType, ChargingRateUnitEnumType,
+            ChargingSchedulePeriodType, ChargingScheduleType, ConsumptionCostType,
+            CostKindEnumType, CostType, CustomDataType, RecurrencyKindEnumType,
+            RelativeTimeIntervalType, SalesTariffEntryType, SalesTariffType, StatusInfoType,
+        };
+
+        /// The smallest valid profile: the five required fields, one schedule
+        /// with one period.
+        fn minimal_profile() -> ChargingProfileType {
+            ChargingProfileType {
+                id: 1,
+                stack_level: 0,
+                charging_profile_purpose: ChargingProfilePurposeEnumType::TxDefaultProfile,
+                charging_profile_kind: ChargingProfileKindEnumType::Absolute,
+                charging_schedule: vec![ChargingScheduleType {
+                    id: 1,
+                    charging_rate_unit: ChargingRateUnitEnumType::A,
+                    charging_schedule_period: vec![ChargingSchedulePeriodType {
+                        start_period: 0,
+                        limit: 16.0,
+                        number_phases: None,
+                        phase_to_use: None,
+                        custom_data: None,
+                    }],
+                    start_schedule: None,
+                    duration: None,
+                    min_charging_rate: None,
+                    sales_tariff: None,
+                    custom_data: None,
+                }],
+                recurrency_kind: None,
+                valid_from: None,
+                valid_to: None,
+                transaction_id: None,
+                custom_data: None,
+            }
+        }
+
+        /// A recurring profile carrying a full sales-tariff tree, exercising the
+        /// reused [`ChargingProfileType`] through the new message.
+        fn full_profile() -> ChargingProfileType {
+            ChargingProfileType {
+                id: 5,
+                stack_level: 1,
+                charging_profile_purpose: ChargingProfilePurposeEnumType::TxDefaultProfile,
+                charging_profile_kind: ChargingProfileKindEnumType::Recurring,
+                charging_schedule: vec![ChargingScheduleType {
+                    id: 2,
+                    charging_rate_unit: ChargingRateUnitEnumType::W,
+                    charging_schedule_period: vec![ChargingSchedulePeriodType {
+                        start_period: 0,
+                        limit: 11000.0,
+                        number_phases: Some(3),
+                        phase_to_use: Some(1),
+                        custom_data: None,
+                    }],
+                    start_schedule: Some("2022-01-01T00:00:00Z".to_string()),
+                    duration: Some(86400),
+                    min_charging_rate: Some(1380.0),
+                    sales_tariff: Some(SalesTariffType {
+                        id: 3,
+                        sales_tariff_entry: vec![SalesTariffEntryType {
+                            relative_time_interval: RelativeTimeIntervalType {
+                                start: 0,
+                                duration: Some(3600),
+                                custom_data: None,
+                            },
+                            e_price_level: Some(1),
+                            consumption_cost: Some(vec![ConsumptionCostType {
+                                start_value: 0.0,
+                                cost: vec![CostType {
+                                    cost_kind: CostKindEnumType::RelativePricePercentage,
+                                    amount: 25,
+                                    amount_multiplier: Some(-1),
+                                    custom_data: None,
+                                }],
+                                custom_data: None,
+                            }]),
+                            custom_data: None,
+                        }],
+                        sales_tariff_description: Some("peak".to_string()),
+                        num_e_price_levels: Some(2),
+                        custom_data: None,
+                    }),
+                    custom_data: None,
+                }],
+                recurrency_kind: Some(RecurrencyKindEnumType::Daily),
+                valid_from: Some("2022-01-01T00:00:00Z".to_string()),
+                valid_to: Some("2022-12-31T23:59:59Z".to_string()),
+                transaction_id: None,
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            let req = SetChargingProfileRequest {
+                evse_id: 1,
+                charging_profile: minimal_profile(),
+                custom_data: None,
+            };
+            let expected = json!({
+                "evseId": 1,
+                "chargingProfile": {
+                    "id": 1,
+                    "stackLevel": 0,
+                    "chargingProfilePurpose": "TxDefaultProfile",
+                    "chargingProfileKind": "Absolute",
+                    "chargingSchedule": [{
+                        "id": 1,
+                        "chargingRateUnit": "A",
+                        "chargingSchedulePeriod": [{ "startPeriod": 0, "limit": 16.0 }]
+                    }]
+                }
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            // `customData` stays off the wire when `None`.
+            assert!(!expected.as_object().unwrap().contains_key("customData"));
+            let back: SetChargingProfileRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("SetChargingProfile", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_full_profile_tree_round_trips_and_validates() {
+            let req = SetChargingProfileRequest {
+                evse_id: 0,
+                charging_profile: full_profile(),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            // Spot-check a deeply-nested value made it onto the wire with renames.
+            assert_eq!(
+                wire["chargingProfile"]["chargingSchedule"][0]["salesTariff"]["salesTariffEntry"]
+                    [0]["consumptionCost"][0]["cost"][0]["costKind"],
+                json!("RelativePricePercentage")
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call("SetChargingProfile", &wire)
+                .is_ok());
+            let back: SetChargingProfileRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_with_custom_data_round_trips() {
+            let req = SetChargingProfileRequest {
+                evse_id: 2,
+                charging_profile: minimal_profile(),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("SetChargingProfile", &wire)
+                .is_ok());
+            let back: SetChargingProfileRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = SetChargingProfileResponse {
+                status: ChargingProfileStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            // `statusInfo` is omitted when `None`.
+            assert!(!expected.as_object().unwrap().contains_key("statusInfo"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetChargingProfile", &expected)
+                .is_ok());
+            let back: SetChargingProfileResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_rejected_with_status_info_round_trips() {
+            let resp = SetChargingProfileResponse {
+                status: ChargingProfileStatusEnumType::Rejected,
+                status_info: Some(StatusInfoType {
+                    reason_code: "InvalidProfile".to_string(),
+                    additional_info: Some("stack level conflict".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Rejected"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("InvalidProfile"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetChargingProfile", &wire)
+                .is_ok());
+            let back: SetChargingProfileResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_enum_serializes_to_wire_values_and_rejects_unknown() {
+            for (variant, wire) in [
+                (ChargingProfileStatusEnumType::Accepted, "Accepted"),
+                (ChargingProfileStatusEnumType::Rejected, "Rejected"),
+            ] {
+                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+                assert_eq!(
+                    serde_json::from_value::<ChargingProfileStatusEnumType>(json!(wire)).unwrap(),
+                    variant
+                );
+            }
+            // `Scheduled` belongs to other status enums, not SetChargingProfile.
+            assert!(
+                serde_json::from_value::<ChargingProfileStatusEnumType>(json!("Scheduled"))
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(SetChargingProfileRequest::ACTION_NAME, "SetChargingProfile");
+            assert_eq!(
+                SetChargingProfileResponse::ACTION_NAME,
+                "SetChargingProfileResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            let req = SetChargingProfileRequest {
+                evse_id: 1,
+                charging_profile: minimal_profile(),
+                custom_data: None,
+            };
+            let full = serde_json::to_value(&req).unwrap();
+            assert!(v.validate_call("SetChargingProfile", &full).is_ok());
+            for missing in ["evseId", "chargingProfile"] {
+                let mut bad = full.clone();
+                bad.as_object_mut().unwrap().remove(missing);
+                assert!(
+                    v.validate_call("SetChargingProfile", &bad).is_err(),
+                    "expected rejection when `{missing}` is absent"
+                );
+            }
+        }
+
+        #[test]
+        fn schema_and_serde_reject_non_integer_evse_id() {
+            let bad = json!({
+                "evseId": "1",
+                "chargingProfile": serde_json::to_value(minimal_profile()).unwrap()
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("SetChargingProfile", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<SetChargingProfileRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_profile_with_empty_schedule() {
+            // `chargingSchedule` has `minItems: 1` — an empty list is rejected by
+            // the schema even though the Rust `Vec` permits it.
+            let mut profile = serde_json::to_value(minimal_profile()).unwrap();
+            profile["chargingSchedule"] = json!([]);
+            let bad = json!({ "evseId": 1, "chargingProfile": profile });
+            assert!(SchemaValidator::v201()
+                .validate_call("SetChargingProfile", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_profile_missing_required_field() {
+            // Drop a required field of the nested ChargingProfileType.
+            let mut profile = serde_json::to_value(minimal_profile()).unwrap();
+            profile
+                .as_object_mut()
+                .unwrap()
+                .remove("chargingProfileKind");
+            let bad = json!({ "evseId": 1, "chargingProfile": profile });
+            assert!(SchemaValidator::v201()
+                .validate_call("SetChargingProfile", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_or_unknown_status() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("SetChargingProfile", &json!({}))
+                .is_err());
+            let bad = json!({ "status": "Scheduled" });
+            assert!(v.validate_call_result("SetChargingProfile", &bad).is_err());
+            assert!(serde_json::from_value::<SetChargingProfileResponse>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let bad_req = json!({
+                "evseId": 1,
+                "chargingProfile": serde_json::to_value(minimal_profile()).unwrap(),
+                "bogusExtra": true
+            });
+            assert!(v.validate_call("SetChargingProfile", &bad_req).is_err());
+            let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
+            assert!(v
+                .validate_call_result("SetChargingProfile", &bad_resp)
                 .is_err());
         }
     }
