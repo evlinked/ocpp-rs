@@ -482,6 +482,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/FirmwareStatusNotificationResponse.json"),
     ),
     (
+        "SecurityEventNotification",
+        include_str!("../schemas/v201/SecurityEventNotification.json"),
+    ),
+    (
+        "SecurityEventNotificationResponse",
+        include_str!("../schemas/v201/SecurityEventNotificationResponse.json"),
+    ),
+    (
         "SetChargingProfile",
         include_str!("../schemas/v201/SetChargingProfile.json"),
     ),
