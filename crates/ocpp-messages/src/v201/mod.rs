@@ -31,6 +31,7 @@ mod firmware_status_notification;
 mod get_local_list_version;
 mod get_variables;
 mod heartbeat;
+mod log_status_notification;
 mod meter_values;
 mod request_start_transaction;
 mod request_stop_transaction;
@@ -57,6 +58,7 @@ pub use firmware_status_notification::{
 pub use get_local_list_version::{GetLocalListVersionRequest, GetLocalListVersionResponse};
 pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
 pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
+pub use log_status_notification::{LogStatusNotificationRequest, LogStatusNotificationResponse};
 pub use meter_values::{MeterValuesRequest, MeterValuesResponse};
 pub use request_start_transaction::{
     RequestStartTransactionRequest, RequestStartTransactionResponse,
@@ -3923,6 +3925,149 @@ mod tests {
             let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
             assert!(v
                 .validate_call_result("SetChargingProfile", &bad_resp)
+                .is_err());
+        }
+    }
+
+    mod log_status_notification {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{CustomDataType, UploadLogStatusEnumType};
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only the required `status`; `requestId` / `customData` stay off the
+            // wire when `None`.
+            let req = LogStatusNotificationRequest {
+                status: UploadLogStatusEnumType::Idle,
+                request_id: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Idle" });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            for key in ["requestId", "customData"] {
+                assert!(!obj.contains_key(key));
+            }
+            let back: LogStatusNotificationRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("LogStatusNotification", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_request_id_round_trips_and_validates() {
+            let req = LogStatusNotificationRequest {
+                status: UploadLogStatusEnumType::Uploading,
+                request_id: Some(1234),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["status"], json!("Uploading"));
+            assert_eq!(wire["requestId"], json!(1234));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("LogStatusNotification", &wire)
+                .is_ok());
+            let back: LogStatusNotificationRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_empty_is_object_and_validates() {
+            let resp = LogStatusNotificationResponse::default();
+            assert_eq!(serde_json::to_value(&resp).unwrap(), json!({}));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("LogStatusNotification", &json!({}))
+                .is_ok());
+            let back: LogStatusNotificationResponse = serde_json::from_value(json!({})).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_enum_serializes_to_exact_wire_values_and_schema_accepts() {
+            // Every one of the 8 members round-trips to its FINAL-schema wire
+            // spelling, and the bundled schema accepts a request carrying it.
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (UploadLogStatusEnumType::BadMessage, "BadMessage"),
+                (UploadLogStatusEnumType::Idle, "Idle"),
+                (
+                    UploadLogStatusEnumType::NotSupportedOperation,
+                    "NotSupportedOperation",
+                ),
+                (
+                    UploadLogStatusEnumType::PermissionDenied,
+                    "PermissionDenied",
+                ),
+                (UploadLogStatusEnumType::Uploaded, "Uploaded"),
+                (UploadLogStatusEnumType::UploadFailure, "UploadFailure"),
+                (UploadLogStatusEnumType::Uploading, "Uploading"),
+                (
+                    UploadLogStatusEnumType::AcceptedCanceled,
+                    "AcceptedCanceled",
+                ),
+            ] {
+                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+                assert_eq!(
+                    serde_json::from_value::<UploadLogStatusEnumType>(json!(wire)).unwrap(),
+                    variant
+                );
+                assert!(v
+                    .validate_call("LogStatusNotification", &json!({ "status": wire }))
+                    .is_ok());
+            }
+        }
+
+        #[test]
+        fn enum_and_schema_reject_unknown_status() {
+            let v = SchemaValidator::v201();
+            for bad in ["idle", "Bogus", "Upload"] {
+                assert!(serde_json::from_value::<UploadLogStatusEnumType>(json!(bad)).is_err());
+                assert!(v
+                    .validate_call("LogStatusNotification", &json!({ "status": bad }))
+                    .is_err());
+            }
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                LogStatusNotificationRequest::ACTION_NAME,
+                "LogStatusNotification"
+            );
+            assert_eq!(
+                LogStatusNotificationResponse::ACTION_NAME,
+                "LogStatusNotificationResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_missing_status_and_non_integer_request_id() {
+            let v = SchemaValidator::v201();
+            // `status` is required.
+            assert!(v
+                .validate_call("LogStatusNotification", &json!({}))
+                .is_err());
+            // `requestId` must be an integer — both schema and serde reject a string.
+            let bad = json!({ "status": "Idle", "requestId": "1" });
+            assert!(v.validate_call("LogStatusNotification", &bad).is_err());
+            assert!(serde_json::from_value::<LogStatusNotificationRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let bad_req = json!({ "status": "Idle", "bogusExtra": true });
+            assert!(v.validate_call("LogStatusNotification", &bad_req).is_err());
+            let bad_resp = json!({ "bogusExtra": true });
+            assert!(v
+                .validate_call_result("LogStatusNotification", &bad_resp)
                 .is_err());
         }
     }

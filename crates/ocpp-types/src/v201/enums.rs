@@ -769,3 +769,25 @@ pub enum ChargingProfileStatusEnumType {
     Accepted,
     Rejected,
 }
+
+/// Progress of a diagnostics/security log upload, reported in
+/// `LogStatusNotification.req` while a `GetLog` flow proceeds.
+///
+/// Ports `UploadLogStatusEnumType` (`ocpp/v201/enums.py`). The values cover the
+/// idle/uploading/uploaded lifecycle, the terminal `UploadFailure`, the
+/// `BadMessage` / `NotSupportedOperation` / `PermissionDenied` rejections, and
+/// `AcceptedCanceled` (a new upload request supersedes one already running).
+/// Every wire value is PascalCase and identical between the reference dataclass
+/// enum and the bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]`
+/// is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UploadLogStatusEnumType {
+    BadMessage,
+    Idle,
+    NotSupportedOperation,
+    PermissionDenied,
+    Uploaded,
+    UploadFailure,
+    Uploading,
+    AcceptedCanceled,
+}
