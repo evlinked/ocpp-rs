@@ -35,6 +35,7 @@ mod log_status_notification;
 mod meter_values;
 mod request_start_transaction;
 mod request_stop_transaction;
+mod reservation_status_update;
 mod reserve_now;
 mod reset;
 mod security_event_notification;
@@ -64,6 +65,9 @@ pub use request_start_transaction::{
     RequestStartTransactionRequest, RequestStartTransactionResponse,
 };
 pub use request_stop_transaction::{RequestStopTransactionRequest, RequestStopTransactionResponse};
+pub use reservation_status_update::{
+    ReservationStatusUpdateRequest, ReservationStatusUpdateResponse,
+};
 pub use reserve_now::{ReserveNowRequest, ReserveNowResponse};
 pub use reset::{ResetRequest, ResetResponse};
 pub use security_event_notification::{
