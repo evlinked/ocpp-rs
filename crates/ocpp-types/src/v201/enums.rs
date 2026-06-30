@@ -791,3 +791,17 @@ pub enum UploadLogStatusEnumType {
     Uploading,
     AcceptedCanceled,
 }
+
+/// Why a previously-made reservation is no longer valid, reported by the
+/// Charging Station in `ReservationStatusUpdate.req`.
+///
+/// Ports `ReservationUpdateStatusEnumType` (`ocpp/v201/enums.py`): `Expired`
+/// (the reservation passed its `expiryDateTime`) or `Removed` (it was dropped
+/// for another reason, e.g. the connector became unavailable). Both wire values
+/// are PascalCase and identical between the reference dataclass enum and the
+/// bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReservationUpdateStatusEnumType {
+    Expired,
+    Removed,
+}
