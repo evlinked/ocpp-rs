@@ -805,3 +805,29 @@ pub enum ReservationUpdateStatusEnumType {
     Expired,
     Removed,
 }
+
+/// Progress of a firmware *publish* to a Local Controller's local cache,
+/// reported in `PublishFirmwareStatusNotification.req` while a
+/// `PublishFirmware` flow proceeds.
+///
+/// Ports `PublishFirmwareStatusEnumType` (`ocpp/v201/enums.py`). Mirrors
+/// [`FirmwareStatusEnumType`] but for the publish-to-local-cache flow: the
+/// download lifecycle (`Idle` → `DownloadScheduled` → `Downloading` →
+/// `Downloaded`), the terminal `Published`, the failure/pause states
+/// (`DownloadFailed`, `DownloadPaused`, `PublishFailed`), and the checksum
+/// outcomes (`InvalidChecksum`, `ChecksumVerified`). Every wire value is
+/// PascalCase and identical between the reference dataclass enum and the
+/// bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PublishFirmwareStatusEnumType {
+    Idle,
+    DownloadScheduled,
+    Downloading,
+    Downloaded,
+    Published,
+    DownloadFailed,
+    DownloadPaused,
+    InvalidChecksum,
+    ChecksumVerified,
+    PublishFailed,
+}

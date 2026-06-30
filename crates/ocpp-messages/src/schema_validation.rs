@@ -529,6 +529,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "CostUpdatedResponse",
         include_str!("../schemas/v201/CostUpdatedResponse.json"),
     ),
+    (
+        "PublishFirmwareStatusNotification",
+        include_str!("../schemas/v201/PublishFirmwareStatusNotification.json"),
+    ),
+    (
+        "PublishFirmwareStatusNotificationResponse",
+        include_str!("../schemas/v201/PublishFirmwareStatusNotificationResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J

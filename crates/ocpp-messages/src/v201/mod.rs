@@ -35,6 +35,7 @@ mod get_variables;
 mod heartbeat;
 mod log_status_notification;
 mod meter_values;
+mod publish_firmware_status_notification;
 mod request_start_transaction;
 mod request_stop_transaction;
 mod reservation_status_update;
@@ -65,6 +66,9 @@ pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
 pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
 pub use log_status_notification::{LogStatusNotificationRequest, LogStatusNotificationResponse};
 pub use meter_values::{MeterValuesRequest, MeterValuesResponse};
+pub use publish_firmware_status_notification::{
+    PublishFirmwareStatusNotificationRequest, PublishFirmwareStatusNotificationResponse,
+};
 pub use request_start_transaction::{
     RequestStartTransactionRequest, RequestStartTransactionResponse,
 };
@@ -4353,6 +4357,221 @@ mod tests {
             assert!(v.validate_call("CostUpdated", &bad_req).is_err());
             let bad_resp = json!({ "bogusExtra": true });
             assert!(v.validate_call_result("CostUpdated", &bad_resp).is_err());
+        }
+    }
+
+    /// `PublishFirmwareStatusNotification` — the 2.0.1 publish-firmware progress
+    /// report (#179). Mirrors `FirmwareStatusNotification` (status enum + empty
+    /// response) but adds the optional `location` URI list.
+    mod publish_firmware_status_notification {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{CustomDataType, PublishFirmwareStatusEnumType};
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only the required `status`; `location` / `requestId` / `customData`
+            // stay off the wire when `None`.
+            let req = PublishFirmwareStatusNotificationRequest {
+                status: PublishFirmwareStatusEnumType::Idle,
+                location: None,
+                request_id: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Idle" });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            for key in ["location", "requestId", "customData"] {
+                assert!(!obj.contains_key(key));
+            }
+            let back: PublishFirmwareStatusNotificationRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("PublishFirmwareStatusNotification", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn published_request_with_location_round_trips_and_validates() {
+            // A `Published` notification carries the download URIs plus the
+            // correlating `requestId` and a vendor extension.
+            let req = PublishFirmwareStatusNotificationRequest {
+                status: PublishFirmwareStatusEnumType::Published,
+                location: Some(vec![
+                    "http://lc.example/fw/image.bin".to_string(),
+                    "ftp://lc.example/fw/image.bin".to_string(),
+                ]),
+                request_id: Some(1234),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let expected = json!({
+                "status": "Published",
+                "location": [
+                    "http://lc.example/fw/image.bin",
+                    "ftp://lc.example/fw/image.bin"
+                ],
+                "requestId": 1234,
+                "customData": { "vendorId": "com.example" }
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call("PublishFirmwareStatusNotification", &expected)
+                .is_ok());
+            let back: PublishFirmwareStatusNotificationRequest =
+                serde_json::from_value(expected).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_empty_is_object_and_validates() {
+            let resp = PublishFirmwareStatusNotificationResponse::default();
+            assert_eq!(serde_json::to_value(&resp).unwrap(), json!({}));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("PublishFirmwareStatusNotification", &json!({}))
+                .is_ok());
+            let back: PublishFirmwareStatusNotificationResponse =
+                serde_json::from_value(json!({})).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_with_custom_data_round_trips() {
+            let resp = PublishFirmwareStatusNotificationResponse {
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("PublishFirmwareStatusNotification", &wire)
+                .is_ok());
+            let back: PublishFirmwareStatusNotificationResponse =
+                serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_enum_serializes_to_exact_wire_values_and_schema_accepts() {
+            // Every one of the 10 members round-trips to its FINAL-schema wire
+            // spelling, and the bundled schema accepts a request carrying it.
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (PublishFirmwareStatusEnumType::Idle, "Idle"),
+                (
+                    PublishFirmwareStatusEnumType::DownloadScheduled,
+                    "DownloadScheduled",
+                ),
+                (PublishFirmwareStatusEnumType::Downloading, "Downloading"),
+                (PublishFirmwareStatusEnumType::Downloaded, "Downloaded"),
+                (PublishFirmwareStatusEnumType::Published, "Published"),
+                (
+                    PublishFirmwareStatusEnumType::DownloadFailed,
+                    "DownloadFailed",
+                ),
+                (
+                    PublishFirmwareStatusEnumType::DownloadPaused,
+                    "DownloadPaused",
+                ),
+                (
+                    PublishFirmwareStatusEnumType::InvalidChecksum,
+                    "InvalidChecksum",
+                ),
+                (
+                    PublishFirmwareStatusEnumType::ChecksumVerified,
+                    "ChecksumVerified",
+                ),
+                (
+                    PublishFirmwareStatusEnumType::PublishFailed,
+                    "PublishFailed",
+                ),
+            ] {
+                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+                assert_eq!(
+                    serde_json::from_value::<PublishFirmwareStatusEnumType>(json!(wire)).unwrap(),
+                    variant
+                );
+                assert!(v
+                    .validate_call(
+                        "PublishFirmwareStatusNotification",
+                        &json!({ "status": wire })
+                    )
+                    .is_ok());
+            }
+        }
+
+        #[test]
+        fn enum_and_schema_reject_unknown_status() {
+            // `Installed` is a FirmwareStatusEnumType value, not valid here.
+            let v = SchemaValidator::v201();
+            for bad in ["published", "Installed", "Bogus"] {
+                assert!(
+                    serde_json::from_value::<PublishFirmwareStatusEnumType>(json!(bad)).is_err()
+                );
+                assert!(v
+                    .validate_call(
+                        "PublishFirmwareStatusNotification",
+                        &json!({ "status": bad })
+                    )
+                    .is_err());
+            }
+        }
+
+        #[test]
+        fn schema_rejects_missing_status_and_non_array_location() {
+            let v = SchemaValidator::v201();
+            // `status` is required.
+            assert!(v
+                .validate_call("PublishFirmwareStatusNotification", &json!({}))
+                .is_err());
+            // `location` must be an array of strings — a bare string is rejected.
+            let bad = json!({ "status": "Published", "location": "http://x" });
+            assert!(v
+                .validate_call("PublishFirmwareStatusNotification", &bad)
+                .is_err());
+            assert!(
+                serde_json::from_value::<PublishFirmwareStatusNotificationRequest>(bad).is_err()
+            );
+        }
+
+        #[test]
+        fn schema_rejects_empty_location_array() {
+            // The schema sets `minItems: 1` on `location`; an empty list is
+            // rejected even though the Rust `Vec` would allow it.
+            let bad = json!({ "status": "Published", "location": [] });
+            assert!(SchemaValidator::v201()
+                .validate_call("PublishFirmwareStatusNotification", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let bad_req = json!({ "status": "Idle", "bogusExtra": true });
+            assert!(v
+                .validate_call("PublishFirmwareStatusNotification", &bad_req)
+                .is_err());
+            let bad_resp = json!({ "bogusExtra": true });
+            assert!(v
+                .validate_call_result("PublishFirmwareStatusNotification", &bad_resp)
+                .is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                PublishFirmwareStatusNotificationRequest::ACTION_NAME,
+                "PublishFirmwareStatusNotification"
+            );
+            assert_eq!(
+                PublishFirmwareStatusNotificationResponse::ACTION_NAME,
+                "PublishFirmwareStatusNotificationResponse"
+            );
         }
     }
 }
