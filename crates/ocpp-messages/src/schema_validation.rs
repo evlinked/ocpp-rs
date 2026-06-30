@@ -506,6 +506,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/SetChargingProfileResponse.json"),
     ),
     (
+        "GetTransactionStatus",
+        include_str!("../schemas/v201/GetTransactionStatus.json"),
+    ),
+    (
+        "GetTransactionStatusResponse",
+        include_str!("../schemas/v201/GetTransactionStatusResponse.json"),
+    ),
+    (
         "ReservationStatusUpdate",
         include_str!("../schemas/v201/ReservationStatusUpdate.json"),
     ),
