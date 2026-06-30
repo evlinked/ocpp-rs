@@ -513,6 +513,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "GetTransactionStatusResponse",
         include_str!("../schemas/v201/GetTransactionStatusResponse.json"),
     ),
+    (
+        "ReservationStatusUpdate",
+        include_str!("../schemas/v201/ReservationStatusUpdate.json"),
+    ),
+    (
+        "ReservationStatusUpdateResponse",
+        include_str!("../schemas/v201/ReservationStatusUpdateResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -1777,6 +1785,84 @@ mod tests {
                 "CancelReservation",
                 &json!({ "status": "Accepted", "bogus": true })
             )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_reservation_status_update_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call(
+                "ReservationStatusUpdate",
+                &json!({ "reservationId": 42, "reservationUpdateStatus": "Expired" })
+            )
+            .is_ok());
+        assert!(v
+            .validate_call(
+                "ReservationStatusUpdate",
+                &json!({
+                    "reservationId": 1,
+                    "reservationUpdateStatus": "Removed",
+                    "customData": { "vendorId": "ACME" }
+                })
+            )
+            .is_ok());
+        // The response is an empty object.
+        assert!(v
+            .validate_call_result("ReservationStatusUpdate", &json!({}))
+            .is_ok());
+    }
+
+    #[test]
+    fn v201_reservation_status_update_call_missing_required_fields_fail() {
+        let v = SchemaValidator::v201();
+        // Missing reservationUpdateStatus.
+        assert!(v
+            .validate_call("ReservationStatusUpdate", &json!({ "reservationId": 1 }))
+            .is_err());
+        // Missing reservationId.
+        assert!(v
+            .validate_call(
+                "ReservationStatusUpdate",
+                &json!({ "reservationUpdateStatus": "Expired" })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_reservation_status_update_rejects_wrong_types_and_unknown_enum() {
+        let v = SchemaValidator::v201();
+        // reservationId must be an integer.
+        assert!(v
+            .validate_call(
+                "ReservationStatusUpdate",
+                &json!({ "reservationId": "1", "reservationUpdateStatus": "Expired" })
+            )
+            .is_err());
+        // Unknown enum value.
+        assert!(v
+            .validate_call(
+                "ReservationStatusUpdate",
+                &json!({ "reservationId": 1, "reservationUpdateStatus": "Cancelled" })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_reservation_status_update_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call(
+                "ReservationStatusUpdate",
+                &json!({
+                    "reservationId": 1,
+                    "reservationUpdateStatus": "Expired",
+                    "bogus": true
+                })
+            )
+            .is_err());
+        assert!(v
+            .validate_call_result("ReservationStatusUpdate", &json!({ "bogus": true }))
             .is_err());
     }
 
