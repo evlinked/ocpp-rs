@@ -26,6 +26,7 @@ mod boot_notification;
 mod cancel_reservation;
 mod change_availability;
 mod clear_cache;
+mod cost_updated;
 mod data_transfer;
 mod firmware_status_notification;
 mod get_local_list_version;
@@ -53,6 +54,7 @@ pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
 pub use cancel_reservation::{CancelReservationRequest, CancelReservationResponse};
 pub use change_availability::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
 pub use clear_cache::{ClearCacheRequest, ClearCacheResponse};
+pub use cost_updated::{CostUpdatedRequest, CostUpdatedResponse};
 pub use data_transfer::{DataTransferRequest, DataTransferResponse};
 pub use firmware_status_notification::{
     FirmwareStatusNotificationRequest, FirmwareStatusNotificationResponse,
@@ -4233,6 +4235,124 @@ mod tests {
             assert!(v
                 .validate_call_result("LogStatusNotification", &bad_resp)
                 .is_err());
+        }
+    }
+
+    mod cost_updated {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::CustomDataType;
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Both `totalCost` and `transactionId` are required; `customData`
+            // stays off the wire when `None`. `0.0` is exactly representable, so
+            // derived `PartialEq` round-trips reliably.
+            let req = CostUpdatedRequest {
+                total_cost: 0.0,
+                transaction_id: "tx-001".to_string(),
+                custom_data: None,
+            };
+            let expected = json!({ "totalCost": 0.0, "transactionId": "tx-001" });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(!expected.as_object().unwrap().contains_key("customData"));
+            let back: CostUpdatedRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("CostUpdated", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn total_cost_round_trips_as_number_integral_and_fractional() {
+            let v = SchemaValidator::v201();
+            // Integral and fractional values, both exactly representable.
+            for (cost, expected_json) in [(12.0_f64, json!(12.0)), (12.5_f64, json!(12.5))] {
+                let req = CostUpdatedRequest {
+                    total_cost: cost,
+                    transaction_id: "tx-42".to_string(),
+                    custom_data: None,
+                };
+                let wire = serde_json::to_value(&req).unwrap();
+                // Serializes as a JSON number, not a string.
+                assert!(wire["totalCost"].is_number());
+                assert_eq!(wire["totalCost"], expected_json);
+                assert_eq!(wire["transactionId"], json!("tx-42"));
+                assert!(v.validate_call("CostUpdated", &wire).is_ok());
+                let back: CostUpdatedRequest = serde_json::from_value(wire).unwrap();
+                assert_eq!(back, req);
+            }
+        }
+
+        #[test]
+        fn request_with_custom_data_round_trips_and_validates() {
+            let req = CostUpdatedRequest {
+                total_cost: 3.25,
+                transaction_id: "tx-7".to_string(),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("CostUpdated", &wire)
+                .is_ok());
+            let back: CostUpdatedRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_empty_is_object_and_validates() {
+            let resp = CostUpdatedResponse::default();
+            assert_eq!(serde_json::to_value(&resp).unwrap(), json!({}));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("CostUpdated", &json!({}))
+                .is_ok());
+            let back: CostUpdatedResponse = serde_json::from_value(json!({})).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(CostUpdatedRequest::ACTION_NAME, "CostUpdated");
+            assert_eq!(CostUpdatedResponse::ACTION_NAME, "CostUpdatedResponse");
+        }
+
+        #[test]
+        fn schema_rejects_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            // Both fields required.
+            assert!(v.validate_call("CostUpdated", &json!({})).is_err());
+            assert!(v
+                .validate_call("CostUpdated", &json!({ "totalCost": 1.0 }))
+                .is_err());
+            assert!(v
+                .validate_call("CostUpdated", &json!({ "transactionId": "tx-1" }))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_wrong_types() {
+            let v = SchemaValidator::v201();
+            // `totalCost` must be a number, not a string.
+            let bad_cost = json!({ "totalCost": "1.0", "transactionId": "tx-1" });
+            assert!(v.validate_call("CostUpdated", &bad_cost).is_err());
+            assert!(serde_json::from_value::<CostUpdatedRequest>(bad_cost).is_err());
+            // `transactionId` must be a string, not a number.
+            let bad_id = json!({ "totalCost": 1.0, "transactionId": 1 });
+            assert!(v.validate_call("CostUpdated", &bad_id).is_err());
+            assert!(serde_json::from_value::<CostUpdatedRequest>(bad_id).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let bad_req = json!({ "totalCost": 1.0, "transactionId": "tx-1", "bogusExtra": true });
+            assert!(v.validate_call("CostUpdated", &bad_req).is_err());
+            let bad_resp = json!({ "bogusExtra": true });
+            assert!(v.validate_call_result("CostUpdated", &bad_resp).is_err());
         }
     }
 }

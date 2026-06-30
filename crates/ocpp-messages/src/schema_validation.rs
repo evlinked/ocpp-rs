@@ -521,6 +521,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "ReservationStatusUpdateResponse",
         include_str!("../schemas/v201/ReservationStatusUpdateResponse.json"),
     ),
+    (
+        "CostUpdated",
+        include_str!("../schemas/v201/CostUpdated.json"),
+    ),
+    (
+        "CostUpdatedResponse",
+        include_str!("../schemas/v201/CostUpdatedResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
