@@ -522,6 +522,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/ReservationStatusUpdateResponse.json"),
     ),
     (
+        "CostUpdated",
+        include_str!("../schemas/v201/CostUpdated.json"),
+    ),
+    (
+        "CostUpdatedResponse",
+        include_str!("../schemas/v201/CostUpdatedResponse.json"),
+    ),
+    (
         "ClearedChargingLimit",
         include_str!("../schemas/v201/ClearedChargingLimit.json"),
     ),
