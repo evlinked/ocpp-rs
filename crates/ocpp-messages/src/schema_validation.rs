@@ -566,6 +566,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "GetReportResponse",
         include_str!("../schemas/v201/GetReportResponse.json"),
     ),
+    (
+        "UnpublishFirmware",
+        include_str!("../schemas/v201/UnpublishFirmware.json"),
+    ),
+    (
+        "UnpublishFirmwareResponse",
+        include_str!("../schemas/v201/UnpublishFirmwareResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J

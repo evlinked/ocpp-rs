@@ -53,6 +53,7 @@ mod status_notification;
 mod transaction_event;
 mod trigger_message;
 mod unlock_connector;
+mod unpublish_firmware;
 
 pub use authorize::{AuthorizeRequest, AuthorizeResponse};
 pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
@@ -96,6 +97,7 @@ pub use status_notification::{StatusNotificationRequest, StatusNotificationRespo
 pub use transaction_event::{TransactionEventRequest, TransactionEventResponse};
 pub use trigger_message::{TriggerMessageRequest, TriggerMessageResponse};
 pub use unlock_connector::{UnlockConnectorRequest, UnlockConnectorResponse};
+pub use unpublish_firmware::{UnpublishFirmwareRequest, UnpublishFirmwareResponse};
 
 #[cfg(test)]
 mod tests {
@@ -4906,6 +4908,154 @@ mod tests {
         fn action_names_are_stable() {
             assert_eq!(GetBaseReportRequest::ACTION_NAME, "GetBaseReport");
             assert_eq!(GetBaseReportResponse::ACTION_NAME, "GetBaseReportResponse");
+        }
+    }
+
+    /// `UnpublishFirmware` — the 2.0.1 firmware-unpublish command (#180). A
+    /// single `checksum` string in, an [`UnpublishFirmwareStatusEnumType`] out;
+    /// the teardown counterpart to the `PublishFirmware` family.
+    mod unpublish_firmware {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{CustomDataType, UnpublishFirmwareStatusEnumType};
+
+        #[test]
+        fn request_matches_wire_json_and_validates() {
+            let req = UnpublishFirmwareRequest {
+                checksum: "8b3a8e1c9e2f4a6b0d1c3e5f7a9b0d2f".to_string(),
+                custom_data: None,
+            };
+            let expected = json!({ "checksum": "8b3a8e1c9e2f4a6b0d1c3e5f7a9b0d2f" });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let back: UnpublishFirmwareRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("UnpublishFirmware", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_round_trips_with_custom_data() {
+            let req = UnpublishFirmwareRequest {
+                checksum: "deadbeef".to_string(),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("UnpublishFirmware", &wire)
+                .is_ok());
+            let back: UnpublishFirmwareRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = UnpublishFirmwareResponse {
+                status: UnpublishFirmwareStatusEnumType::Unpublished,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Unpublished" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("UnpublishFirmware", &expected)
+                .is_ok());
+            let back: UnpublishFirmwareResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_no_firmware_round_trips_with_custom_data() {
+            let resp = UnpublishFirmwareResponse {
+                status: UnpublishFirmwareStatusEnumType::NoFirmware,
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("NoFirmware"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("UnpublishFirmware", &wire)
+                .is_ok());
+            let back: UnpublishFirmwareResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_enum_serializes_to_wire_values_and_rejects_unknown() {
+            for (variant, wire) in [
+                (
+                    UnpublishFirmwareStatusEnumType::DownloadOngoing,
+                    "DownloadOngoing",
+                ),
+                (UnpublishFirmwareStatusEnumType::NoFirmware, "NoFirmware"),
+                (UnpublishFirmwareStatusEnumType::Unpublished, "Unpublished"),
+            ] {
+                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+            }
+            // `Published` is a PublishFirmwareStatusEnumType value, not valid here.
+            assert!(
+                serde_json::from_value::<UnpublishFirmwareStatusEnumType>(json!("Published"))
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(UnpublishFirmwareRequest::ACTION_NAME, "UnpublishFirmware");
+            assert_eq!(
+                UnpublishFirmwareResponse::ACTION_NAME,
+                "UnpublishFirmwareResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_checksum() {
+            assert!(SchemaValidator::v201()
+                .validate_call("UnpublishFirmware", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_non_string_checksum() {
+            let bad = json!({ "checksum": 12345 });
+            assert!(SchemaValidator::v201()
+                .validate_call("UnpublishFirmware", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<UnpublishFirmwareRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status_and_unknown_value() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("UnpublishFirmware", &json!({}))
+                .is_err());
+            assert!(v
+                .validate_call_result("UnpublishFirmware", &json!({ "status": "Published" }))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "UnpublishFirmware",
+                    &json!({ "checksum": "abc", "bogusExtra": true })
+                )
+                .is_err());
+            assert!(v
+                .validate_call_result(
+                    "UnpublishFirmware",
+                    &json!({ "status": "Unpublished", "bogusExtra": true })
+                )
+                .is_err());
         }
     }
 }

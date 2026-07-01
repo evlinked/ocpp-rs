@@ -851,6 +851,22 @@ pub enum PublishFirmwareStatusEnumType {
     PublishFailed,
 }
 
+/// Outcome of an `UnpublishFirmware` request: whether the Local Controller
+/// removed the previously-published firmware image from its local cache.
+///
+/// Ports `UnpublishFirmwareStatusEnumType` (`ocpp/v201/enums.py`). `NoFirmware`
+/// means no image matched the requested checksum; `DownloadOngoing` means a
+/// publish is still in progress and cannot be torn down yet; `Unpublished` is
+/// the success terminal. Every wire value is PascalCase and identical between
+/// the reference dataclass enum and the bundled OCPP 2.0.1 FINAL JSON Schema,
+/// so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnpublishFirmwareStatusEnumType {
+    DownloadOngoing,
+    NoFirmware,
+    Unpublished,
+}
+
 /// Whether a request was accepted, used as the generic Accepted/Rejected result
 /// status shared by several 2.0.1 messages (e.g. `PublishFirmware`).
 ///
