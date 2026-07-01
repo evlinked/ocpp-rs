@@ -26,6 +26,7 @@ mod boot_notification;
 mod cancel_reservation;
 mod change_availability;
 mod clear_cache;
+mod cleared_charging_limit;
 mod cost_updated;
 mod data_transfer;
 mod firmware_status_notification;
@@ -55,6 +56,7 @@ pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
 pub use cancel_reservation::{CancelReservationRequest, CancelReservationResponse};
 pub use change_availability::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
 pub use clear_cache::{ClearCacheRequest, ClearCacheResponse};
+pub use cleared_charging_limit::{ClearedChargingLimitRequest, ClearedChargingLimitResponse};
 pub use cost_updated::{CostUpdatedRequest, CostUpdatedResponse};
 pub use data_transfer::{DataTransferRequest, DataTransferResponse};
 pub use firmware_status_notification::{
