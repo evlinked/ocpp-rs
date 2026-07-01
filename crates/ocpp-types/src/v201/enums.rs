@@ -805,3 +805,22 @@ pub enum ReservationUpdateStatusEnumType {
     Expired,
     Removed,
 }
+
+/// Where an externally-imposed charging limit originated, reported by the
+/// Charging Station in `ClearedChargingLimit.req` (and `NotifyChargingLimit`).
+///
+/// Ports `ChargingLimitSourceEnumType` (`ocpp/v201/enums.py`): `EMS` (an Energy
+/// Management System), `Other`, `SO` (a System Operator) or `CSO` (the Charging
+/// Station Operator). The acronym variants carry a `#[serde(rename)]` so the
+/// Rust identifier stays idiomatic while the wire value matches the OCPP 2.0.1
+/// FINAL JSON Schema verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ChargingLimitSourceEnumType {
+    #[serde(rename = "EMS")]
+    Ems,
+    Other,
+    #[serde(rename = "SO")]
+    So,
+    #[serde(rename = "CSO")]
+    Cso,
+}

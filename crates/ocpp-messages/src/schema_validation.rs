@@ -529,6 +529,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "CostUpdatedResponse",
         include_str!("../schemas/v201/CostUpdatedResponse.json"),
     ),
+    (
+        "ClearedChargingLimit",
+        include_str!("../schemas/v201/ClearedChargingLimit.json"),
+    ),
+    (
+        "ClearedChargingLimitResponse",
+        include_str!("../schemas/v201/ClearedChargingLimitResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -1871,6 +1879,74 @@ mod tests {
             .is_err());
         assert!(v
             .validate_call_result("ReservationStatusUpdate", &json!({ "bogus": true }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_cleared_charging_limit_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        // Minimal request: just the required source.
+        assert!(v
+            .validate_call(
+                "ClearedChargingLimit",
+                &json!({ "chargingLimitSource": "EMS" })
+            )
+            .is_ok());
+        // With the optional evseId and vendor extension.
+        assert!(v
+            .validate_call(
+                "ClearedChargingLimit",
+                &json!({
+                    "chargingLimitSource": "CSO",
+                    "evseId": 3,
+                    "customData": { "vendorId": "ACME" }
+                })
+            )
+            .is_ok());
+        // The response is an empty object.
+        assert!(v
+            .validate_call_result("ClearedChargingLimit", &json!({}))
+            .is_ok());
+    }
+
+    #[test]
+    fn v201_cleared_charging_limit_call_missing_source_fails() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call("ClearedChargingLimit", &json!({ "evseId": 1 }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_cleared_charging_limit_rejects_wrong_type_and_unknown_enum() {
+        let v = SchemaValidator::v201();
+        // evseId must be an integer.
+        assert!(v
+            .validate_call(
+                "ClearedChargingLimit",
+                &json!({ "chargingLimitSource": "EMS", "evseId": "1" })
+            )
+            .is_err());
+        // Unknown enum value.
+        assert!(v
+            .validate_call(
+                "ClearedChargingLimit",
+                &json!({ "chargingLimitSource": "DSO" })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_cleared_charging_limit_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call(
+                "ClearedChargingLimit",
+                &json!({ "chargingLimitSource": "EMS", "bogus": true })
+            )
+            .is_err());
+        assert!(v
+            .validate_call_result("ClearedChargingLimit", &json!({ "bogus": true }))
             .is_err());
     }
 
