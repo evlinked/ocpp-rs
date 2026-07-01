@@ -862,4 +862,34 @@ pub enum PublishFirmwareStatusEnumType {
 pub enum GenericStatusEnumType {
     Accepted,
     Rejected,
+/// Which slice of the device model a `GetBaseReport` request asks the Charging
+/// Station to report: the writable configuration only, the full component /
+/// variable inventory, or a summary.
+///
+/// Ports `ReportBaseEnumType` (`ocpp/v201/enums.py`). Every wire value is
+/// PascalCase and identical between the reference dataclass enum and the
+/// bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReportBaseEnumType {
+    ConfigurationInventory,
+    FullInventory,
+    SummaryInventory,
+}
+
+/// Whether the Charging Station can honour a device-model report or monitoring
+/// request (`GetBaseReport`, and — reused as the shared response status — the
+/// `GetReport` / `GetMonitoringReport` / `SetMonitoringBase` / `SetMonitoringLevel`
+/// / `SetNetworkProfile` family).
+///
+/// Ports `GenericDeviceModelStatusEnumType` (`ocpp/v201/enums.py`).
+/// `EmptyResultSet` reports that the request was accepted but matched no
+/// components/variables. Every wire value is PascalCase and identical between
+/// the reference dataclass enum and the bundled OCPP 2.0.1 FINAL JSON Schema,
+/// so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GenericDeviceModelStatusEnumType {
+    Accepted,
+    Rejected,
+    NotSupported,
+    EmptyResultSet,
 }
