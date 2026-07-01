@@ -552,6 +552,8 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
     (
         "PublishFirmwareResponse",
         include_str!("../schemas/v201/PublishFirmwareResponse.json"),
+    ),
+    (
         "GetBaseReport",
         include_str!("../schemas/v201/GetBaseReport.json"),
     ),

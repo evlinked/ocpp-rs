@@ -862,6 +862,8 @@ pub enum PublishFirmwareStatusEnumType {
 pub enum GenericStatusEnumType {
     Accepted,
     Rejected,
+}
+
 /// Which slice of the device model a `GetBaseReport` request asks the Charging
 /// Station to report: the writable configuration only, the full component /
 /// variable inventory, or a summary.
