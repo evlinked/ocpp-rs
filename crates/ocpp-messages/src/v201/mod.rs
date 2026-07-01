@@ -30,6 +30,7 @@ mod cleared_charging_limit;
 mod cost_updated;
 mod data_transfer;
 mod firmware_status_notification;
+mod get_base_report;
 mod get_local_list_version;
 mod get_transaction_status;
 mod get_variables;
@@ -62,6 +63,7 @@ pub use data_transfer::{DataTransferRequest, DataTransferResponse};
 pub use firmware_status_notification::{
     FirmwareStatusNotificationRequest, FirmwareStatusNotificationResponse,
 };
+pub use get_base_report::{GetBaseReportRequest, GetBaseReportResponse};
 pub use get_local_list_version::{GetLocalListVersionRequest, GetLocalListVersionResponse};
 pub use get_transaction_status::{GetTransactionStatusRequest, GetTransactionStatusResponse};
 pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
@@ -4574,6 +4576,155 @@ mod tests {
                 PublishFirmwareStatusNotificationResponse::ACTION_NAME,
                 "PublishFirmwareStatusNotificationResponse"
             );
+        }
+    }
+
+    mod get_base_report {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::CustomDataType;
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Both `requestId` and `reportBase` are required; `customData`
+            // stays off the wire when `None`.
+            let req = GetBaseReportRequest {
+                request_id: 42,
+                report_base: ReportBaseEnumType::FullInventory,
+                custom_data: None,
+            };
+            let expected = json!({ "requestId": 42, "reportBase": "FullInventory" });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(!expected.as_object().unwrap().contains_key("customData"));
+            // `requestId` is a JSON integer, not a string.
+            assert!(expected["requestId"].is_i64());
+            let back: GetBaseReportRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("GetBaseReport", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_report_base_round_trips_all_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (
+                    ReportBaseEnumType::ConfigurationInventory,
+                    "ConfigurationInventory",
+                ),
+                (ReportBaseEnumType::FullInventory, "FullInventory"),
+                (ReportBaseEnumType::SummaryInventory, "SummaryInventory"),
+            ] {
+                let req = GetBaseReportRequest {
+                    request_id: 1,
+                    report_base: variant,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&req).unwrap();
+                assert_eq!(value["reportBase"], json!(wire));
+                assert!(v.validate_call("GetBaseReport", &value).is_ok());
+                let back: GetBaseReportRequest = serde_json::from_value(value).unwrap();
+                assert_eq!(back, req);
+            }
+        }
+
+        #[test]
+        fn request_with_custom_data_round_trips_and_validates() {
+            let req = GetBaseReportRequest {
+                request_id: 7,
+                report_base: ReportBaseEnumType::SummaryInventory,
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("GetBaseReport", &wire)
+                .is_ok());
+            let back: GetBaseReportRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            // Only `status` is required; `statusInfo` / `customData` stay off
+            // the wire when `None`.
+            let resp = GetBaseReportResponse {
+                status: GenericDeviceModelStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("statusInfo"));
+            assert!(!obj.contains_key("customData"));
+            let back: GetBaseReportResponse = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, resp);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetBaseReport", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn response_status_round_trips_all_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (GenericDeviceModelStatusEnumType::Accepted, "Accepted"),
+                (GenericDeviceModelStatusEnumType::Rejected, "Rejected"),
+                (
+                    GenericDeviceModelStatusEnumType::NotSupported,
+                    "NotSupported",
+                ),
+                (
+                    GenericDeviceModelStatusEnumType::EmptyResultSet,
+                    "EmptyResultSet",
+                ),
+            ] {
+                let resp = GetBaseReportResponse {
+                    status: variant,
+                    status_info: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&resp).unwrap();
+                assert_eq!(value["status"], json!(wire));
+                assert!(v.validate_call_result("GetBaseReport", &value).is_ok());
+                let back: GetBaseReportResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn response_with_status_info_and_custom_data_round_trips_and_validates() {
+            let resp = GetBaseReportResponse {
+                status: GenericDeviceModelStatusEnumType::Rejected,
+                status_info: Some(StatusInfoType {
+                    reason_code: "NotEnabled".to_string(),
+                    additional_info: Some("Device model reporting disabled".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("NotEnabled"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetBaseReport", &wire)
+                .is_ok());
+            let back: GetBaseReportResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(GetBaseReportRequest::ACTION_NAME, "GetBaseReport");
+            assert_eq!(GetBaseReportResponse::ACTION_NAME, "GetBaseReportResponse");
         }
     }
 }

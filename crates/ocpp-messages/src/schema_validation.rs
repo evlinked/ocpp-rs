@@ -545,6 +545,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "PublishFirmwareStatusNotificationResponse",
         include_str!("../schemas/v201/PublishFirmwareStatusNotificationResponse.json"),
     ),
+    (
+        "GetBaseReport",
+        include_str!("../schemas/v201/GetBaseReport.json"),
+    ),
+    (
+        "GetBaseReportResponse",
+        include_str!("../schemas/v201/GetBaseReportResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -2219,6 +2227,98 @@ mod tests {
             .validate_call_result(
                 "DataTransfer",
                 &json!({ "status": "Accepted", "bogusExtra": true })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_get_base_report_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call(
+                "GetBaseReport",
+                &json!({ "requestId": 42, "reportBase": "FullInventory" })
+            )
+            .is_ok());
+        assert!(v
+            .validate_call(
+                "GetBaseReport",
+                &json!({
+                    "requestId": 1,
+                    "reportBase": "SummaryInventory",
+                    "customData": { "vendorId": "ACME" }
+                })
+            )
+            .is_ok());
+        assert!(v
+            .validate_call_result("GetBaseReport", &json!({ "status": "Accepted" }))
+            .is_ok());
+        assert!(v
+            .validate_call_result(
+                "GetBaseReport",
+                &json!({
+                    "status": "EmptyResultSet",
+                    "statusInfo": { "reasonCode": "NoData" }
+                })
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn v201_get_base_report_call_missing_required_fields_fail() {
+        let v = SchemaValidator::v201();
+        // Missing reportBase.
+        assert!(v
+            .validate_call("GetBaseReport", &json!({ "requestId": 1 }))
+            .is_err());
+        // Missing requestId.
+        assert!(v
+            .validate_call("GetBaseReport", &json!({ "reportBase": "FullInventory" }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_get_base_report_result_missing_status_fails() {
+        let v = SchemaValidator::v201();
+        assert!(v.validate_call_result("GetBaseReport", &json!({})).is_err());
+    }
+
+    #[test]
+    fn v201_get_base_report_rejects_wrong_types_and_unknown_enums() {
+        let v = SchemaValidator::v201();
+        // requestId must be an integer.
+        assert!(v
+            .validate_call(
+                "GetBaseReport",
+                &json!({ "requestId": "1", "reportBase": "FullInventory" })
+            )
+            .is_err());
+        // Unknown reportBase value.
+        assert!(v
+            .validate_call(
+                "GetBaseReport",
+                &json!({ "requestId": 1, "reportBase": "PartialInventory" })
+            )
+            .is_err());
+        // Unknown status value on the response.
+        assert!(v
+            .validate_call_result("GetBaseReport", &json!({ "status": "Maybe" }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_get_base_report_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call(
+                "GetBaseReport",
+                &json!({ "requestId": 1, "reportBase": "FullInventory", "bogus": true })
+            )
+            .is_err());
+        assert!(v
+            .validate_call_result(
+                "GetBaseReport",
+                &json!({ "status": "Accepted", "bogus": true })
             )
             .is_err());
     }
