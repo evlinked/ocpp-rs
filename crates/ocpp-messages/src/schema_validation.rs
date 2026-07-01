@@ -561,6 +561,11 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "GetBaseReportResponse",
         include_str!("../schemas/v201/GetBaseReportResponse.json"),
     ),
+    ("GetReport", include_str!("../schemas/v201/GetReport.json")),
+    (
+        "GetReportResponse",
+        include_str!("../schemas/v201/GetReportResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -2328,6 +2333,123 @@ mod tests {
                 "GetBaseReport",
                 &json!({ "status": "Accepted", "bogus": true })
             )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_get_report_registered() {
+        let v = SchemaValidator::v201();
+        assert!(v.has_schema("GetReport"));
+        assert!(v.has_schema("GetReportResponse"));
+    }
+
+    #[test]
+    fn v201_get_report_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        // Bare request — only requestId is required.
+        assert!(v
+            .validate_call("GetReport", &json!({ "requestId": 42 }))
+            .is_ok());
+        // Both filters populated, plus a nested variable and customData.
+        assert!(v
+            .validate_call(
+                "GetReport",
+                &json!({
+                    "requestId": 1,
+                    "componentVariable": [{
+                        "component": { "name": "EVSE" },
+                        "variable": { "name": "Available" }
+                    }],
+                    "componentCriteria": ["Active", "Problem"],
+                    "customData": { "vendorId": "ACME" }
+                })
+            )
+            .is_ok());
+        assert!(v
+            .validate_call_result("GetReport", &json!({ "status": "Accepted" }))
+            .is_ok());
+        assert!(v
+            .validate_call_result(
+                "GetReport",
+                &json!({
+                    "status": "EmptyResultSet",
+                    "statusInfo": { "reasonCode": "NoData" }
+                })
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn v201_get_report_call_missing_required_request_id_fails() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call("GetReport", &json!({ "componentCriteria": ["Active"] }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_get_report_result_missing_status_fails() {
+        let v = SchemaValidator::v201();
+        assert!(v.validate_call_result("GetReport", &json!({})).is_err());
+    }
+
+    #[test]
+    fn v201_get_report_rejects_wrong_types_and_unknown_enums() {
+        let v = SchemaValidator::v201();
+        // requestId must be an integer.
+        assert!(v
+            .validate_call("GetReport", &json!({ "requestId": "1" }))
+            .is_err());
+        // Unknown componentCriteria value.
+        assert!(v
+            .validate_call(
+                "GetReport",
+                &json!({ "requestId": 1, "componentCriteria": ["Broken"] })
+            )
+            .is_err());
+        // Unknown status value on the response.
+        assert!(v
+            .validate_call_result("GetReport", &json!({ "status": "Maybe" }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_get_report_rejects_empty_filter_arrays() {
+        let v = SchemaValidator::v201();
+        // componentVariable requires minItems: 1.
+        assert!(v
+            .validate_call(
+                "GetReport",
+                &json!({ "requestId": 1, "componentVariable": [] })
+            )
+            .is_err());
+        // componentCriteria requires minItems: 1.
+        assert!(v
+            .validate_call(
+                "GetReport",
+                &json!({ "requestId": 1, "componentCriteria": [] })
+            )
+            .is_err());
+        // componentCriteria caps at maxItems: 4.
+        assert!(v
+            .validate_call(
+                "GetReport",
+                &json!({
+                    "requestId": 1,
+                    "componentCriteria": ["Active", "Available", "Enabled", "Problem", "Active"]
+                })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_get_report_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call("GetReport", &json!({ "requestId": 1, "bogus": true }))
+            .is_err());
+        assert!(v
+            .validate_call_result("GetReport", &json!({ "status": "Accepted", "bogus": true }))
             .is_err());
     }
 

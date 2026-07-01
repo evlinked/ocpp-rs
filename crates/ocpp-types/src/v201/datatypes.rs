@@ -713,3 +713,20 @@ pub struct ChargingProfileType {
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
 }
+
+/// A component together with (optionally) a specific variable within it, used to
+/// narrow a `GetReport` request to a subset of the device model.
+///
+/// Ports `ComponentVariableType`. Only `component` is required; when `variable`
+/// is omitted the whole component is referenced.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComponentVariableType {
+    /// Component that is referenced.
+    pub component: ComponentType,
+    /// Variable within the component; absent means the whole component.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variable: Option<VariableType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}

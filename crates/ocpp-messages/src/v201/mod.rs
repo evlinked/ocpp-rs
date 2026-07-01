@@ -32,6 +32,7 @@ mod data_transfer;
 mod firmware_status_notification;
 mod get_base_report;
 mod get_local_list_version;
+mod get_report;
 mod get_transaction_status;
 mod get_variables;
 mod heartbeat;
@@ -66,6 +67,7 @@ pub use firmware_status_notification::{
 };
 pub use get_base_report::{GetBaseReportRequest, GetBaseReportResponse};
 pub use get_local_list_version::{GetLocalListVersionRequest, GetLocalListVersionResponse};
+pub use get_report::{GetReportRequest, GetReportResponse};
 pub use get_transaction_status::{GetTransactionStatusRequest, GetTransactionStatusResponse};
 pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
 pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
