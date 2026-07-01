@@ -851,6 +851,17 @@ pub enum PublishFirmwareStatusEnumType {
     PublishFailed,
 }
 
+/// Whether a request was accepted, used as the generic Accepted/Rejected result
+/// status shared by several 2.0.1 messages (e.g. `PublishFirmware`).
+///
+/// Ports `GenericStatusEnumType` (`ocpp/v201/enums.py`). Both wire values are
+/// PascalCase (`"Accepted"`, `"Rejected"`) and identical between the reference
+/// dataclass enum and the bundled OCPP 2.0.1 FINAL JSON Schema, so no
+/// `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GenericStatusEnumType {
+    Accepted,
+    Rejected,
 /// Which slice of the device model a `GetBaseReport` request asks the Charging
 /// Station to report: the writable configuration only, the full component /
 /// variable inventory, or a summary.
