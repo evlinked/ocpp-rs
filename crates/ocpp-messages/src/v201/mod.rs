@@ -36,6 +36,7 @@ mod get_variables;
 mod heartbeat;
 mod log_status_notification;
 mod meter_values;
+mod publish_firmware;
 mod publish_firmware_status_notification;
 mod request_start_transaction;
 mod request_stop_transaction;
@@ -68,6 +69,7 @@ pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
 pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
 pub use log_status_notification::{LogStatusNotificationRequest, LogStatusNotificationResponse};
 pub use meter_values::{MeterValuesRequest, MeterValuesResponse};
+pub use publish_firmware::{PublishFirmwareRequest, PublishFirmwareResponse};
 pub use publish_firmware_status_notification::{
     PublishFirmwareStatusNotificationRequest, PublishFirmwareStatusNotificationResponse,
 };
@@ -4574,6 +4576,187 @@ mod tests {
                 PublishFirmwareStatusNotificationResponse::ACTION_NAME,
                 "PublishFirmwareStatusNotificationResponse"
             );
+        }
+    }
+
+    /// `PublishFirmware` — the 2.0.1 publish-firmware-to-Local-Controller
+    /// command (#183). Triggers the firmware-publish family whose progress is
+    /// reported by `PublishFirmwareStatusNotification` (#182); the response is a
+    /// generic [`GenericStatusEnumType`] acknowledgement reusing `StatusInfoType`.
+    mod publish_firmware {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{CustomDataType, GenericStatusEnumType, StatusInfoType};
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only the three required fields — optional retry tuning omitted.
+            let req = PublishFirmwareRequest {
+                location: "https://lc.example/fw/v2.bin".to_string(),
+                retries: None,
+                checksum: "5f4dcc3b5aa765d61d8327deb882cf99".to_string(),
+                request_id: 42,
+                retry_interval: None,
+                custom_data: None,
+            };
+            let expected = json!({
+                "location": "https://lc.example/fw/v2.bin",
+                "checksum": "5f4dcc3b5aa765d61d8327deb882cf99",
+                "requestId": 42
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let back: PublishFirmwareRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("PublishFirmware", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_all_optionals_round_trips_and_validates() {
+            let req = PublishFirmwareRequest {
+                location: "https://lc.example/fw/v2.bin".to_string(),
+                retries: Some(3),
+                checksum: "5f4dcc3b5aa765d61d8327deb882cf99".to_string(),
+                request_id: 7,
+                retry_interval: Some(30),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["retries"], json!(3));
+            assert_eq!(wire["retryInterval"], json!(30));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("PublishFirmware", &wire)
+                .is_ok());
+            let back: PublishFirmwareRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = PublishFirmwareResponse {
+                status: GenericStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("PublishFirmware", &expected)
+                .is_ok());
+            let back: PublishFirmwareResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_rejected_with_status_info_and_custom_data_round_trips() {
+            let resp = PublishFirmwareResponse {
+                status: GenericStatusEnumType::Rejected,
+                status_info: Some(StatusInfoType {
+                    reason_code: "NotSupported".to_string(),
+                    additional_info: Some("local caching disabled".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Rejected"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("NotSupported"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("PublishFirmware", &wire)
+                .is_ok());
+            let back: PublishFirmwareResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn generic_status_serializes_to_wire_values_and_rejects_unknown() {
+            assert_eq!(
+                serde_json::to_value(GenericStatusEnumType::Accepted).unwrap(),
+                json!("Accepted")
+            );
+            assert_eq!(
+                serde_json::to_value(GenericStatusEnumType::Rejected).unwrap(),
+                json!("Rejected")
+            );
+            // `Scheduled` belongs to other status enums, not this generic one.
+            assert!(serde_json::from_value::<GenericStatusEnumType>(json!("Scheduled")).is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(PublishFirmwareRequest::ACTION_NAME, "PublishFirmware");
+            assert_eq!(
+                PublishFirmwareResponse::ACTION_NAME,
+                "PublishFirmwareResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_missing_required_request_fields() {
+            let v = SchemaValidator::v201();
+            let full = json!({
+                "location": "https://lc.example/fw.bin",
+                "checksum": "5f4dcc3b5aa765d61d8327deb882cf99",
+                "requestId": 1
+            });
+            // Drop each required field in turn.
+            for missing in ["location", "checksum", "requestId"] {
+                let mut bad = full.clone();
+                bad.as_object_mut().unwrap().remove(missing);
+                assert!(
+                    v.validate_call("PublishFirmware", &bad).is_err(),
+                    "missing {missing} should fail"
+                );
+            }
+        }
+
+        #[test]
+        fn schema_and_serde_reject_non_integer_request_id() {
+            let bad = json!({
+                "location": "https://lc.example/fw.bin",
+                "checksum": "5f4dcc3b5aa765d61d8327deb882cf99",
+                "requestId": "1"
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("PublishFirmware", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<PublishFirmwareRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status_and_unknown_value() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("PublishFirmware", &json!({}))
+                .is_err());
+            let bad = json!({ "status": "Maybe" });
+            assert!(v.validate_call_result("PublishFirmware", &bad).is_err());
+            assert!(serde_json::from_value::<PublishFirmwareResponse>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let bad_req = json!({
+                "location": "https://lc.example/fw.bin",
+                "checksum": "5f4dcc3b5aa765d61d8327deb882cf99",
+                "requestId": 1,
+                "bogusExtra": true
+            });
+            assert!(v.validate_call("PublishFirmware", &bad_req).is_err());
+            let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
+            assert!(v
+                .validate_call_result("PublishFirmware", &bad_resp)
+                .is_err());
         }
     }
 }
