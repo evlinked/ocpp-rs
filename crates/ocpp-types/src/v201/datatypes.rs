@@ -802,3 +802,76 @@ pub struct ClearMonitoringResultType {
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
 }
+
+/// One monitor to install via a `SetVariableMonitoring` request, targeting a
+/// single component-variable.
+///
+/// Ports `SetMonitoringDataType`. `value`, `kind` (`type`), `severity`,
+/// `component`, and `variable` are required; `id` is supplied only to *replace*
+/// an existing monitor (the Charging Station assigns ids for new monitors), and
+/// `transaction` defaults to `false`. `value` is a threshold/delta magnitude for
+/// [`MonitorEnumType::UpperThreshold`] / [`MonitorEnumType::LowerThreshold`] /
+/// [`MonitorEnumType::Delta`], or an interval in seconds for
+/// [`MonitorEnumType::Periodic`] / [`MonitorEnumType::PeriodicClockAligned`].
+/// `severity` runs 0 (highest) to 9 (lowest).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetMonitoringDataType {
+    /// Set only to replace an existing monitor; omitted for new monitors, whose
+    /// id the Charging Station assigns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<i32>,
+    /// Whether the monitor is only active while a transaction is ongoing on a
+    /// component relevant to this transaction. Defaults to `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction: Option<bool>,
+    /// Threshold/delta magnitude, or the interval in seconds for periodic
+    /// monitors.
+    pub value: f64,
+    /// The kind of monitor to install.
+    #[serde(rename = "type")]
+    pub kind: MonitorEnumType,
+    /// Severity assigned to events this monitor triggers (0 = highest, 9 =
+    /// lowest).
+    pub severity: i32,
+    /// Component the monitored variable belongs to.
+    pub component: ComponentType,
+    /// The variable to monitor.
+    pub variable: VariableType,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// The per-monitor outcome of a `SetVariableMonitoring` request, one entry in
+/// the response's `setMonitoringResult` list.
+///
+/// Ports `SetMonitoringResultType`. `status`, `kind` (`type`), `severity`,
+/// `component`, and `variable` are required; `id` is returned only when
+/// `status` is [`SetMonitoringStatusEnumType::Accepted`], and `status_info`
+/// carries optional detail. The echoed `kind` / `severity` / `component` /
+/// `variable` correlate each result back to its requested
+/// [`SetMonitoringDataType`] entry.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SetMonitoringResultType {
+    /// The id assigned to the monitor; returned only when `status` is
+    /// [`SetMonitoringStatusEnumType::Accepted`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<i32>,
+    /// Whether the monitor was installed, or why it was rejected.
+    pub status: SetMonitoringStatusEnumType,
+    /// The kind of monitor this result refers to (echoed from the request).
+    #[serde(rename = "type")]
+    pub kind: MonitorEnumType,
+    /// Component the monitored variable belongs to (echoed from the request).
+    pub component: ComponentType,
+    /// The monitored variable (echoed from the request).
+    pub variable: VariableType,
+    /// Severity of the monitor this result refers to (echoed from the request).
+    pub severity: i32,
+    /// Optional detail about the status.
+    #[serde(rename = "statusInfo", skip_serializing_if = "Option::is_none")]
+    pub status_info: Option<StatusInfoType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}

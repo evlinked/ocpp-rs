@@ -985,3 +985,22 @@ pub enum ClearMonitoringStatusEnumType {
     Rejected,
     NotFound,
 }
+
+/// Per-monitor result of a `SetVariableMonitoring` request: `Accepted` (the
+/// monitor was installed, and its assigned `id` is returned), or one of the
+/// rejection reasons — the component/variable is unknown, the monitor type is
+/// unsupported for that variable, the request was `Rejected`, or it would
+/// create a `Duplicate` monitor.
+///
+/// Ports `SetMonitoringStatusEnumType` (`ocpp/v201/enums.py`). Every wire value
+/// is PascalCase and identical between the reference dataclass enum and the
+/// bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetMonitoringStatusEnumType {
+    Accepted,
+    UnknownComponent,
+    UnknownVariable,
+    UnsupportedMonitorType,
+    Rejected,
+    Duplicate,
+}
