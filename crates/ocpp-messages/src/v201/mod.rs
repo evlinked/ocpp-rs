@@ -49,6 +49,7 @@ mod reset;
 mod security_event_notification;
 mod send_local_list;
 mod set_charging_profile;
+mod set_monitoring_base;
 mod set_variables;
 mod status_notification;
 mod transaction_event;
@@ -94,6 +95,7 @@ pub use security_event_notification::{
 };
 pub use send_local_list::{SendLocalListRequest, SendLocalListResponse};
 pub use set_charging_profile::{SetChargingProfileRequest, SetChargingProfileResponse};
+pub use set_monitoring_base::{SetMonitoringBaseRequest, SetMonitoringBaseResponse};
 pub use set_variables::{SetVariablesRequest, SetVariablesResponse};
 pub use status_notification::{StatusNotificationRequest, StatusNotificationResponse};
 pub use transaction_event::{TransactionEventRequest, TransactionEventResponse};
@@ -5358,6 +5360,213 @@ mod tests {
             assert_eq!(
                 GetMonitoringReportResponse::ACTION_NAME,
                 "GetMonitoringReportResponse"
+            );
+        }
+    }
+
+    mod set_monitoring_base {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // `monitoringBase` is the only required field; `customData` stays
+            // off the wire when `None`.
+            let req = SetMonitoringBaseRequest {
+                monitoring_base: MonitorBaseEnumType::All,
+                custom_data: None,
+            };
+            let expected = json!({ "monitoringBase": "All" });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(!expected.as_object().unwrap().contains_key("customData"));
+            let back: SetMonitoringBaseRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("SetMonitoringBase", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_custom_data_round_trips_and_validates() {
+            let req = SetMonitoringBaseRequest {
+                monitoring_base: MonitorBaseEnumType::FactoryDefault,
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["monitoringBase"], json!("FactoryDefault"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("SetMonitoringBase", &wire)
+                .is_ok());
+            let back: SetMonitoringBaseRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_monitoring_base_round_trips_all_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (MonitorBaseEnumType::All, "All"),
+                (MonitorBaseEnumType::FactoryDefault, "FactoryDefault"),
+                (MonitorBaseEnumType::HardWiredOnly, "HardWiredOnly"),
+            ] {
+                let req = SetMonitoringBaseRequest {
+                    monitoring_base: variant,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&req).unwrap();
+                assert_eq!(value["monitoringBase"], json!(wire));
+                assert!(v.validate_call("SetMonitoringBase", &value).is_ok());
+                let back: SetMonitoringBaseRequest = serde_json::from_value(value).unwrap();
+                assert_eq!(back, req);
+            }
+        }
+
+        #[test]
+        fn request_rejects_missing_monitoring_base() {
+            let v = SchemaValidator::v201();
+            assert!(v.validate_call("SetMonitoringBase", &json!({})).is_err());
+        }
+
+        #[test]
+        fn request_rejects_wrong_monitoring_base_type() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call("SetMonitoringBase", &json!({ "monitoringBase": 1 }))
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_unknown_monitoring_base() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "SetMonitoringBase",
+                    &json!({ "monitoringBase": "SomeMonitors" })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "SetMonitoringBase",
+                    &json!({ "monitoringBase": "All", "unexpected": true })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            // Only `status` is required; `statusInfo` / `customData` stay off
+            // the wire when `None`.
+            let resp = SetMonitoringBaseResponse {
+                status: GenericDeviceModelStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("statusInfo"));
+            assert!(!obj.contains_key("customData"));
+            let back: SetMonitoringBaseResponse = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, resp);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetMonitoringBase", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn response_status_round_trips_all_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (GenericDeviceModelStatusEnumType::Accepted, "Accepted"),
+                (GenericDeviceModelStatusEnumType::Rejected, "Rejected"),
+                (
+                    GenericDeviceModelStatusEnumType::NotSupported,
+                    "NotSupported",
+                ),
+                (
+                    GenericDeviceModelStatusEnumType::EmptyResultSet,
+                    "EmptyResultSet",
+                ),
+            ] {
+                let resp = SetMonitoringBaseResponse {
+                    status: variant,
+                    status_info: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&resp).unwrap();
+                assert_eq!(value["status"], json!(wire));
+                assert!(v.validate_call_result("SetMonitoringBase", &value).is_ok());
+                let back: SetMonitoringBaseResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn response_with_status_info_and_custom_data_round_trips_and_validates() {
+            let resp = SetMonitoringBaseResponse {
+                status: GenericDeviceModelStatusEnumType::Rejected,
+                status_info: Some(StatusInfoType {
+                    reason_code: "NotEnabled".to_string(),
+                    additional_info: Some("Monitoring base not supported".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("NotEnabled"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetMonitoringBase", &wire)
+                .is_ok());
+            let back: SetMonitoringBaseResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_rejects_missing_status() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("SetMonitoringBase", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn response_rejects_unknown_status() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("SetMonitoringBase", &json!({ "status": "Maybe" }))
+                .is_err());
+        }
+
+        #[test]
+        fn response_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result(
+                    "SetMonitoringBase",
+                    &json!({ "status": "Accepted", "unexpected": true })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(SetMonitoringBaseRequest::ACTION_NAME, "SetMonitoringBase");
+            assert_eq!(
+                SetMonitoringBaseResponse::ACTION_NAME,
+                "SetMonitoringBaseResponse"
             );
         }
     }
