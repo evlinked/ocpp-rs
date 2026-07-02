@@ -26,6 +26,7 @@ mod boot_notification;
 mod cancel_reservation;
 mod change_availability;
 mod clear_cache;
+mod clear_charging_profile;
 mod cleared_charging_limit;
 mod cost_updated;
 mod data_transfer;
@@ -64,6 +65,7 @@ pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
 pub use cancel_reservation::{CancelReservationRequest, CancelReservationResponse};
 pub use change_availability::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
 pub use clear_cache::{ClearCacheRequest, ClearCacheResponse};
+pub use clear_charging_profile::{ClearChargingProfileRequest, ClearChargingProfileResponse};
 pub use cleared_charging_limit::{ClearedChargingLimitRequest, ClearedChargingLimitResponse};
 pub use cost_updated::{CostUpdatedRequest, CostUpdatedResponse};
 pub use data_transfer::{DataTransferRequest, DataTransferResponse};
@@ -1009,6 +1011,248 @@ mod tests {
             let bad = json!({ "status": "Accepted", "bogus": true });
             assert!(SchemaValidator::v201()
                 .validate_call_result("ClearCache", &bad)
+                .is_err());
+        }
+    }
+
+    /// `ClearChargingProfile` — the 2.0.1 clear-charging-profile command (#202).
+    /// Teardown counterpart to `SetChargingProfile`; the request has no required
+    /// fields (an empty `{}` means "clear all"), reuses
+    /// `ChargingProfilePurposeEnumType` in its filter, and the response returns a
+    /// two-value `ClearChargingProfileStatusEnumType` plus optional
+    /// `StatusInfoType`.
+    mod clear_charging_profile {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            ChargingProfilePurposeEnumType, ClearChargingProfileStatusEnumType,
+            ClearChargingProfileType, CustomDataType, StatusInfoType,
+        };
+
+        #[test]
+        fn empty_request_means_clear_all_and_validates() {
+            // No fields set → `{}` on the wire, meaning "clear every profile".
+            let req = ClearChargingProfileRequest::default();
+            let expected = json!({});
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let back: ClearChargingProfileRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("ClearChargingProfile", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_by_profile_id_matches_wire_json_and_validates() {
+            let req = ClearChargingProfileRequest {
+                charging_profile_id: Some(7),
+                charging_profile_criteria: None,
+                custom_data: None,
+            };
+            let expected = json!({ "chargingProfileId": 7 });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let back: ClearChargingProfileRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("ClearChargingProfile", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_full_criteria_matches_wire_json_and_validates() {
+            let req = ClearChargingProfileRequest {
+                charging_profile_id: None,
+                charging_profile_criteria: Some(ClearChargingProfileType {
+                    evse_id: Some(1),
+                    charging_profile_purpose: Some(
+                        ChargingProfilePurposeEnumType::TxDefaultProfile,
+                    ),
+                    stack_level: Some(3),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let expected = json!({
+                "chargingProfileCriteria": {
+                    "evseId": 1,
+                    "chargingProfilePurpose": "TxDefaultProfile",
+                    "stackLevel": 3
+                }
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let back: ClearChargingProfileRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("ClearChargingProfile", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_empty_criteria_object_validates() {
+            // An empty criteria object is valid (no required fields) and matches
+            // "every profile on the station wide overall limit for evseId 0".
+            let req = ClearChargingProfileRequest {
+                charging_profile_id: None,
+                charging_profile_criteria: Some(ClearChargingProfileType {
+                    evse_id: Some(0),
+                    charging_profile_purpose: None,
+                    stack_level: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire, json!({ "chargingProfileCriteria": { "evseId": 0 } }));
+            assert!(SchemaValidator::v201()
+                .validate_call("ClearChargingProfile", &wire)
+                .is_ok());
+            // A truly empty criteria object also validates.
+            assert!(SchemaValidator::v201()
+                .validate_call(
+                    "ClearChargingProfile",
+                    &json!({ "chargingProfileCriteria": {} })
+                )
+                .is_ok());
+            let back: ClearChargingProfileRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_round_trips_with_custom_data() {
+            let req = ClearChargingProfileRequest {
+                charging_profile_id: Some(42),
+                charging_profile_criteria: None,
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("ClearChargingProfile", &wire)
+                .is_ok());
+            let back: ClearChargingProfileRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = ClearChargingProfileResponse {
+                status: ClearChargingProfileStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ClearChargingProfile", &expected)
+                .is_ok());
+            let back: ClearChargingProfileResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_unknown_with_status_info_round_trips() {
+            let resp = ClearChargingProfileResponse {
+                status: ClearChargingProfileStatusEnumType::Unknown,
+                status_info: Some(StatusInfoType {
+                    reason_code: "NoProfile".to_string(),
+                    additional_info: Some("no profile matched the criteria".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Unknown"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("NoProfile"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ClearChargingProfile", &wire)
+                .is_ok());
+            let back: ClearChargingProfileResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_enum_serializes_to_wire_values_and_rejects_unknown() {
+            assert_eq!(
+                serde_json::to_value(ClearChargingProfileStatusEnumType::Accepted).unwrap(),
+                json!("Accepted")
+            );
+            assert_eq!(
+                serde_json::to_value(ClearChargingProfileStatusEnumType::Unknown).unwrap(),
+                json!("Unknown")
+            );
+            // `Rejected` is a `ChargingProfileStatusEnumType` value, not valid here.
+            assert!(
+                serde_json::from_value::<ClearChargingProfileStatusEnumType>(json!("Rejected"))
+                    .is_err()
+            );
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                ClearChargingProfileRequest::ACTION_NAME,
+                "ClearChargingProfile"
+            );
+            assert_eq!(
+                ClearChargingProfileResponse::ACTION_NAME,
+                "ClearChargingProfileResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ClearChargingProfile", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_unknown_status() {
+            let bad = json!({ "status": "Rejected" });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ClearChargingProfile", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<ClearChargingProfileResponse>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_non_integer_profile_id() {
+            let bad = json!({ "chargingProfileId": "7" });
+            assert!(SchemaValidator::v201()
+                .validate_call("ClearChargingProfile", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<ClearChargingProfileRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            // On the request itself.
+            assert!(v
+                .validate_call(
+                    "ClearChargingProfile",
+                    &json!({ "chargingProfileId": 1, "bogus": true })
+                )
+                .is_err());
+            // Inside the criteria object.
+            assert!(v
+                .validate_call(
+                    "ClearChargingProfile",
+                    &json!({ "chargingProfileCriteria": { "bogus": true } })
+                )
+                .is_err());
+            // On the response.
+            assert!(v
+                .validate_call_result(
+                    "ClearChargingProfile",
+                    &json!({ "status": "Accepted", "bogus": true })
+                )
                 .is_err());
         }
     }

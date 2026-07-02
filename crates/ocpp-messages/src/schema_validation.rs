@@ -606,6 +606,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "SetVariableMonitoringResponse",
         include_str!("../schemas/v201/SetVariableMonitoringResponse.json"),
     ),
+    (
+        "ClearChargingProfile",
+        include_str!("../schemas/v201/ClearChargingProfile.json"),
+    ),
+    (
+        "ClearChargingProfileResponse",
+        include_str!("../schemas/v201/ClearChargingProfileResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J

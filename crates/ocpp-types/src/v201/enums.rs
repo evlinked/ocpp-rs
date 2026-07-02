@@ -990,3 +990,18 @@ pub enum SetMonitoringStatusEnumType {
     Rejected,
     Duplicate,
 }
+
+/// Whether the Charging Station was able to execute a `ClearChargingProfile`
+/// request, reported in `ClearChargingProfile.conf`.
+///
+/// Ports `ClearChargingProfileStatusEnumType` (`ocpp/v201/enums.py`). `Accepted`
+/// means at least one charging profile matched the request's criteria and was
+/// cleared; `Unknown` means nothing matched, so no profile was removed. Both
+/// wire values are PascalCase and identical between the reference dataclass enum
+/// and the bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is
+/// needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClearChargingProfileStatusEnumType {
+    Accepted,
+    Unknown,
+}
