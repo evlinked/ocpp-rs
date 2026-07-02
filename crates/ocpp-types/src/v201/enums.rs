@@ -971,3 +971,17 @@ pub enum MonitorBaseEnumType {
     FactoryDefault,
     HardWiredOnly,
 }
+
+/// Per-monitor result of a `ClearVariableMonitoring` request: the monitor was
+/// cleared (`Accepted`), the station refused to clear it (`Rejected`), or no
+/// monitor with the requested id exists (`NotFound`).
+///
+/// Ports `ClearMonitoringStatusEnumType` (`ocpp/v201/enums.py`). Every wire
+/// value is PascalCase and identical between the reference dataclass enum and
+/// the bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClearMonitoringStatusEnumType {
+    Accepted,
+    Rejected,
+    NotFound,
+}

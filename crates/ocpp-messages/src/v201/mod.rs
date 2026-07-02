@@ -26,6 +26,7 @@ mod boot_notification;
 mod cancel_reservation;
 mod change_availability;
 mod clear_cache;
+mod clear_variable_monitoring;
 mod cleared_charging_limit;
 mod cost_updated;
 mod data_transfer;
@@ -63,6 +64,9 @@ pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
 pub use cancel_reservation::{CancelReservationRequest, CancelReservationResponse};
 pub use change_availability::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
 pub use clear_cache::{ClearCacheRequest, ClearCacheResponse};
+pub use clear_variable_monitoring::{
+    ClearVariableMonitoringRequest, ClearVariableMonitoringResponse,
+};
 pub use cleared_charging_limit::{ClearedChargingLimitRequest, ClearedChargingLimitResponse};
 pub use cost_updated::{CostUpdatedRequest, CostUpdatedResponse};
 pub use data_transfer::{DataTransferRequest, DataTransferResponse};
@@ -5872,6 +5876,190 @@ mod tests {
                 SetMonitoringBaseResponse::ACTION_NAME,
                 "SetMonitoringBaseResponse"
             );
+        }
+    }
+
+    mod clear_variable_monitoring {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+
+        #[test]
+        fn request_round_trips_and_validates() {
+            let req = ClearVariableMonitoringRequest {
+                id: vec![1, 2, 3],
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire, json!({ "id": [1, 2, 3] }));
+            assert!(SchemaValidator::v201()
+                .validate_call("ClearVariableMonitoring", &wire)
+                .is_ok());
+            let back: ClearVariableMonitoringRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_round_trips_and_validates() {
+            let resp = ClearVariableMonitoringResponse {
+                clear_monitoring_result: vec![
+                    ClearMonitoringResultType {
+                        status: ClearMonitoringStatusEnumType::Accepted,
+                        id: 1,
+                        status_info: None,
+                        custom_data: None,
+                    },
+                    ClearMonitoringResultType {
+                        status: ClearMonitoringStatusEnumType::Rejected,
+                        id: 2,
+                        status_info: Some(StatusInfoType {
+                            reason_code: "InUse".to_string(),
+                            additional_info: Some("monitor busy".to_string()),
+                            custom_data: None,
+                        }),
+                        custom_data: None,
+                    },
+                ],
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(
+                wire["clearMonitoringResult"][0]["status"],
+                json!("Accepted")
+            );
+            assert_eq!(
+                wire["clearMonitoringResult"][1]["status"],
+                json!("Rejected")
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ClearVariableMonitoring", &wire)
+                .is_ok());
+            let back: ClearVariableMonitoringResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn all_status_wire_spellings_round_trip_and_validate() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (ClearMonitoringStatusEnumType::Accepted, "Accepted"),
+                (ClearMonitoringStatusEnumType::Rejected, "Rejected"),
+                (ClearMonitoringStatusEnumType::NotFound, "NotFound"),
+            ] {
+                let resp = ClearVariableMonitoringResponse {
+                    clear_monitoring_result: vec![ClearMonitoringResultType {
+                        status: variant,
+                        id: 5,
+                        status_info: None,
+                        custom_data: None,
+                    }],
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&resp).unwrap();
+                assert_eq!(value["clearMonitoringResult"][0]["status"], json!(wire));
+                assert!(v
+                    .validate_call_result("ClearVariableMonitoring", &value)
+                    .is_ok());
+            }
+        }
+
+        #[test]
+        fn request_rejects_missing_id() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call("ClearVariableMonitoring", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_empty_id_array() {
+            // Schema enforces `minItems: 1` even though serde accepts an empty Vec.
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call("ClearVariableMonitoring", &json!({ "id": [] }))
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_non_integer_id() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call("ClearVariableMonitoring", &json!({ "id": ["oops"] }))
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "ClearVariableMonitoring",
+                    &json!({ "id": [1], "unexpected": true })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_rejects_missing_result_list() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("ClearVariableMonitoring", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn response_rejects_empty_result_list() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result(
+                    "ClearVariableMonitoring",
+                    &json!({ "clearMonitoringResult": [] })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_rejects_result_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            // Missing `id`.
+            assert!(v
+                .validate_call_result(
+                    "ClearVariableMonitoring",
+                    &json!({ "clearMonitoringResult": [{ "status": "Accepted" }] })
+                )
+                .is_err());
+            // Missing `status`.
+            assert!(v
+                .validate_call_result(
+                    "ClearVariableMonitoring",
+                    &json!({ "clearMonitoringResult": [{ "id": 1 }] })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_rejects_unknown_status() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result(
+                    "ClearVariableMonitoring",
+                    &json!({ "clearMonitoringResult": [{ "status": "Maybe", "id": 1 }] })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_rejects_additional_properties_on_result() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result(
+                    "ClearVariableMonitoring",
+                    &json!({
+                        "clearMonitoringResult": [
+                            { "status": "Accepted", "id": 1, "unexpected": true }
+                        ]
+                    })
+                )
+                .is_err());
         }
     }
 }
