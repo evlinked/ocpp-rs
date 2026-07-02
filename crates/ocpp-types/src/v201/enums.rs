@@ -926,3 +926,17 @@ pub enum ComponentCriterionEnumType {
     Enabled,
     Problem,
 }
+
+/// Criterion selecting which components a `GetMonitoringReport` request asks the
+/// Charging Station to include, by the kind of monitor configured on them:
+/// `ThresholdMonitoring`, `DeltaMonitoring`, or `PeriodicMonitoring`.
+///
+/// Ports `MonitoringCriterionEnumType` (`ocpp/v201/enums.py`). Every wire value
+/// is PascalCase and identical between the reference dataclass enum and the
+/// bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MonitoringCriterionEnumType {
+    ThresholdMonitoring,
+    DeltaMonitoring,
+    PeriodicMonitoring,
+}

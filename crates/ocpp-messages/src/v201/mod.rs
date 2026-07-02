@@ -32,6 +32,7 @@ mod data_transfer;
 mod firmware_status_notification;
 mod get_base_report;
 mod get_local_list_version;
+mod get_monitoring_report;
 mod get_report;
 mod get_transaction_status;
 mod get_variables;
@@ -68,6 +69,7 @@ pub use firmware_status_notification::{
 };
 pub use get_base_report::{GetBaseReportRequest, GetBaseReportResponse};
 pub use get_local_list_version::{GetLocalListVersionRequest, GetLocalListVersionResponse};
+pub use get_monitoring_report::{GetMonitoringReportRequest, GetMonitoringReportResponse};
 pub use get_report::{GetReportRequest, GetReportResponse};
 pub use get_transaction_status::{GetTransactionStatusRequest, GetTransactionStatusResponse};
 pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
@@ -4911,9 +4913,6 @@ mod tests {
         }
     }
 
-    /// `UnpublishFirmware` — the 2.0.1 firmware-unpublish command (#180). A
-    /// single `checksum` string in, an [`UnpublishFirmwareStatusEnumType`] out;
-    /// the teardown counterpart to the `PublishFirmware` family.
     mod unpublish_firmware {
         use super::*;
         use crate::schema_validation::SchemaValidator;
@@ -5056,6 +5055,310 @@ mod tests {
                     &json!({ "status": "Unpublished", "bogusExtra": true })
                 )
                 .is_err());
+        }
+    }
+
+    mod get_monitoring_report {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{ComponentType, CustomDataType, MonitoringCriterionEnumType};
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only `requestId` is required; the optional filters and
+            // `customData` stay off the wire when `None`.
+            let req = GetMonitoringReportRequest {
+                component_variable: None,
+                request_id: 42,
+                monitoring_criteria: None,
+                custom_data: None,
+            };
+            let expected = json!({ "requestId": 42 });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("componentVariable"));
+            assert!(!obj.contains_key("monitoringCriteria"));
+            assert!(!obj.contains_key("customData"));
+            // `requestId` is a JSON integer, not a string.
+            assert!(expected["requestId"].is_i64());
+            let back: GetMonitoringReportRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("GetMonitoringReport", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_filters_round_trips_and_validates() {
+            let req = GetMonitoringReportRequest {
+                component_variable: Some(vec![ComponentVariableType {
+                    component: ComponentType {
+                        name: "EVSE".to_string(),
+                        instance: None,
+                        evse: None,
+                        custom_data: None,
+                    },
+                    variable: None,
+                    custom_data: None,
+                }]),
+                request_id: 7,
+                monitoring_criteria: Some(vec![
+                    MonitoringCriterionEnumType::ThresholdMonitoring,
+                    MonitoringCriterionEnumType::DeltaMonitoring,
+                    MonitoringCriterionEnumType::PeriodicMonitoring,
+                ]),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(
+                wire["componentVariable"][0]["component"]["name"],
+                json!("EVSE")
+            );
+            assert_eq!(
+                wire["monitoringCriteria"],
+                json!([
+                    "ThresholdMonitoring",
+                    "DeltaMonitoring",
+                    "PeriodicMonitoring"
+                ])
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call("GetMonitoringReport", &wire)
+                .is_ok());
+            let back: GetMonitoringReportRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_monitoring_criteria_round_trips_all_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (
+                    MonitoringCriterionEnumType::ThresholdMonitoring,
+                    "ThresholdMonitoring",
+                ),
+                (
+                    MonitoringCriterionEnumType::DeltaMonitoring,
+                    "DeltaMonitoring",
+                ),
+                (
+                    MonitoringCriterionEnumType::PeriodicMonitoring,
+                    "PeriodicMonitoring",
+                ),
+            ] {
+                let req = GetMonitoringReportRequest {
+                    component_variable: None,
+                    request_id: 1,
+                    monitoring_criteria: Some(vec![variant]),
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&req).unwrap();
+                assert_eq!(value["monitoringCriteria"], json!([wire]));
+                assert!(v.validate_call("GetMonitoringReport", &value).is_ok());
+                let back: GetMonitoringReportRequest = serde_json::from_value(value).unwrap();
+                assert_eq!(back, req);
+            }
+        }
+
+        #[test]
+        fn request_rejects_missing_request_id() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "GetMonitoringReport",
+                    &json!({ "monitoringCriteria": ["DeltaMonitoring"] })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_wrong_request_id_type() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call("GetMonitoringReport", &json!({ "requestId": "42" }))
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_empty_component_variable() {
+            // Schema requires `minItems: 1` when the filter is present.
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "GetMonitoringReport",
+                    &json!({ "requestId": 1, "componentVariable": [] })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_empty_monitoring_criteria() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "GetMonitoringReport",
+                    &json!({ "requestId": 1, "monitoringCriteria": [] })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_oversized_monitoring_criteria() {
+            // Schema caps `monitoringCriteria` at `maxItems: 3`; four entries
+            // (even valid ones) must fail.
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "GetMonitoringReport",
+                    &json!({
+                        "requestId": 1,
+                        "monitoringCriteria": [
+                            "ThresholdMonitoring",
+                            "DeltaMonitoring",
+                            "PeriodicMonitoring",
+                            "ThresholdMonitoring"
+                        ]
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_unknown_criterion() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "GetMonitoringReport",
+                    &json!({ "requestId": 1, "monitoringCriteria": ["HourlyMonitoring"] })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "GetMonitoringReport",
+                    &json!({ "requestId": 1, "unexpected": true })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            // Only `status` is required; `statusInfo` / `customData` stay off
+            // the wire when `None`.
+            let resp = GetMonitoringReportResponse {
+                status: GenericDeviceModelStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("statusInfo"));
+            assert!(!obj.contains_key("customData"));
+            let back: GetMonitoringReportResponse =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, resp);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetMonitoringReport", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn response_status_round_trips_all_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (GenericDeviceModelStatusEnumType::Accepted, "Accepted"),
+                (GenericDeviceModelStatusEnumType::Rejected, "Rejected"),
+                (
+                    GenericDeviceModelStatusEnumType::NotSupported,
+                    "NotSupported",
+                ),
+                (
+                    GenericDeviceModelStatusEnumType::EmptyResultSet,
+                    "EmptyResultSet",
+                ),
+            ] {
+                let resp = GetMonitoringReportResponse {
+                    status: variant,
+                    status_info: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&resp).unwrap();
+                assert_eq!(value["status"], json!(wire));
+                assert!(v
+                    .validate_call_result("GetMonitoringReport", &value)
+                    .is_ok());
+                let back: GetMonitoringReportResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn response_with_status_info_and_custom_data_round_trips_and_validates() {
+            let resp = GetMonitoringReportResponse {
+                status: GenericDeviceModelStatusEnumType::Rejected,
+                status_info: Some(StatusInfoType {
+                    reason_code: "NotEnabled".to_string(),
+                    additional_info: Some("Monitoring reporting disabled".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("NotEnabled"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetMonitoringReport", &wire)
+                .is_ok());
+            let back: GetMonitoringReportResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_rejects_missing_status() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("GetMonitoringReport", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn response_rejects_unknown_status() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("GetMonitoringReport", &json!({ "status": "Maybe" }))
+                .is_err());
+        }
+
+        #[test]
+        fn response_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result(
+                    "GetMonitoringReport",
+                    &json!({ "status": "Accepted", "unexpected": true })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                GetMonitoringReportRequest::ACTION_NAME,
+                "GetMonitoringReport"
+            );
+            assert_eq!(
+                GetMonitoringReportResponse::ACTION_NAME,
+                "GetMonitoringReportResponse"
+            );
         }
     }
 }
