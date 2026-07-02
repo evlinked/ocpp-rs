@@ -39,6 +39,7 @@ mod get_variables;
 mod heartbeat;
 mod log_status_notification;
 mod meter_values;
+mod notify_monitoring_report;
 mod publish_firmware;
 mod publish_firmware_status_notification;
 mod request_start_transaction;
@@ -76,6 +77,7 @@ pub use get_variables::{GetVariablesRequest, GetVariablesResponse};
 pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
 pub use log_status_notification::{LogStatusNotificationRequest, LogStatusNotificationResponse};
 pub use meter_values::{MeterValuesRequest, MeterValuesResponse};
+pub use notify_monitoring_report::{NotifyMonitoringReportRequest, NotifyMonitoringReportResponse};
 pub use publish_firmware::{PublishFirmwareRequest, PublishFirmwareResponse};
 pub use publish_firmware_status_notification::{
     PublishFirmwareStatusNotificationRequest, PublishFirmwareStatusNotificationResponse,
@@ -5358,6 +5360,308 @@ mod tests {
             assert_eq!(
                 GetMonitoringReportResponse::ACTION_NAME,
                 "GetMonitoringReportResponse"
+            );
+        }
+    }
+
+    mod notify_monitoring_report {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            ComponentType, CustomDataType, MonitorEnumType, MonitoringDataType,
+            VariableMonitoringType, VariableType,
+        };
+
+        fn sample_monitor() -> MonitoringDataType {
+            MonitoringDataType {
+                component: ComponentType {
+                    name: "EVSE".to_string(),
+                    instance: None,
+                    evse: None,
+                    custom_data: None,
+                },
+                variable: VariableType {
+                    name: "Temperature".to_string(),
+                    instance: None,
+                    custom_data: None,
+                },
+                variable_monitoring: vec![VariableMonitoringType {
+                    id: 1,
+                    transaction: false,
+                    value: 80.0,
+                    kind: MonitorEnumType::UpperThreshold,
+                    severity: 5,
+                    custom_data: None,
+                }],
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only `requestId` / `seqNo` / `generatedAt` are required; the
+            // optional `monitor` / `tbc` / `customData` stay off the wire.
+            let req = NotifyMonitoringReportRequest {
+                monitor: None,
+                request_id: 42,
+                tbc: None,
+                seq_no: 0,
+                generated_at: "2022-01-01T10:00:00Z".to_string(),
+                custom_data: None,
+            };
+            let expected = json!({
+                "requestId": 42,
+                "seqNo": 0,
+                "generatedAt": "2022-01-01T10:00:00Z"
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("monitor"));
+            assert!(!obj.contains_key("tbc"));
+            assert!(!obj.contains_key("customData"));
+            assert!(expected["requestId"].is_i64());
+            assert!(expected["seqNo"].is_i64());
+            let back: NotifyMonitoringReportRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("NotifyMonitoringReport", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_monitor_round_trips_and_validates() {
+            let req = NotifyMonitoringReportRequest {
+                monitor: Some(vec![sample_monitor()]),
+                request_id: 7,
+                tbc: Some(true),
+                seq_no: 3,
+                generated_at: "2022-01-01T10:05:00Z".to_string(),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["monitor"][0]["component"]["name"], json!("EVSE"));
+            assert_eq!(
+                wire["monitor"][0]["variableMonitoring"][0]["type"],
+                json!("UpperThreshold")
+            );
+            assert_eq!(wire["tbc"], json!(true));
+            assert!(SchemaValidator::v201()
+                .validate_call("NotifyMonitoringReport", &wire)
+                .is_ok());
+            let back: NotifyMonitoringReportRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_monitor_kind_round_trips_all_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (MonitorEnumType::UpperThreshold, "UpperThreshold"),
+                (MonitorEnumType::LowerThreshold, "LowerThreshold"),
+                (MonitorEnumType::Delta, "Delta"),
+                (MonitorEnumType::Periodic, "Periodic"),
+                (
+                    MonitorEnumType::PeriodicClockAligned,
+                    "PeriodicClockAligned",
+                ),
+            ] {
+                let mut monitor = sample_monitor();
+                monitor.variable_monitoring[0].kind = variant;
+                let req = NotifyMonitoringReportRequest {
+                    monitor: Some(vec![monitor]),
+                    request_id: 1,
+                    tbc: None,
+                    seq_no: 0,
+                    generated_at: "2022-01-01T10:00:00Z".to_string(),
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&req).unwrap();
+                assert_eq!(
+                    value["monitor"][0]["variableMonitoring"][0]["type"],
+                    json!(wire)
+                );
+                assert!(v.validate_call("NotifyMonitoringReport", &value).is_ok());
+                let back: NotifyMonitoringReportRequest = serde_json::from_value(value).unwrap();
+                assert_eq!(back, req);
+            }
+        }
+
+        #[test]
+        fn request_rejects_missing_seq_no() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "NotifyMonitoringReport",
+                    &json!({ "requestId": 1, "generatedAt": "2022-01-01T10:00:00Z" })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_missing_generated_at() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "NotifyMonitoringReport",
+                    &json!({ "requestId": 1, "seqNo": 0 })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_wrong_request_id_type() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "NotifyMonitoringReport",
+                    &json!({ "requestId": "1", "seqNo": 0, "generatedAt": "2022-01-01T10:00:00Z" })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_empty_monitor_array() {
+            // Schema requires `minItems: 1` when `monitor` is present.
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "NotifyMonitoringReport",
+                    &json!({
+                        "requestId": 1, "seqNo": 0,
+                        "generatedAt": "2022-01-01T10:00:00Z",
+                        "monitor": []
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_empty_variable_monitoring_array() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "NotifyMonitoringReport",
+                    &json!({
+                        "requestId": 1, "seqNo": 0,
+                        "generatedAt": "2022-01-01T10:00:00Z",
+                        "monitor": [{
+                            "component": { "name": "EVSE" },
+                            "variable": { "name": "Temperature" },
+                            "variableMonitoring": []
+                        }]
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_missing_required_variable_monitoring_field() {
+            // `severity` is required inside VariableMonitoringType.
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "NotifyMonitoringReport",
+                    &json!({
+                        "requestId": 1, "seqNo": 0,
+                        "generatedAt": "2022-01-01T10:00:00Z",
+                        "monitor": [{
+                            "component": { "name": "EVSE" },
+                            "variable": { "name": "Temperature" },
+                            "variableMonitoring": [{
+                                "id": 1, "transaction": false,
+                                "value": 80.0, "type": "UpperThreshold"
+                            }]
+                        }]
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_unknown_monitor_kind() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "NotifyMonitoringReport",
+                    &json!({
+                        "requestId": 1, "seqNo": 0,
+                        "generatedAt": "2022-01-01T10:00:00Z",
+                        "monitor": [{
+                            "component": { "name": "EVSE" },
+                            "variable": { "name": "Temperature" },
+                            "variableMonitoring": [{
+                                "id": 1, "transaction": false, "value": 80.0,
+                                "type": "Hourly", "severity": 5
+                            }]
+                        }]
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "NotifyMonitoringReport",
+                    &json!({
+                        "requestId": 1, "seqNo": 0,
+                        "generatedAt": "2022-01-01T10:00:00Z",
+                        "unexpected": true
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_empty_matches_wire_json_and_validates() {
+            let resp = NotifyMonitoringReportResponse::default();
+            let expected = json!({});
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let back: NotifyMonitoringReportResponse =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, resp);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("NotifyMonitoringReport", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn response_with_custom_data_round_trips_and_validates() {
+            let resp = NotifyMonitoringReportResponse {
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("NotifyMonitoringReport", &wire)
+                .is_ok());
+            let back: NotifyMonitoringReportResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("NotifyMonitoringReport", &json!({ "unexpected": true }))
+                .is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                NotifyMonitoringReportRequest::ACTION_NAME,
+                "NotifyMonitoringReport"
+            );
+            assert_eq!(
+                NotifyMonitoringReportResponse::ACTION_NAME,
+                "NotifyMonitoringReportResponse"
             );
         }
     }
