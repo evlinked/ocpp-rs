@@ -51,6 +51,7 @@ mod security_event_notification;
 mod send_local_list;
 mod set_charging_profile;
 mod set_monitoring_base;
+mod set_variable_monitoring;
 mod set_variables;
 mod status_notification;
 mod transaction_event;
@@ -98,6 +99,7 @@ pub use security_event_notification::{
 pub use send_local_list::{SendLocalListRequest, SendLocalListResponse};
 pub use set_charging_profile::{SetChargingProfileRequest, SetChargingProfileResponse};
 pub use set_monitoring_base::{SetMonitoringBaseRequest, SetMonitoringBaseResponse};
+pub use set_variable_monitoring::{SetVariableMonitoringRequest, SetVariableMonitoringResponse};
 pub use set_variables::{SetVariablesRequest, SetVariablesResponse};
 pub use status_notification::{StatusNotificationRequest, StatusNotificationResponse};
 pub use transaction_event::{TransactionEventRequest, TransactionEventResponse};
@@ -5871,6 +5873,329 @@ mod tests {
             assert_eq!(
                 SetMonitoringBaseResponse::ACTION_NAME,
                 "SetMonitoringBaseResponse"
+            );
+        }
+    }
+
+    mod set_variable_monitoring {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            ComponentType, MonitorEnumType, SetMonitoringDataType, SetMonitoringResultType,
+            SetMonitoringStatusEnumType, VariableType,
+        };
+
+        fn sample_data() -> SetMonitoringDataType {
+            SetMonitoringDataType {
+                id: None,
+                transaction: None,
+                value: 80.0,
+                kind: MonitorEnumType::UpperThreshold,
+                severity: 5,
+                component: ComponentType {
+                    name: "EVSE".to_string(),
+                    instance: None,
+                    evse: None,
+                    custom_data: None,
+                },
+                variable: VariableType {
+                    name: "Temperature".to_string(),
+                    instance: None,
+                    custom_data: None,
+                },
+                custom_data: None,
+            }
+        }
+
+        fn sample_result() -> SetMonitoringResultType {
+            SetMonitoringResultType {
+                id: Some(1),
+                status: SetMonitoringStatusEnumType::Accepted,
+                kind: MonitorEnumType::UpperThreshold,
+                component: ComponentType {
+                    name: "EVSE".to_string(),
+                    instance: None,
+                    evse: None,
+                    custom_data: None,
+                },
+                variable: VariableType {
+                    name: "Temperature".to_string(),
+                    instance: None,
+                    custom_data: None,
+                },
+                severity: 5,
+                status_info: None,
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn request_round_trips_and_validates() {
+            let req = SetVariableMonitoringRequest {
+                set_monitoring_data: vec![sample_data()],
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(
+                wire["setMonitoringData"][0]["type"],
+                json!("UpperThreshold")
+            );
+            assert!(wire["setMonitoringData"][0]["value"].is_number());
+            assert!(SchemaValidator::v201()
+                .validate_call("SetVariableMonitoring", &wire)
+                .is_ok());
+            let back: SetVariableMonitoringRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_with_id_and_transaction_validates() {
+            let mut data = sample_data();
+            data.id = Some(9);
+            data.transaction = Some(true);
+            let req = SetVariableMonitoringRequest {
+                set_monitoring_data: vec![data],
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["setMonitoringData"][0]["id"], json!(9));
+            assert_eq!(wire["setMonitoringData"][0]["transaction"], json!(true));
+            assert!(SchemaValidator::v201()
+                .validate_call("SetVariableMonitoring", &wire)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_rejects_missing_set_monitoring_data() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call("SetVariableMonitoring", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_empty_set_monitoring_data() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call("SetVariableMonitoring", &json!({ "setMonitoringData": [] }))
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_data_entry_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            // Missing `value`.
+            assert!(v
+                .validate_call(
+                    "SetVariableMonitoring",
+                    &json!({ "setMonitoringData": [{
+                        "type": "UpperThreshold",
+                        "severity": 5,
+                        "component": { "name": "EVSE" },
+                        "variable": { "name": "Temperature" }
+                    }] })
+                )
+                .is_err());
+            // Missing `component`.
+            assert!(v
+                .validate_call(
+                    "SetVariableMonitoring",
+                    &json!({ "setMonitoringData": [{
+                        "value": 1.0,
+                        "type": "UpperThreshold",
+                        "severity": 5,
+                        "variable": { "name": "Temperature" }
+                    }] })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_wrong_value_type() {
+            let v = SchemaValidator::v201();
+            let mut wire = serde_json::to_value(SetVariableMonitoringRequest {
+                set_monitoring_data: vec![sample_data()],
+                custom_data: None,
+            })
+            .unwrap();
+            wire["setMonitoringData"][0]["value"] = json!("hot");
+            assert!(v.validate_call("SetVariableMonitoring", &wire).is_err());
+        }
+
+        #[test]
+        fn request_rejects_unknown_monitor_type() {
+            let v = SchemaValidator::v201();
+            let mut wire = serde_json::to_value(SetVariableMonitoringRequest {
+                set_monitoring_data: vec![sample_data()],
+                custom_data: None,
+            })
+            .unwrap();
+            wire["setMonitoringData"][0]["type"] = json!("Sideways");
+            assert!(v.validate_call("SetVariableMonitoring", &wire).is_err());
+        }
+
+        #[test]
+        fn request_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            // On the request object.
+            assert!(v
+                .validate_call(
+                    "SetVariableMonitoring",
+                    &json!({ "setMonitoringData": [], "unexpected": true })
+                )
+                .is_err());
+            // On the nested data object.
+            let mut wire = serde_json::to_value(SetVariableMonitoringRequest {
+                set_monitoring_data: vec![sample_data()],
+                custom_data: None,
+            })
+            .unwrap();
+            wire["setMonitoringData"][0]["unexpected"] = json!(true);
+            assert!(v.validate_call("SetVariableMonitoring", &wire).is_err());
+        }
+
+        #[test]
+        fn response_round_trips_and_validates() {
+            let resp = SetVariableMonitoringResponse {
+                set_monitoring_result: vec![sample_result()],
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["setMonitoringResult"][0]["status"], json!("Accepted"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetVariableMonitoring", &wire)
+                .is_ok());
+            let back: SetVariableMonitoringResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_result_status_round_trips_all_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (SetMonitoringStatusEnumType::Accepted, "Accepted"),
+                (
+                    SetMonitoringStatusEnumType::UnknownComponent,
+                    "UnknownComponent",
+                ),
+                (
+                    SetMonitoringStatusEnumType::UnknownVariable,
+                    "UnknownVariable",
+                ),
+                (
+                    SetMonitoringStatusEnumType::UnsupportedMonitorType,
+                    "UnsupportedMonitorType",
+                ),
+                (SetMonitoringStatusEnumType::Rejected, "Rejected"),
+                (SetMonitoringStatusEnumType::Duplicate, "Duplicate"),
+            ] {
+                let mut result = sample_result();
+                result.status = variant;
+                let resp = SetVariableMonitoringResponse {
+                    set_monitoring_result: vec![result],
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&resp).unwrap();
+                assert_eq!(value["setMonitoringResult"][0]["status"], json!(wire));
+                assert!(v
+                    .validate_call_result("SetVariableMonitoring", &value)
+                    .is_ok());
+                let back: SetVariableMonitoringResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn response_rejects_missing_set_monitoring_result() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("SetVariableMonitoring", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn response_rejects_empty_set_monitoring_result() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result(
+                    "SetVariableMonitoring",
+                    &json!({ "setMonitoringResult": [] })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_rejects_result_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            // Missing `status`.
+            assert!(v
+                .validate_call_result(
+                    "SetVariableMonitoring",
+                    &json!({ "setMonitoringResult": [{
+                        "type": "UpperThreshold",
+                        "severity": 5,
+                        "component": { "name": "EVSE" },
+                        "variable": { "name": "Temperature" }
+                    }] })
+                )
+                .is_err());
+            // Missing `severity` (required on the result object).
+            assert!(v
+                .validate_call_result(
+                    "SetVariableMonitoring",
+                    &json!({ "setMonitoringResult": [{
+                        "status": "Accepted",
+                        "type": "UpperThreshold",
+                        "component": { "name": "EVSE" },
+                        "variable": { "name": "Temperature" }
+                    }] })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_rejects_unknown_status() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result(
+                    "SetVariableMonitoring",
+                    &json!({ "setMonitoringResult": [{
+                        "status": "Maybe",
+                        "type": "UpperThreshold",
+                        "severity": 5,
+                        "component": { "name": "EVSE" },
+                        "variable": { "name": "Temperature" }
+                    }] })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let mut wire = serde_json::to_value(SetVariableMonitoringResponse {
+                set_monitoring_result: vec![sample_result()],
+                custom_data: None,
+            })
+            .unwrap();
+            wire["setMonitoringResult"][0]["unexpected"] = json!(true);
+            assert!(v
+                .validate_call_result("SetVariableMonitoring", &wire)
+                .is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                SetVariableMonitoringRequest::ACTION_NAME,
+                "SetVariableMonitoring"
+            );
+            assert_eq!(
+                SetVariableMonitoringResponse::ACTION_NAME,
+                "SetVariableMonitoringResponse"
             );
         }
     }
