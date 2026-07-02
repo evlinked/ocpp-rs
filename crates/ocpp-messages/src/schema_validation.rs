@@ -582,6 +582,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "GetMonitoringReportResponse",
         include_str!("../schemas/v201/GetMonitoringReportResponse.json"),
     ),
+    (
+        "NotifyMonitoringReport",
+        include_str!("../schemas/v201/NotifyMonitoringReport.json"),
+    ),
+    (
+        "NotifyMonitoringReportResponse",
+        include_str!("../schemas/v201/NotifyMonitoringReportResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J

@@ -730,3 +730,54 @@ pub struct ComponentVariableType {
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
 }
+
+/// A single active monitor configured on a component-variable, carried by
+/// [`MonitoringDataType`] inside a `NotifyMonitoringReport`.
+///
+/// Ports `VariableMonitoringType`. Every field except `custom_data` is
+/// required. `value` is a threshold/delta magnitude for
+/// [`MonitorEnumType::UpperThreshold`] / [`MonitorEnumType::LowerThreshold`] /
+/// [`MonitorEnumType::Delta`], and an interval in seconds for
+/// [`MonitorEnumType::Periodic`] / [`MonitorEnumType::PeriodicClockAligned`].
+/// `severity` runs 0 (highest) to 9 (lowest).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariableMonitoringType {
+    /// Identifies the monitor.
+    pub id: i32,
+    /// Whether the monitor is only active while a transaction is ongoing on a
+    /// component relevant to this transaction.
+    pub transaction: bool,
+    /// Threshold/delta magnitude, or the interval in seconds for periodic
+    /// monitors.
+    pub value: f64,
+    /// The kind of monitor this is.
+    #[serde(rename = "type")]
+    pub kind: MonitorEnumType,
+    /// Severity assigned to events this monitor triggers (0 = highest, 9 =
+    /// lowest).
+    pub severity: i32,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// The set of monitors configured on one component-variable, one entry in a
+/// `NotifyMonitoringReport`'s `monitor` list.
+///
+/// Ports `MonitoringDataType`. `component`, `variable`, and
+/// `variable_monitoring` are required; the schema also caps
+/// `variable_monitoring` at a minimum of one item.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MonitoringDataType {
+    /// Component the monitored variable belongs to.
+    pub component: ComponentType,
+    /// The monitored variable.
+    pub variable: VariableType,
+    /// The monitors active on this component-variable. The schema requires at
+    /// least one item.
+    #[serde(rename = "variableMonitoring")]
+    pub variable_monitoring: Vec<VariableMonitoringType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
