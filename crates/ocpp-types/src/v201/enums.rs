@@ -941,6 +941,23 @@ pub enum MonitoringCriterionEnumType {
     PeriodicMonitoring,
 }
 
+/// The kind of variable monitor a `VariableMonitoringType` describes: a fixed
+/// `UpperThreshold` / `LowerThreshold`, a `Delta` (change-since-last-report),
+/// or a `Periodic` / `PeriodicClockAligned` interval.
+///
+/// Ports `MonitorEnumType` (`ocpp/v201/enums.py`). Carried by
+/// `NotifyMonitoringReport` (and `SetVariableMonitoring`). Every wire value is
+/// PascalCase and identical between the reference dataclass enum and the
+/// bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MonitorEnumType {
+    UpperThreshold,
+    LowerThreshold,
+    Delta,
+    Periodic,
+    PeriodicClockAligned,
+}
+
 /// Which set of pre-configured variable monitors a `SetMonitoringBase` request
 /// activates on the Charging Station: `All` monitors, the `FactoryDefault` set,
 /// or only the `HardWiredOnly` monitors.

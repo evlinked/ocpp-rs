@@ -583,6 +583,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/GetMonitoringReportResponse.json"),
     ),
     (
+        "NotifyMonitoringReport",
+        include_str!("../schemas/v201/NotifyMonitoringReport.json"),
+    ),
+    (
+        "NotifyMonitoringReportResponse",
+        include_str!("../schemas/v201/NotifyMonitoringReportResponse.json"),
+    ),
+    (
         "SetMonitoringBase",
         include_str!("../schemas/v201/SetMonitoringBase.json"),
     ),
