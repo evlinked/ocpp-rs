@@ -56,6 +56,7 @@ mod set_charging_profile;
 mod set_monitoring_base;
 mod set_variable_monitoring;
 mod set_variables;
+mod sign_certificate;
 mod status_notification;
 mod transaction_event;
 mod trigger_message;
@@ -110,6 +111,7 @@ pub use set_charging_profile::{SetChargingProfileRequest, SetChargingProfileResp
 pub use set_monitoring_base::{SetMonitoringBaseRequest, SetMonitoringBaseResponse};
 pub use set_variable_monitoring::{SetVariableMonitoringRequest, SetVariableMonitoringResponse};
 pub use set_variables::{SetVariablesRequest, SetVariablesResponse};
+pub use sign_certificate::{SignCertificateRequest, SignCertificateResponse};
 pub use status_notification::{StatusNotificationRequest, StatusNotificationResponse};
 pub use transaction_event::{TransactionEventRequest, TransactionEventResponse};
 pub use trigger_message::{TriggerMessageRequest, TriggerMessageResponse};
@@ -6913,6 +6915,223 @@ mod tests {
             assert!(v.validate_call("UpdateFirmware", &bad_firmware).is_err());
             let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
             assert!(v.validate_call_result("UpdateFirmware", &bad_resp).is_err());
+        }
+    }
+
+    /// `SignCertificate` (#211) — the Charging Station submits a PEM-encoded CSR
+    /// to the CSMS to have it signed. The request carries a required `csr` string
+    /// plus an optional `CertificateSigningUseEnumType`; the response is a
+    /// `GenericStatusEnumType` acknowledgement with optional `StatusInfoType`.
+    /// The entry point of the certificate-provisioning flow (paired with
+    /// `CertificateSigned`).
+    mod sign_certificate {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            CertificateSigningUseEnumType, CustomDataType, GenericStatusEnumType, StatusInfoType,
+        };
+
+        const SAMPLE_CSR: &str =
+            "-----BEGIN CERTIFICATE REQUEST-----\nMIIBnzCCAQ==\n-----END CERTIFICATE REQUEST-----";
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only the one required field — `csr`; everything else off the wire.
+            let req = SignCertificateRequest {
+                csr: SAMPLE_CSR.to_string(),
+                certificate_type: None,
+                custom_data: None,
+            };
+            let expected = json!({ "csr": SAMPLE_CSR });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("certificateType"));
+            assert!(!obj.contains_key("customData"));
+            // `csr` is a JSON string.
+            assert!(expected["csr"].is_string());
+            let back: SignCertificateRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("SignCertificate", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_all_optionals_round_trips_and_validates() {
+            let req = SignCertificateRequest {
+                csr: SAMPLE_CSR.to_string(),
+                certificate_type: Some(CertificateSigningUseEnumType::V2GCertificate),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["certificateType"], json!("V2GCertificate"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("SignCertificate", &wire)
+                .is_ok());
+            let back: SignCertificateRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn certificate_type_round_trips_all_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (
+                    CertificateSigningUseEnumType::ChargingStationCertificate,
+                    "ChargingStationCertificate",
+                ),
+                (
+                    CertificateSigningUseEnumType::V2GCertificate,
+                    "V2GCertificate",
+                ),
+            ] {
+                let req = SignCertificateRequest {
+                    csr: SAMPLE_CSR.to_string(),
+                    certificate_type: Some(variant),
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&req).unwrap();
+                assert_eq!(value["certificateType"], json!(wire));
+                assert!(v.validate_call("SignCertificate", &value).is_ok());
+                let back: SignCertificateRequest = serde_json::from_value(value).unwrap();
+                assert_eq!(back, req);
+            }
+        }
+
+        #[test]
+        fn certificate_type_rejects_unknown_value() {
+            // Unknown / mis-spelled enum values are rejected by both serde and schema.
+            assert!(
+                serde_json::from_value::<CertificateSigningUseEnumType>(json!(
+                    "ChargePointCertificate"
+                ))
+                .is_err()
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call(
+                    "SignCertificate",
+                    &json!({ "csr": SAMPLE_CSR, "certificateType": "ChargePointCertificate" })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = SignCertificateResponse {
+                status: GenericStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("statusInfo"));
+            assert!(!obj.contains_key("customData"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SignCertificate", &expected)
+                .is_ok());
+            let back: SignCertificateResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_status_round_trips_both_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (GenericStatusEnumType::Accepted, "Accepted"),
+                (GenericStatusEnumType::Rejected, "Rejected"),
+            ] {
+                let resp = SignCertificateResponse {
+                    status: variant,
+                    status_info: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&resp).unwrap();
+                assert_eq!(value["status"], json!(wire));
+                assert!(v.validate_call_result("SignCertificate", &value).is_ok());
+                let back: SignCertificateResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn response_with_status_info_and_custom_data_round_trips() {
+            let resp = SignCertificateResponse {
+                status: GenericStatusEnumType::Rejected,
+                status_info: Some(StatusInfoType {
+                    reason_code: "InvalidCsr".to_string(),
+                    additional_info: Some("CSR could not be parsed".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Rejected"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("InvalidCsr"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SignCertificate", &wire)
+                .is_ok());
+            let back: SignCertificateResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn generic_status_rejects_unknown_value() {
+            assert!(serde_json::from_value::<GenericStatusEnumType>(json!("Pending")).is_err());
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SignCertificate", &json!({ "status": "Pending" }))
+                .is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(SignCertificateRequest::ACTION_NAME, "SignCertificate");
+            assert_eq!(
+                SignCertificateResponse::ACTION_NAME,
+                "SignCertificateResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_csr() {
+            assert!(SchemaValidator::v201()
+                .validate_call("SignCertificate", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_non_string_csr() {
+            let bad = json!({ "csr": 42 });
+            assert!(SchemaValidator::v201()
+                .validate_call("SignCertificate", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<SignCertificateRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SignCertificate", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let bad_req = json!({ "csr": SAMPLE_CSR, "bogusExtra": true });
+            assert!(v.validate_call("SignCertificate", &bad_req).is_err());
+            let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
+            assert!(v
+                .validate_call_result("SignCertificate", &bad_resp)
+                .is_err());
         }
     }
 

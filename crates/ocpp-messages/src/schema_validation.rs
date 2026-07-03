@@ -638,6 +638,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "UpdateFirmwareResponse",
         include_str!("../schemas/v201/UpdateFirmwareResponse.json"),
     ),
+    (
+        "SignCertificate",
+        include_str!("../schemas/v201/SignCertificate.json"),
+    ),
+    (
+        "SignCertificateResponse",
+        include_str!("../schemas/v201/SignCertificateResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
