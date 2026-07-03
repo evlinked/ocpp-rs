@@ -875,3 +875,32 @@ pub struct SetMonitoringResultType {
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
 }
+
+/// Filter selecting which installed charging profiles a `ClearChargingProfile`
+/// request should remove.
+///
+/// Ports `ClearChargingProfileType`. This is a *filter*, distinct from the full
+/// [`ChargingProfileType`] carried by `SetChargingProfile`: every field is
+/// optional, and a profile is cleared only if it matches all the criteria that
+/// are present. An `evse_id` of `0` targets the station-wide profile; omitting
+/// `evse_id` matches profiles on any EVSE. An empty `{}` criteria object matches
+/// every profile.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClearChargingProfileType {
+    /// EVSE whose profiles are cleared; `0` targets the station-wide profile.
+    /// Omitted means "any EVSE".
+    #[serde(rename = "evseId", skip_serializing_if = "Option::is_none")]
+    pub evse_id: Option<i32>,
+    /// Only clear profiles with this purpose. Omitted means "any purpose".
+    #[serde(
+        rename = "chargingProfilePurpose",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub charging_profile_purpose: Option<ChargingProfilePurposeEnumType>,
+    /// Only clear profiles at this stack level. Omitted means "any level".
+    #[serde(rename = "stackLevel", skip_serializing_if = "Option::is_none")]
+    pub stack_level: Option<i32>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
