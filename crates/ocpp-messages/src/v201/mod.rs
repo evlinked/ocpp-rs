@@ -61,6 +61,7 @@ mod transaction_event;
 mod trigger_message;
 mod unlock_connector;
 mod unpublish_firmware;
+mod update_firmware;
 
 pub use authorize::{AuthorizeRequest, AuthorizeResponse};
 pub use boot_notification::{BootNotificationRequest, BootNotificationResponse};
@@ -114,6 +115,7 @@ pub use transaction_event::{TransactionEventRequest, TransactionEventResponse};
 pub use trigger_message::{TriggerMessageRequest, TriggerMessageResponse};
 pub use unlock_connector::{UnlockConnectorRequest, UnlockConnectorResponse};
 pub use unpublish_firmware::{UnpublishFirmwareRequest, UnpublishFirmwareResponse};
+pub use update_firmware::{UpdateFirmwareRequest, UpdateFirmwareResponse};
 
 #[cfg(test)]
 mod tests {
@@ -6631,6 +6633,286 @@ mod tests {
                 SetVariableMonitoringResponse::ACTION_NAME,
                 "SetVariableMonitoringResponse"
             );
+        }
+    }
+
+    mod update_firmware {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            CustomDataType, FirmwareType, StatusInfoType, UpdateFirmwareStatusEnumType,
+        };
+
+        fn minimal_firmware() -> FirmwareType {
+            FirmwareType {
+                location: "https://csms.example/fw/v2.bin".to_string(),
+                retrieve_date_time: "2026-07-03T00:00:00Z".to_string(),
+                install_date_time: None,
+                signing_certificate: None,
+                signature: None,
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only the two required fields — `requestId` plus a minimal
+            // `firmware` (`location` + `retrieveDateTime`); everything else off
+            // the wire.
+            let req = UpdateFirmwareRequest {
+                retries: None,
+                retry_interval: None,
+                request_id: 42,
+                firmware: minimal_firmware(),
+                custom_data: None,
+            };
+            let expected = json!({
+                "requestId": 42,
+                "firmware": {
+                    "location": "https://csms.example/fw/v2.bin",
+                    "retrieveDateTime": "2026-07-03T00:00:00Z"
+                }
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("retries"));
+            assert!(!obj.contains_key("retryInterval"));
+            assert!(!obj.contains_key("customData"));
+            // `requestId` is a JSON integer, not a string.
+            assert!(expected["requestId"].is_i64());
+            let back: UpdateFirmwareRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("UpdateFirmware", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_all_optionals_round_trips_and_validates() {
+            let req = UpdateFirmwareRequest {
+                retries: Some(3),
+                retry_interval: Some(30),
+                request_id: 7,
+                firmware: FirmwareType {
+                    location: "https://csms.example/fw/v2.bin".to_string(),
+                    retrieve_date_time: "2026-07-03T00:00:00Z".to_string(),
+                    install_date_time: Some("2026-07-03T02:00:00Z".to_string()),
+                    signing_certificate: Some(
+                        "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----".to_string(),
+                    ),
+                    signature: Some("YmFzZTY0c2ln".to_string()),
+                    custom_data: Some(CustomDataType {
+                        vendor_id: "com.example.fw".to_string(),
+                        extra: Default::default(),
+                    }),
+                },
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["retries"], json!(3));
+            assert_eq!(wire["retryInterval"], json!(30));
+            assert_eq!(
+                wire["firmware"]["installDateTime"],
+                json!("2026-07-03T02:00:00Z")
+            );
+            assert_eq!(wire["firmware"]["signature"], json!("YmFzZTY0c2ln"));
+            assert_eq!(
+                wire["firmware"]["customData"]["vendorId"],
+                json!("com.example.fw")
+            );
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("UpdateFirmware", &wire)
+                .is_ok());
+            let back: UpdateFirmwareRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = UpdateFirmwareResponse {
+                status: UpdateFirmwareStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("statusInfo"));
+            assert!(!obj.contains_key("customData"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("UpdateFirmware", &expected)
+                .is_ok());
+            let back: UpdateFirmwareResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_status_round_trips_all_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (UpdateFirmwareStatusEnumType::Accepted, "Accepted"),
+                (UpdateFirmwareStatusEnumType::Rejected, "Rejected"),
+                (
+                    UpdateFirmwareStatusEnumType::AcceptedCanceled,
+                    "AcceptedCanceled",
+                ),
+                (
+                    UpdateFirmwareStatusEnumType::InvalidCertificate,
+                    "InvalidCertificate",
+                ),
+                (
+                    UpdateFirmwareStatusEnumType::RevokedCertificate,
+                    "RevokedCertificate",
+                ),
+            ] {
+                let resp = UpdateFirmwareResponse {
+                    status: variant,
+                    status_info: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&resp).unwrap();
+                assert_eq!(value["status"], json!(wire));
+                assert!(v.validate_call_result("UpdateFirmware", &value).is_ok());
+                let back: UpdateFirmwareResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn response_with_status_info_and_custom_data_round_trips() {
+            let resp = UpdateFirmwareResponse {
+                status: UpdateFirmwareStatusEnumType::InvalidCertificate,
+                status_info: Some(StatusInfoType {
+                    reason_code: "BadSignature".to_string(),
+                    additional_info: Some("firmware signing certificate not trusted".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("InvalidCertificate"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("BadSignature"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("UpdateFirmware", &wire)
+                .is_ok());
+            let back: UpdateFirmwareResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn update_firmware_status_serializes_and_rejects_unknown() {
+            assert_eq!(
+                serde_json::to_value(UpdateFirmwareStatusEnumType::AcceptedCanceled).unwrap(),
+                json!("AcceptedCanceled")
+            );
+            // Unknown / mis-spelled values are rejected by both serde and schema.
+            assert!(
+                serde_json::from_value::<UpdateFirmwareStatusEnumType>(json!("Canceled")).is_err()
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call_result("UpdateFirmware", &json!({ "status": "Canceled" }))
+                .is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(UpdateFirmwareRequest::ACTION_NAME, "UpdateFirmware");
+            assert_eq!(
+                UpdateFirmwareResponse::ACTION_NAME,
+                "UpdateFirmwareResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_missing_required_request_fields() {
+            let v = SchemaValidator::v201();
+            let full = json!({
+                "requestId": 1,
+                "firmware": {
+                    "location": "https://csms.example/fw.bin",
+                    "retrieveDateTime": "2026-07-03T00:00:00Z"
+                }
+            });
+            for missing in ["requestId", "firmware"] {
+                let mut bad = full.clone();
+                bad.as_object_mut().unwrap().remove(missing);
+                assert!(
+                    v.validate_call("UpdateFirmware", &bad).is_err(),
+                    "missing {missing} should fail"
+                );
+            }
+        }
+
+        #[test]
+        fn schema_rejects_firmware_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            for missing in ["location", "retrieveDateTime"] {
+                let mut firmware = json!({
+                    "location": "https://csms.example/fw.bin",
+                    "retrieveDateTime": "2026-07-03T00:00:00Z"
+                });
+                firmware.as_object_mut().unwrap().remove(missing);
+                let bad = json!({ "requestId": 1, "firmware": firmware });
+                assert!(
+                    v.validate_call("UpdateFirmware", &bad).is_err(),
+                    "firmware missing {missing} should fail"
+                );
+            }
+        }
+
+        #[test]
+        fn schema_and_serde_reject_non_integer_request_id() {
+            let bad = json!({
+                "requestId": "1",
+                "firmware": {
+                    "location": "https://csms.example/fw.bin",
+                    "retrieveDateTime": "2026-07-03T00:00:00Z"
+                }
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("UpdateFirmware", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<UpdateFirmwareRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("UpdateFirmware", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let bad_req = json!({
+                "requestId": 1,
+                "firmware": {
+                    "location": "https://csms.example/fw.bin",
+                    "retrieveDateTime": "2026-07-03T00:00:00Z"
+                },
+                "bogusExtra": true
+            });
+            assert!(v.validate_call("UpdateFirmware", &bad_req).is_err());
+            let bad_firmware = json!({
+                "requestId": 1,
+                "firmware": {
+                    "location": "https://csms.example/fw.bin",
+                    "retrieveDateTime": "2026-07-03T00:00:00Z",
+                    "bogusExtra": true
+                }
+            });
+            assert!(v.validate_call("UpdateFirmware", &bad_firmware).is_err());
+            let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
+            assert!(v.validate_call_result("UpdateFirmware", &bad_resp).is_err());
         }
     }
 
