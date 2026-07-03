@@ -33,6 +33,7 @@ mod cost_updated;
 mod data_transfer;
 mod firmware_status_notification;
 mod get_base_report;
+mod get_composite_schedule;
 mod get_local_list_version;
 mod get_monitoring_report;
 mod get_report;
@@ -77,6 +78,7 @@ pub use firmware_status_notification::{
     FirmwareStatusNotificationRequest, FirmwareStatusNotificationResponse,
 };
 pub use get_base_report::{GetBaseReportRequest, GetBaseReportResponse};
+pub use get_composite_schedule::{GetCompositeScheduleRequest, GetCompositeScheduleResponse};
 pub use get_local_list_version::{GetLocalListVersionRequest, GetLocalListVersionResponse};
 pub use get_monitoring_report::{GetMonitoringReportRequest, GetMonitoringReportResponse};
 pub use get_report::{GetReportRequest, GetReportResponse};
@@ -6629,6 +6631,276 @@ mod tests {
                 SetVariableMonitoringResponse::ACTION_NAME,
                 "SetVariableMonitoringResponse"
             );
+        }
+    }
+
+    /// `GetCompositeSchedule` — the 2.0.1 composite-schedule query command
+    /// (#206). Read/query side of the smart-charging family: the request names
+    /// a `duration` and `evseId` (both required, `chargingRateUnit` optional);
+    /// the response returns a two-value `GenericStatusEnumType` plus, when
+    /// `Accepted`, a `CompositeScheduleType` (a non-empty `chargingSchedulePeriod`
+    /// list) and optional `StatusInfoType`.
+    mod get_composite_schedule {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            ChargingRateUnitEnumType, ChargingSchedulePeriodType, CompositeScheduleType,
+            CustomDataType, GenericStatusEnumType, StatusInfoType,
+        };
+
+        fn sample_schedule() -> CompositeScheduleType {
+            CompositeScheduleType {
+                evse_id: 1,
+                duration: 3600,
+                schedule_start: "2026-07-03T00:00:00Z".to_string(),
+                charging_rate_unit: ChargingRateUnitEnumType::A,
+                charging_schedule_period: vec![ChargingSchedulePeriodType {
+                    start_period: 0,
+                    limit: 16.0,
+                    number_phases: Some(3),
+                    phase_to_use: None,
+                    custom_data: None,
+                }],
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            let req = GetCompositeScheduleRequest {
+                duration: 3600,
+                charging_rate_unit: None,
+                evse_id: 0,
+                custom_data: None,
+            };
+            let expected = json!({ "duration": 3600, "evseId": 0 });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call("GetCompositeSchedule", &expected)
+                .is_ok());
+            let back: GetCompositeScheduleRequest = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_with_rate_unit_and_custom_data_round_trips() {
+            let req = GetCompositeScheduleRequest {
+                duration: 900,
+                charging_rate_unit: Some(ChargingRateUnitEnumType::W),
+                evse_id: 2,
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["duration"], json!(900));
+            assert_eq!(wire["evseId"], json!(2));
+            assert_eq!(wire["chargingRateUnit"], json!("W"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("GetCompositeSchedule", &wire)
+                .is_ok());
+            let back: GetCompositeScheduleRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = GetCompositeScheduleResponse {
+                status: GenericStatusEnumType::Rejected,
+                schedule: None,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Rejected" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetCompositeSchedule", &expected)
+                .is_ok());
+            let back: GetCompositeScheduleResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_accepted_with_schedule_round_trips_and_validates() {
+            let resp = GetCompositeScheduleResponse {
+                status: GenericStatusEnumType::Accepted,
+                schedule: Some(sample_schedule()),
+                status_info: None,
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Accepted"));
+            assert_eq!(wire["schedule"]["evseId"], json!(1));
+            assert_eq!(
+                wire["schedule"]["scheduleStart"],
+                json!("2026-07-03T00:00:00Z")
+            );
+            assert_eq!(wire["schedule"]["chargingRateUnit"], json!("A"));
+            assert_eq!(
+                wire["schedule"]["chargingSchedulePeriod"][0]["limit"],
+                json!(16.0)
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetCompositeSchedule", &wire)
+                .is_ok());
+            let back: GetCompositeScheduleResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_with_status_info_round_trips() {
+            let resp = GetCompositeScheduleResponse {
+                status: GenericStatusEnumType::Rejected,
+                schedule: None,
+                status_info: Some(StatusInfoType {
+                    reason_code: "NotSupported".to_string(),
+                    additional_info: Some("no profiles installed".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("NotSupported"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetCompositeSchedule", &wire)
+                .is_ok());
+            let back: GetCompositeScheduleResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_enum_serializes_to_wire_values_and_rejects_unknown() {
+            assert_eq!(
+                serde_json::to_value(GenericStatusEnumType::Accepted).unwrap(),
+                json!("Accepted")
+            );
+            // `Scheduled` is not a `GenericStatusEnumType` value.
+            let bad = json!({ "status": "Scheduled" });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetCompositeSchedule", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<GetCompositeScheduleResponse>(bad).is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                GetCompositeScheduleRequest::ACTION_NAME,
+                "GetCompositeSchedule"
+            );
+            assert_eq!(
+                GetCompositeScheduleResponse::ACTION_NAME,
+                "GetCompositeScheduleResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            // Missing `evseId`.
+            assert!(v
+                .validate_call("GetCompositeSchedule", &json!({ "duration": 60 }))
+                .is_err());
+            // Missing `duration`.
+            assert!(v
+                .validate_call("GetCompositeSchedule", &json!({ "evseId": 0 }))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_non_integer_duration() {
+            let bad = json!({ "duration": "60", "evseId": 0 });
+            assert!(SchemaValidator::v201()
+                .validate_call("GetCompositeSchedule", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<GetCompositeScheduleRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_unknown_charging_rate_unit() {
+            let bad = json!({ "duration": 60, "evseId": 0, "chargingRateUnit": "kW" });
+            assert!(SchemaValidator::v201()
+                .validate_call("GetCompositeSchedule", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<GetCompositeScheduleRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetCompositeSchedule", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_schedule_missing_required_and_empty_periods() {
+            let v = SchemaValidator::v201();
+            // Full, valid schedule as the baseline.
+            let good = serde_json::to_value(sample_schedule()).unwrap();
+            assert!(v
+                .validate_call_result(
+                    "GetCompositeSchedule",
+                    &json!({ "status": "Accepted", "schedule": good })
+                )
+                .is_ok());
+            // Each required field, dropped in turn, must fail.
+            for field in [
+                "evseId",
+                "duration",
+                "scheduleStart",
+                "chargingRateUnit",
+                "chargingSchedulePeriod",
+            ] {
+                let mut sched = serde_json::to_value(sample_schedule()).unwrap();
+                sched.as_object_mut().unwrap().remove(field);
+                assert!(
+                    v.validate_call_result(
+                        "GetCompositeSchedule",
+                        &json!({ "status": "Accepted", "schedule": sched })
+                    )
+                    .is_err(),
+                    "schedule missing `{field}` should be rejected"
+                );
+            }
+            // `chargingSchedulePeriod` must be non-empty (schema minItems: 1).
+            let mut empty = serde_json::to_value(sample_schedule()).unwrap();
+            empty["chargingSchedulePeriod"] = json!([]);
+            assert!(v
+                .validate_call_result(
+                    "GetCompositeSchedule",
+                    &json!({ "status": "Accepted", "schedule": empty })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            // On the request.
+            assert!(v
+                .validate_call(
+                    "GetCompositeSchedule",
+                    &json!({ "duration": 60, "evseId": 0, "bogus": true })
+                )
+                .is_err());
+            // On the response.
+            assert!(v
+                .validate_call_result(
+                    "GetCompositeSchedule",
+                    &json!({ "status": "Accepted", "bogus": true })
+                )
+                .is_err());
+            // Inside the schedule object.
+            let mut sched = serde_json::to_value(sample_schedule()).unwrap();
+            sched["bogus"] = json!(true);
+            assert!(v
+                .validate_call_result(
+                    "GetCompositeSchedule",
+                    &json!({ "status": "Accepted", "schedule": sched })
+                )
+                .is_err());
         }
     }
 }

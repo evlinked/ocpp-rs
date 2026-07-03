@@ -622,6 +622,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "ClearChargingProfileResponse",
         include_str!("../schemas/v201/ClearChargingProfileResponse.json"),
     ),
+    (
+        "GetCompositeSchedule",
+        include_str!("../schemas/v201/GetCompositeSchedule.json"),
+    ),
+    (
+        "GetCompositeScheduleResponse",
+        include_str!("../schemas/v201/GetCompositeScheduleResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
