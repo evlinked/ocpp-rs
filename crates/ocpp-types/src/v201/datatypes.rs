@@ -904,3 +904,36 @@ pub struct ClearChargingProfileType {
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
 }
+
+/// A firmware image the CSMS asks a Charging Station to download and install via
+/// `UpdateFirmware`.
+///
+/// Ports `FirmwareType`. `location` (schema `maxLength: 512`) is the URI to fetch
+/// the image from and `retrieveDateTime` (date-time) is when the station shall
+/// retrieve it — both required. `installDateTime` (date-time) optionally defers
+/// installation. `signingCertificate` (PEM X.509, `maxLength: 5500`) and
+/// `signature` (base64, `maxLength: 800`) optionally carry the firmware's
+/// signature so the station can verify authenticity. The `maxLength` bounds are
+/// enforced at the schema layer, consistent with the rest of v201.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FirmwareType {
+    /// URI defining the origin of the firmware image (max length 512).
+    pub location: String,
+    /// Date and time at which the firmware shall be retrieved (date-time).
+    #[serde(rename = "retrieveDateTime")]
+    pub retrieve_date_time: String,
+    /// Date and time at which the firmware shall be installed (date-time).
+    /// Omitted leaves the timing to the Charging Station.
+    #[serde(rename = "installDateTime", skip_serializing_if = "Option::is_none")]
+    pub install_date_time: Option<String>,
+    /// PEM-encoded X.509 certificate the firmware was signed with (max length
+    /// 5500).
+    #[serde(rename = "signingCertificate", skip_serializing_if = "Option::is_none")]
+    pub signing_certificate: Option<String>,
+    /// Base64-encoded firmware signature (max length 800).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}

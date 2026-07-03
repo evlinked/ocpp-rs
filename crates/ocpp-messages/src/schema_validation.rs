@@ -622,6 +622,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "ClearChargingProfileResponse",
         include_str!("../schemas/v201/ClearChargingProfileResponse.json"),
     ),
+    (
+        "UpdateFirmware",
+        include_str!("../schemas/v201/UpdateFirmware.json"),
+    ),
+    (
+        "UpdateFirmwareResponse",
+        include_str!("../schemas/v201/UpdateFirmwareResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J

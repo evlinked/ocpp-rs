@@ -1019,3 +1019,23 @@ pub enum ClearChargingProfileStatusEnumType {
     Accepted,
     Unknown,
 }
+
+/// Whether the Charging Station accepted an `UpdateFirmware` request, reported in
+/// `UpdateFirmware.conf`.
+///
+/// Ports `UpdateFirmwareStatusEnumType` (`ocpp/v201/enums.py`). `Accepted` means
+/// the station will download and install the firmware; `Rejected` declines the
+/// request; `AcceptedCanceled` accepts the new request while canceling a
+/// firmware update already in progress; `InvalidCertificate` /
+/// `RevokedCertificate` reject the request because the firmware's signing
+/// certificate is invalid or has been revoked. Every wire value is PascalCase
+/// and identical between the reference dataclass enum and the bundled OCPP 2.0.1
+/// FINAL JSON Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateFirmwareStatusEnumType {
+    Accepted,
+    Rejected,
+    AcceptedCanceled,
+    InvalidCertificate,
+    RevokedCertificate,
+}
