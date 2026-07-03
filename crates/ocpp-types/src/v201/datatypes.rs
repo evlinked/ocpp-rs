@@ -782,6 +782,27 @@ pub struct MonitoringDataType {
     pub custom_data: Option<CustomDataType>,
 }
 
+/// The result of clearing one monitor requested by a `ClearVariableMonitoring`,
+/// one entry in the response's `clear_monitoring_result` list.
+///
+/// Ports `ClearMonitoringResultType`. `status` and `id` are required; `id`
+/// echoes the monitor id from the request so the CSMS can correlate each
+/// outcome. `status_info` optionally elaborates on a `Rejected` result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClearMonitoringResultType {
+    /// Whether the monitor was cleared (`Accepted`), refused (`Rejected`), or
+    /// did not exist (`NotFound`).
+    pub status: ClearMonitoringStatusEnumType,
+    /// Id of the monitor a clear was requested for.
+    pub id: i32,
+    /// Optional detail about the status (typically for `Rejected`).
+    #[serde(rename = "statusInfo", skip_serializing_if = "Option::is_none")]
+    pub status_info: Option<StatusInfoType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 /// One monitor to install via a `SetVariableMonitoring` request, targeting a
 /// single component-variable.
 ///
