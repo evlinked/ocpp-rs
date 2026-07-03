@@ -623,6 +623,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/ClearChargingProfileResponse.json"),
     ),
     (
+        "GetCompositeSchedule",
+        include_str!("../schemas/v201/GetCompositeSchedule.json"),
+    ),
+    (
+        "GetCompositeScheduleResponse",
+        include_str!("../schemas/v201/GetCompositeScheduleResponse.json"),
+    ),
+    (
         "UpdateFirmware",
         include_str!("../schemas/v201/UpdateFirmware.json"),
     ),

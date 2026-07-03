@@ -675,6 +675,37 @@ pub struct ChargingScheduleType {
     pub custom_data: Option<CustomDataType>,
 }
 
+/// The net charging schedule a station will enforce over a requested window,
+/// returned by `GetCompositeSchedule` after stacking all applicable charging
+/// profiles.
+///
+/// Ports `CompositeScheduleType`. Every field except `customData` is required:
+/// the `evseId` the schedule applies to (`0` = the whole grid connection), the
+/// `duration` in seconds, the absolute `scheduleStart` (RFC 3339), the
+/// `chargingRateUnit` the period limits are expressed in, and a non-empty
+/// `chargingSchedulePeriod` list (schema `minItems: 1`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CompositeScheduleType {
+    /// EVSE the schedule was computed for; `0` means the whole grid connection.
+    #[serde(rename = "evseId")]
+    pub evse_id: i32,
+    /// Duration of the schedule in seconds.
+    pub duration: i32,
+    /// Absolute start of the schedule (RFC 3339); all periods are relative to
+    /// this instant.
+    #[serde(rename = "scheduleStart")]
+    pub schedule_start: String,
+    /// Unit the period limits are expressed in (watts or amperes).
+    #[serde(rename = "chargingRateUnit")]
+    pub charging_rate_unit: ChargingRateUnitEnumType,
+    /// The computed limit periods; the schema requires at least one.
+    #[serde(rename = "chargingSchedulePeriod")]
+    pub charging_schedule_period: Vec<ChargingSchedulePeriodType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 /// A charging profile: the station's limit on charging power/current over time,
 /// carried in `RequestStartTransaction` / `SetChargingProfile`.
 ///
