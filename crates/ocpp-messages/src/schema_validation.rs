@@ -599,6 +599,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/SetMonitoringBaseResponse.json"),
     ),
     (
+        "ClearVariableMonitoring",
+        include_str!("../schemas/v201/ClearVariableMonitoring.json"),
+    ),
+    (
+        "ClearVariableMonitoringResponse",
+        include_str!("../schemas/v201/ClearVariableMonitoringResponse.json"),
+    ),
+    (
         "SetVariableMonitoring",
         include_str!("../schemas/v201/SetVariableMonitoring.json"),
     ),
