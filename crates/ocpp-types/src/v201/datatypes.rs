@@ -269,6 +269,47 @@ pub struct MessageContentType {
     pub custom_data: Option<CustomDataType>,
 }
 
+/// A single display message to be shown on a Charging Station.
+///
+/// Ports `MessageInfoType`. Carried by `SetDisplayMessage` and reported by
+/// `NotifyDisplayMessages`. `id`, `priority`, and `message` are required; the
+/// remaining fields narrow *when*, *where*, and in *which state* the message is
+/// shown. Reuses [`MessageContentType`] for the message body and
+/// [`ComponentType`] for the optional target display.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MessageInfoType {
+    /// Master resource identifier for the message, unique within the exchange
+    /// context (a non-negative integer). Used later to `ClearDisplayMessage`.
+    pub id: i32,
+    /// With what priority the message should be shown.
+    pub priority: MessagePriorityEnumType,
+    /// The message contents to display.
+    pub message: MessageContentType,
+    /// During which Charging Station state the message should be shown. When
+    /// omitted, the message is shown in any state.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<MessageStateEnumType>,
+    /// From what date-time the message should be shown (RFC 3339 / ISO 8601).
+    /// When omitted, immediately.
+    #[serde(rename = "startDateTime", skip_serializing_if = "Option::is_none")]
+    pub start_date_time: Option<String>,
+    /// Until what date-time the message should be shown (RFC 3339 / ISO 8601);
+    /// after this the station removes it.
+    #[serde(rename = "endDateTime", skip_serializing_if = "Option::is_none")]
+    pub end_date_time: Option<String>,
+    /// During which transaction the message should be shown; removed by the
+    /// station once that transaction ends (max length 36).
+    #[serde(rename = "transactionId", skip_serializing_if = "Option::is_none")]
+    pub transaction_id: Option<String>,
+    /// The specific display component to show the message on. When omitted, the
+    /// station's default display.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display: Option<ComponentType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 /// Reference key to a variable within a [`ComponentType`].
 ///
 /// Ports `VariableType`. Only `name` is required.

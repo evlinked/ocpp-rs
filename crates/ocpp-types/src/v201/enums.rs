@@ -1072,6 +1072,52 @@ pub enum ClearMessageStatusEnumType {
     Unknown,
 }
 
+/// With what priority a display message should be shown on a Charging Station.
+///
+/// Ports `MessagePriorityEnumType` (`ocpp/v201/enums.py`). Carried by
+/// [`MessageInfoType`](crate::v201::MessageInfoType) and used by
+/// `SetDisplayMessage` / `NotifyDisplayMessages`. All three wire values are
+/// PascalCase and identical between the reference dataclass enum and the bundled
+/// OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessagePriorityEnumType {
+    AlwaysFront,
+    InFront,
+    NormalCycle,
+}
+
+/// During which Charging Station state a display message should be shown.
+///
+/// Ports `MessageStateEnumType` (`ocpp/v201/enums.py`). Optional on
+/// [`MessageInfoType`](crate::v201::MessageInfoType); when omitted the message
+/// is shown in any state. All four wire values are PascalCase and identical
+/// between the reference dataclass enum and the bundled OCPP 2.0.1 FINAL JSON
+/// Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MessageStateEnumType {
+    Charging,
+    Faulted,
+    Idle,
+    Unavailable,
+}
+
+/// Whether a Charging Station accepted a display message installed via
+/// `SetDisplayMessage`, and if not, why.
+///
+/// Ports `DisplayMessageStatusEnumType` (`ocpp/v201/enums.py`). Returned by
+/// `SetDisplayMessage.conf`. All six wire values are PascalCase and identical
+/// between the reference dataclass enum and the bundled OCPP 2.0.1 FINAL JSON
+/// Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayMessageStatusEnumType {
+    Accepted,
+    NotSupportedMessageFormat,
+    Rejected,
+    NotSupportedPriority,
+    NotSupportedState,
+    UnknownTransaction,
+}
+
 /// Whether a Charging Station accepted the signed certificate chain the CSMS
 /// delivered via `CertificateSigned`.
 ///

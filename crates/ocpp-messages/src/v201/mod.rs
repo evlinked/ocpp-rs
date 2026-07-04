@@ -58,6 +58,7 @@ mod reset;
 mod security_event_notification;
 mod send_local_list;
 mod set_charging_profile;
+mod set_display_message;
 mod set_monitoring_base;
 mod set_monitoring_level;
 mod set_variable_monitoring;
@@ -121,6 +122,7 @@ pub use security_event_notification::{
 };
 pub use send_local_list::{SendLocalListRequest, SendLocalListResponse};
 pub use set_charging_profile::{SetChargingProfileRequest, SetChargingProfileResponse};
+pub use set_display_message::{SetDisplayMessageRequest, SetDisplayMessageResponse};
 pub use set_monitoring_base::{SetMonitoringBaseRequest, SetMonitoringBaseResponse};
 pub use set_monitoring_level::{SetMonitoringLevelRequest, SetMonitoringLevelResponse};
 pub use set_variable_monitoring::{SetVariableMonitoringRequest, SetVariableMonitoringResponse};
@@ -8185,6 +8187,278 @@ mod tests {
             assert!(v
                 .validate_call_result(
                     "ClearDisplayMessage",
+                    &json!({ "status": "Accepted", "bogus": true })
+                )
+                .is_err());
+        }
+    }
+
+    /// `SetDisplayMessage` — the 2.0.1 display-message *install* command (#216).
+    /// The CSMS sends a `MessageInfoType` (id + priority + `MessageContentType`
+    /// body, plus optional state / display / date-time window / transaction
+    /// scope) and the station reports a six-value `DisplayMessageStatusEnumType`.
+    /// The install side of the display-message family whose removal side is
+    /// `ClearDisplayMessage`. Reuses `MessageContentType`, `ComponentType`, and
+    /// `StatusInfoType`.
+    mod set_display_message {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            CustomDataType, DisplayMessageStatusEnumType, MessageContentType,
+            MessageFormatEnumType, MessageInfoType, MessagePriorityEnumType, MessageStateEnumType,
+            StatusInfoType,
+        };
+
+        fn minimal_message() -> MessageInfoType {
+            MessageInfoType {
+                id: 1,
+                priority: MessagePriorityEnumType::NormalCycle,
+                message: MessageContentType {
+                    format: MessageFormatEnumType::Utf8,
+                    content: "Welcome".to_string(),
+                    language: None,
+                    custom_data: None,
+                },
+                state: None,
+                start_date_time: None,
+                end_date_time: None,
+                transaction_id: None,
+                display: None,
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            let req = SetDisplayMessageRequest {
+                message: minimal_message(),
+                custom_data: None,
+            };
+            let expected = json!({
+                "message": {
+                    "id": 1,
+                    "priority": "NormalCycle",
+                    "message": { "format": "UTF8", "content": "Welcome" }
+                }
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call("SetDisplayMessage", &expected)
+                .is_ok());
+            let back: SetDisplayMessageRequest = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_full_message_info_round_trips_and_validates() {
+            let req = SetDisplayMessageRequest {
+                message: MessageInfoType {
+                    id: 7,
+                    priority: MessagePriorityEnumType::AlwaysFront,
+                    message: MessageContentType {
+                        format: MessageFormatEnumType::Html,
+                        content: "<b>Charging</b>".to_string(),
+                        language: Some("en".to_string()),
+                        custom_data: None,
+                    },
+                    state: Some(MessageStateEnumType::Charging),
+                    start_date_time: Some("2026-07-04T00:00:00Z".to_string()),
+                    end_date_time: Some("2026-07-05T00:00:00Z".to_string()),
+                    transaction_id: Some("txn-123".to_string()),
+                    display: None,
+                    custom_data: Some(CustomDataType {
+                        vendor_id: "com.example".to_string(),
+                        extra: Default::default(),
+                    }),
+                },
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["message"]["state"], json!("Charging"));
+            assert_eq!(wire["message"]["transactionId"], json!("txn-123"));
+            assert!(SchemaValidator::v201()
+                .validate_call("SetDisplayMessage", &wire)
+                .is_ok());
+            let back: SetDisplayMessageRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = SetDisplayMessageResponse {
+                status: DisplayMessageStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetDisplayMessage", &expected)
+                .is_ok());
+            let back: SetDisplayMessageResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_with_status_info_round_trips_and_validates() {
+            let resp = SetDisplayMessageResponse {
+                status: DisplayMessageStatusEnumType::NotSupportedPriority,
+                status_info: Some(StatusInfoType {
+                    reason_code: "BadPriority".to_string(),
+                    additional_info: Some("AlwaysFront not supported".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("NotSupportedPriority"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("BadPriority"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetDisplayMessage", &wire)
+                .is_ok());
+            let back: SetDisplayMessageResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn all_status_values_validate() {
+            let v = SchemaValidator::v201();
+            for status in [
+                "Accepted",
+                "NotSupportedMessageFormat",
+                "Rejected",
+                "NotSupportedPriority",
+                "NotSupportedState",
+                "UnknownTransaction",
+            ] {
+                assert!(
+                    v.validate_call_result("SetDisplayMessage", &json!({ "status": status }))
+                        .is_ok(),
+                    "status {status} should validate"
+                );
+            }
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(SetDisplayMessageRequest::ACTION_NAME, "SetDisplayMessage");
+            assert_eq!(
+                SetDisplayMessageResponse::ACTION_NAME,
+                "SetDisplayMessageResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_message() {
+            assert!(SchemaValidator::v201()
+                .validate_call("SetDisplayMessage", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_message_info_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            // Missing `id`.
+            assert!(v
+                .validate_call(
+                    "SetDisplayMessage",
+                    &json!({ "message": {
+                        "priority": "NormalCycle",
+                        "message": { "format": "UTF8", "content": "hi" }
+                    }})
+                )
+                .is_err());
+            // Missing `priority`.
+            assert!(v
+                .validate_call(
+                    "SetDisplayMessage",
+                    &json!({ "message": {
+                        "id": 1,
+                        "message": { "format": "UTF8", "content": "hi" }
+                    }})
+                )
+                .is_err());
+            // Missing `message` body.
+            assert!(v
+                .validate_call(
+                    "SetDisplayMessage",
+                    &json!({ "message": { "id": 1, "priority": "NormalCycle" }})
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_non_integer_id() {
+            let bad = json!({ "message": {
+                "id": "1",
+                "priority": "NormalCycle",
+                "message": { "format": "UTF8", "content": "hi" }
+            }});
+            assert!(SchemaValidator::v201()
+                .validate_call("SetDisplayMessage", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<SetDisplayMessageRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_unknown_enum_values() {
+            let v = SchemaValidator::v201();
+            // Unknown priority on the request.
+            let bad_priority = json!({ "message": {
+                "id": 1,
+                "priority": "Whenever",
+                "message": { "format": "UTF8", "content": "hi" }
+            }});
+            assert!(v.validate_call("SetDisplayMessage", &bad_priority).is_err());
+            assert!(serde_json::from_value::<SetDisplayMessageRequest>(bad_priority).is_err());
+            // Unknown status on the response.
+            let bad_status = json!({ "status": "Maybe" });
+            assert!(v
+                .validate_call_result("SetDisplayMessage", &bad_status)
+                .is_err());
+            assert!(serde_json::from_value::<SetDisplayMessageResponse>(bad_status).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetDisplayMessage", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            // On the request.
+            assert!(v
+                .validate_call(
+                    "SetDisplayMessage",
+                    &json!({
+                        "message": {
+                            "id": 1,
+                            "priority": "NormalCycle",
+                            "message": { "format": "UTF8", "content": "hi" }
+                        },
+                        "bogus": true
+                    })
+                )
+                .is_err());
+            // On the nested MessageInfoType.
+            assert!(v
+                .validate_call(
+                    "SetDisplayMessage",
+                    &json!({ "message": {
+                        "id": 1,
+                        "priority": "NormalCycle",
+                        "message": { "format": "UTF8", "content": "hi" },
+                        "bogus": true
+                    }})
+                )
+                .is_err());
+            // On the response.
+            assert!(v
+                .validate_call_result(
+                    "SetDisplayMessage",
                     &json!({ "status": "Accepted", "bogus": true })
                 )
                 .is_err());
