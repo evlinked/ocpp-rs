@@ -1118,6 +1118,22 @@ pub enum DisplayMessageStatusEnumType {
     UnknownTransaction,
 }
 
+/// Whether a Charging Station holds any display messages matching a
+/// `GetDisplayMessages` query.
+///
+/// Ports `GetDisplayMessagesStatusEnumType` (`ocpp/v201/enums.py`). Returned
+/// synchronously by `GetDisplayMessages.conf` to acknowledge the query: the
+/// station answers `Accepted` when it has one or more matching messages (which
+/// it then streams asynchronously via `NotifyDisplayMessages`), or `Unknown`
+/// when it has none. Both wire values are PascalCase and identical between the
+/// reference dataclass enum and the bundled OCPP 2.0.1 FINAL JSON Schema, so no
+/// `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GetDisplayMessagesStatusEnumType {
+    Accepted,
+    Unknown,
+}
+
 /// Whether a Charging Station accepted the signed certificate chain the CSMS
 /// delivered via `CertificateSigned`.
 ///
