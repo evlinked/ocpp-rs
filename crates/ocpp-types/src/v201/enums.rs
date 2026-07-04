@@ -1071,3 +1071,19 @@ pub enum ClearMessageStatusEnumType {
     Accepted,
     Unknown,
 }
+
+/// Whether a Charging Station accepted the signed certificate chain the CSMS
+/// delivered via `CertificateSigned`.
+///
+/// Ports `CertificateSignedStatusEnumType` (`ocpp/v201/enums.py`). Returned by
+/// `CertificateSigned.conf` to report whether the station installed the chain.
+/// The two wire values are PascalCase (`"Accepted"`, `"Rejected"`) and identical
+/// between the reference dataclass enum and the bundled OCPP 2.0.1 FINAL JSON
+/// Schema, so no `#[serde(rename)]` is needed. Its members coincide with
+/// [`GenericStatusEnumType`], but the schema defines it as its own type, so it is
+/// kept distinct here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CertificateSignedStatusEnumType {
+    Accepted,
+    Rejected,
+}
