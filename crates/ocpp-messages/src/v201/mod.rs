@@ -50,6 +50,7 @@ mod heartbeat;
 mod install_certificate;
 mod log_status_notification;
 mod meter_values;
+mod notify_display_messages;
 mod notify_monitoring_report;
 mod publish_firmware;
 mod publish_firmware_status_notification;
@@ -109,6 +110,7 @@ pub use heartbeat::{HeartbeatRequest, HeartbeatResponse};
 pub use install_certificate::{InstallCertificateRequest, InstallCertificateResponse};
 pub use log_status_notification::{LogStatusNotificationRequest, LogStatusNotificationResponse};
 pub use meter_values::{MeterValuesRequest, MeterValuesResponse};
+pub use notify_display_messages::{NotifyDisplayMessagesRequest, NotifyDisplayMessagesResponse};
 pub use notify_monitoring_report::{NotifyMonitoringReportRequest, NotifyMonitoringReportResponse};
 pub use publish_firmware::{PublishFirmwareRequest, PublishFirmwareResponse};
 pub use publish_firmware_status_notification::{
@@ -9955,6 +9957,231 @@ mod tests {
             assert!(v
                 .validate_call_result("GetDisplayMessages", &bad_resp)
                 .is_err());
+        }
+    }
+
+    /// `NotifyDisplayMessages` — the async data carrier of the display-message
+    /// query flow (#226). The station streams the installed `MessageInfoType`
+    /// entries (paged via `tbc`) that `GetDisplayMessages` asked for; the
+    /// response is empty. Reuses `MessageInfoType` (from #216) verbatim.
+    mod notify_display_messages {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            CustomDataType, MessageContentType, MessageFormatEnumType, MessageInfoType,
+            MessagePriorityEnumType, MessageStateEnumType,
+        };
+
+        fn sample_message_info() -> MessageInfoType {
+            MessageInfoType {
+                id: 7,
+                priority: MessagePriorityEnumType::AlwaysFront,
+                message: MessageContentType {
+                    format: MessageFormatEnumType::Utf8,
+                    language: Some("en".to_string()),
+                    content: "Welcome".to_string(),
+                    custom_data: None,
+                },
+                state: Some(MessageStateEnumType::Idle),
+                start_date_time: Some("2022-01-01T10:00:00Z".to_string()),
+                end_date_time: Some("2022-01-02T10:00:00Z".to_string()),
+                transaction_id: None,
+                display: None,
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only `requestId` is required; the optional `messageInfo` / `tbc` /
+            // `customData` stay off the wire.
+            let req = NotifyDisplayMessagesRequest {
+                request_id: 42,
+                message_info: None,
+                tbc: None,
+                custom_data: None,
+            };
+            let expected = json!({ "requestId": 42 });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("messageInfo"));
+            assert!(!obj.contains_key("tbc"));
+            assert!(!obj.contains_key("customData"));
+            assert!(expected["requestId"].is_i64());
+            let back: NotifyDisplayMessagesRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("NotifyDisplayMessages", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_message_info_round_trips_and_validates() {
+            // A full `MessageInfoType` entry (incl. state + date-time window)
+            // plus a multi-page request (`tbc: true`).
+            let req = NotifyDisplayMessagesRequest {
+                request_id: 7,
+                message_info: Some(vec![sample_message_info()]),
+                tbc: Some(true),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["messageInfo"][0]["id"], json!(7));
+            assert_eq!(wire["messageInfo"][0]["priority"], json!("AlwaysFront"));
+            assert_eq!(wire["messageInfo"][0]["message"]["format"], json!("UTF8"));
+            assert_eq!(
+                wire["messageInfo"][0]["message"]["content"],
+                json!("Welcome")
+            );
+            assert_eq!(wire["messageInfo"][0]["state"], json!("Idle"));
+            assert_eq!(wire["tbc"], json!(true));
+            assert!(SchemaValidator::v201()
+                .validate_call("NotifyDisplayMessages", &wire)
+                .is_ok());
+            let back: NotifyDisplayMessagesRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_rejects_missing_request_id() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call("NotifyDisplayMessages", &json!({ "tbc": true }))
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_wrong_request_id_type() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call("NotifyDisplayMessages", &json!({ "requestId": "1" }))
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_empty_message_info_array() {
+            // Schema requires `minItems: 1` when `messageInfo` is present.
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "NotifyDisplayMessages",
+                    &json!({ "requestId": 1, "messageInfo": [] })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_missing_required_message_info_field() {
+            // `priority` is required inside MessageInfoType.
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "NotifyDisplayMessages",
+                    &json!({
+                        "requestId": 1,
+                        "messageInfo": [{
+                            "id": 1,
+                            "message": { "format": "UTF8", "content": "hi" }
+                        }]
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_unknown_message_priority() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "NotifyDisplayMessages",
+                    &json!({
+                        "requestId": 1,
+                        "messageInfo": [{
+                            "id": 1,
+                            "priority": "Whenever",
+                            "message": { "format": "UTF8", "content": "hi" }
+                        }]
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            // On the request.
+            assert!(v
+                .validate_call(
+                    "NotifyDisplayMessages",
+                    &json!({ "requestId": 1, "unexpected": true })
+                )
+                .is_err());
+            // On a nested `MessageInfoType`.
+            assert!(v
+                .validate_call(
+                    "NotifyDisplayMessages",
+                    &json!({
+                        "requestId": 1,
+                        "messageInfo": [{
+                            "id": 1,
+                            "priority": "AlwaysFront",
+                            "message": { "format": "UTF8", "content": "hi" },
+                            "unexpected": true
+                        }]
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_empty_matches_wire_json_and_validates() {
+            let resp = NotifyDisplayMessagesResponse::default();
+            let expected = json!({});
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let back: NotifyDisplayMessagesResponse =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, resp);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("NotifyDisplayMessages", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn response_with_custom_data_round_trips_and_validates() {
+            let resp = NotifyDisplayMessagesResponse {
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("NotifyDisplayMessages", &wire)
+                .is_ok());
+            let back: NotifyDisplayMessagesResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("NotifyDisplayMessages", &json!({ "unexpected": true }))
+                .is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                NotifyDisplayMessagesRequest::ACTION_NAME,
+                "NotifyDisplayMessages"
+            );
+            assert_eq!(
+                NotifyDisplayMessagesResponse::ACTION_NAME,
+                "NotifyDisplayMessagesResponse"
+            );
         }
     }
 }
