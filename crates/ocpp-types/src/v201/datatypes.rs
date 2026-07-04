@@ -192,6 +192,34 @@ pub struct OCSPRequestDataType {
     pub custom_data: Option<CustomDataType>,
 }
 
+/// Hash of an installed certificate, identifying it for removal or lookup
+/// without transmitting the certificate itself.
+///
+/// Ports `CertificateHashDataType`. Every field except `custom_data` is
+/// required. It is the certificate-management counterpart of
+/// [`OCSPRequestDataType`] — the same issuer-name / issuer-key / serial-number
+/// hash triple, but without the OCSP `responderURL`. Carried by a
+/// `DeleteCertificate` request and reused by `CertificateHashDataChainType`
+/// (`GetInstalledCertificateIds`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CertificateHashDataType {
+    /// Hash algorithm used for `issuer_name_hash` and `issuer_key_hash`.
+    #[serde(rename = "hashAlgorithm")]
+    pub hash_algorithm: HashAlgorithmEnumType,
+    /// Hashed value of the issuer Distinguished Name (max length 128).
+    #[serde(rename = "issuerNameHash")]
+    pub issuer_name_hash: String,
+    /// Hashed value of the issuer's public key (max length 128).
+    #[serde(rename = "issuerKeyHash")]
+    pub issuer_key_hash: String,
+    /// Serial number of the certificate (max length 40).
+    #[serde(rename = "serialNumber")]
+    pub serial_number: String,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 /// Message details for a message to be displayed on a Charging Station.
 ///
 /// Ports `MessageContentType`. `format` and `content` are required. Carried by
