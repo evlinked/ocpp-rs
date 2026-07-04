@@ -220,6 +220,37 @@ pub struct CertificateHashDataType {
     pub custom_data: Option<CustomDataType>,
 }
 
+/// A single installed certificate reported by `GetInstalledCertificateIds`,
+/// pairing the certificate's type with its hash and, optionally, the hashes of
+/// its child (leaf) certificates.
+///
+/// Ports `CertificateHashDataChainType`. `certificate_type` and
+/// `certificate_hash_data` are required; `child_certificate_hash_data` is an
+/// optional chain of up to four child certificate hashes (schema `minItems` 1,
+/// `maxItems` 4 when present). Reuses [`CertificateHashDataType`] for every hash
+/// entry — the same triple carried by a `DeleteCertificate` request — so this
+/// datatype adds only the chaining structure on top. Carried by
+/// `GetInstalledCertificateIds` responses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CertificateHashDataChainType {
+    /// Which kind of certificate this chain entry describes.
+    #[serde(rename = "certificateType")]
+    pub certificate_type: GetCertificateIdUseEnumType,
+    /// Hash identifying the certificate itself.
+    #[serde(rename = "certificateHashData")]
+    pub certificate_hash_data: CertificateHashDataType,
+    /// Hashes of the child (leaf) certificates in the chain, when present
+    /// (1–4 entries).
+    #[serde(
+        rename = "childCertificateHashData",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub child_certificate_hash_data: Option<Vec<CertificateHashDataType>>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 /// Message details for a message to be displayed on a Charging Station.
 ///
 /// Ports `MessageContentType`. `format` and `content` are required. Carried by

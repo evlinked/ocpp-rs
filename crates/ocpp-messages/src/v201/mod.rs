@@ -37,6 +37,7 @@ mod delete_certificate;
 mod firmware_status_notification;
 mod get_base_report;
 mod get_composite_schedule;
+mod get_installed_certificate_ids;
 mod get_local_list_version;
 mod get_monitoring_report;
 mod get_report;
@@ -89,6 +90,9 @@ pub use firmware_status_notification::{
 };
 pub use get_base_report::{GetBaseReportRequest, GetBaseReportResponse};
 pub use get_composite_schedule::{GetCompositeScheduleRequest, GetCompositeScheduleResponse};
+pub use get_installed_certificate_ids::{
+    GetInstalledCertificateIdsRequest, GetInstalledCertificateIdsResponse,
+};
 pub use get_local_list_version::{GetLocalListVersionRequest, GetLocalListVersionResponse};
 pub use get_monitoring_report::{GetMonitoringReportRequest, GetMonitoringReportResponse};
 pub use get_report::{GetReportRequest, GetReportResponse};
@@ -8469,6 +8473,382 @@ mod tests {
             let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
             assert!(v
                 .validate_call_result("DeleteCertificate", &bad_resp)
+                .is_err());
+        }
+    }
+
+    mod get_installed_certificate_ids {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            CertificateHashDataChainType, CertificateHashDataType, CustomDataType,
+            GetCertificateIdUseEnumType, GetInstalledCertificateStatusEnumType,
+            HashAlgorithmEnumType, StatusInfoType,
+        };
+
+        fn sample_hash_data() -> CertificateHashDataType {
+            CertificateHashDataType {
+                hash_algorithm: HashAlgorithmEnumType::Sha256,
+                issuer_name_hash: "a1b2c3".to_string(),
+                issuer_key_hash: "d4e5f6".to_string(),
+                serial_number: "0123456789ABCDEF".to_string(),
+                custom_data: None,
+            }
+        }
+
+        fn sample_hash_data_json() -> serde_json::Value {
+            json!({
+                "hashAlgorithm": "SHA256",
+                "issuerNameHash": "a1b2c3",
+                "issuerKeyHash": "d4e5f6",
+                "serialNumber": "0123456789ABCDEF"
+            })
+        }
+
+        fn sample_chain() -> CertificateHashDataChainType {
+            CertificateHashDataChainType {
+                certificate_type: GetCertificateIdUseEnumType::CSMSRootCertificate,
+                certificate_hash_data: sample_hash_data(),
+                child_certificate_hash_data: None,
+                custom_data: None,
+            }
+        }
+
+        fn sample_chain_json() -> serde_json::Value {
+            json!({
+                "certificateType": "CSMSRootCertificate",
+                "certificateHashData": sample_hash_data_json()
+            })
+        }
+
+        #[test]
+        fn request_empty_serializes_to_empty_object_and_validates() {
+            // Neither field is required; an all-`None` request must be `{}`.
+            let req = GetInstalledCertificateIdsRequest {
+                certificate_type: None,
+                custom_data: None,
+            };
+            let expected = json!({});
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call("GetInstalledCertificateIds", &expected)
+                .is_ok());
+            let back: GetInstalledCertificateIdsRequest = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_with_certificate_types_round_trips_and_validates() {
+            let req = GetInstalledCertificateIdsRequest {
+                certificate_type: Some(vec![
+                    GetCertificateIdUseEnumType::CSMSRootCertificate,
+                    GetCertificateIdUseEnumType::V2GCertificateChain,
+                ]),
+                custom_data: None,
+            };
+            let expected = json!({
+                "certificateType": ["CSMSRootCertificate", "V2GCertificateChain"]
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call("GetInstalledCertificateIds", &expected)
+                .is_ok());
+            let back: GetInstalledCertificateIdsRequest = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn certificate_id_use_round_trips_all_five_wire_spellings() {
+            // Includes the extra `V2GCertificateChain` member that distinguishes
+            // this enum from `InstallCertificateUseEnumType`.
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (
+                    GetCertificateIdUseEnumType::V2GRootCertificate,
+                    "V2GRootCertificate",
+                ),
+                (
+                    GetCertificateIdUseEnumType::MORootCertificate,
+                    "MORootCertificate",
+                ),
+                (
+                    GetCertificateIdUseEnumType::CSMSRootCertificate,
+                    "CSMSRootCertificate",
+                ),
+                (
+                    GetCertificateIdUseEnumType::V2GCertificateChain,
+                    "V2GCertificateChain",
+                ),
+                (
+                    GetCertificateIdUseEnumType::ManufacturerRootCertificate,
+                    "ManufacturerRootCertificate",
+                ),
+            ] {
+                assert_eq!(serde_json::to_value(variant).unwrap(), json!(wire));
+                let back: GetCertificateIdUseEnumType =
+                    serde_json::from_value(json!(wire)).unwrap();
+                assert_eq!(back, variant);
+                let req = GetInstalledCertificateIdsRequest {
+                    certificate_type: Some(vec![variant]),
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&req).unwrap();
+                assert!(v
+                    .validate_call("GetInstalledCertificateIds", &value)
+                    .is_ok());
+            }
+        }
+
+        #[test]
+        fn certificate_id_use_rejects_unknown_value() {
+            assert!(
+                serde_json::from_value::<GetCertificateIdUseEnumType>(json!("V2GRoot")).is_err()
+            );
+            let bad = json!({ "certificateType": ["V2GRoot"] });
+            assert!(SchemaValidator::v201()
+                .validate_call("GetInstalledCertificateIds", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn request_with_custom_data_round_trips_and_validates() {
+            let req = GetInstalledCertificateIdsRequest {
+                certificate_type: Some(vec![GetCertificateIdUseEnumType::MORootCertificate]),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("GetInstalledCertificateIds", &wire)
+                .is_ok());
+            let back: GetInstalledCertificateIdsRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = GetInstalledCertificateIdsResponse {
+                status: GetInstalledCertificateStatusEnumType::NotFound,
+                status_info: None,
+                certificate_hash_data_chain: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "NotFound" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("statusInfo"));
+            assert!(!obj.contains_key("certificateHashDataChain"));
+            assert!(!obj.contains_key("customData"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetInstalledCertificateIds", &expected)
+                .is_ok());
+            let back: GetInstalledCertificateIdsResponse =
+                serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_status_round_trips_both_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (GetInstalledCertificateStatusEnumType::Accepted, "Accepted"),
+                (GetInstalledCertificateStatusEnumType::NotFound, "NotFound"),
+            ] {
+                let resp = GetInstalledCertificateIdsResponse {
+                    status: variant,
+                    status_info: None,
+                    certificate_hash_data_chain: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&resp).unwrap();
+                assert_eq!(value["status"], json!(wire));
+                assert!(v
+                    .validate_call_result("GetInstalledCertificateIds", &value)
+                    .is_ok());
+                let back: GetInstalledCertificateIdsResponse =
+                    serde_json::from_value(value).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn status_rejects_unknown_value() {
+            // `Failed` is valid for DeleteCertificate but not for this status enum.
+            assert!(
+                serde_json::from_value::<GetInstalledCertificateStatusEnumType>(json!("Failed"))
+                    .is_err()
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetInstalledCertificateIds", &json!({ "status": "Failed" }))
+                .is_err());
+        }
+
+        #[test]
+        fn response_with_chain_round_trips_and_validates() {
+            // A representative chain: one plain entry, plus one carrying an
+            // optional `childCertificateHashData` leaf list.
+            let resp = GetInstalledCertificateIdsResponse {
+                status: GetInstalledCertificateStatusEnumType::Accepted,
+                status_info: None,
+                certificate_hash_data_chain: Some(vec![
+                    sample_chain(),
+                    CertificateHashDataChainType {
+                        certificate_type: GetCertificateIdUseEnumType::V2GCertificateChain,
+                        certificate_hash_data: sample_hash_data(),
+                        child_certificate_hash_data: Some(vec![CertificateHashDataType {
+                            serial_number: "FEDCBA9876543210".to_string(),
+                            ..sample_hash_data()
+                        }]),
+                        custom_data: None,
+                    },
+                ]),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Accepted"));
+            assert_eq!(
+                wire["certificateHashDataChain"][0]["certificateType"],
+                json!("CSMSRootCertificate")
+            );
+            assert_eq!(
+                wire["certificateHashDataChain"][1]["childCertificateHashData"][0]["serialNumber"],
+                json!("FEDCBA9876543210")
+            );
+            // A plain chain entry must not emit the optional child list.
+            assert!(wire["certificateHashDataChain"][0]
+                .as_object()
+                .unwrap()
+                .get("childCertificateHashData")
+                .is_none());
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetInstalledCertificateIds", &wire)
+                .is_ok());
+            let back: GetInstalledCertificateIdsResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_with_status_info_and_custom_data_round_trips() {
+            let resp = GetInstalledCertificateIdsResponse {
+                status: GetInstalledCertificateStatusEnumType::Accepted,
+                status_info: Some(StatusInfoType {
+                    reason_code: "OK".to_string(),
+                    additional_info: Some("2 certificates installed".to_string()),
+                    custom_data: None,
+                }),
+                certificate_hash_data_chain: Some(vec![sample_chain()]),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("OK"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetInstalledCertificateIds", &wire)
+                .is_ok());
+            let back: GetInstalledCertificateIdsResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                GetInstalledCertificateIdsRequest::ACTION_NAME,
+                "GetInstalledCertificateIds"
+            );
+            assert_eq!(
+                GetInstalledCertificateIdsResponse::ACTION_NAME,
+                "GetInstalledCertificateIdsResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetInstalledCertificateIds", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_chain_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            for missing in ["certificateType", "certificateHashData"] {
+                let mut entry = sample_chain_json();
+                entry.as_object_mut().unwrap().remove(missing);
+                let bad = json!({
+                    "status": "Accepted",
+                    "certificateHashDataChain": [entry]
+                });
+                assert!(
+                    v.validate_call_result("GetInstalledCertificateIds", &bad)
+                        .is_err(),
+                    "expected schema to reject chain entry missing {missing}"
+                );
+            }
+        }
+
+        #[test]
+        fn schema_rejects_empty_certificate_type_array() {
+            // Request `certificateType` is `minItems: 1` when present.
+            assert!(SchemaValidator::v201()
+                .validate_call(
+                    "GetInstalledCertificateIds",
+                    &json!({ "certificateType": [] })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_empty_certificate_hash_data_chain_array() {
+            // Response `certificateHashDataChain` is `minItems: 1` when present.
+            let bad = json!({ "status": "Accepted", "certificateHashDataChain": [] });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetInstalledCertificateIds", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_non_array_certificate_type() {
+            let bad = json!({ "certificateType": "CSMSRootCertificate" });
+            assert!(SchemaValidator::v201()
+                .validate_call("GetInstalledCertificateIds", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<GetInstalledCertificateIdsRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            // On the request.
+            let bad_req = json!({
+                "certificateType": ["CSMSRootCertificate"],
+                "bogusExtra": true
+            });
+            assert!(v
+                .validate_call("GetInstalledCertificateIds", &bad_req)
+                .is_err());
+            // On the response.
+            let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
+            assert!(v
+                .validate_call_result("GetInstalledCertificateIds", &bad_resp)
+                .is_err());
+            // Inside the nested chain datatype.
+            let mut entry = sample_chain_json();
+            entry
+                .as_object_mut()
+                .unwrap()
+                .insert("bogusExtra".to_string(), json!(true));
+            let bad_nested = json!({
+                "status": "Accepted",
+                "certificateHashDataChain": [entry]
+            });
+            assert!(v
+                .validate_call_result("GetInstalledCertificateIds", &bad_nested)
                 .is_err());
         }
     }
