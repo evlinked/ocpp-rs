@@ -1039,3 +1039,20 @@ pub enum UpdateFirmwareStatusEnumType {
     InvalidCertificate,
     RevokedCertificate,
 }
+
+/// Which certificate a signing request (or the signed chain returned for it) is
+/// for, used by the certificate-provisioning flow.
+///
+/// Ports `CertificateSigningUseEnumType` (`ocpp/v201/enums.py`). `SignCertificate`
+/// carries this to select the certificate the submitted CSR is for; the paired
+/// `CertificateSigned` reuses it to say which certificate the signed chain
+/// installs. When omitted the request applies to both the ISO 15118 connection
+/// and the Charging-Station-to-CSMS connection. Both wire values are PascalCase
+/// (`"ChargingStationCertificate"`, `"V2GCertificate"`) and identical between the
+/// reference dataclass enum and the bundled OCPP 2.0.1 FINAL JSON Schema, so no
+/// `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CertificateSigningUseEnumType {
+    ChargingStationCertificate,
+    V2GCertificate,
+}

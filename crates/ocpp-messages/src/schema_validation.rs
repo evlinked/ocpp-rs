@@ -646,6 +646,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "SetMonitoringLevelResponse",
         include_str!("../schemas/v201/SetMonitoringLevelResponse.json"),
     ),
+    (
+        "SignCertificate",
+        include_str!("../schemas/v201/SignCertificate.json"),
+    ),
+    (
+        "SignCertificateResponse",
+        include_str!("../schemas/v201/SignCertificateResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
