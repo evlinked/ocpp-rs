@@ -1143,3 +1143,42 @@ pub enum DeleteCertificateStatusEnumType {
     Failed,
     NotFound,
 }
+
+/// Which kind of installed certificate a `GetInstalledCertificateIds` request
+/// asks the Charging Station to enumerate.
+///
+/// Ports `GetCertificateIdUseEnumType` (`ocpp/v201/enums.py`). It is a superset
+/// of [`InstallCertificateUseEnumType`]: the same four trust-anchor roots plus a
+/// fifth member, `V2GCertificateChain`, which selects the station's installed
+/// V2G leaf-certificate chain rather than a root. Because of that extra member it
+/// is kept as its own type and **not** aliased to `InstallCertificateUseEnumType`.
+/// All five wire values are PascalCase (`"V2GRootCertificate"`,
+/// `"MORootCertificate"`, `"CSMSRootCertificate"`, `"V2GCertificateChain"`,
+/// `"ManufacturerRootCertificate"`) and identical between the reference dataclass
+/// enum and the bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is
+/// needed. Carried by `GetInstalledCertificateIds` requests and by
+/// [`super::CertificateHashDataChainType`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GetCertificateIdUseEnumType {
+    V2GRootCertificate,
+    MORootCertificate,
+    CSMSRootCertificate,
+    V2GCertificateChain,
+    ManufacturerRootCertificate,
+}
+
+/// Whether a Charging Station could process a `GetInstalledCertificateIds`
+/// request.
+///
+/// Ports `GetInstalledCertificateStatusEnumType` (`ocpp/v201/enums.py`). Returned
+/// by `GetInstalledCertificateIds.conf`: `Accepted` when the station returns the
+/// (possibly empty) set of matching installed certificates, `NotFound` when no
+/// certificate of the requested type(s) is installed. Both wire values are
+/// PascalCase (`"Accepted"`, `"NotFound"`) and identical between the reference
+/// dataclass enum and the bundled OCPP 2.0.1 FINAL JSON Schema, so no
+/// `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GetInstalledCertificateStatusEnumType {
+    Accepted,
+    NotFound,
+}

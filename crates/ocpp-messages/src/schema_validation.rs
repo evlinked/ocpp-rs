@@ -686,6 +686,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "DeleteCertificateResponse",
         include_str!("../schemas/v201/DeleteCertificateResponse.json"),
     ),
+    (
+        "GetInstalledCertificateIds",
+        include_str!("../schemas/v201/GetInstalledCertificateIds.json"),
+    ),
+    (
+        "GetInstalledCertificateIdsResponse",
+        include_str!("../schemas/v201/GetInstalledCertificateIdsResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
