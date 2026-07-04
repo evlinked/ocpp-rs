@@ -33,6 +33,7 @@ mod clear_variable_monitoring;
 mod cleared_charging_limit;
 mod cost_updated;
 mod data_transfer;
+mod delete_certificate;
 mod firmware_status_notification;
 mod get_base_report;
 mod get_composite_schedule;
@@ -82,6 +83,7 @@ pub use clear_variable_monitoring::{
 pub use cleared_charging_limit::{ClearedChargingLimitRequest, ClearedChargingLimitResponse};
 pub use cost_updated::{CostUpdatedRequest, CostUpdatedResponse};
 pub use data_transfer::{DataTransferRequest, DataTransferResponse};
+pub use delete_certificate::{DeleteCertificateRequest, DeleteCertificateResponse};
 pub use firmware_status_notification::{
     FirmwareStatusNotificationRequest, FirmwareStatusNotificationResponse,
 };
@@ -8181,6 +8183,292 @@ mod tests {
                     "ClearDisplayMessage",
                     &json!({ "status": "Accepted", "bogus": true })
                 )
+                .is_err());
+        }
+    }
+
+    /// `DeleteCertificate` — the 2.0.1 certificate-*management* removal command
+    /// (#220). The CSMS names an installed certificate by its
+    /// `CertificateHashDataType` (issuer-name / issuer-key / serial-number hash
+    /// triple plus `HashAlgorithmEnumType`) and the station reports a
+    /// three-value `DeleteCertificateStatusEnumType` (`Accepted` / `Failed` /
+    /// `NotFound`). Reuses the existing `HashAlgorithmEnumType` (from the OCSP /
+    /// `Authorize` port) and `StatusInfoType`.
+    mod delete_certificate {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            CertificateHashDataType, CustomDataType, DeleteCertificateStatusEnumType,
+            HashAlgorithmEnumType, StatusInfoType,
+        };
+
+        fn sample_hash_data() -> CertificateHashDataType {
+            CertificateHashDataType {
+                hash_algorithm: HashAlgorithmEnumType::Sha256,
+                issuer_name_hash: "a1b2c3".to_string(),
+                issuer_key_hash: "d4e5f6".to_string(),
+                serial_number: "0123456789ABCDEF".to_string(),
+                custom_data: None,
+            }
+        }
+
+        fn sample_hash_data_json() -> serde_json::Value {
+            json!({
+                "hashAlgorithm": "SHA256",
+                "issuerNameHash": "a1b2c3",
+                "issuerKeyHash": "d4e5f6",
+                "serialNumber": "0123456789ABCDEF"
+            })
+        }
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only the one required field — `certificateHashData`; `customData`
+            // stays off the wire.
+            let req = DeleteCertificateRequest {
+                certificate_hash_data: sample_hash_data(),
+                custom_data: None,
+            };
+            let expected = json!({ "certificateHashData": sample_hash_data_json() });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("customData"));
+            // The hash fields round-trip as strings, the algorithm as an enum.
+            assert!(expected["certificateHashData"]["issuerNameHash"].is_string());
+            assert_eq!(
+                expected["certificateHashData"]["hashAlgorithm"],
+                json!("SHA256")
+            );
+            let back: DeleteCertificateRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("DeleteCertificate", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_custom_data_round_trips_and_validates() {
+            let req = DeleteCertificateRequest {
+                certificate_hash_data: CertificateHashDataType {
+                    custom_data: Some(CustomDataType {
+                        vendor_id: "com.example.inner".to_string(),
+                        extra: Default::default(),
+                    }),
+                    ..sample_hash_data()
+                },
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert_eq!(
+                wire["certificateHashData"]["customData"]["vendorId"],
+                json!("com.example.inner")
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call("DeleteCertificate", &wire)
+                .is_ok());
+            let back: DeleteCertificateRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn hash_algorithm_round_trips_all_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (HashAlgorithmEnumType::Sha256, "SHA256"),
+                (HashAlgorithmEnumType::Sha384, "SHA384"),
+                (HashAlgorithmEnumType::Sha512, "SHA512"),
+            ] {
+                let req = DeleteCertificateRequest {
+                    certificate_hash_data: CertificateHashDataType {
+                        hash_algorithm: variant,
+                        ..sample_hash_data()
+                    },
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&req).unwrap();
+                assert_eq!(value["certificateHashData"]["hashAlgorithm"], json!(wire));
+                assert!(v.validate_call("DeleteCertificate", &value).is_ok());
+                let back: DeleteCertificateRequest = serde_json::from_value(value).unwrap();
+                assert_eq!(back, req);
+            }
+        }
+
+        #[test]
+        fn hash_algorithm_rejects_unknown_value() {
+            // Unknown / mis-spelled algorithms are rejected by both serde and schema.
+            assert!(serde_json::from_value::<HashAlgorithmEnumType>(json!("MD5")).is_err());
+            let bad = json!({
+                "certificateHashData": {
+                    "hashAlgorithm": "MD5",
+                    "issuerNameHash": "a1b2c3",
+                    "issuerKeyHash": "d4e5f6",
+                    "serialNumber": "0123456789ABCDEF"
+                }
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("DeleteCertificate", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = DeleteCertificateResponse {
+                status: DeleteCertificateStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("statusInfo"));
+            assert!(!obj.contains_key("customData"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("DeleteCertificate", &expected)
+                .is_ok());
+            let back: DeleteCertificateResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_status_round_trips_all_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (DeleteCertificateStatusEnumType::Accepted, "Accepted"),
+                (DeleteCertificateStatusEnumType::Failed, "Failed"),
+                (DeleteCertificateStatusEnumType::NotFound, "NotFound"),
+            ] {
+                let resp = DeleteCertificateResponse {
+                    status: variant,
+                    status_info: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&resp).unwrap();
+                assert_eq!(value["status"], json!(wire));
+                assert!(v.validate_call_result("DeleteCertificate", &value).is_ok());
+                let back: DeleteCertificateResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn response_with_status_info_and_custom_data_round_trips() {
+            let resp = DeleteCertificateResponse {
+                status: DeleteCertificateStatusEnumType::Failed,
+                status_info: Some(StatusInfoType {
+                    reason_code: "InUse".to_string(),
+                    additional_info: Some("Certificate is currently in use".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Failed"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("InUse"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("DeleteCertificate", &wire)
+                .is_ok());
+            let back: DeleteCertificateResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_rejects_unknown_value() {
+            assert!(
+                serde_json::from_value::<DeleteCertificateStatusEnumType>(json!("Rejected"))
+                    .is_err()
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call_result("DeleteCertificate", &json!({ "status": "Rejected" }))
+                .is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(DeleteCertificateRequest::ACTION_NAME, "DeleteCertificate");
+            assert_eq!(
+                DeleteCertificateResponse::ACTION_NAME,
+                "DeleteCertificateResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_certificate_hash_data() {
+            assert!(SchemaValidator::v201()
+                .validate_call("DeleteCertificate", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_hash_data_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            // Each of the four required hash-data fields, dropped one at a time.
+            for missing in [
+                "hashAlgorithm",
+                "issuerNameHash",
+                "issuerKeyHash",
+                "serialNumber",
+            ] {
+                let mut hd = sample_hash_data_json();
+                hd.as_object_mut().unwrap().remove(missing);
+                let bad = json!({ "certificateHashData": hd });
+                assert!(
+                    v.validate_call("DeleteCertificate", &bad).is_err(),
+                    "expected schema to reject certificateHashData missing {missing}"
+                );
+            }
+        }
+
+        #[test]
+        fn schema_and_serde_reject_non_string_serial_number() {
+            let bad = json!({
+                "certificateHashData": {
+                    "hashAlgorithm": "SHA256",
+                    "issuerNameHash": "a1b2c3",
+                    "issuerKeyHash": "d4e5f6",
+                    "serialNumber": 42
+                }
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("DeleteCertificate", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<DeleteCertificateRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("DeleteCertificate", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            // On the request.
+            let bad_req = json!({
+                "certificateHashData": sample_hash_data_json(),
+                "bogusExtra": true
+            });
+            assert!(v.validate_call("DeleteCertificate", &bad_req).is_err());
+            // Inside the nested hash-data datatype.
+            let mut hd = sample_hash_data_json();
+            hd.as_object_mut()
+                .unwrap()
+                .insert("bogusExtra".to_string(), json!(true));
+            let bad_nested = json!({ "certificateHashData": hd });
+            assert!(v.validate_call("DeleteCertificate", &bad_nested).is_err());
+            // On the response.
+            let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
+            assert!(v
+                .validate_call_result("DeleteCertificate", &bad_resp)
                 .is_err());
         }
     }

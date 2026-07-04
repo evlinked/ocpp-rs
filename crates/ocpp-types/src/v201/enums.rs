@@ -1125,3 +1125,21 @@ pub enum InstallCertificateStatusEnumType {
     Rejected,
     Failed,
 }
+
+/// Whether a Charging Station could remove a previously installed certificate
+/// requested by a `DeleteCertificate` command.
+///
+/// Ports `DeleteCertificateStatusEnumType` (`ocpp/v201/enums.py`). Returned by
+/// `DeleteCertificate.conf`: `Accepted` means the certificate matching the
+/// supplied [`super::CertificateHashDataType`] was found and removed; `NotFound`
+/// means no installed certificate matched the hash, so nothing was removed;
+/// `Failed` means a match existed but the station could not remove it. All three
+/// wire values are PascalCase (`"Accepted"`, `"Failed"`, `"NotFound"`) and
+/// identical between the reference dataclass enum and the bundled OCPP 2.0.1
+/// FINAL JSON Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeleteCertificateStatusEnumType {
+    Accepted,
+    Failed,
+    NotFound,
+}
