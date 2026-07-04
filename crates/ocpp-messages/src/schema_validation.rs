@@ -671,6 +671,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/CertificateSignedResponse.json"),
     ),
     (
+        "InstallCertificate",
+        include_str!("../schemas/v201/InstallCertificate.json"),
+    ),
+    (
+        "InstallCertificateResponse",
+        include_str!("../schemas/v201/InstallCertificateResponse.json"),
+    ),
+    (
         "DeleteCertificate",
         include_str!("../schemas/v201/DeleteCertificate.json"),
     ),
