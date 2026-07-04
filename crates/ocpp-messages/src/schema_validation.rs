@@ -639,6 +639,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/UpdateFirmwareResponse.json"),
     ),
     (
+        "SetMonitoringLevel",
+        include_str!("../schemas/v201/SetMonitoringLevel.json"),
+    ),
+    (
+        "SetMonitoringLevelResponse",
+        include_str!("../schemas/v201/SetMonitoringLevelResponse.json"),
+    ),
+    (
         "SignCertificate",
         include_str!("../schemas/v201/SignCertificate.json"),
     ),
