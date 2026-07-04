@@ -703,6 +703,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/SetDisplayMessageResponse.json"),
     ),
     (
+        "GetDisplayMessages",
+        include_str!("../schemas/v201/GetDisplayMessages.json"),
+    ),
+    (
+        "GetDisplayMessagesResponse",
+        include_str!("../schemas/v201/GetDisplayMessagesResponse.json"),
+    ),
+    (
         "GetCertificateStatus",
         include_str!("../schemas/v201/GetCertificateStatus.json"),
     ),

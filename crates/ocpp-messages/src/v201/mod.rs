@@ -38,6 +38,7 @@ mod firmware_status_notification;
 mod get_base_report;
 mod get_certificate_status;
 mod get_composite_schedule;
+mod get_display_messages;
 mod get_installed_certificate_ids;
 mod get_local_list_version;
 mod get_monitoring_report;
@@ -93,6 +94,7 @@ pub use firmware_status_notification::{
 pub use get_base_report::{GetBaseReportRequest, GetBaseReportResponse};
 pub use get_certificate_status::{GetCertificateStatusRequest, GetCertificateStatusResponse};
 pub use get_composite_schedule::{GetCompositeScheduleRequest, GetCompositeScheduleResponse};
+pub use get_display_messages::{GetDisplayMessagesRequest, GetDisplayMessagesResponse};
 pub use get_installed_certificate_ids::{
     GetInstalledCertificateIdsRequest, GetInstalledCertificateIdsResponse,
 };
@@ -9386,6 +9388,271 @@ mod tests {
             });
             assert!(v
                 .validate_call_result("GetInstalledCertificateIds", &bad_nested)
+                .is_err());
+        }
+    }
+
+    mod get_display_messages {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            CustomDataType, GetDisplayMessagesStatusEnumType, MessagePriorityEnumType,
+            MessageStateEnumType, StatusInfoType,
+        };
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only `requestId` is required; every other field is omitted.
+            let req = GetDisplayMessagesRequest {
+                request_id: 42,
+                id: None,
+                priority: None,
+                state: None,
+                custom_data: None,
+            };
+            let expected = json!({ "requestId": 42 });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("id"));
+            assert!(!obj.contains_key("priority"));
+            assert!(!obj.contains_key("state"));
+            assert!(!obj.contains_key("customData"));
+            assert!(SchemaValidator::v201()
+                .validate_call("GetDisplayMessages", &expected)
+                .is_ok());
+            let back: GetDisplayMessagesRequest = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_id_round_trips_as_integer() {
+            let req = GetDisplayMessagesRequest {
+                request_id: -7,
+                id: None,
+                priority: None,
+                state: None,
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["requestId"], json!(-7));
+            assert!(wire["requestId"].is_i64());
+        }
+
+        #[test]
+        fn request_with_all_filters_round_trips_and_validates() {
+            let req = GetDisplayMessagesRequest {
+                request_id: 1,
+                id: Some(vec![10, 20, 30]),
+                priority: Some(MessagePriorityEnumType::AlwaysFront),
+                state: Some(MessageStateEnumType::Charging),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["requestId"], json!(1));
+            assert_eq!(wire["id"], json!([10, 20, 30]));
+            assert_eq!(wire["priority"], json!("AlwaysFront"));
+            assert_eq!(wire["state"], json!("Charging"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("GetDisplayMessages", &wire)
+                .is_ok());
+            let back: GetDisplayMessagesRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_reused_priority_and_state_enums_accept_full_value_set() {
+            // These enums are shared with `SetDisplayMessage`; confirm every
+            // member is accepted here, both by serde and the bundled schema.
+            let v = SchemaValidator::v201();
+            for (priority, wire) in [
+                (MessagePriorityEnumType::AlwaysFront, "AlwaysFront"),
+                (MessagePriorityEnumType::InFront, "InFront"),
+                (MessagePriorityEnumType::NormalCycle, "NormalCycle"),
+            ] {
+                let req = GetDisplayMessagesRequest {
+                    request_id: 1,
+                    id: None,
+                    priority: Some(priority),
+                    state: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&req).unwrap();
+                assert_eq!(value["priority"], json!(wire));
+                assert!(v.validate_call("GetDisplayMessages", &value).is_ok());
+            }
+            for (state, wire) in [
+                (MessageStateEnumType::Charging, "Charging"),
+                (MessageStateEnumType::Faulted, "Faulted"),
+                (MessageStateEnumType::Idle, "Idle"),
+                (MessageStateEnumType::Unavailable, "Unavailable"),
+            ] {
+                let req = GetDisplayMessagesRequest {
+                    request_id: 1,
+                    id: None,
+                    priority: None,
+                    state: Some(state),
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&req).unwrap();
+                assert_eq!(value["state"], json!(wire));
+                assert!(v.validate_call("GetDisplayMessages", &value).is_ok());
+            }
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = GetDisplayMessagesResponse {
+                status: GetDisplayMessagesStatusEnumType::Unknown,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Unknown" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("statusInfo"));
+            assert!(!obj.contains_key("customData"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetDisplayMessages", &expected)
+                .is_ok());
+            let back: GetDisplayMessagesResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_status_round_trips_both_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (GetDisplayMessagesStatusEnumType::Accepted, "Accepted"),
+                (GetDisplayMessagesStatusEnumType::Unknown, "Unknown"),
+            ] {
+                let resp = GetDisplayMessagesResponse {
+                    status: variant,
+                    status_info: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&resp).unwrap();
+                assert_eq!(value["status"], json!(wire));
+                assert!(v.validate_call_result("GetDisplayMessages", &value).is_ok());
+                let back: GetDisplayMessagesResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn response_with_status_info_and_custom_data_round_trips() {
+            let resp = GetDisplayMessagesResponse {
+                status: GetDisplayMessagesStatusEnumType::Accepted,
+                status_info: Some(StatusInfoType {
+                    reason_code: "OK".to_string(),
+                    additional_info: Some("3 messages match".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Accepted"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("OK"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetDisplayMessages", &wire)
+                .is_ok());
+            let back: GetDisplayMessagesResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(GetDisplayMessagesRequest::ACTION_NAME, "GetDisplayMessages");
+            assert_eq!(
+                GetDisplayMessagesResponse::ACTION_NAME,
+                "GetDisplayMessagesResponse"
+            );
+        }
+
+        #[test]
+        fn schema_and_serde_reject_request_missing_request_id() {
+            let bad = json!({ "priority": "AlwaysFront" });
+            assert!(SchemaValidator::v201()
+                .validate_call("GetDisplayMessages", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<GetDisplayMessagesRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetDisplayMessages", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn status_rejects_unknown_value() {
+            // `Rejected` is a valid `DisplayMessageStatusEnumType` value but not
+            // one of this enum's two members.
+            assert!(
+                serde_json::from_value::<GetDisplayMessagesStatusEnumType>(json!("Rejected"))
+                    .is_err()
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetDisplayMessages", &json!({ "status": "Rejected" }))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_unknown_priority_and_state() {
+            let v = SchemaValidator::v201();
+            let bad_priority = json!({ "requestId": 1, "priority": "Highest" });
+            assert!(v
+                .validate_call("GetDisplayMessages", &bad_priority)
+                .is_err());
+            let bad_state = json!({ "requestId": 1, "state": "Sleeping" });
+            assert!(v.validate_call("GetDisplayMessages", &bad_state).is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_non_integer_request_id() {
+            let bad = json!({ "requestId": "42" });
+            assert!(SchemaValidator::v201()
+                .validate_call("GetDisplayMessages", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<GetDisplayMessagesRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_empty_id_array() {
+            // Request `id` is `minItems: 1` when present.
+            let bad = json!({ "requestId": 1, "id": [] });
+            assert!(SchemaValidator::v201()
+                .validate_call("GetDisplayMessages", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_non_array_id() {
+            let bad = json!({ "requestId": 1, "id": 10 });
+            assert!(SchemaValidator::v201()
+                .validate_call("GetDisplayMessages", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<GetDisplayMessagesRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            // On the request.
+            let bad_req = json!({ "requestId": 1, "bogusExtra": true });
+            assert!(v.validate_call("GetDisplayMessages", &bad_req).is_err());
+            // On the response.
+            let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
+            assert!(v
+                .validate_call_result("GetDisplayMessages", &bad_resp)
                 .is_err());
         }
     }
