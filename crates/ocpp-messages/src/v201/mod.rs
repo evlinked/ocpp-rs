@@ -54,6 +54,7 @@ mod security_event_notification;
 mod send_local_list;
 mod set_charging_profile;
 mod set_monitoring_base;
+mod set_monitoring_level;
 mod set_variable_monitoring;
 mod set_variables;
 mod status_notification;
@@ -108,6 +109,7 @@ pub use security_event_notification::{
 pub use send_local_list::{SendLocalListRequest, SendLocalListResponse};
 pub use set_charging_profile::{SetChargingProfileRequest, SetChargingProfileResponse};
 pub use set_monitoring_base::{SetMonitoringBaseRequest, SetMonitoringBaseResponse};
+pub use set_monitoring_level::{SetMonitoringLevelRequest, SetMonitoringLevelResponse};
 pub use set_variable_monitoring::{SetVariableMonitoringRequest, SetVariableMonitoringResponse};
 pub use set_variables::{SetVariablesRequest, SetVariablesResponse};
 pub use status_notification::{StatusNotificationRequest, StatusNotificationResponse};
@@ -7181,6 +7183,154 @@ mod tests {
                 .validate_call_result(
                     "GetCompositeSchedule",
                     &json!({ "status": "Accepted", "schedule": sched })
+                )
+                .is_err());
+        }
+    }
+
+    mod set_monitoring_level {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{CustomDataType, GenericStatusEnumType, StatusInfoType};
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            let req = SetMonitoringLevelRequest {
+                severity: 5,
+                custom_data: None,
+            };
+            let expected = json!({ "severity": 5 });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call("SetMonitoringLevel", &expected)
+                .is_ok());
+            let back: SetMonitoringLevelRequest = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_boundary_severities_and_custom_data_round_trip() {
+            for severity in [0, 9] {
+                let req = SetMonitoringLevelRequest {
+                    severity,
+                    custom_data: Some(CustomDataType {
+                        vendor_id: "com.example".to_string(),
+                        extra: Default::default(),
+                    }),
+                };
+                let wire = serde_json::to_value(&req).unwrap();
+                assert_eq!(wire["severity"], json!(severity));
+                assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+                assert!(SchemaValidator::v201()
+                    .validate_call("SetMonitoringLevel", &wire)
+                    .is_ok());
+                let back: SetMonitoringLevelRequest = serde_json::from_value(wire).unwrap();
+                assert_eq!(back, req);
+            }
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = SetMonitoringLevelResponse {
+                status: GenericStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetMonitoringLevel", &expected)
+                .is_ok());
+            let back: SetMonitoringLevelResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_with_status_info_round_trips_and_validates() {
+            let resp = SetMonitoringLevelResponse {
+                status: GenericStatusEnumType::Rejected,
+                status_info: Some(StatusInfoType {
+                    reason_code: "OutOfRange".to_string(),
+                    additional_info: Some("severity must be 0-9".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Rejected"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("OutOfRange"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetMonitoringLevel", &wire)
+                .is_ok());
+            let back: SetMonitoringLevelResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_enum_serializes_to_wire_values_and_rejects_unknown() {
+            assert_eq!(
+                serde_json::to_value(GenericStatusEnumType::Accepted).unwrap(),
+                json!("Accepted")
+            );
+            assert_eq!(
+                serde_json::to_value(GenericStatusEnumType::Rejected).unwrap(),
+                json!("Rejected")
+            );
+            // `Scheduled` is not a `GenericStatusEnumType` value.
+            let bad = json!({ "status": "Scheduled" });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetMonitoringLevel", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<SetMonitoringLevelResponse>(bad).is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(SetMonitoringLevelRequest::ACTION_NAME, "SetMonitoringLevel");
+            assert_eq!(
+                SetMonitoringLevelResponse::ACTION_NAME,
+                "SetMonitoringLevelResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_severity() {
+            assert!(SchemaValidator::v201()
+                .validate_call("SetMonitoringLevel", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_non_integer_severity() {
+            let bad = json!({ "severity": "5" });
+            assert!(SchemaValidator::v201()
+                .validate_call("SetMonitoringLevel", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<SetMonitoringLevelRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetMonitoringLevel", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            // On the request.
+            assert!(v
+                .validate_call(
+                    "SetMonitoringLevel",
+                    &json!({ "severity": 5, "bogus": true })
+                )
+                .is_err());
+            // On the response.
+            assert!(v
+                .validate_call_result(
+                    "SetMonitoringLevel",
+                    &json!({ "status": "Accepted", "bogus": true })
                 )
                 .is_err());
         }
