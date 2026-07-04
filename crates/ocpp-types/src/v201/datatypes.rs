@@ -1068,3 +1068,27 @@ pub struct FirmwareType {
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
 }
+
+/// Configuration of a log-upload request, carried by `GetLog.req`.
+///
+/// Ports `LogParametersType` (`ocpp/v201/datatypes.py`). `remoteLocation` (the
+/// URI where the station should upload the log, `maxLength: 512`) is required;
+/// `oldestTimestamp` and `latestTimestamp` (both date-time) optionally bound the
+/// time window of log entries to include. The `maxLength` bound is enforced at
+/// the schema layer, consistent with the rest of v201.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct LogParametersType {
+    /// URI of the remote location where the log should be stored (max length
+    /// 512).
+    #[serde(rename = "remoteLocation")]
+    pub remote_location: String,
+    /// Date and time of the oldest logging information to include (date-time).
+    #[serde(rename = "oldestTimestamp", skip_serializing_if = "Option::is_none")]
+    pub oldest_timestamp: Option<String>,
+    /// Date and time of the latest logging information to include (date-time).
+    #[serde(rename = "latestTimestamp", skip_serializing_if = "Option::is_none")]
+    pub latest_timestamp: Option<String>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}

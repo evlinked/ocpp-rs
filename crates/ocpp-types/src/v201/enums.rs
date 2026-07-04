@@ -1263,3 +1263,38 @@ pub enum GetCertificateStatusEnumType {
     Accepted,
     Failed,
 }
+
+/// The kind of log a Charging Station should collect and upload in response to
+/// a `GetLog.req`.
+///
+/// Ports `LogEnumType` (`ocpp/v201/enums.py`): `DiagnosticsLog` (the general
+/// diagnostics log) or `SecurityLog` (the security event log). Both wire values
+/// are PascalCase (`"DiagnosticsLog"`, `"SecurityLog"`) and identical between
+/// the reference dataclass enum and the bundled OCPP 2.0.1 FINAL JSON Schema, so
+/// no `#[serde(rename)]` is needed. Carried by `GetLog.req` in its `logType`
+/// field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogEnumType {
+    DiagnosticsLog,
+    SecurityLog,
+}
+
+/// Whether a Charging Station accepted a `GetLog.req`, i.e. whether it will
+/// collect and upload the requested log.
+///
+/// Ports `LogStatusEnumType` (`ocpp/v201/enums.py`): `Accepted` (the upload will
+/// proceed), `Rejected` (the station declined), or `AcceptedCanceled` (accepted,
+/// but a log upload already in progress was canceled to serve this one). All
+/// three wire values are PascalCase and identical between the reference dataclass
+/// enum and the bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is
+/// needed. Returned by `GetLog.conf`.
+///
+/// Distinct from [`UploadLogStatusEnumType`], which reports the *progress* of an
+/// upload already underway in `LogStatusNotification.req`; this enum is the
+/// synchronous accept/reject ack of the triggering `GetLog.req`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LogStatusEnumType {
+    Accepted,
+    Rejected,
+    AcceptedCanceled,
+}

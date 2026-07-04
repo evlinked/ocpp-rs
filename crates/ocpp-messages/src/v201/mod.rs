@@ -41,6 +41,7 @@ mod get_composite_schedule;
 mod get_display_messages;
 mod get_installed_certificate_ids;
 mod get_local_list_version;
+mod get_log;
 mod get_monitoring_report;
 mod get_report;
 mod get_transaction_status;
@@ -99,6 +100,7 @@ pub use get_installed_certificate_ids::{
     GetInstalledCertificateIdsRequest, GetInstalledCertificateIdsResponse,
 };
 pub use get_local_list_version::{GetLocalListVersionRequest, GetLocalListVersionResponse};
+pub use get_log::{GetLogRequest, GetLogResponse};
 pub use get_monitoring_report::{GetMonitoringReportRequest, GetMonitoringReportResponse};
 pub use get_report::{GetReportRequest, GetReportResponse};
 pub use get_transaction_status::{GetTransactionStatusRequest, GetTransactionStatusResponse};
@@ -5335,6 +5337,305 @@ mod tests {
                     &json!({ "status": "Unpublished", "bogusExtra": true })
                 )
                 .is_err());
+        }
+    }
+
+    /// `GetLog` — the 2.0.1 log-upload request command (#229). The CSMS names a
+    /// log kind (`LogEnumType`: `DiagnosticsLog` / `SecurityLog`) and a
+    /// `LogParametersType` (remote URI plus an optional oldest/latest date-time
+    /// window), with a `requestId` and optional `retries` / `retryInterval`. The
+    /// station acks with a three-value `LogStatusEnumType` (`Accepted` /
+    /// `Rejected` / `AcceptedCanceled`), an optional `StatusInfoType`, and — when
+    /// it will upload — the `filename` (schema `maxLength` 255). Distinct from
+    /// `UploadLogStatusEnumType`, which reports upload *progress* in
+    /// `LogStatusNotification.req`.
+    mod get_log {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            CustomDataType, LogEnumType, LogParametersType, LogStatusEnumType, StatusInfoType,
+        };
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // `log` (with only its required `remoteLocation`), `logType` and
+            // `requestId` are required; every optional stays off the wire.
+            let req = GetLogRequest {
+                log: LogParametersType {
+                    remote_location: "https://logs.example.com/upload".to_string(),
+                    oldest_timestamp: None,
+                    latest_timestamp: None,
+                    custom_data: None,
+                },
+                log_type: LogEnumType::DiagnosticsLog,
+                request_id: 42,
+                retries: None,
+                retry_interval: None,
+                custom_data: None,
+            };
+            let expected = json!({
+                "log": { "remoteLocation": "https://logs.example.com/upload" },
+                "logType": "DiagnosticsLog",
+                "requestId": 42
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("retries"));
+            assert!(!obj.contains_key("retryInterval"));
+            assert!(!obj.contains_key("customData"));
+            let back: GetLogRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("GetLog", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_full_round_trips_and_validates() {
+            // Full LogParametersType (both timestamps) plus retries/retryInterval
+            // and customData; integers stay integers, timestamps stay strings.
+            let req = GetLogRequest {
+                log: LogParametersType {
+                    remote_location: "ftp://logs.example.com/security".to_string(),
+                    oldest_timestamp: Some("2026-07-01T00:00:00Z".to_string()),
+                    latest_timestamp: Some("2026-07-04T23:59:59Z".to_string()),
+                    custom_data: None,
+                },
+                log_type: LogEnumType::SecurityLog,
+                request_id: 7,
+                retries: Some(3),
+                retry_interval: Some(60),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["logType"], json!("SecurityLog"));
+            assert_eq!(wire["requestId"], json!(7));
+            assert_eq!(wire["retries"], json!(3));
+            assert_eq!(wire["retryInterval"], json!(60));
+            assert_eq!(
+                wire["log"]["oldestTimestamp"],
+                json!("2026-07-01T00:00:00Z")
+            );
+            assert_eq!(
+                wire["log"]["latestTimestamp"],
+                json!("2026-07-04T23:59:59Z")
+            );
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("GetLog", &wire)
+                .is_ok());
+            let back: GetLogRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn log_type_round_trips_both_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (LogEnumType::DiagnosticsLog, "DiagnosticsLog"),
+                (LogEnumType::SecurityLog, "SecurityLog"),
+            ] {
+                let req = GetLogRequest {
+                    log: LogParametersType {
+                        remote_location: "https://logs.example.com/upload".to_string(),
+                        oldest_timestamp: None,
+                        latest_timestamp: None,
+                        custom_data: None,
+                    },
+                    log_type: variant,
+                    request_id: 1,
+                    retries: None,
+                    retry_interval: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&req).unwrap();
+                assert_eq!(value["logType"], json!(wire));
+                assert!(v.validate_call("GetLog", &value).is_ok());
+                let back: GetLogRequest = serde_json::from_value(value).unwrap();
+                assert_eq!(back, req);
+            }
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = GetLogResponse {
+                status: LogStatusEnumType::Rejected,
+                status_info: None,
+                filename: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Rejected" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("statusInfo"));
+            assert!(!obj.contains_key("filename"));
+            assert!(!obj.contains_key("customData"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetLog", &expected)
+                .is_ok());
+            let back: GetLogResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_status_round_trips_all_three_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (LogStatusEnumType::Accepted, "Accepted"),
+                (LogStatusEnumType::Rejected, "Rejected"),
+                (LogStatusEnumType::AcceptedCanceled, "AcceptedCanceled"),
+            ] {
+                let resp = GetLogResponse {
+                    status: variant,
+                    status_info: None,
+                    filename: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&resp).unwrap();
+                assert_eq!(value["status"], json!(wire));
+                assert!(v.validate_call_result("GetLog", &value).is_ok());
+                let back: GetLogResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn response_with_filename_status_info_and_custom_data_round_trips() {
+            let resp = GetLogResponse {
+                status: LogStatusEnumType::Accepted,
+                status_info: Some(StatusInfoType {
+                    reason_code: "Queued".to_string(),
+                    additional_info: Some("upload will start shortly".to_string()),
+                    custom_data: None,
+                }),
+                filename: Some("diagnostics-20260704.log".to_string()),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Accepted"));
+            assert_eq!(wire["filename"], json!("diagnostics-20260704.log"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("Queued"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetLog", &wire)
+                .is_ok());
+            let back: GetLogResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn enums_reject_unknown_values() {
+            assert!(serde_json::from_value::<LogEnumType>(json!("AuditLog")).is_err());
+            assert!(serde_json::from_value::<LogStatusEnumType>(json!("Pending")).is_err());
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "GetLog",
+                    &json!({
+                        "log": { "remoteLocation": "https://x" },
+                        "logType": "AuditLog",
+                        "requestId": 1
+                    })
+                )
+                .is_err());
+            assert!(v
+                .validate_call_result("GetLog", &json!({ "status": "Pending" }))
+                .is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(GetLogRequest::ACTION_NAME, "GetLog");
+            assert_eq!(GetLogResponse::ACTION_NAME, "GetLogResponse");
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            let full = json!({
+                "log": { "remoteLocation": "https://logs.example.com/upload" },
+                "logType": "DiagnosticsLog",
+                "requestId": 1
+            });
+            assert!(v.validate_call("GetLog", &full).is_ok());
+            for missing in ["log", "logType", "requestId"] {
+                let mut bad = full.clone();
+                bad.as_object_mut().unwrap().remove(missing);
+                assert!(
+                    v.validate_call("GetLog", &bad).is_err(),
+                    "expected rejection when `{missing}` is absent"
+                );
+                assert!(serde_json::from_value::<GetLogRequest>(bad).is_err());
+            }
+        }
+
+        #[test]
+        fn schema_and_serde_reject_log_parameters_missing_remote_location() {
+            // Drop the required `remoteLocation` from the nested LogParametersType.
+            let bad = json!({
+                "log": { "oldestTimestamp": "2026-07-01T00:00:00Z" },
+                "logType": "DiagnosticsLog",
+                "requestId": 1
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("GetLog", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<GetLogRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_wrong_types() {
+            let v = SchemaValidator::v201();
+            // requestId must be an integer, not a string.
+            assert!(v
+                .validate_call(
+                    "GetLog",
+                    &json!({
+                        "log": { "remoteLocation": "https://x" },
+                        "logType": "DiagnosticsLog",
+                        "requestId": "1"
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetLog", &json!({ "filename": "x.log" }))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let bad_req = json!({
+                "log": { "remoteLocation": "https://logs.example.com/upload" },
+                "logType": "DiagnosticsLog",
+                "requestId": 1,
+                "bogusExtra": true
+            });
+            assert!(v.validate_call("GetLog", &bad_req).is_err());
+
+            // additionalProperties on the nested LogParametersType.
+            let bad_nested = json!({
+                "log": {
+                    "remoteLocation": "https://logs.example.com/upload",
+                    "bogusExtra": true
+                },
+                "logType": "DiagnosticsLog",
+                "requestId": 1
+            });
+            assert!(v.validate_call("GetLog", &bad_nested).is_err());
+
+            let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
+            assert!(v.validate_call_result("GetLog", &bad_resp).is_err());
         }
     }
 
