@@ -655,6 +655,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/SignCertificateResponse.json"),
     ),
     (
+        "ClearDisplayMessage",
+        include_str!("../schemas/v201/ClearDisplayMessage.json"),
+    ),
+    (
+        "ClearDisplayMessageResponse",
+        include_str!("../schemas/v201/ClearDisplayMessageResponse.json"),
+    ),
+    (
         "CertificateSigned",
         include_str!("../schemas/v201/CertificateSigned.json"),
     ),

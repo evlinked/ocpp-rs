@@ -28,6 +28,7 @@ mod certificate_signed;
 mod change_availability;
 mod clear_cache;
 mod clear_charging_profile;
+mod clear_display_message;
 mod clear_variable_monitoring;
 mod cleared_charging_limit;
 mod cost_updated;
@@ -73,6 +74,7 @@ pub use certificate_signed::{CertificateSignedRequest, CertificateSignedResponse
 pub use change_availability::{ChangeAvailabilityRequest, ChangeAvailabilityResponse};
 pub use clear_cache::{ClearCacheRequest, ClearCacheResponse};
 pub use clear_charging_profile::{ClearChargingProfileRequest, ClearChargingProfileResponse};
+pub use clear_display_message::{ClearDisplayMessageRequest, ClearDisplayMessageResponse};
 pub use clear_variable_monitoring::{
     ClearVariableMonitoringRequest, ClearVariableMonitoringResponse,
 };
@@ -7778,6 +7780,152 @@ mod tests {
             assert!(v
                 .validate_call_result(
                     "SetMonitoringLevel",
+                    &json!({ "status": "Accepted", "bogus": true })
+                )
+                .is_err());
+        }
+    }
+
+    mod clear_display_message {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{ClearMessageStatusEnumType, CustomDataType, StatusInfoType};
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            let req = ClearDisplayMessageRequest {
+                id: 42,
+                custom_data: None,
+            };
+            let expected = json!({ "id": 42 });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call("ClearDisplayMessage", &expected)
+                .is_ok());
+            let back: ClearDisplayMessageRequest = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_with_custom_data_round_trips_and_validates() {
+            let req = ClearDisplayMessageRequest {
+                id: 7,
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["id"], json!(7));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("ClearDisplayMessage", &wire)
+                .is_ok());
+            let back: ClearDisplayMessageRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = ClearDisplayMessageResponse {
+                status: ClearMessageStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ClearDisplayMessage", &expected)
+                .is_ok());
+            let back: ClearDisplayMessageResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_with_status_info_round_trips_and_validates() {
+            let resp = ClearDisplayMessageResponse {
+                status: ClearMessageStatusEnumType::Unknown,
+                status_info: Some(StatusInfoType {
+                    reason_code: "NoSuchMessage".to_string(),
+                    additional_info: Some("no display message with that id".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Unknown"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("NoSuchMessage"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ClearDisplayMessage", &wire)
+                .is_ok());
+            let back: ClearDisplayMessageResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_enum_serializes_to_wire_values_and_rejects_unknown() {
+            assert_eq!(
+                serde_json::to_value(ClearMessageStatusEnumType::Accepted).unwrap(),
+                json!("Accepted")
+            );
+            assert_eq!(
+                serde_json::to_value(ClearMessageStatusEnumType::Unknown).unwrap(),
+                json!("Unknown")
+            );
+            // `Rejected` is not a `ClearMessageStatusEnumType` value.
+            let bad = json!({ "status": "Rejected" });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ClearDisplayMessage", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<ClearDisplayMessageResponse>(bad).is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                ClearDisplayMessageRequest::ACTION_NAME,
+                "ClearDisplayMessage"
+            );
+            assert_eq!(
+                ClearDisplayMessageResponse::ACTION_NAME,
+                "ClearDisplayMessageResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_id() {
+            assert!(SchemaValidator::v201()
+                .validate_call("ClearDisplayMessage", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_non_integer_id() {
+            let bad = json!({ "id": "42" });
+            assert!(SchemaValidator::v201()
+                .validate_call("ClearDisplayMessage", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<ClearDisplayMessageRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ClearDisplayMessage", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            // On the request.
+            assert!(v
+                .validate_call("ClearDisplayMessage", &json!({ "id": 42, "bogus": true }))
+                .is_err());
+            // On the response.
+            assert!(v
+                .validate_call_result(
+                    "ClearDisplayMessage",
                     &json!({ "status": "Accepted", "bogus": true })
                 )
                 .is_err());

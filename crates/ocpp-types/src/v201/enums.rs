@@ -1057,6 +1057,21 @@ pub enum CertificateSigningUseEnumType {
     V2GCertificate,
 }
 
+/// Whether the Charging Station was able to remove a display message in response
+/// to a `ClearDisplayMessage` request, reported in `ClearDisplayMessage.conf`.
+///
+/// Ports `ClearMessageStatusEnumType` (`ocpp/v201/enums.py`). `Accepted` means
+/// the message matching the requested id was found and removed; `Unknown` means
+/// no message with that id existed on the station, so nothing was removed. Both
+/// wire values are PascalCase and identical between the reference dataclass enum
+/// and the bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is
+/// needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClearMessageStatusEnumType {
+    Accepted,
+    Unknown,
+}
+
 /// Whether a Charging Station accepted the signed certificate chain the CSMS
 /// delivered via `CertificateSigned`.
 ///
