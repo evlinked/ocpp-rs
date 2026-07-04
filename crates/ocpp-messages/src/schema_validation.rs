@@ -710,6 +710,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "GetDisplayMessagesResponse",
         include_str!("../schemas/v201/GetDisplayMessagesResponse.json"),
     ),
+    (
+        "GetCertificateStatus",
+        include_str!("../schemas/v201/GetCertificateStatus.json"),
+    ),
+    (
+        "GetCertificateStatusResponse",
+        include_str!("../schemas/v201/GetCertificateStatusResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J

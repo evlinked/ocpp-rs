@@ -1244,3 +1244,22 @@ pub enum GetInstalledCertificateStatusEnumType {
     Accepted,
     NotFound,
 }
+
+/// Whether a Charging Station was able to retrieve the OCSP status of a
+/// certificate on the CSMS's behalf.
+///
+/// Ports `GetCertificateStatusEnumType` (`ocpp/v201/enums.py`). Returned by
+/// `GetCertificateStatus.conf`: `Accepted` means the CSMS obtained the OCSP
+/// response (carried back in `ocspResult`), `Failed` means it could not. Both
+/// wire values are PascalCase (`"Accepted"`, `"Failed"`) and identical between
+/// the reference dataclass enum and the bundled OCPP 2.0.1 FINAL JSON Schema, so
+/// no `#[serde(rename)]` is needed. Distinct from the two-member
+/// [`GenericStatusEnumType`] (`Accepted` / `Rejected`): it pairs `Accepted` with
+/// `Failed`, not `Rejected`, so it is kept as its own type. Used by
+/// `GetCertificateStatus.conf` to report the OCSP lookup outcome for a
+/// [`super::OCSPRequestDataType`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GetCertificateStatusEnumType {
+    Accepted,
+    Failed,
+}
