@@ -1087,3 +1087,41 @@ pub enum CertificateSignedStatusEnumType {
     Accepted,
     Rejected,
 }
+
+/// Which root (CA) certificate an `InstallCertificate` request installs into the
+/// Charging Station's trust store.
+///
+/// Ports `InstallCertificateUseEnumType` (`ocpp/v201/enums.py`). This selects the
+/// trust anchor being installed — the V2G root, an MO (Mobility Operator) root,
+/// the CSMS root, or a manufacturer root. It is the certificate-*management*
+/// counterpart to [`CertificateSigningUseEnumType`], which selects the station's
+/// *own* certificate during provisioning. All four wire values are PascalCase
+/// (`"V2GRootCertificate"`, `"MORootCertificate"`, `"CSMSRootCertificate"`,
+/// `"ManufacturerRootCertificate"`) and identical between the reference dataclass
+/// enum and the bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is
+/// needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InstallCertificateUseEnumType {
+    V2GRootCertificate,
+    MORootCertificate,
+    CSMSRootCertificate,
+    ManufacturerRootCertificate,
+}
+
+/// Whether a Charging Station installed the root certificate the CSMS delivered
+/// via `InstallCertificate`.
+///
+/// Ports `InstallCertificateStatusEnumType` (`ocpp/v201/enums.py`). Returned by
+/// `InstallCertificate.conf`: `Accepted` if the certificate was installed,
+/// `Rejected` if the station refused it, `Failed` if installation was attempted
+/// but did not complete. The three wire values are PascalCase (`"Accepted"`,
+/// `"Rejected"`, `"Failed"`) and identical between the reference dataclass enum
+/// and the bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is
+/// needed. Unlike the two-member [`GenericStatusEnumType`], it carries a distinct
+/// third `Failed` member, so it is kept as its own type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InstallCertificateStatusEnumType {
+    Accepted,
+    Rejected,
+    Failed,
+}
