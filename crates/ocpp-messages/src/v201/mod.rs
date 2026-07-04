@@ -36,6 +36,7 @@ mod data_transfer;
 mod delete_certificate;
 mod firmware_status_notification;
 mod get_base_report;
+mod get_certificate_status;
 mod get_composite_schedule;
 mod get_installed_certificate_ids;
 mod get_local_list_version;
@@ -90,6 +91,7 @@ pub use firmware_status_notification::{
     FirmwareStatusNotificationRequest, FirmwareStatusNotificationResponse,
 };
 pub use get_base_report::{GetBaseReportRequest, GetBaseReportResponse};
+pub use get_certificate_status::{GetCertificateStatusRequest, GetCertificateStatusResponse};
 pub use get_composite_schedule::{GetCompositeScheduleRequest, GetCompositeScheduleResponse};
 pub use get_installed_certificate_ids::{
     GetInstalledCertificateIdsRequest, GetInstalledCertificateIdsResponse,
@@ -7625,6 +7627,267 @@ mod tests {
             let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
             assert!(v
                 .validate_call_result("InstallCertificate", &bad_resp)
+                .is_err());
+        }
+    }
+
+    /// `GetCertificateStatus` — the 2.0.1 OCSP-status query (#228). The OCSP
+    /// query side of the certificate family: a Charging Station hands the CSMS
+    /// an `OCSPRequestDataType` (reused verbatim) and the CSMS replies with a
+    /// two-value `GetCertificateStatusEnumType` (`Accepted` / `Failed`), an
+    /// optional `StatusInfoType`, and — on success — the base64/DER OCSP response
+    /// in `ocspResult` (schema `maxLength` 5500).
+    mod get_certificate_status {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            CustomDataType, GetCertificateStatusEnumType, HashAlgorithmEnumType,
+            OCSPRequestDataType, StatusInfoType,
+        };
+
+        fn sample_ocsp() -> OCSPRequestDataType {
+            OCSPRequestDataType {
+                hash_algorithm: HashAlgorithmEnumType::Sha256,
+                issuer_name_hash: "aabbcc".to_string(),
+                issuer_key_hash: "ddeeff".to_string(),
+                serial_number: "1234567890".to_string(),
+                responder_url: "https://ocsp.example.com".to_string(),
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // `ocspRequestData` is the only required field; `customData` stays off
+            // the wire.
+            let req = GetCertificateStatusRequest {
+                ocsp_request_data: sample_ocsp(),
+                custom_data: None,
+            };
+            let expected = json!({
+                "ocspRequestData": {
+                    "hashAlgorithm": "SHA256",
+                    "issuerNameHash": "aabbcc",
+                    "issuerKeyHash": "ddeeff",
+                    "serialNumber": "1234567890",
+                    "responderURL": "https://ocsp.example.com"
+                }
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(!expected.as_object().unwrap().contains_key("customData"));
+            let back: GetCertificateStatusRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("GetCertificateStatus", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_custom_data_round_trips_and_validates() {
+            let req = GetCertificateStatusRequest {
+                ocsp_request_data: sample_ocsp(),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["ocspRequestData"]["hashAlgorithm"], json!("SHA256"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("GetCertificateStatus", &wire)
+                .is_ok());
+            let back: GetCertificateStatusRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            let resp = GetCertificateStatusResponse {
+                status: GetCertificateStatusEnumType::Failed,
+                status_info: None,
+                ocsp_result: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Failed" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("statusInfo"));
+            assert!(!obj.contains_key("ocspResult"));
+            assert!(!obj.contains_key("customData"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetCertificateStatus", &expected)
+                .is_ok());
+            let back: GetCertificateStatusResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_status_round_trips_both_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (GetCertificateStatusEnumType::Accepted, "Accepted"),
+                (GetCertificateStatusEnumType::Failed, "Failed"),
+            ] {
+                let resp = GetCertificateStatusResponse {
+                    status: variant,
+                    status_info: None,
+                    ocsp_result: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&resp).unwrap();
+                assert_eq!(value["status"], json!(wire));
+                assert!(v
+                    .validate_call_result("GetCertificateStatus", &value)
+                    .is_ok());
+                let back: GetCertificateStatusResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn response_with_ocsp_result_status_info_and_custom_data_round_trips() {
+            let resp = GetCertificateStatusResponse {
+                status: GetCertificateStatusEnumType::Accepted,
+                status_info: Some(StatusInfoType {
+                    reason_code: "Retrieved".to_string(),
+                    additional_info: Some("OCSP responder answered".to_string()),
+                    custom_data: None,
+                }),
+                ocsp_result: Some("MIIB0AoBAKCCAckwggHF".to_string()),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Accepted"));
+            assert_eq!(wire["ocspResult"], json!("MIIB0AoBAKCCAckwggHF"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("Retrieved"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetCertificateStatus", &wire)
+                .is_ok());
+            let back: GetCertificateStatusResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn status_rejects_unknown_value() {
+            // Two-member enum: only `Accepted` / `Failed`. `Rejected` (valid for
+            // `GenericStatusEnumType`) must be rejected by both serde and schema.
+            assert!(
+                serde_json::from_value::<GetCertificateStatusEnumType>(json!("Rejected")).is_err()
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetCertificateStatus", &json!({ "status": "Rejected" }))
+                .is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                GetCertificateStatusRequest::ACTION_NAME,
+                "GetCertificateStatus"
+            );
+            assert_eq!(
+                GetCertificateStatusResponse::ACTION_NAME,
+                "GetCertificateStatusResponse"
+            );
+        }
+
+        #[test]
+        fn schema_rejects_request_missing_ocsp_request_data() {
+            assert!(SchemaValidator::v201()
+                .validate_call("GetCertificateStatus", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_ocsp_request_data_missing_nested_field() {
+            // Drop the required `serialNumber` from the nested OCSPRequestDataType.
+            let bad = json!({
+                "ocspRequestData": {
+                    "hashAlgorithm": "SHA256",
+                    "issuerNameHash": "aabbcc",
+                    "issuerKeyHash": "ddeeff",
+                    "responderURL": "https://ocsp.example.com"
+                }
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("GetCertificateStatus", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<GetCertificateStatusRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_unknown_hash_algorithm() {
+            let bad = json!({
+                "ocspRequestData": {
+                    "hashAlgorithm": "MD5",
+                    "issuerNameHash": "aabbcc",
+                    "issuerKeyHash": "ddeeff",
+                    "serialNumber": "1234567890",
+                    "responderURL": "https://ocsp.example.com"
+                }
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("GetCertificateStatus", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<GetCertificateStatusRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_response_missing_status() {
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetCertificateStatus", &json!({ "ocspResult": "AA" }))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_ocsp_result_over_max_length() {
+            // The schema caps `ocspResult` at 5500 chars; 5501 must be rejected.
+            let too_long = "A".repeat(5501);
+            let bad = json!({ "status": "Accepted", "ocspResult": too_long });
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetCertificateStatus", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let bad_req = json!({
+                "ocspRequestData": {
+                    "hashAlgorithm": "SHA256",
+                    "issuerNameHash": "aabbcc",
+                    "issuerKeyHash": "ddeeff",
+                    "serialNumber": "1234567890",
+                    "responderURL": "https://ocsp.example.com"
+                },
+                "bogusExtra": true
+            });
+            assert!(v.validate_call("GetCertificateStatus", &bad_req).is_err());
+
+            // additionalProperties on the nested OCSPRequestDataType.
+            let bad_nested = json!({
+                "ocspRequestData": {
+                    "hashAlgorithm": "SHA256",
+                    "issuerNameHash": "aabbcc",
+                    "issuerKeyHash": "ddeeff",
+                    "serialNumber": "1234567890",
+                    "responderURL": "https://ocsp.example.com",
+                    "bogusExtra": true
+                }
+            });
+            assert!(v
+                .validate_call("GetCertificateStatus", &bad_nested)
+                .is_err());
+
+            let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
+            assert!(v
+                .validate_call_result("GetCertificateStatus", &bad_resp)
                 .is_err());
         }
     }
