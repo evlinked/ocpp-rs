@@ -52,6 +52,7 @@ mod install_certificate;
 mod log_status_notification;
 mod meter_values;
 mod notify_charging_limit;
+mod notify_customer_information;
 mod notify_display_messages;
 mod notify_event;
 mod notify_monitoring_report;
@@ -117,6 +118,9 @@ pub use install_certificate::{InstallCertificateRequest, InstallCertificateRespo
 pub use log_status_notification::{LogStatusNotificationRequest, LogStatusNotificationResponse};
 pub use meter_values::{MeterValuesRequest, MeterValuesResponse};
 pub use notify_charging_limit::{NotifyChargingLimitRequest, NotifyChargingLimitResponse};
+pub use notify_customer_information::{
+    NotifyCustomerInformationRequest, NotifyCustomerInformationResponse,
+};
 pub use notify_display_messages::{NotifyDisplayMessagesRequest, NotifyDisplayMessagesResponse};
 pub use notify_event::{NotifyEventRequest, NotifyEventResponse};
 pub use notify_monitoring_report::{NotifyMonitoringReportRequest, NotifyMonitoringReportResponse};
@@ -10555,6 +10559,194 @@ mod tests {
             assert_eq!(
                 NotifyDisplayMessagesResponse::ACTION_NAME,
                 "NotifyDisplayMessagesResponse"
+            );
+        }
+    }
+
+    /// `NotifyCustomerInformation` — the async data carrier that streams stored
+    /// customer data back to the CSMS, completing the `CustomerInformation`
+    /// flow. A flat-text paged carrier (`data` + `seqNo` + `generatedAt` +
+    /// `requestId` + optional `tbc`); the response is empty. No new datatypes or
+    /// enums.
+    mod notify_customer_information {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::CustomDataType;
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // `data` / `seqNo` / `generatedAt` / `requestId` are required; the
+            // optional `tbc` / `customData` stay off the wire.
+            let req = NotifyCustomerInformationRequest {
+                data: "name=Jane Doe".to_string(),
+                tbc: None,
+                seq_no: 0,
+                generated_at: "2022-01-01T10:00:00Z".to_string(),
+                request_id: 42,
+                custom_data: None,
+            };
+            let expected = json!({
+                "data": "name=Jane Doe",
+                "seqNo": 0,
+                "generatedAt": "2022-01-01T10:00:00Z",
+                "requestId": 42
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("tbc"));
+            assert!(!obj.contains_key("customData"));
+            assert!(expected["seqNo"].is_i64());
+            assert!(expected["requestId"].is_i64());
+            let back: NotifyCustomerInformationRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("NotifyCustomerInformation", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_full_round_trips_and_validates() {
+            // A non-final page: `tbc: true` plus a vendor extension.
+            let req = NotifyCustomerInformationRequest {
+                data: "idToken=ABC123; sessions=17".to_string(),
+                tbc: Some(true),
+                seq_no: 3,
+                generated_at: "2022-01-01T10:05:00Z".to_string(),
+                request_id: 7,
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["tbc"], json!(true));
+            assert_eq!(wire["seqNo"], json!(3));
+            assert_eq!(wire["requestId"], json!(7));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("NotifyCustomerInformation", &wire)
+                .is_ok());
+            let back: NotifyCustomerInformationRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_rejects_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            // Missing `data`.
+            assert!(v
+                .validate_call(
+                    "NotifyCustomerInformation",
+                    &json!({ "seqNo": 0, "generatedAt": "2022-01-01T10:00:00Z", "requestId": 1 })
+                )
+                .is_err());
+            // Missing `seqNo`.
+            assert!(v
+                .validate_call(
+                    "NotifyCustomerInformation",
+                    &json!({ "data": "x", "generatedAt": "2022-01-01T10:00:00Z", "requestId": 1 })
+                )
+                .is_err());
+            // Missing `generatedAt`.
+            assert!(v
+                .validate_call(
+                    "NotifyCustomerInformation",
+                    &json!({ "data": "x", "seqNo": 0, "requestId": 1 })
+                )
+                .is_err());
+            // Missing `requestId`.
+            assert!(v
+                .validate_call(
+                    "NotifyCustomerInformation",
+                    &json!({ "data": "x", "seqNo": 0, "generatedAt": "2022-01-01T10:00:00Z" })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_wrong_scalar_types() {
+            let v = SchemaValidator::v201();
+            // `seqNo` must be an integer.
+            assert!(v
+                .validate_call(
+                    "NotifyCustomerInformation",
+                    &json!({
+                        "data": "x",
+                        "seqNo": "0",
+                        "generatedAt": "2022-01-01T10:00:00Z",
+                        "requestId": 1
+                    })
+                )
+                .is_err());
+            // `requestId` must be an integer.
+            assert!(v
+                .validate_call(
+                    "NotifyCustomerInformation",
+                    &json!({
+                        "data": "x",
+                        "seqNo": 0,
+                        "generatedAt": "2022-01-01T10:00:00Z",
+                        "requestId": "1"
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "NotifyCustomerInformation",
+                    &json!({
+                        "data": "x",
+                        "seqNo": 0,
+                        "generatedAt": "2022-01-01T10:00:00Z",
+                        "requestId": 1,
+                        "unexpected": true
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_empty_matches_wire_json_and_validates() {
+            let resp = NotifyCustomerInformationResponse::default();
+            let expected = json!({});
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let back: NotifyCustomerInformationResponse =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, resp);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("NotifyCustomerInformation", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn response_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("NotifyCustomerInformation", &json!({ "unexpected": true }))
+                .is_err());
+        }
+
+        #[test]
+        fn schemas_are_registered() {
+            let v = SchemaValidator::v201();
+            assert!(v.has_schema("NotifyCustomerInformation"));
+            assert!(v.has_schema("NotifyCustomerInformationResponse"));
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                NotifyCustomerInformationRequest::ACTION_NAME,
+                "NotifyCustomerInformation"
+            );
+            assert_eq!(
+                NotifyCustomerInformationResponse::ACTION_NAME,
+                "NotifyCustomerInformationResponse"
             );
         }
     }
