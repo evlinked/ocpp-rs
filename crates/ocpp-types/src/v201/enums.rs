@@ -537,6 +537,22 @@ pub enum ChargingProfilePurposeEnumType {
     TxProfile,
 }
 
+/// Whether a Charging Station can serve a `GetChargingProfiles.req`, i.e.
+/// whether it will stream the matching profiles back via `ReportChargingProfiles`.
+///
+/// Ports `GetChargingProfileStatusEnumType` (`ocpp/v201/enums.py`). Returned
+/// synchronously by `GetChargingProfiles.conf`: `Accepted` when the station has
+/// one or more profiles matching the [`super::ChargingProfileCriterionType`]
+/// (which it then reports asynchronously), or `NoProfiles` when none match. Both
+/// wire values are PascalCase and identical between the reference dataclass enum
+/// and the bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is
+/// needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GetChargingProfileStatusEnumType {
+    Accepted,
+    NoProfiles,
+}
+
 /// Kind of a [`super::ChargingProfileType`] schedule: absolute, relative to the
 /// transaction start, or recurring.
 ///

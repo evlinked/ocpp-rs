@@ -37,6 +37,7 @@ mod delete_certificate;
 mod firmware_status_notification;
 mod get_base_report;
 mod get_certificate_status;
+mod get_charging_profiles;
 mod get_composite_schedule;
 mod get_display_messages;
 mod get_installed_certificate_ids;
@@ -94,6 +95,7 @@ pub use firmware_status_notification::{
 };
 pub use get_base_report::{GetBaseReportRequest, GetBaseReportResponse};
 pub use get_certificate_status::{GetCertificateStatusRequest, GetCertificateStatusResponse};
+pub use get_charging_profiles::{GetChargingProfilesRequest, GetChargingProfilesResponse};
 pub use get_composite_schedule::{GetCompositeScheduleRequest, GetCompositeScheduleResponse};
 pub use get_display_messages::{GetDisplayMessagesRequest, GetDisplayMessagesResponse};
 pub use get_installed_certificate_ids::{
@@ -9955,6 +9957,277 @@ mod tests {
             assert!(v
                 .validate_call_result("GetDisplayMessages", &bad_resp)
                 .is_err());
+        }
+    }
+
+    /// `GetChargingProfiles` — the query trigger of the charging-profile report
+    /// flow (#230). The CSMS narrows the query with a `ChargingProfileCriterionType`
+    /// and the station acks `Accepted` / `NoProfiles`, then streams the matches
+    /// asynchronously via `ReportChargingProfiles`. Reuses `ChargingProfilePurposeEnumType`,
+    /// `ChargingLimitSourceEnumType`, and `StatusInfoType`.
+    mod get_charging_profiles {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            ChargingLimitSourceEnumType, ChargingProfileCriterionType,
+            ChargingProfilePurposeEnumType, CustomDataType, GetChargingProfileStatusEnumType,
+            StatusInfoType,
+        };
+
+        fn full_criterion() -> ChargingProfileCriterionType {
+            ChargingProfileCriterionType {
+                charging_profile_purpose: Some(ChargingProfilePurposeEnumType::TxDefaultProfile),
+                stack_level: Some(3),
+                charging_profile_id: Some(vec![1, 2, 3]),
+                charging_limit_source: Some(vec![
+                    ChargingLimitSourceEnumType::Ems,
+                    ChargingLimitSourceEnumType::Cso,
+                ]),
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // Only `requestId` + `chargingProfile` are required; an empty
+            // criterion matches every installed profile.
+            let req = GetChargingProfilesRequest {
+                request_id: 42,
+                charging_profile: ChargingProfileCriterionType {
+                    charging_profile_purpose: None,
+                    stack_level: None,
+                    charging_profile_id: None,
+                    charging_limit_source: None,
+                    custom_data: None,
+                },
+                evse_id: None,
+                custom_data: None,
+            };
+            let expected = json!({ "requestId": 42, "chargingProfile": {} });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("evseId"));
+            assert!(!obj.contains_key("customData"));
+            assert!(expected["requestId"].is_i64());
+            let back: GetChargingProfilesRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("GetChargingProfiles", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_full_criterion_round_trips_and_validates() {
+            let req = GetChargingProfilesRequest {
+                request_id: 7,
+                charging_profile: full_criterion(),
+                evse_id: Some(0),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(
+                wire["chargingProfile"]["chargingProfilePurpose"],
+                json!("TxDefaultProfile")
+            );
+            assert_eq!(
+                wire["chargingProfile"]["chargingProfileId"],
+                json!([1, 2, 3])
+            );
+            assert_eq!(
+                wire["chargingProfile"]["chargingLimitSource"],
+                json!(["EMS", "CSO"])
+            );
+            assert_eq!(wire["evseId"], json!(0));
+            assert!(SchemaValidator::v201()
+                .validate_call("GetChargingProfiles", &wire)
+                .is_ok());
+            let back: GetChargingProfilesRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_rejects_missing_request_id() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call("GetChargingProfiles", &json!({ "chargingProfile": {} }))
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_missing_charging_profile() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call("GetChargingProfiles", &json!({ "requestId": 1 }))
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_wrong_request_id_type() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "GetChargingProfiles",
+                    &json!({ "requestId": "1", "chargingProfile": {} })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_unknown_charging_limit_source() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "GetChargingProfiles",
+                    &json!({
+                        "requestId": 1,
+                        "chargingProfile": { "chargingLimitSource": ["Nope"] }
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_empty_charging_profile_id_array() {
+            // Schema requires `minItems: 1` when `chargingProfileId` is present.
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "GetChargingProfiles",
+                    &json!({
+                        "requestId": 1,
+                        "chargingProfile": { "chargingProfileId": [] }
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_too_many_charging_limit_sources() {
+            // Schema bounds `chargingLimitSource` to `maxItems: 4`.
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "GetChargingProfiles",
+                    &json!({
+                        "requestId": 1,
+                        "chargingProfile": {
+                            "chargingLimitSource": ["EMS", "Other", "SO", "CSO", "EMS"]
+                        }
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            // On the request.
+            assert!(v
+                .validate_call(
+                    "GetChargingProfiles",
+                    &json!({ "requestId": 1, "chargingProfile": {}, "unexpected": true })
+                )
+                .is_err());
+            // On the nested `ChargingProfileCriterionType`.
+            assert!(v
+                .validate_call(
+                    "GetChargingProfiles",
+                    &json!({
+                        "requestId": 1,
+                        "chargingProfile": { "stackLevel": 0, "unexpected": true }
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_round_trips_and_validates() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (GetChargingProfileStatusEnumType::Accepted, "Accepted"),
+                (GetChargingProfileStatusEnumType::NoProfiles, "NoProfiles"),
+            ] {
+                let resp = GetChargingProfilesResponse {
+                    status: variant,
+                    status_info: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&resp).unwrap();
+                assert_eq!(value, json!({ "status": wire }));
+                assert!(v
+                    .validate_call_result("GetChargingProfiles", &value)
+                    .is_ok());
+                let back: GetChargingProfilesResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn response_with_status_info_round_trips_and_validates() {
+            let resp = GetChargingProfilesResponse {
+                status: GetChargingProfileStatusEnumType::NoProfiles,
+                status_info: Some(StatusInfoType {
+                    reason_code: "NoMatch".to_string(),
+                    additional_info: Some("no profile matched the criteria".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("NoMatch"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("GetChargingProfiles", &wire)
+                .is_ok());
+            let back: GetChargingProfilesResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_rejects_missing_status() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("GetChargingProfiles", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn response_rejects_unknown_status() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("GetChargingProfiles", &json!({ "status": "Rejected" }))
+                .is_err());
+            assert!(serde_json::from_value::<GetChargingProfilesResponse>(
+                json!({ "status": "Rejected" })
+            )
+            .is_err());
+        }
+
+        #[test]
+        fn response_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result(
+                    "GetChargingProfiles",
+                    &json!({ "status": "Accepted", "unexpected": true })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                GetChargingProfilesRequest::ACTION_NAME,
+                "GetChargingProfiles"
+            );
+            assert_eq!(
+                GetChargingProfilesResponse::ACTION_NAME,
+                "GetChargingProfilesResponse"
+            );
         }
     }
 }

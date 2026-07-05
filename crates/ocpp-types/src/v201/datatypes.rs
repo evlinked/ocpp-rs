@@ -845,6 +845,45 @@ pub struct ChargingProfileType {
     pub custom_data: Option<CustomDataType>,
 }
 
+/// Criteria narrowing which installed charging profiles a station should report
+/// in answer to a `GetChargingProfiles` request.
+///
+/// Ports `ChargingProfileCriterionType`. Every field is optional; an omitted
+/// field means "do not filter on it", so an empty criterion matches every
+/// installed profile. Reuses [`ChargingProfilePurposeEnumType`] and
+/// [`ChargingLimitSourceEnumType`]. Per the schema, `charging_profile_id` and
+/// `charging_limit_source` each hold at least one item when present, and
+/// `charging_limit_source` is bounded to at most four entries.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChargingProfileCriterionType {
+    /// Report only profiles with this purpose; when omitted, purpose is not
+    /// filtered.
+    #[serde(
+        rename = "chargingProfilePurpose",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub charging_profile_purpose: Option<ChargingProfilePurposeEnumType>,
+    /// Report only profiles at this stack level (0 is the lowest); when omitted,
+    /// stack level is not filtered.
+    #[serde(rename = "stackLevel", skip_serializing_if = "Option::is_none")]
+    pub stack_level: Option<i32>,
+    /// Report only profiles whose id is in this list; non-empty when present
+    /// (schema `minItems` 1). When omitted, profile id is not filtered.
+    #[serde(rename = "chargingProfileId", skip_serializing_if = "Option::is_none")]
+    pub charging_profile_id: Option<Vec<i32>>,
+    /// Report only profiles that came from these limit sources; non-empty and at
+    /// most four entries when present (schema `minItems` 1 / `maxItems` 4). When
+    /// omitted, limit source is not filtered.
+    #[serde(
+        rename = "chargingLimitSource",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub charging_limit_source: Option<Vec<ChargingLimitSourceEnumType>>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 /// A component together with (optionally) a specific variable within it, used to
 /// narrow a `GetReport` request to a subset of the device model.
 ///
