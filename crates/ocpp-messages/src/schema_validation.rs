@@ -755,6 +755,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "NotifyChargingLimitResponse",
         include_str!("../schemas/v201/NotifyChargingLimitResponse.json"),
     ),
+    (
+        "NotifyReport",
+        include_str!("../schemas/v201/NotifyReport.json"),
+    ),
+    (
+        "NotifyReportResponse",
+        include_str!("../schemas/v201/NotifyReportResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -2762,6 +2770,235 @@ mod tests {
             .is_err());
         assert!(v
             .validate_call_result("GetReport", &json!({ "status": "Accepted", "bogus": true }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_notify_report_registered() {
+        let v = SchemaValidator::v201();
+        assert!(v.has_schema("NotifyReport"));
+        assert!(v.has_schema("NotifyReportResponse"));
+    }
+
+    #[test]
+    fn v201_notify_report_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        // Bare request — only requestId / generatedAt / seqNo are required.
+        assert!(v
+            .validate_call(
+                "NotifyReport",
+                &json!({
+                    "requestId": 42,
+                    "generatedAt": "2022-01-01T10:00:00Z",
+                    "seqNo": 0
+                })
+            )
+            .is_ok());
+        // A full report-data entry: component + variable + one attribute +
+        // characteristics, plus tbc and customData.
+        assert!(v
+            .validate_call(
+                "NotifyReport",
+                &json!({
+                    "requestId": 1,
+                    "generatedAt": "2022-01-01T10:00:00Z",
+                    "seqNo": 3,
+                    "tbc": true,
+                    "reportData": [{
+                        "component": { "name": "EVSE" },
+                        "variable": { "name": "AvailabilityState" },
+                        "variableAttribute": [{
+                            "type": "Actual",
+                            "value": "Available",
+                            "mutability": "ReadOnly",
+                            "persistent": true,
+                            "constant": false
+                        }],
+                        "variableCharacteristics": {
+                            "dataType": "OptionList",
+                            "valuesList": "Available,Occupied,Faulted",
+                            "supportsMonitoring": true
+                        }
+                    }],
+                    "customData": { "vendorId": "ACME" }
+                })
+            )
+            .is_ok());
+        // Empty response validates.
+        assert!(v.validate_call_result("NotifyReport", &json!({})).is_ok());
+    }
+
+    #[test]
+    fn v201_notify_report_call_missing_required_fields_fail() {
+        let v = SchemaValidator::v201();
+        // Missing seqNo.
+        assert!(v
+            .validate_call(
+                "NotifyReport",
+                &json!({ "requestId": 1, "generatedAt": "2022-01-01T10:00:00Z" })
+            )
+            .is_err());
+        // Missing generatedAt.
+        assert!(v
+            .validate_call("NotifyReport", &json!({ "requestId": 1, "seqNo": 0 }))
+            .is_err());
+        // Missing requestId.
+        assert!(v
+            .validate_call(
+                "NotifyReport",
+                &json!({ "generatedAt": "2022-01-01T10:00:00Z", "seqNo": 0 })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_notify_report_rejects_missing_nested_required_fields() {
+        let v = SchemaValidator::v201();
+        // ReportDataType requires variableAttribute.
+        assert!(v
+            .validate_call(
+                "NotifyReport",
+                &json!({
+                    "requestId": 1,
+                    "generatedAt": "2022-01-01T10:00:00Z",
+                    "seqNo": 0,
+                    "reportData": [{
+                        "component": { "name": "EVSE" },
+                        "variable": { "name": "AvailabilityState" }
+                    }]
+                })
+            )
+            .is_err());
+        // VariableCharacteristicsType requires dataType + supportsMonitoring.
+        assert!(v
+            .validate_call(
+                "NotifyReport",
+                &json!({
+                    "requestId": 1,
+                    "generatedAt": "2022-01-01T10:00:00Z",
+                    "seqNo": 0,
+                    "reportData": [{
+                        "component": { "name": "EVSE" },
+                        "variable": { "name": "AvailabilityState" },
+                        "variableAttribute": [{}],
+                        "variableCharacteristics": { "dataType": "boolean" }
+                    }]
+                })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_notify_report_rejects_wrong_types_and_unknown_enums() {
+        let v = SchemaValidator::v201();
+        // seqNo must be an integer.
+        assert!(v
+            .validate_call(
+                "NotifyReport",
+                &json!({ "requestId": 1, "generatedAt": "2022-01-01T10:00:00Z", "seqNo": "0" })
+            )
+            .is_err());
+        // Unknown dataType value.
+        assert!(v
+            .validate_call(
+                "NotifyReport",
+                &json!({
+                    "requestId": 1,
+                    "generatedAt": "2022-01-01T10:00:00Z",
+                    "seqNo": 0,
+                    "reportData": [{
+                        "component": { "name": "EVSE" },
+                        "variable": { "name": "AvailabilityState" },
+                        "variableAttribute": [{}],
+                        "variableCharacteristics": { "dataType": "float", "supportsMonitoring": true }
+                    }]
+                })
+            )
+            .is_err());
+        // Unknown mutability value.
+        assert!(v
+            .validate_call(
+                "NotifyReport",
+                &json!({
+                    "requestId": 1,
+                    "generatedAt": "2022-01-01T10:00:00Z",
+                    "seqNo": 0,
+                    "reportData": [{
+                        "component": { "name": "EVSE" },
+                        "variable": { "name": "AvailabilityState" },
+                        "variableAttribute": [{ "mutability": "AppendOnly" }]
+                    }]
+                })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_notify_report_rejects_empty_and_oversized_arrays() {
+        let v = SchemaValidator::v201();
+        // reportData requires minItems: 1 when present.
+        assert!(v
+            .validate_call(
+                "NotifyReport",
+                &json!({
+                    "requestId": 1,
+                    "generatedAt": "2022-01-01T10:00:00Z",
+                    "seqNo": 0,
+                    "reportData": []
+                })
+            )
+            .is_err());
+        // variableAttribute caps at maxItems: 4.
+        assert!(v
+            .validate_call(
+                "NotifyReport",
+                &json!({
+                    "requestId": 1,
+                    "generatedAt": "2022-01-01T10:00:00Z",
+                    "seqNo": 0,
+                    "reportData": [{
+                        "component": { "name": "EVSE" },
+                        "variable": { "name": "AvailabilityState" },
+                        "variableAttribute": [{}, {}, {}, {}, {}]
+                    }]
+                })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_notify_report_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call(
+                "NotifyReport",
+                &json!({
+                    "requestId": 1,
+                    "generatedAt": "2022-01-01T10:00:00Z",
+                    "seqNo": 0,
+                    "bogus": true
+                })
+            )
+            .is_err());
+        // additionalProperties on the nested ReportDataType.
+        assert!(v
+            .validate_call(
+                "NotifyReport",
+                &json!({
+                    "requestId": 1,
+                    "generatedAt": "2022-01-01T10:00:00Z",
+                    "seqNo": 0,
+                    "reportData": [{
+                        "component": { "name": "EVSE" },
+                        "variable": { "name": "AvailabilityState" },
+                        "variableAttribute": [{}],
+                        "bogus": true
+                    }]
+                })
+            )
+            .is_err());
+        assert!(v
+            .validate_call_result("NotifyReport", &json!({ "bogus": true }))
             .is_err());
     }
 

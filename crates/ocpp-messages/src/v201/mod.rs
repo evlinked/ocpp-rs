@@ -54,6 +54,7 @@ mod meter_values;
 mod notify_charging_limit;
 mod notify_display_messages;
 mod notify_monitoring_report;
+mod notify_report;
 mod publish_firmware;
 mod publish_firmware_status_notification;
 mod report_charging_profiles;
@@ -117,6 +118,7 @@ pub use meter_values::{MeterValuesRequest, MeterValuesResponse};
 pub use notify_charging_limit::{NotifyChargingLimitRequest, NotifyChargingLimitResponse};
 pub use notify_display_messages::{NotifyDisplayMessagesRequest, NotifyDisplayMessagesResponse};
 pub use notify_monitoring_report::{NotifyMonitoringReportRequest, NotifyMonitoringReportResponse};
+pub use notify_report::{NotifyReportRequest, NotifyReportResponse};
 pub use publish_firmware::{PublishFirmwareRequest, PublishFirmwareResponse};
 pub use publish_firmware_status_notification::{
     PublishFirmwareStatusNotificationRequest, PublishFirmwareStatusNotificationResponse,

@@ -120,6 +120,41 @@ pub enum AttributeEnumType {
     MaxSet,
 }
 
+/// Mutability of a variable attribute, reported by a `NotifyReport`'s
+/// [`VariableAttributeType`](crate::v201::VariableAttributeType).
+///
+/// Ports `MutabilityEnumType` (`ocpp/v201/enums.py`). When omitted on the wire
+/// the 2.0.1 default is `ReadWrite`. Wire values are PascalCase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MutabilityEnumType {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+/// Data type of a variable, reported by a `NotifyReport`'s
+/// [`VariableCharacteristicsType`](crate::v201::VariableCharacteristicsType).
+///
+/// Ports `DataEnumType` (`ocpp/v201/enums.py`). The scalar members carry
+/// lower-case wire spellings (`string` / `decimal` / `integer` / `dateTime` /
+/// `boolean`); the list members are PascalCase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DataEnumType {
+    #[serde(rename = "string")]
+    String,
+    #[serde(rename = "decimal")]
+    Decimal,
+    #[serde(rename = "integer")]
+    Integer,
+    #[serde(rename = "dateTime")]
+    DateTime,
+    #[serde(rename = "boolean")]
+    Boolean,
+    OptionList,
+    SequenceList,
+    MemberList,
+}
+
 /// Result of reading a single component-variable attribute.
 ///
 /// Ports `GetVariableStatusEnumType` (`ocpp/v201/enums.py`).
