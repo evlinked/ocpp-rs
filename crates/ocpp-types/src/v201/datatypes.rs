@@ -913,6 +913,61 @@ pub struct MonitoringDataType {
     pub custom_data: Option<CustomDataType>,
 }
 
+/// A single device-model event notification for one component-variable, one
+/// entry in a `NotifyEvent` request's `event_data` list.
+///
+/// Ports `EventDataType`. `event_id`, `timestamp`, `trigger`, `actual_value`,
+/// `event_notification_type`, `component`, and `variable` are required; the
+/// remaining fields elaborate on the event (its cause, technical detail,
+/// whether it clears a prior alert, the linked transaction, and the monitor
+/// that produced it). Reuses the shared [`ComponentType`] / [`VariableType`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EventDataType {
+    /// Identifies the event; may be referred to as a cause by other events.
+    #[serde(rename = "eventId")]
+    pub event_id: i32,
+    /// Timestamp (RFC 3339 / ISO 8601) of the moment the event occurred.
+    pub timestamp: String,
+    /// The kind of monitor that triggered this event.
+    pub trigger: EventTriggerEnumType,
+    /// Actual (`Actual` attribute) value of the variable (max length 2500).
+    #[serde(rename = "actualValue")]
+    pub actual_value: String,
+    /// The type of monitor that produced this event.
+    #[serde(rename = "eventNotificationType")]
+    pub event_notification_type: EventNotificationEnumType,
+    /// Component the event's variable belongs to.
+    pub component: ComponentType,
+    /// The variable the event is about.
+    pub variable: VariableType,
+    /// Id of an event considered to be the cause of this one, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<i32>,
+    /// Technical (error) code as reported by the component (max length 50).
+    #[serde(rename = "techCode", skip_serializing_if = "Option::is_none")]
+    pub tech_code: Option<String>,
+    /// Technical detail information as reported by the component (max length
+    /// 500).
+    #[serde(rename = "techInfo", skip_serializing_if = "Option::is_none")]
+    pub tech_info: Option<String>,
+    /// `true` reports the clearing of a monitored situation (a return to
+    /// normal); absent means the default `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleared: Option<bool>,
+    /// The transaction this event is linked to, if any (max length 36).
+    #[serde(rename = "transactionId", skip_serializing_if = "Option::is_none")]
+    pub transaction_id: Option<String>,
+    /// Id of the `VariableMonitoring` that triggered the event, if any.
+    #[serde(
+        rename = "variableMonitoringId",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub variable_monitoring_id: Option<i32>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 /// The result of clearing one monitor requested by a `ClearVariableMonitoring`,
 /// one entry in the response's `clear_monitoring_result` list.
 ///
