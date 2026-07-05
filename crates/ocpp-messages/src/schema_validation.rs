@@ -748,6 +748,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/ReportChargingProfilesResponse.json"),
     ),
     (
+        "NotifyChargingLimit",
+        include_str!("../schemas/v201/NotifyChargingLimit.json"),
+    ),
+    (
+        "NotifyChargingLimitResponse",
+        include_str!("../schemas/v201/NotifyChargingLimitResponse.json"),
+    ),
+    (
         "NotifyEvent",
         include_str!("../schemas/v201/NotifyEvent.json"),
     ),
@@ -2165,6 +2173,129 @@ mod tests {
             .is_err());
         assert!(v
             .validate_call_result("ClearedChargingLimit", &json!({ "bogus": true }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_notify_charging_limit_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        // Minimal request: just the required chargingLimit with its source.
+        assert!(v
+            .validate_call(
+                "NotifyChargingLimit",
+                &json!({ "chargingLimit": { "chargingLimitSource": "EMS" } })
+            )
+            .is_ok());
+        // Full request: chargingLimit + evseId + one chargingSchedule + extension.
+        assert!(v
+            .validate_call(
+                "NotifyChargingLimit",
+                &json!({
+                    "chargingLimit": {
+                        "chargingLimitSource": "SO",
+                        "isGridCritical": true
+                    },
+                    "evseId": 2,
+                    "chargingSchedule": [{
+                        "id": 1,
+                        "chargingRateUnit": "A",
+                        "chargingSchedulePeriod": [{ "startPeriod": 0, "limit": 16.0 }]
+                    }],
+                    "customData": { "vendorId": "ACME" }
+                })
+            )
+            .is_ok());
+        // The response is an empty object.
+        assert!(v
+            .validate_call_result("NotifyChargingLimit", &json!({}))
+            .is_ok());
+    }
+
+    #[test]
+    fn v201_notify_charging_limit_missing_required_fails() {
+        let v = SchemaValidator::v201();
+        // Missing the required chargingLimit.
+        assert!(v
+            .validate_call("NotifyChargingLimit", &json!({ "evseId": 1 }))
+            .is_err());
+        // chargingLimit present but missing its required chargingLimitSource.
+        assert!(v
+            .validate_call(
+                "NotifyChargingLimit",
+                &json!({ "chargingLimit": { "isGridCritical": true } })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_notify_charging_limit_rejects_wrong_type_and_unknown_enum() {
+        let v = SchemaValidator::v201();
+        // evseId must be an integer.
+        assert!(v
+            .validate_call(
+                "NotifyChargingLimit",
+                &json!({
+                    "chargingLimit": { "chargingLimitSource": "EMS" },
+                    "evseId": "1"
+                })
+            )
+            .is_err());
+        // Unknown chargingLimitSource value.
+        assert!(v
+            .validate_call(
+                "NotifyChargingLimit",
+                &json!({ "chargingLimit": { "chargingLimitSource": "DSO" } })
+            )
+            .is_err());
+        // isGridCritical must be a boolean.
+        assert!(v
+            .validate_call(
+                "NotifyChargingLimit",
+                &json!({
+                    "chargingLimit": {
+                        "chargingLimitSource": "EMS",
+                        "isGridCritical": "yes"
+                    }
+                })
+            )
+            .is_err());
+        // chargingSchedule, when present, requires at least one entry.
+        assert!(v
+            .validate_call(
+                "NotifyChargingLimit",
+                &json!({
+                    "chargingLimit": { "chargingLimitSource": "EMS" },
+                    "chargingSchedule": []
+                })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_notify_charging_limit_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        // Unknown property on the request.
+        assert!(v
+            .validate_call(
+                "NotifyChargingLimit",
+                &json!({
+                    "chargingLimit": { "chargingLimitSource": "EMS" },
+                    "bogus": true
+                })
+            )
+            .is_err());
+        // Unknown property inside the nested ChargingLimitType.
+        assert!(v
+            .validate_call(
+                "NotifyChargingLimit",
+                &json!({
+                    "chargingLimit": { "chargingLimitSource": "EMS", "bogus": true }
+                })
+            )
+            .is_err());
+        // Unknown property on the response.
+        assert!(v
+            .validate_call_result("NotifyChargingLimit", &json!({ "bogus": true }))
             .is_err());
     }
 
