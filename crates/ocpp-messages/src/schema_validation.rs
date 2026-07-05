@@ -739,6 +739,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "GetChargingProfilesResponse",
         include_str!("../schemas/v201/GetChargingProfilesResponse.json"),
     ),
+    (
+        "ReportChargingProfiles",
+        include_str!("../schemas/v201/ReportChargingProfiles.json"),
+    ),
+    (
+        "ReportChargingProfilesResponse",
+        include_str!("../schemas/v201/ReportChargingProfilesResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J

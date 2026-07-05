@@ -55,6 +55,7 @@ mod notify_display_messages;
 mod notify_monitoring_report;
 mod publish_firmware;
 mod publish_firmware_status_notification;
+mod report_charging_profiles;
 mod request_start_transaction;
 mod request_stop_transaction;
 mod reservation_status_update;
@@ -118,6 +119,7 @@ pub use publish_firmware::{PublishFirmwareRequest, PublishFirmwareResponse};
 pub use publish_firmware_status_notification::{
     PublishFirmwareStatusNotificationRequest, PublishFirmwareStatusNotificationResponse,
 };
+pub use report_charging_profiles::{ReportChargingProfilesRequest, ReportChargingProfilesResponse};
 pub use request_start_transaction::{
     RequestStartTransactionRequest, RequestStartTransactionResponse,
 };
@@ -10547,6 +10549,253 @@ mod tests {
             assert_eq!(
                 NotifyDisplayMessagesResponse::ACTION_NAME,
                 "NotifyDisplayMessagesResponse"
+            );
+        }
+    }
+
+    mod report_charging_profiles {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            ChargingLimitSourceEnumType, ChargingProfileKindEnumType,
+            ChargingProfilePurposeEnumType, ChargingProfileType, ChargingRateUnitEnumType,
+            ChargingSchedulePeriodType, ChargingScheduleType, CustomDataType,
+        };
+
+        /// The smallest valid profile: the five required fields, one schedule
+        /// with one period.
+        fn minimal_profile() -> ChargingProfileType {
+            ChargingProfileType {
+                id: 1,
+                stack_level: 0,
+                charging_profile_purpose: ChargingProfilePurposeEnumType::TxDefaultProfile,
+                charging_profile_kind: ChargingProfileKindEnumType::Absolute,
+                charging_schedule: vec![ChargingScheduleType {
+                    id: 1,
+                    charging_rate_unit: ChargingRateUnitEnumType::A,
+                    charging_schedule_period: vec![ChargingSchedulePeriodType {
+                        start_period: 0,
+                        limit: 16.0,
+                        number_phases: None,
+                        phase_to_use: None,
+                        custom_data: None,
+                    }],
+                    start_schedule: None,
+                    duration: None,
+                    min_charging_rate: None,
+                    sales_tariff: None,
+                    custom_data: None,
+                }],
+                recurrency_kind: None,
+                valid_from: None,
+                valid_to: None,
+                transaction_id: None,
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn request_round_trips_and_validates() {
+            // A full request carrying the reused `ChargingProfileType` tree.
+            let req = ReportChargingProfilesRequest {
+                request_id: 42,
+                charging_limit_source: ChargingLimitSourceEnumType::Cso,
+                charging_profile: vec![minimal_profile()],
+                evse_id: 1,
+                tbc: Some(true),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["requestId"], json!(42));
+            assert_eq!(wire["chargingLimitSource"], json!("CSO"));
+            assert_eq!(wire["evseId"], json!(1));
+            assert_eq!(wire["tbc"], json!(true));
+            assert_eq!(
+                wire["chargingProfile"][0]["chargingProfilePurpose"],
+                json!("TxDefaultProfile")
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call("ReportChargingProfiles", &wire)
+                .is_ok());
+            let back: ReportChargingProfilesRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_minimal_evse_zero_validates() {
+            // `evseId: 0` == an overall station-wide limit; `tbc` omitted.
+            let req = ReportChargingProfilesRequest {
+                request_id: 1,
+                charging_limit_source: ChargingLimitSourceEnumType::Ems,
+                charging_profile: vec![minimal_profile()],
+                evse_id: 0,
+                tbc: None,
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert!(!wire.as_object().unwrap().contains_key("tbc"));
+            assert!(SchemaValidator::v201()
+                .validate_call("ReportChargingProfiles", &wire)
+                .is_ok());
+        }
+
+        #[test]
+        fn charging_limit_source_full_value_set_round_trips() {
+            let v = SchemaValidator::v201();
+            for src in ["EMS", "Other", "SO", "CSO"] {
+                let payload = json!({
+                    "requestId": 1,
+                    "chargingLimitSource": src,
+                    "evseId": 0,
+                    "chargingProfile": [serde_json::to_value(minimal_profile()).unwrap()]
+                });
+                assert!(
+                    v.validate_call("ReportChargingProfiles", &payload).is_ok(),
+                    "source {src} should validate"
+                );
+            }
+        }
+
+        #[test]
+        fn request_rejects_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            let profile = serde_json::to_value(minimal_profile()).unwrap();
+            // Missing `requestId`.
+            assert!(v
+                .validate_call(
+                    "ReportChargingProfiles",
+                    &json!({ "chargingLimitSource": "CSO", "evseId": 0, "chargingProfile": [profile.clone()] })
+                )
+                .is_err());
+            // Missing `chargingLimitSource`.
+            assert!(v
+                .validate_call(
+                    "ReportChargingProfiles",
+                    &json!({ "requestId": 1, "evseId": 0, "chargingProfile": [profile.clone()] })
+                )
+                .is_err());
+            // Missing `evseId`.
+            assert!(v
+                .validate_call(
+                    "ReportChargingProfiles",
+                    &json!({ "requestId": 1, "chargingLimitSource": "CSO", "chargingProfile": [profile.clone()] })
+                )
+                .is_err());
+            // Missing `chargingProfile`.
+            assert!(v
+                .validate_call(
+                    "ReportChargingProfiles",
+                    &json!({ "requestId": 1, "chargingLimitSource": "CSO", "evseId": 0 })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_empty_charging_profile_array() {
+            // Schema requires `minItems: 1`.
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "ReportChargingProfiles",
+                    &json!({
+                        "requestId": 1,
+                        "chargingLimitSource": "CSO",
+                        "evseId": 0,
+                        "chargingProfile": []
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_wrong_types_and_unknown_enum() {
+            let v = SchemaValidator::v201();
+            let profile = serde_json::to_value(minimal_profile()).unwrap();
+            // `requestId` must be an integer.
+            assert!(v
+                .validate_call(
+                    "ReportChargingProfiles",
+                    &json!({ "requestId": "1", "chargingLimitSource": "CSO", "evseId": 0, "chargingProfile": [profile.clone()] })
+                )
+                .is_err());
+            // Unknown `chargingLimitSource`.
+            assert!(v
+                .validate_call(
+                    "ReportChargingProfiles",
+                    &json!({ "requestId": 1, "chargingLimitSource": "Nope", "evseId": 0, "chargingProfile": [profile] })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let profile = serde_json::to_value(minimal_profile()).unwrap();
+            // On the request.
+            assert!(v
+                .validate_call(
+                    "ReportChargingProfiles",
+                    &json!({ "requestId": 1, "chargingLimitSource": "CSO", "evseId": 0, "chargingProfile": [profile], "unexpected": true })
+                )
+                .is_err());
+            // On a nested `ChargingProfileType`.
+            let mut bad_profile = serde_json::to_value(minimal_profile()).unwrap();
+            bad_profile["unexpected"] = json!(true);
+            assert!(v
+                .validate_call(
+                    "ReportChargingProfiles",
+                    &json!({ "requestId": 1, "chargingLimitSource": "CSO", "evseId": 0, "chargingProfile": [bad_profile] })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_empty_matches_wire_json_and_validates() {
+            let resp = ReportChargingProfilesResponse::default();
+            let expected = json!({});
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let back: ReportChargingProfilesResponse =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, resp);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ReportChargingProfiles", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn response_with_custom_data_round_trips_and_validates() {
+            let resp = ReportChargingProfilesResponse {
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("ReportChargingProfiles", &wire)
+                .is_ok());
+            let back: ReportChargingProfilesResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("ReportChargingProfiles", &json!({ "unexpected": true }))
+                .is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                ReportChargingProfilesRequest::ACTION_NAME,
+                "ReportChargingProfiles"
+            );
+            assert_eq!(
+                ReportChargingProfilesResponse::ACTION_NAME,
+                "ReportChargingProfilesResponse"
             );
         }
     }
