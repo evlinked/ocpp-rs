@@ -55,6 +55,7 @@ mod meter_values;
 mod notify_charging_limit;
 mod notify_customer_information;
 mod notify_display_messages;
+mod notify_ev_charging_schedule;
 mod notify_event;
 mod notify_monitoring_report;
 mod notify_report;
@@ -124,6 +125,9 @@ pub use notify_customer_information::{
     NotifyCustomerInformationRequest, NotifyCustomerInformationResponse,
 };
 pub use notify_display_messages::{NotifyDisplayMessagesRequest, NotifyDisplayMessagesResponse};
+pub use notify_ev_charging_schedule::{
+    NotifyEVChargingScheduleRequest, NotifyEVChargingScheduleResponse,
+};
 pub use notify_event::{NotifyEventRequest, NotifyEventResponse};
 pub use notify_monitoring_report::{NotifyMonitoringReportRequest, NotifyMonitoringReportResponse};
 pub use notify_report::{NotifyReportRequest, NotifyReportResponse};
@@ -10749,6 +10753,251 @@ mod tests {
             assert_eq!(
                 NotifyCustomerInformationResponse::ACTION_NAME,
                 "NotifyCustomerInformationResponse"
+            );
+        }
+    }
+
+    /// `NotifyEVChargingSchedule` — the station reports the EV's charging
+    /// schedule to the CSMS. A reuse-only carrier: `ChargingScheduleType` +
+    /// `GenericStatusEnumType` + `StatusInfoType`, no new datatypes or enums.
+    mod notify_ev_charging_schedule {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            ChargingRateUnitEnumType, ChargingSchedulePeriodType, ChargingScheduleType,
+            CustomDataType, GenericStatusEnumType,
+        };
+
+        fn sample_schedule() -> ChargingScheduleType {
+            ChargingScheduleType {
+                id: 1,
+                charging_rate_unit: ChargingRateUnitEnumType::A,
+                charging_schedule_period: vec![ChargingSchedulePeriodType {
+                    start_period: 0,
+                    limit: 16.0,
+                    number_phases: Some(3),
+                    phase_to_use: None,
+                    custom_data: None,
+                }],
+                start_schedule: None,
+                duration: Some(3600),
+                min_charging_rate: None,
+                sales_tariff: None,
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn request_matches_wire_json_and_validates() {
+            let req = NotifyEVChargingScheduleRequest {
+                time_base: "2022-01-01T10:00:00Z".to_string(),
+                charging_schedule: sample_schedule(),
+                evse_id: 1,
+                custom_data: None,
+            };
+            let expected = json!({
+                "timeBase": "2022-01-01T10:00:00Z",
+                "chargingSchedule": {
+                    "id": 1,
+                    "chargingRateUnit": "A",
+                    "chargingSchedulePeriod": [
+                        { "startPeriod": 0, "limit": 16.0, "numberPhases": 3 }
+                    ],
+                    "duration": 3600
+                },
+                "evseId": 1
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(expected["evseId"].is_i64());
+            let back: NotifyEVChargingScheduleRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("NotifyEVChargingSchedule", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_rejects_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            let good_schedule = json!({
+                "id": 1,
+                "chargingRateUnit": "A",
+                "chargingSchedulePeriod": [{ "startPeriod": 0, "limit": 16.0 }]
+            });
+            // Missing `timeBase`.
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingSchedule",
+                    &json!({ "chargingSchedule": good_schedule, "evseId": 1 })
+                )
+                .is_err());
+            // Missing `chargingSchedule`.
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingSchedule",
+                    &json!({ "timeBase": "2022-01-01T10:00:00Z", "evseId": 1 })
+                )
+                .is_err());
+            // Missing `evseId`.
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingSchedule",
+                    &json!({
+                        "timeBase": "2022-01-01T10:00:00Z",
+                        "chargingSchedule": good_schedule
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_wrong_types_and_additional_properties() {
+            let v = SchemaValidator::v201();
+            let good_schedule = json!({
+                "id": 1,
+                "chargingRateUnit": "A",
+                "chargingSchedulePeriod": [{ "startPeriod": 0, "limit": 16.0 }]
+            });
+            // `evseId` must be an integer.
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingSchedule",
+                    &json!({
+                        "timeBase": "2022-01-01T10:00:00Z",
+                        "chargingSchedule": good_schedule,
+                        "evseId": "1"
+                    })
+                )
+                .is_err());
+            // `additionalProperties` on the request.
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingSchedule",
+                    &json!({
+                        "timeBase": "2022-01-01T10:00:00Z",
+                        "chargingSchedule": good_schedule,
+                        "evseId": 1,
+                        "unexpected": true
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_bad_nested_charging_schedule() {
+            let v = SchemaValidator::v201();
+            // The nested `ChargingScheduleType` requires a non-empty
+            // `chargingSchedulePeriod` (schema `minItems: 1`).
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingSchedule",
+                    &json!({
+                        "timeBase": "2022-01-01T10:00:00Z",
+                        "chargingSchedule": {
+                            "id": 1,
+                            "chargingRateUnit": "A",
+                            "chargingSchedulePeriod": []
+                        },
+                        "evseId": 1
+                    })
+                )
+                .is_err());
+            // `additionalProperties` inside the nested `ChargingScheduleType`.
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingSchedule",
+                    &json!({
+                        "timeBase": "2022-01-01T10:00:00Z",
+                        "chargingSchedule": {
+                            "id": 1,
+                            "chargingRateUnit": "A",
+                            "chargingSchedulePeriod": [{ "startPeriod": 0, "limit": 16.0 }],
+                            "unexpected": true
+                        },
+                        "evseId": 1
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_matches_wire_json_and_validates() {
+            let resp = NotifyEVChargingScheduleResponse {
+                status: GenericStatusEnumType::Accepted,
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Accepted" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let back: NotifyEVChargingScheduleResponse =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, resp);
+            assert!(SchemaValidator::v201()
+                .validate_call_result("NotifyEVChargingSchedule", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn response_full_validates() {
+            let resp = NotifyEVChargingScheduleResponse {
+                status: GenericStatusEnumType::Rejected,
+                status_info: Some(ocpp_types::v201::StatusInfoType {
+                    reason_code: "InternalError".to_string(),
+                    additional_info: Some("busy".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Rejected"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("InternalError"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("NotifyEVChargingSchedule", &wire)
+                .is_ok());
+            let back: NotifyEVChargingScheduleResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_rejects_missing_status_unknown_status_and_additional_properties() {
+            let v = SchemaValidator::v201();
+            // Missing required `status`.
+            assert!(v
+                .validate_call_result("NotifyEVChargingSchedule", &json!({}))
+                .is_err());
+            // Unknown enum value.
+            assert!(v
+                .validate_call_result("NotifyEVChargingSchedule", &json!({ "status": "Maybe" }))
+                .is_err());
+            // `additionalProperties` on the response.
+            assert!(v
+                .validate_call_result(
+                    "NotifyEVChargingSchedule",
+                    &json!({ "status": "Accepted", "unexpected": true })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn schemas_are_registered() {
+            let v = SchemaValidator::v201();
+            assert!(v.has_schema("NotifyEVChargingSchedule"));
+            assert!(v.has_schema("NotifyEVChargingScheduleResponse"));
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                NotifyEVChargingScheduleRequest::ACTION_NAME,
+                "NotifyEVChargingSchedule"
+            );
+            assert_eq!(
+                NotifyEVChargingScheduleResponse::ACTION_NAME,
+                "NotifyEVChargingScheduleResponse"
             );
         }
     }
