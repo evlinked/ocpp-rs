@@ -763,6 +763,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "NotifyEventResponse",
         include_str!("../schemas/v201/NotifyEventResponse.json"),
     ),
+    (
+        "CustomerInformation",
+        include_str!("../schemas/v201/CustomerInformation.json"),
+    ),
+    (
+        "CustomerInformationResponse",
+        include_str!("../schemas/v201/CustomerInformationResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J
@@ -2770,6 +2778,151 @@ mod tests {
             .is_err());
         assert!(v
             .validate_call_result("GetReport", &json!({ "status": "Accepted", "bogus": true }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_customer_information_registered() {
+        let v = SchemaValidator::v201();
+        assert!(v.has_schema("CustomerInformation"));
+        assert!(v.has_schema("CustomerInformationResponse"));
+    }
+
+    #[test]
+    fn v201_customer_information_call_and_result_valid_pass() {
+        let v = SchemaValidator::v201();
+        // Minimal request — only the three required flags.
+        assert!(v
+            .validate_call(
+                "CustomerInformation",
+                &json!({ "requestId": 1, "report": true, "clear": false })
+            )
+            .is_ok());
+        // Each selector present.
+        assert!(v
+            .validate_call(
+                "CustomerInformation",
+                &json!({
+                    "requestId": 2,
+                    "report": false,
+                    "clear": true,
+                    "customerCertificate": {
+                        "hashAlgorithm": "SHA256",
+                        "issuerNameHash": "a1",
+                        "issuerKeyHash": "b2",
+                        "serialNumber": "c3"
+                    },
+                    "idToken": { "idToken": "RFID-1234", "type": "ISO14443" },
+                    "customerIdentifier": "customer-abc",
+                    "customData": { "vendorId": "ACME" }
+                })
+            )
+            .is_ok());
+        assert!(v
+            .validate_call_result("CustomerInformation", &json!({ "status": "Accepted" }))
+            .is_ok());
+        assert!(v
+            .validate_call_result(
+                "CustomerInformation",
+                &json!({
+                    "status": "Rejected",
+                    "statusInfo": { "reasonCode": "UnknownCustomer" }
+                })
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn v201_customer_information_call_missing_required_fields_fail() {
+        let v = SchemaValidator::v201();
+        // Missing requestId.
+        assert!(v
+            .validate_call(
+                "CustomerInformation",
+                &json!({ "report": true, "clear": false })
+            )
+            .is_err());
+        // Missing report.
+        assert!(v
+            .validate_call(
+                "CustomerInformation",
+                &json!({ "requestId": 1, "clear": false })
+            )
+            .is_err());
+        // Missing clear.
+        assert!(v
+            .validate_call(
+                "CustomerInformation",
+                &json!({ "requestId": 1, "report": true })
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn v201_customer_information_result_missing_status_fails() {
+        let v = SchemaValidator::v201();
+        assert!(v
+            .validate_call_result("CustomerInformation", &json!({}))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_customer_information_rejects_wrong_types_and_unknown_enums() {
+        let v = SchemaValidator::v201();
+        // requestId must be an integer.
+        assert!(v
+            .validate_call(
+                "CustomerInformation",
+                &json!({ "requestId": "1", "report": true, "clear": false })
+            )
+            .is_err());
+        // report must be a boolean.
+        assert!(v
+            .validate_call(
+                "CustomerInformation",
+                &json!({ "requestId": 1, "report": "yes", "clear": false })
+            )
+            .is_err());
+        // Unknown status value on the response.
+        assert!(v
+            .validate_call_result("CustomerInformation", &json!({ "status": "Maybe" }))
+            .is_err());
+    }
+
+    #[test]
+    fn v201_customer_information_rejects_additional_properties() {
+        let v = SchemaValidator::v201();
+        // Root request.
+        assert!(v
+            .validate_call(
+                "CustomerInformation",
+                &json!({ "requestId": 1, "report": true, "clear": false, "bogus": 1 })
+            )
+            .is_err());
+        // Nested selector (CertificateHashDataType is additionalProperties:false).
+        assert!(v
+            .validate_call(
+                "CustomerInformation",
+                &json!({
+                    "requestId": 1,
+                    "report": true,
+                    "clear": false,
+                    "customerCertificate": {
+                        "hashAlgorithm": "SHA256",
+                        "issuerNameHash": "a1",
+                        "issuerKeyHash": "b2",
+                        "serialNumber": "c3",
+                        "bogus": true
+                    }
+                })
+            )
+            .is_err());
+        // Response.
+        assert!(v
+            .validate_call_result(
+                "CustomerInformation",
+                &json!({ "status": "Accepted", "bogus": true })
+            )
             .is_err());
     }
 

@@ -32,6 +32,7 @@ mod clear_display_message;
 mod clear_variable_monitoring;
 mod cleared_charging_limit;
 mod cost_updated;
+mod customer_information;
 mod data_transfer;
 mod delete_certificate;
 mod firmware_status_notification;
@@ -92,6 +93,7 @@ pub use clear_variable_monitoring::{
 };
 pub use cleared_charging_limit::{ClearedChargingLimitRequest, ClearedChargingLimitResponse};
 pub use cost_updated::{CostUpdatedRequest, CostUpdatedResponse};
+pub use customer_information::{CustomerInformationRequest, CustomerInformationResponse};
 pub use data_transfer::{DataTransferRequest, DataTransferResponse};
 pub use delete_certificate::{DeleteCertificateRequest, DeleteCertificateResponse};
 pub use firmware_status_notification::{
