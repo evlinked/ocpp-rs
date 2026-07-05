@@ -755,6 +755,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "NotifyChargingLimitResponse",
         include_str!("../schemas/v201/NotifyChargingLimitResponse.json"),
     ),
+    (
+        "NotifyEvent",
+        include_str!("../schemas/v201/NotifyEvent.json"),
+    ),
+    (
+        "NotifyEventResponse",
+        include_str!("../schemas/v201/NotifyEventResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J

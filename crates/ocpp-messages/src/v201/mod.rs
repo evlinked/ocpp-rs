@@ -53,6 +53,7 @@ mod log_status_notification;
 mod meter_values;
 mod notify_charging_limit;
 mod notify_display_messages;
+mod notify_event;
 mod notify_monitoring_report;
 mod publish_firmware;
 mod publish_firmware_status_notification;
@@ -116,6 +117,7 @@ pub use log_status_notification::{LogStatusNotificationRequest, LogStatusNotific
 pub use meter_values::{MeterValuesRequest, MeterValuesResponse};
 pub use notify_charging_limit::{NotifyChargingLimitRequest, NotifyChargingLimitResponse};
 pub use notify_display_messages::{NotifyDisplayMessagesRequest, NotifyDisplayMessagesResponse};
+pub use notify_event::{NotifyEventRequest, NotifyEventResponse};
 pub use notify_monitoring_report::{NotifyMonitoringReportRequest, NotifyMonitoringReportResponse};
 pub use publish_firmware::{PublishFirmwareRequest, PublishFirmwareResponse};
 pub use publish_firmware_status_notification::{
@@ -10799,6 +10801,294 @@ mod tests {
                 ReportChargingProfilesResponse::ACTION_NAME,
                 "ReportChargingProfilesResponse"
             );
+        }
+    }
+
+    mod notify_event {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            ComponentType, EventDataType, EventNotificationEnumType, EventTriggerEnumType,
+            VariableType,
+        };
+
+        fn sample_event() -> EventDataType {
+            EventDataType {
+                event_id: 42,
+                timestamp: "2022-01-01T10:00:00Z".to_string(),
+                trigger: EventTriggerEnumType::Alerting,
+                actual_value: "85".to_string(),
+                event_notification_type: EventNotificationEnumType::HardWiredMonitor,
+                component: ComponentType {
+                    name: "EVSE".to_string(),
+                    instance: None,
+                    evse: None,
+                    custom_data: None,
+                },
+                variable: VariableType {
+                    name: "Temperature".to_string(),
+                    instance: None,
+                    custom_data: None,
+                },
+                cause: None,
+                tech_code: None,
+                tech_info: None,
+                cleared: None,
+                transaction_id: None,
+                variable_monitoring_id: None,
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            let req = NotifyEventRequest {
+                generated_at: "2022-01-01T10:00:00Z".to_string(),
+                seq_no: 0,
+                event_data: vec![sample_event()],
+                tbc: None,
+                custom_data: None,
+            };
+            let expected = json!({
+                "generatedAt": "2022-01-01T10:00:00Z",
+                "seqNo": 0,
+                "eventData": [{
+                    "eventId": 42,
+                    "timestamp": "2022-01-01T10:00:00Z",
+                    "trigger": "Alerting",
+                    "actualValue": "85",
+                    "eventNotificationType": "HardWiredMonitor",
+                    "component": { "name": "EVSE" },
+                    "variable": { "name": "Temperature" }
+                }]
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("tbc"));
+            assert!(!obj.contains_key("customData"));
+            let back: NotifyEventRequest = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("NotifyEvent", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_full_event_with_paging_round_trips_and_validates() {
+            let mut event = sample_event();
+            event.cause = Some(7);
+            event.tech_code = Some("E42".to_string());
+            event.tech_info = Some("over temperature".to_string());
+            event.cleared = Some(true);
+            event.transaction_id = Some("txn-1".to_string());
+            event.variable_monitoring_id = Some(3);
+            let req = NotifyEventRequest {
+                generated_at: "2022-01-01T10:05:00Z".to_string(),
+                seq_no: 2,
+                event_data: vec![event],
+                tbc: Some(true),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["tbc"], json!(true));
+            assert_eq!(wire["eventData"][0]["cause"], json!(7));
+            assert_eq!(wire["eventData"][0]["variableMonitoringId"], json!(3));
+            assert!(SchemaValidator::v201()
+                .validate_call("NotifyEvent", &wire)
+                .is_ok());
+            let back: NotifyEventRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn trigger_enum_round_trips_all_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (EventTriggerEnumType::Alerting, "Alerting"),
+                (EventTriggerEnumType::Delta, "Delta"),
+                (EventTriggerEnumType::Periodic, "Periodic"),
+            ] {
+                let mut event = sample_event();
+                event.trigger = variant;
+                let req = NotifyEventRequest {
+                    generated_at: "2022-01-01T10:00:00Z".to_string(),
+                    seq_no: 0,
+                    event_data: vec![event],
+                    tbc: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&req).unwrap();
+                assert_eq!(value["eventData"][0]["trigger"], json!(wire));
+                assert!(v.validate_call("NotifyEvent", &value).is_ok());
+                let back: NotifyEventRequest = serde_json::from_value(value).unwrap();
+                assert_eq!(back, req);
+            }
+        }
+
+        #[test]
+        fn notification_enum_round_trips_all_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (
+                    EventNotificationEnumType::HardWiredNotification,
+                    "HardWiredNotification",
+                ),
+                (
+                    EventNotificationEnumType::HardWiredMonitor,
+                    "HardWiredMonitor",
+                ),
+                (
+                    EventNotificationEnumType::PreconfiguredMonitor,
+                    "PreconfiguredMonitor",
+                ),
+                (EventNotificationEnumType::CustomMonitor, "CustomMonitor"),
+            ] {
+                let mut event = sample_event();
+                event.event_notification_type = variant;
+                let value = serde_json::to_value(NotifyEventRequest {
+                    generated_at: "2022-01-01T10:00:00Z".to_string(),
+                    seq_no: 0,
+                    event_data: vec![event],
+                    tbc: None,
+                    custom_data: None,
+                })
+                .unwrap();
+                assert_eq!(value["eventData"][0]["eventNotificationType"], json!(wire));
+                assert!(v.validate_call("NotifyEvent", &value).is_ok());
+            }
+        }
+
+        #[test]
+        fn request_rejects_missing_event_data() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "NotifyEvent",
+                    &json!({ "generatedAt": "2022-01-01T10:00:00Z", "seqNo": 0 })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_empty_event_data_array() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call(
+                    "NotifyEvent",
+                    &json!({
+                        "generatedAt": "2022-01-01T10:00:00Z",
+                        "seqNo": 0,
+                        "eventData": []
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_missing_required_field_in_event() {
+            let v = SchemaValidator::v201();
+            // `actualValue` is required inside EventDataType.
+            assert!(v
+                .validate_call(
+                    "NotifyEvent",
+                    &json!({
+                        "generatedAt": "2022-01-01T10:00:00Z",
+                        "seqNo": 0,
+                        "eventData": [{
+                            "eventId": 1,
+                            "timestamp": "2022-01-01T10:00:00Z",
+                            "trigger": "Alerting",
+                            "eventNotificationType": "HardWiredMonitor",
+                            "component": { "name": "EVSE" },
+                            "variable": { "name": "Temperature" }
+                        }]
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_wrong_scalar_type() {
+            let v = SchemaValidator::v201();
+            // `seqNo` must be an integer, not a string.
+            assert!(v
+                .validate_call(
+                    "NotifyEvent",
+                    &json!({
+                        "generatedAt": "2022-01-01T10:00:00Z",
+                        "seqNo": "0",
+                        "eventData": [sample_event_json()]
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_unknown_enum_value() {
+            let v = SchemaValidator::v201();
+            let mut ev = sample_event_json();
+            ev["trigger"] = json!("Hourly");
+            assert!(v
+                .validate_call(
+                    "NotifyEvent",
+                    &json!({
+                        "generatedAt": "2022-01-01T10:00:00Z",
+                        "seqNo": 0,
+                        "eventData": [ev]
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            // On the request itself.
+            assert!(v
+                .validate_call(
+                    "NotifyEvent",
+                    &json!({
+                        "generatedAt": "2022-01-01T10:00:00Z",
+                        "seqNo": 0,
+                        "eventData": [sample_event_json()],
+                        "extra": true
+                    })
+                )
+                .is_err());
+            // On the nested EventDataType.
+            let mut ev = sample_event_json();
+            ev["extra"] = json!(true);
+            assert!(v
+                .validate_call(
+                    "NotifyEvent",
+                    &json!({
+                        "generatedAt": "2022-01-01T10:00:00Z",
+                        "seqNo": 0,
+                        "eventData": [ev]
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_empty_validates_and_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v.validate_call_result("NotifyEvent", &json!({})).is_ok());
+            assert!(v
+                .validate_call_result("NotifyEvent", &json!({ "extra": true }))
+                .is_err());
+        }
+
+        fn sample_event_json() -> serde_json::Value {
+            json!({
+                "eventId": 42,
+                "timestamp": "2022-01-01T10:00:00Z",
+                "trigger": "Alerting",
+                "actualValue": "85",
+                "eventNotificationType": "HardWiredMonitor",
+                "component": { "name": "EVSE" },
+                "variable": { "name": "Temperature" }
+            })
         }
     }
 }
