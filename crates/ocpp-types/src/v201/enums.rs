@@ -993,6 +993,36 @@ pub enum MonitorEnumType {
     PeriodicClockAligned,
 }
 
+/// Which kind of monitor triggered a device-model event carried by a
+/// `NotifyEvent` request: a threshold `Alerting` monitor, a `Delta` monitor, or
+/// a `Periodic` monitor.
+///
+/// Ports `EventTriggerEnumType` (`ocpp/v201/enums.py`). Every wire value is
+/// PascalCase and identical between the reference dataclass enum and the
+/// bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventTriggerEnumType {
+    Alerting,
+    Delta,
+    Periodic,
+}
+
+/// The type of monitor that produced a device-model event carried by a
+/// `NotifyEvent` request: a `HardWired` notification or monitor built into the
+/// station, a `Preconfigured` monitor, or a `Custom` monitor set up by the
+/// CSMS.
+///
+/// Ports `EventNotificationEnumType` (`ocpp/v201/enums.py`). Every wire value is
+/// PascalCase and identical between the reference dataclass enum and the
+/// bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventNotificationEnumType {
+    HardWiredNotification,
+    HardWiredMonitor,
+    PreconfiguredMonitor,
+    CustomMonitor,
+}
+
 /// Which set of pre-configured variable monitors a `SetMonitoringBase` request
 /// activates on the Charging Station: `All` monitors, the `FactoryDefault` set,
 /// or only the `HardWiredOnly` monitors.

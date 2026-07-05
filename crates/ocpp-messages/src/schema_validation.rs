@@ -756,6 +756,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/NotifyChargingLimitResponse.json"),
     ),
     (
+        "NotifyEvent",
+        include_str!("../schemas/v201/NotifyEvent.json"),
+    ),
+    (
+        "NotifyEventResponse",
+        include_str!("../schemas/v201/NotifyEventResponse.json"),
+    ),
+    (
         "NotifyReport",
         include_str!("../schemas/v201/NotifyReport.json"),
     ),
