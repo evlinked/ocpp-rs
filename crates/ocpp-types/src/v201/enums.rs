@@ -1298,3 +1298,19 @@ pub enum LogStatusEnumType {
     Rejected,
     AcceptedCanceled,
 }
+
+/// Whether a Charging Station can honour a `GetChargingProfiles` query and will
+/// stream the matching profiles back.
+///
+/// Ports `GetChargingProfileStatusEnumType` (`ocpp/v201/enums.py`). Returned
+/// synchronously by `GetChargingProfiles.conf`: the station answers `Accepted`
+/// when it has one or more profiles matching the criterion (which it then
+/// streams asynchronously via `ReportChargingProfiles`, correlated by
+/// `requestId`), or `NoProfiles` when nothing matches. Both wire values are
+/// PascalCase and identical between the reference dataclass enum and the bundled
+/// OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GetChargingProfileStatusEnumType {
+    Accepted,
+    NoProfiles,
+}
