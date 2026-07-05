@@ -1379,3 +1379,21 @@ pub enum GetChargingProfileStatusEnumType {
     Accepted,
     NoProfiles,
 }
+
+/// Whether a Charging Station accepted a `CustomerInformation` request to report
+/// and/or clear stored customer data.
+///
+/// Ports `CustomerInformationStatusEnumType` (`ocpp/v201/enums.py`). Returned
+/// synchronously by `CustomerInformation.conf`: `Accepted` acknowledges the
+/// command (any requested report data then arrives asynchronously via
+/// `NotifyCustomerInformation`), `Rejected` refuses it, and `Invalid` signals
+/// that the request itself was malformed (e.g. no usable customer selector).
+/// All three wire values are PascalCase and identical between the reference
+/// dataclass enum and the bundled OCPP 2.0.1 FINAL JSON Schema, so no
+/// `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CustomerInformationStatusEnumType {
+    Accepted,
+    Rejected,
+    Invalid,
+}
