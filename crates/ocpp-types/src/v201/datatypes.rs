@@ -1092,3 +1092,42 @@ pub struct LogParametersType {
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
 }
+
+/// Criterion selecting which installed charging profiles a `GetChargingProfiles`
+/// request should have the station report.
+///
+/// Ports `ChargingProfileCriterionType`. This is a *filter*, distinct from the
+/// full [`ChargingProfileType`] carried by `SetChargingProfile`: every field is
+/// optional, and a profile is reported only if it matches all the criteria that
+/// are present. Omitting `charging_profile_id` / `charging_limit_source` means
+/// "do not filter on that dimension"; an empty `{}` criterion reports every
+/// installed profile. Both list fields are non-empty when present (schema
+/// `minItems` 1) and `charging_limit_source` is additionally bounded to at most
+/// four entries (schema `maxItems` 4) — enforced at the schema layer.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChargingProfileCriterionType {
+    /// Only report profiles with this purpose. Omitted means "any purpose".
+    #[serde(
+        rename = "chargingProfilePurpose",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub charging_profile_purpose: Option<ChargingProfilePurposeEnumType>,
+    /// Only report profiles at this stack level. Omitted means "any level".
+    #[serde(rename = "stackLevel", skip_serializing_if = "Option::is_none")]
+    pub stack_level: Option<i32>,
+    /// Only report profiles whose id is in this list. Non-empty when present
+    /// (schema `minItems` 1); omitted means "do not filter on id".
+    #[serde(rename = "chargingProfileId", skip_serializing_if = "Option::is_none")]
+    pub charging_profile_id: Option<Vec<i32>>,
+    /// Only report profiles that originated from one of these limit sources.
+    /// Non-empty and at most four entries when present (schema `minItems` 1,
+    /// `maxItems` 4); omitted means "do not filter on source".
+    #[serde(
+        rename = "chargingLimitSource",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub charging_limit_source: Option<Vec<ChargingLimitSourceEnumType>>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
