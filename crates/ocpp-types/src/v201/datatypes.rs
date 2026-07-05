@@ -932,6 +932,104 @@ pub struct MonitoringDataType {
     pub custom_data: Option<CustomDataType>,
 }
 
+/// A single component-variable's attributes and characteristics, one entry in a
+/// `NotifyReport`'s `report_data` list.
+///
+/// Ports `ReportDataType`. `component`, `variable`, and `variable_attribute`
+/// are required; the schema caps `variable_attribute` at 1–4 items.
+/// `variable_characteristics` carries the fixed read-only metadata of the
+/// variable when reported. Reuses [`ComponentType`] / [`VariableType`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReportDataType {
+    /// Component the reported variable belongs to.
+    pub component: ComponentType,
+    /// The reported variable.
+    pub variable: VariableType,
+    /// Attribute data for the variable. The schema requires 1–4 items.
+    #[serde(rename = "variableAttribute")]
+    pub variable_attribute: Vec<VariableAttributeType>,
+    /// Fixed read-only characteristics of the variable, when reported.
+    #[serde(
+        rename = "variableCharacteristics",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub variable_characteristics: Option<VariableCharacteristicsType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// The value and access metadata of one attribute of a variable, one entry in a
+/// [`ReportDataType`]'s `variable_attribute` list.
+///
+/// Ports `VariableAttributeType`. Every field is optional: `kind` (`type`)
+/// defaults to [`AttributeEnumType::Actual`], `mutability` to
+/// [`MutabilityEnumType::ReadWrite`], and `persistent` / `constant` to `false`
+/// when omitted. `value` may be omitted when `mutability` is
+/// [`MutabilityEnumType::WriteOnly`] (max length 2500).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariableAttributeType {
+    /// Which attribute this is; absent means [`AttributeEnumType::Actual`].
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<AttributeEnumType>,
+    /// Value of the attribute (max length 2500); may be omitted when
+    /// `mutability` is [`MutabilityEnumType::WriteOnly`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Mutability of the attribute; absent means
+    /// [`MutabilityEnumType::ReadWrite`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutability: Option<MutabilityEnumType>,
+    /// Whether the value persists across reboots/power-down. Absent means
+    /// `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistent: Option<bool>,
+    /// Whether the value is never changed by the Charging Station at runtime.
+    /// Absent means `false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constant: Option<bool>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// Fixed read-only parameters of a variable, carried by a [`ReportDataType`]'s
+/// `variable_characteristics`.
+///
+/// Ports `VariableCharacteristicsType`. `data_type` and `supports_monitoring`
+/// are required. `min_limit` / `max_limit` bound numeric values; for
+/// String/OptionList/SequenceList/MemberList variables `max_limit` instead caps
+/// the (CSV) string length. `values_list` is the comma-separated set of allowed
+/// values for the list data types (max length 1000); `unit` is the variable's
+/// unit (max length 16).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VariableCharacteristicsType {
+    /// Unit of the variable (max length 16); included whenever the value has a
+    /// unit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Data type of the variable.
+    #[serde(rename = "dataType")]
+    pub data_type: DataEnumType,
+    /// Minimum possible value of the variable.
+    #[serde(rename = "minLimit", skip_serializing_if = "Option::is_none")]
+    pub min_limit: Option<f64>,
+    /// Maximum possible value of the variable, or the max (CSV) string length
+    /// for the list/string data types.
+    #[serde(rename = "maxLimit", skip_serializing_if = "Option::is_none")]
+    pub max_limit: Option<f64>,
+    /// Comma-separated list of allowed values for the Option/Sequence/Member
+    /// list data types (max length 1000).
+    #[serde(rename = "valuesList", skip_serializing_if = "Option::is_none")]
+    pub values_list: Option<String>,
+    /// Whether this variable supports monitoring.
+    #[serde(rename = "supportsMonitoring")]
+    pub supports_monitoring: bool,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 /// A single device-model event notification for one component-variable, one
 /// entry in a `NotifyEvent` request's `event_data` list.
 ///

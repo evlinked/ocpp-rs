@@ -55,6 +55,7 @@ mod notify_charging_limit;
 mod notify_display_messages;
 mod notify_event;
 mod notify_monitoring_report;
+mod notify_report;
 mod publish_firmware;
 mod publish_firmware_status_notification;
 mod report_charging_profiles;
@@ -119,6 +120,7 @@ pub use notify_charging_limit::{NotifyChargingLimitRequest, NotifyChargingLimitR
 pub use notify_display_messages::{NotifyDisplayMessagesRequest, NotifyDisplayMessagesResponse};
 pub use notify_event::{NotifyEventRequest, NotifyEventResponse};
 pub use notify_monitoring_report::{NotifyMonitoringReportRequest, NotifyMonitoringReportResponse};
+pub use notify_report::{NotifyReportRequest, NotifyReportResponse};
 pub use publish_firmware::{PublishFirmwareRequest, PublishFirmwareResponse};
 pub use publish_firmware_status_notification::{
     PublishFirmwareStatusNotificationRequest, PublishFirmwareStatusNotificationResponse,
