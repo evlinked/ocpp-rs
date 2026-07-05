@@ -775,6 +775,25 @@ pub struct ChargingScheduleType {
     pub custom_data: Option<CustomDataType>,
 }
 
+/// An externally-imposed charging limit reported in `NotifyChargingLimit.req`:
+/// its source and whether it is critical for the grid.
+///
+/// Ports `ChargingLimitType`. Only `chargingLimitSource` is required;
+/// `isGridCritical` (whether honouring the limit is critical for grid
+/// stability) is optional. Reuses [`ChargingLimitSourceEnumType`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChargingLimitType {
+    /// Origin of the limit (an EMS, system operator, or the CSO).
+    #[serde(rename = "chargingLimitSource")]
+    pub charging_limit_source: ChargingLimitSourceEnumType,
+    /// Whether honouring this limit is critical for grid stability.
+    #[serde(rename = "isGridCritical", skip_serializing_if = "Option::is_none")]
+    pub is_grid_critical: Option<bool>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 /// The net charging schedule a station will enforce over a requested window,
 /// returned by `GetCompositeSchedule` after stacking all applicable charging
 /// profiles.
