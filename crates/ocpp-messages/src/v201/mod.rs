@@ -36,6 +36,7 @@ mod customer_information;
 mod data_transfer;
 mod delete_certificate;
 mod firmware_status_notification;
+mod get_15118_ev_certificate;
 mod get_base_report;
 mod get_certificate_status;
 mod get_charging_profiles;
@@ -103,6 +104,7 @@ pub use delete_certificate::{DeleteCertificateRequest, DeleteCertificateResponse
 pub use firmware_status_notification::{
     FirmwareStatusNotificationRequest, FirmwareStatusNotificationResponse,
 };
+pub use get_15118_ev_certificate::{Get15118EVCertificateRequest, Get15118EVCertificateResponse};
 pub use get_base_report::{GetBaseReportRequest, GetBaseReportResponse};
 pub use get_certificate_status::{GetCertificateStatusRequest, GetCertificateStatusResponse};
 pub use get_charging_profiles::{GetChargingProfilesRequest, GetChargingProfilesResponse};
@@ -5066,6 +5068,272 @@ mod tests {
             let bad_resp = json!({ "status": "Accepted", "bogusExtra": true });
             assert!(v
                 .validate_call_result("PublishFirmware", &bad_resp)
+                .is_err());
+        }
+    }
+
+    /// `Get15118EVCertificate` — the 2.0.1 ISO 15118 Plug-and-Charge
+    /// certificate relay (#249). The Charging Station → CSMS leg: the station
+    /// forwards the EV's opaque base64-EXI `CertificateInstallationReq`
+    /// (`exiRequest`, schema `maxLength` 5600) with an `action`
+    /// (`CertificateActionEnumType`: `Install` / `Update`) and the 15118 schema
+    /// version; the CSMS replies with an `Iso15118EVCertificateStatusEnumType`
+    /// (`Accepted` / `Failed`), a required `exiResponse` (schema `maxLength`
+    /// 7500), and an optional `StatusInfoType`. Reuses `StatusInfoType`; no new
+    /// datatypes.
+    mod get_15118_ev_certificate {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            CertificateActionEnumType, CustomDataType, Iso15118EVCertificateStatusEnumType,
+            StatusInfoType,
+        };
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // All three fields required; `customData` stays off the wire.
+            let req = Get15118EVCertificateRequest {
+                iso15118_schema_version: "urn:iso:15118:2:2013:MsgDef".to_string(),
+                action: CertificateActionEnumType::Install,
+                exi_request: "gA4AABQAgBFPZWTXAgAA".to_string(),
+                custom_data: None,
+            };
+            let expected = json!({
+                "iso15118SchemaVersion": "urn:iso:15118:2:2013:MsgDef",
+                "action": "Install",
+                "exiRequest": "gA4AABQAgBFPZWTXAgAA"
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(!expected.as_object().unwrap().contains_key("customData"));
+            let back: Get15118EVCertificateRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("Get15118EVCertificate", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_custom_data_round_trips_and_validates() {
+            let req = Get15118EVCertificateRequest {
+                iso15118_schema_version: "urn:iso:15118:2:2013:MsgDef".to_string(),
+                action: CertificateActionEnumType::Update,
+                exi_request: "gA4AABQAgBFPZWTXAgAA".to_string(),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["action"], json!("Update"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("Get15118EVCertificate", &wire)
+                .is_ok());
+            let back: Get15118EVCertificateRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_action_round_trips_both_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (CertificateActionEnumType::Install, "Install"),
+                (CertificateActionEnumType::Update, "Update"),
+            ] {
+                let req = Get15118EVCertificateRequest {
+                    iso15118_schema_version: "v".to_string(),
+                    action: variant,
+                    exi_request: "AA".to_string(),
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&req).unwrap();
+                assert_eq!(value["action"], json!(wire));
+                assert!(v.validate_call("Get15118EVCertificate", &value).is_ok());
+                let back: Get15118EVCertificateRequest = serde_json::from_value(value).unwrap();
+                assert_eq!(back, req);
+            }
+        }
+
+        #[test]
+        fn response_minimal_matches_wire_json_and_validates() {
+            // `status` and `exiResponse` are both required; on `Failed` an empty
+            // `exiResponse` is used.
+            let resp = Get15118EVCertificateResponse {
+                status: Iso15118EVCertificateStatusEnumType::Failed,
+                exi_response: String::new(),
+                status_info: None,
+                custom_data: None,
+            };
+            let expected = json!({ "status": "Failed", "exiResponse": "" });
+            assert_eq!(serde_json::to_value(&resp).unwrap(), expected);
+            let obj = expected.as_object().unwrap();
+            assert!(!obj.contains_key("statusInfo"));
+            assert!(!obj.contains_key("customData"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("Get15118EVCertificate", &expected)
+                .is_ok());
+            let back: Get15118EVCertificateResponse = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_status_round_trips_both_wire_spellings() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (Iso15118EVCertificateStatusEnumType::Accepted, "Accepted"),
+                (Iso15118EVCertificateStatusEnumType::Failed, "Failed"),
+            ] {
+                let resp = Get15118EVCertificateResponse {
+                    status: variant,
+                    exi_response: "gA4AABQAgBFPZWTXAgAA".to_string(),
+                    status_info: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&resp).unwrap();
+                assert_eq!(value["status"], json!(wire));
+                assert!(v
+                    .validate_call_result("Get15118EVCertificate", &value)
+                    .is_ok());
+                let back: Get15118EVCertificateResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn response_with_status_info_and_custom_data_round_trips() {
+            let resp = Get15118EVCertificateResponse {
+                status: Iso15118EVCertificateStatusEnumType::Accepted,
+                exi_response: "gA4AABQAgBFPZWTXAgAA".to_string(),
+                status_info: Some(StatusInfoType {
+                    reason_code: "Processed".to_string(),
+                    additional_info: Some("relayed to V2G root".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Accepted"));
+            assert_eq!(wire["exiResponse"], json!("gA4AABQAgBFPZWTXAgAA"));
+            assert_eq!(wire["statusInfo"]["reasonCode"], json!("Processed"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("Get15118EVCertificate", &wire)
+                .is_ok());
+            let back: Get15118EVCertificateResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn action_and_status_reject_unknown_values() {
+            // `CertificateActionEnumType` is `Install` / `Update` only.
+            assert!(serde_json::from_value::<CertificateActionEnumType>(json!("Renew")).is_err());
+            assert!(SchemaValidator::v201()
+                .validate_call(
+                    "Get15118EVCertificate",
+                    &json!({
+                        "iso15118SchemaVersion": "v",
+                        "action": "Renew",
+                        "exiRequest": "AA"
+                    })
+                )
+                .is_err());
+            // `Iso15118EVCertificateStatusEnumType` is `Accepted` / `Failed` only;
+            // `Rejected` (valid elsewhere) must be rejected by serde and schema.
+            assert!(
+                serde_json::from_value::<Iso15118EVCertificateStatusEnumType>(json!("Rejected"))
+                    .is_err()
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call_result(
+                    "Get15118EVCertificate",
+                    &json!({ "status": "Rejected", "exiResponse": "AA" })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                Get15118EVCertificateRequest::ACTION_NAME,
+                "Get15118EVCertificate"
+            );
+            assert_eq!(
+                Get15118EVCertificateResponse::ACTION_NAME,
+                "Get15118EVCertificateResponse"
+            );
+        }
+
+        #[test]
+        fn schema_and_serde_reject_request_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            // Missing `action`.
+            let bad = json!({ "iso15118SchemaVersion": "v", "exiRequest": "AA" });
+            assert!(v.validate_call("Get15118EVCertificate", &bad).is_err());
+            assert!(serde_json::from_value::<Get15118EVCertificateRequest>(bad).is_err());
+            // Missing `exiRequest`.
+            let bad = json!({ "iso15118SchemaVersion": "v", "action": "Install" });
+            assert!(v.validate_call("Get15118EVCertificate", &bad).is_err());
+            assert!(serde_json::from_value::<Get15118EVCertificateRequest>(bad).is_err());
+            // Missing `iso15118SchemaVersion`.
+            let bad = json!({ "action": "Install", "exiRequest": "AA" });
+            assert!(v.validate_call("Get15118EVCertificate", &bad).is_err());
+            assert!(serde_json::from_value::<Get15118EVCertificateRequest>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_and_serde_reject_response_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            // Missing `exiResponse`.
+            let bad = json!({ "status": "Accepted" });
+            assert!(v
+                .validate_call_result("Get15118EVCertificate", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<Get15118EVCertificateResponse>(bad).is_err());
+            // Missing `status`.
+            let bad = json!({ "exiResponse": "AA" });
+            assert!(v
+                .validate_call_result("Get15118EVCertificate", &bad)
+                .is_err());
+            assert!(serde_json::from_value::<Get15118EVCertificateResponse>(bad).is_err());
+        }
+
+        #[test]
+        fn schema_rejects_exi_over_max_length() {
+            let v = SchemaValidator::v201();
+            // `exiRequest` caps at 5600; 5601 must be rejected.
+            let too_long = "A".repeat(5601);
+            let bad = json!({
+                "iso15118SchemaVersion": "v",
+                "action": "Install",
+                "exiRequest": too_long
+            });
+            assert!(v.validate_call("Get15118EVCertificate", &bad).is_err());
+            // `exiResponse` caps at 7500; 7501 must be rejected.
+            let too_long = "A".repeat(7501);
+            let bad = json!({ "status": "Accepted", "exiResponse": too_long });
+            assert!(v
+                .validate_call_result("Get15118EVCertificate", &bad)
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            let bad_req = json!({
+                "iso15118SchemaVersion": "v",
+                "action": "Install",
+                "exiRequest": "AA",
+                "bogusExtra": true
+            });
+            assert!(v.validate_call("Get15118EVCertificate", &bad_req).is_err());
+
+            let bad_resp = json!({ "status": "Accepted", "exiResponse": "AA", "bogusExtra": true });
+            assert!(v
+                .validate_call_result("Get15118EVCertificate", &bad_resp)
                 .is_err());
         }
     }

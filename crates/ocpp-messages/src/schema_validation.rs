@@ -796,6 +796,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/NotifyEVChargingScheduleResponse.json"),
     ),
     (
+        "Get15118EVCertificate",
+        include_str!("../schemas/v201/Get15118EVCertificate.json"),
+    ),
+    (
+        "Get15118EVCertificateResponse",
+        include_str!("../schemas/v201/Get15118EVCertificateResponse.json"),
+    ),
+    (
         "NotifyEVChargingNeeds",
         include_str!("../schemas/v201/NotifyEVChargingNeeds.json"),
     ),
