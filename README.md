@@ -16,7 +16,7 @@ Target protocols: **OCPP 1.6J** first, then **OCPP 2.0.1** modules incrementally
 | Version | Status |
 | --- | --- |
 | OCPP **1.6J** | Implemented — framing, CSMS, transactions, CP simulator, commands, hardening (M1–M6) |
-| OCPP **2.0.1** | 🚧 In progress — message types & draft-06 schema validation landing incrementally (M7) |
+| OCPP **2.0.1** | 🚧 In progress (M7) — message-type coverage complete: 63 / 64 CALL messages ported & draft-06 schema-validated (1 in review); routing & simulator wiring next |
 
 ---
 
@@ -46,17 +46,29 @@ Target protocols: **OCPP 1.6J** first, then **OCPP 2.0.1** modules incrementally
 - [x] **M4**: CP simulator (scenarios, jitter, reconnect storm)
 - [x] **M5**: Commands & control (RemoteStartTransaction, Reset)
 - [x] **M6**: Hardening (drain, rate limits, security)
-- [ ] **M7**: OCPP 2.0.1 (initial) — 🚧 **in progress**
-  - [x] BootNotification
-  - [x] Heartbeat
-  - [x] StatusNotification
-  - [x] Authorize (incl. ISO 15118 certificate path)
-  - [x] GetVariables / SetVariables (device model)
-  - [x] TransactionEvent (transaction model)
-  - [ ] Reset _(in review)_
-  - [ ] TransactionEvent `meterValue` _(in review)_
-  - [ ] RequestStartTransaction / RequestStopTransaction
-  - [ ] ChargingProfileType
+- [ ] **M7**: OCPP 2.0.1 — 🚧 **in progress** (message-type coverage complete; routing & simulator wiring next)
+
+  **Message coverage — 63 / 64 CALL messages ported, 1 in review.** All message
+  types, payload datatypes, and enums are ported from the
+  [mobilityhouse/ocpp](https://github.com/mobilityhouse/ocpp) 2.0.1 reference, each
+  round-tripped in serde and validated against its bundled FINAL JSON Schema:
+
+  - [x] **Provisioning & core** — BootNotification, Heartbeat, StatusNotification, SetNetworkProfile, GetBaseReport, GetReport, NotifyReport, Reset, TriggerMessage, DataTransfer
+  - [x] **Availability & connector** — ChangeAvailability, UnlockConnector
+  - [x] **Device model** (variables & monitoring) — GetVariables, SetVariables, SetVariableMonitoring, ClearVariableMonitoring, SetMonitoringBase, SetMonitoringLevel, GetMonitoringReport, NotifyMonitoringReport, NotifyEvent
+  - [x] **Authorization & local list** — Authorize (incl. ISO 15118 certificate path), ClearCache, GetLocalListVersion, SendLocalList
+  - [x] **Transactions & metering** — TransactionEvent (incl. `meterValue`), MeterValues, RequestStartTransaction, RequestStopTransaction, GetTransactionStatus, CostUpdated
+  - [ ] **Smart charging** — SetChargingProfile, GetChargingProfiles, ReportChargingProfiles, ClearChargingProfile, GetCompositeSchedule, NotifyChargingLimit, ClearedChargingLimit, NotifyEVChargingSchedule ✅ · **NotifyEVChargingNeeds** _(in review — [#254](https://github.com/EVLinked/ocpp-rs/pull/254))_
+  - [x] **Reservation** — ReserveNow, CancelReservation, ReservationStatusUpdate
+  - [x] **Display messages** — SetDisplayMessage, GetDisplayMessages, ClearDisplayMessage, NotifyDisplayMessages
+  - [x] **Firmware** — UpdateFirmware, FirmwareStatusNotification, PublishFirmware, PublishFirmwareStatusNotification, UnpublishFirmware
+  - [x] **Certificates & security** (ISO 15118 / PKI) — CertificateSigned, SignCertificate, InstallCertificate, DeleteCertificate, GetInstalledCertificateIds, GetCertificateStatus, Get15118EVCertificate, SecurityEventNotification
+  - [x] **Diagnostics & logging** — GetLog, LogStatusNotification
+  - [x] **Customer information** — CustomerInformation, NotifyCustomerInformation
+
+  **Remaining before M7 completes:**
+  - [ ] NotifyEVChargingNeeds — the last CALL message, in review ([#254](https://github.com/EVLinked/ocpp-rs/pull/254))
+  - [ ] Wire 2.0.1 end-to-end through routing and the CP simulator (next-track direction tracked in [#256](https://github.com/EVLinked/ocpp-rs/issues/256))
 - [ ] **M8**: Conformance & docs
 
 ¹ The `main` CI badge currently shows red only because of the GitHub Pages
