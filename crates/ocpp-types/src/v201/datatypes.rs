@@ -1304,6 +1304,104 @@ pub struct ChargingProfileCriterionType {
     pub custom_data: Option<CustomDataType>,
 }
 
+/// AC charging parameters an EV expresses over ISO 15118, carried inside a
+/// [`ChargingNeedsType`].
+///
+/// Ports `ACChargingParametersType`. All four fields are required by the OCPP
+/// 2.0.1 FINAL JSON Schema. Currents are per-phase amps and voltage is in volts;
+/// `energyAmount` is in Wh and includes energy required for preconditioning.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ACChargingParametersType {
+    /// Amount of energy requested (in Wh), including preconditioning energy.
+    #[serde(rename = "energyAmount")]
+    pub energy_amount: i32,
+    /// Minimum current (amps) supported by the EV, per phase.
+    #[serde(rename = "evMinCurrent")]
+    pub ev_min_current: i32,
+    /// Maximum current (amps) supported by the EV, per phase; includes cable
+    /// capacity.
+    #[serde(rename = "evMaxCurrent")]
+    pub ev_max_current: i32,
+    /// Maximum voltage supported by the EV.
+    #[serde(rename = "evMaxVoltage")]
+    pub ev_max_voltage: i32,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// DC charging parameters an EV expresses over ISO 15118, carried inside a
+/// [`ChargingNeedsType`].
+///
+/// Ports `DCChargingParametersType`. Only `evMaxCurrent` and `evMaxVoltage` are
+/// required by the OCPP 2.0.1 FINAL JSON Schema; the remaining fields are
+/// optional. The SoC percentages (`stateOfCharge`, `fullSoC`, `bulkSoC`) are
+/// constrained to 0–100 by the bundled schema, not the Rust type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DCChargingParametersType {
+    /// Maximum current (amps) supported by the EV; includes cable capacity.
+    #[serde(rename = "evMaxCurrent")]
+    pub ev_max_current: i32,
+    /// Maximum voltage supported by the EV.
+    #[serde(rename = "evMaxVoltage")]
+    pub ev_max_voltage: i32,
+    /// Amount of energy requested (in Wh), including preconditioning energy.
+    #[serde(rename = "energyAmount", skip_serializing_if = "Option::is_none")]
+    pub energy_amount: Option<i32>,
+    /// Maximum power (in W) supported by the EV. Required in practice for DC
+    /// charging, but optional in the schema.
+    #[serde(rename = "evMaxPower", skip_serializing_if = "Option::is_none")]
+    pub ev_max_power: Option<i32>,
+    /// Energy available in the battery (percent of capacity, 0–100).
+    #[serde(rename = "stateOfCharge", skip_serializing_if = "Option::is_none")]
+    pub state_of_charge: Option<i32>,
+    /// Capacity of the EV battery (in Wh).
+    #[serde(rename = "evEnergyCapacity", skip_serializing_if = "Option::is_none")]
+    pub ev_energy_capacity: Option<i32>,
+    /// Percentage of SoC at which the EV considers the battery fully charged
+    /// (0–100).
+    #[serde(rename = "fullSoC", skip_serializing_if = "Option::is_none")]
+    pub full_soc: Option<i32>,
+    /// Percentage of SoC at which the EV considers fast charging to end (0–100).
+    #[serde(rename = "bulkSoC", skip_serializing_if = "Option::is_none")]
+    pub bulk_soc: Option<i32>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// The charging needs an EV has communicated to the station over ISO 15118,
+/// reported in `NotifyEVChargingNeeds.req`.
+///
+/// Ports `ChargingNeedsType`. Only `requestedEnergyTransfer` is required; the
+/// AC and DC parameter blocks and the estimated `departureTime` are optional.
+/// A given request typically carries at most one of `acChargingParameters` /
+/// `dcChargingParameters`, matching `requestedEnergyTransfer`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChargingNeedsType {
+    /// Mode of energy transfer requested by the EV.
+    #[serde(rename = "requestedEnergyTransfer")]
+    pub requested_energy_transfer: EnergyTransferModeEnumType,
+    /// Estimated departure time of the EV (RFC 3339 date-time).
+    #[serde(rename = "departureTime", skip_serializing_if = "Option::is_none")]
+    pub departure_time: Option<String>,
+    /// AC charging parameters, when the EV is charging over AC.
+    #[serde(
+        rename = "acChargingParameters",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub ac_charging_parameters: Option<ACChargingParametersType>,
+    /// DC charging parameters, when the EV is charging over DC.
+    #[serde(
+        rename = "dcChargingParameters",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub dc_charging_parameters: Option<DCChargingParametersType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
 /// Configuration needed to make a data connection over a cellular network,
 /// carried by a [`NetworkConnectionProfileType`].
 ///

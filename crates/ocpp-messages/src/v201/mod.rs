@@ -56,6 +56,7 @@ mod meter_values;
 mod notify_charging_limit;
 mod notify_customer_information;
 mod notify_display_messages;
+mod notify_ev_charging_needs;
 mod notify_ev_charging_schedule;
 mod notify_event;
 mod notify_monitoring_report;
@@ -128,6 +129,7 @@ pub use notify_customer_information::{
     NotifyCustomerInformationRequest, NotifyCustomerInformationResponse,
 };
 pub use notify_display_messages::{NotifyDisplayMessagesRequest, NotifyDisplayMessagesResponse};
+pub use notify_ev_charging_needs::{NotifyEVChargingNeedsRequest, NotifyEVChargingNeedsResponse};
 pub use notify_ev_charging_schedule::{
     NotifyEVChargingScheduleRequest, NotifyEVChargingScheduleResponse,
 };
@@ -11804,6 +11806,289 @@ mod tests {
                 "component": { "name": "EVSE" },
                 "variable": { "name": "Temperature" }
             })
+        }
+    }
+
+    /// `NotifyEVChargingNeeds` — the station reports an EV's charging needs
+    /// (requested energy-transfer mode + AC/DC parameters) to the CSMS. Adds
+    /// `ChargingNeedsType` / `ACChargingParametersType` /
+    /// `DCChargingParametersType` and two enums; reuses `StatusInfoType`.
+    mod notify_ev_charging_needs {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            ACChargingParametersType, ChargingNeedsType, DCChargingParametersType,
+            EnergyTransferModeEnumType, NotifyEVChargingNeedsStatusEnumType, StatusInfoType,
+        };
+
+        #[test]
+        fn request_matches_wire_json_and_validates() {
+            let req = NotifyEVChargingNeedsRequest {
+                charging_needs: ChargingNeedsType {
+                    requested_energy_transfer: EnergyTransferModeEnumType::AcThreePhase,
+                    departure_time: Some("2022-01-01T12:00:00Z".to_string()),
+                    ac_charging_parameters: Some(ACChargingParametersType {
+                        energy_amount: 20000,
+                        ev_min_current: 6,
+                        ev_max_current: 32,
+                        ev_max_voltage: 230,
+                        custom_data: None,
+                    }),
+                    dc_charging_parameters: None,
+                    custom_data: None,
+                },
+                evse_id: 1,
+                max_schedule_tuples: Some(4),
+                custom_data: None,
+            };
+            let expected = json!({
+                "chargingNeeds": {
+                    "requestedEnergyTransfer": "AC_three_phase",
+                    "departureTime": "2022-01-01T12:00:00Z",
+                    "acChargingParameters": {
+                        "energyAmount": 20000,
+                        "evMinCurrent": 6,
+                        "evMaxCurrent": 32,
+                        "evMaxVoltage": 230
+                    }
+                },
+                "evseId": 1,
+                "maxScheduleTuples": 4
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            assert!(expected["evseId"].is_i64());
+            let back: NotifyEVChargingNeedsRequest =
+                serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(back, req);
+            assert!(SchemaValidator::v201()
+                .validate_call("NotifyEVChargingNeeds", &expected)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_with_dc_parameters_validates() {
+            let req = NotifyEVChargingNeedsRequest {
+                charging_needs: ChargingNeedsType {
+                    requested_energy_transfer: EnergyTransferModeEnumType::Dc,
+                    departure_time: None,
+                    ac_charging_parameters: None,
+                    dc_charging_parameters: Some(DCChargingParametersType {
+                        ev_max_current: 400,
+                        ev_max_voltage: 900,
+                        energy_amount: Some(60000),
+                        ev_max_power: Some(150000),
+                        state_of_charge: Some(20),
+                        ev_energy_capacity: Some(80000),
+                        full_soc: Some(100),
+                        bulk_soc: Some(80),
+                        custom_data: None,
+                    }),
+                    custom_data: None,
+                },
+                evse_id: 2,
+                max_schedule_tuples: None,
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(
+                wire["chargingNeeds"]["dcChargingParameters"]["fullSoC"],
+                json!(100)
+            );
+            assert!(SchemaValidator::v201()
+                .validate_call("NotifyEVChargingNeeds", &wire)
+                .is_ok());
+        }
+
+        #[test]
+        fn minimal_request_validates() {
+            // Only the required fields: `requestedEnergyTransfer` inside
+            // `chargingNeeds`, plus `evseId`.
+            let wire = json!({
+                "chargingNeeds": { "requestedEnergyTransfer": "DC" },
+                "evseId": 1
+            });
+            assert!(SchemaValidator::v201()
+                .validate_call("NotifyEVChargingNeeds", &wire)
+                .is_ok());
+        }
+
+        #[test]
+        fn request_rejects_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            // Missing top-level `chargingNeeds`.
+            assert!(v
+                .validate_call("NotifyEVChargingNeeds", &json!({ "evseId": 1 }))
+                .is_err());
+            // Missing top-level `evseId`.
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingNeeds",
+                    &json!({ "chargingNeeds": { "requestedEnergyTransfer": "DC" } })
+                )
+                .is_err());
+            // Missing required `requestedEnergyTransfer` inside `chargingNeeds`.
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingNeeds",
+                    &json!({ "chargingNeeds": {}, "evseId": 1 })
+                )
+                .is_err());
+            // Missing a required field inside `ACChargingParametersType`
+            // (`evMaxVoltage`).
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingNeeds",
+                    &json!({
+                        "chargingNeeds": {
+                            "requestedEnergyTransfer": "AC_three_phase",
+                            "acChargingParameters": {
+                                "energyAmount": 20000,
+                                "evMinCurrent": 6,
+                                "evMaxCurrent": 32
+                            }
+                        },
+                        "evseId": 1
+                    })
+                )
+                .is_err());
+            // Missing a required field inside `DCChargingParametersType`
+            // (`evMaxVoltage`).
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingNeeds",
+                    &json!({
+                        "chargingNeeds": {
+                            "requestedEnergyTransfer": "DC",
+                            "dcChargingParameters": { "evMaxCurrent": 400 }
+                        },
+                        "evseId": 1
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_unknown_enum_and_wrong_types() {
+            let v = SchemaValidator::v201();
+            // Unknown energy-transfer mode.
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingNeeds",
+                    &json!({
+                        "chargingNeeds": { "requestedEnergyTransfer": "AC_four_phase" },
+                        "evseId": 1
+                    })
+                )
+                .is_err());
+            // `evseId` must be an integer.
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingNeeds",
+                    &json!({
+                        "chargingNeeds": { "requestedEnergyTransfer": "DC" },
+                        "evseId": "1"
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn request_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            // On the request root.
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingNeeds",
+                    &json!({
+                        "chargingNeeds": { "requestedEnergyTransfer": "DC" },
+                        "evseId": 1,
+                        "extra": true
+                    })
+                )
+                .is_err());
+            // On the nested `ChargingNeedsType`.
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingNeeds",
+                    &json!({
+                        "chargingNeeds": { "requestedEnergyTransfer": "DC", "extra": true },
+                        "evseId": 1
+                    })
+                )
+                .is_err());
+            // On the nested `DCChargingParametersType`.
+            assert!(v
+                .validate_call(
+                    "NotifyEVChargingNeeds",
+                    &json!({
+                        "chargingNeeds": {
+                            "requestedEnergyTransfer": "DC",
+                            "dcChargingParameters": {
+                                "evMaxCurrent": 400,
+                                "evMaxVoltage": 900,
+                                "extra": true
+                            }
+                        },
+                        "evseId": 1
+                    })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn response_round_trips_and_validates() {
+            let resp = NotifyEVChargingNeedsResponse {
+                status: NotifyEVChargingNeedsStatusEnumType::Processing,
+                status_info: Some(StatusInfoType {
+                    reason_code: "Gathering".to_string(),
+                    additional_info: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&resp).unwrap();
+            assert_eq!(wire["status"], json!("Processing"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("NotifyEVChargingNeeds", &wire)
+                .is_ok());
+            let back: NotifyEVChargingNeedsResponse = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn response_rejects_missing_status_unknown_status_and_additional_properties() {
+            let v = SchemaValidator::v201();
+            assert!(v
+                .validate_call_result("NotifyEVChargingNeeds", &json!({}))
+                .is_err());
+            assert!(v
+                .validate_call_result("NotifyEVChargingNeeds", &json!({ "status": "Maybe" }))
+                .is_err());
+            assert!(v
+                .validate_call_result(
+                    "NotifyEVChargingNeeds",
+                    &json!({ "status": "Accepted", "extra": true })
+                )
+                .is_err());
+        }
+
+        #[test]
+        fn schemas_are_registered() {
+            let v = SchemaValidator::v201();
+            assert!(v.has_schema("NotifyEVChargingNeeds"));
+            assert!(v.has_schema("NotifyEVChargingNeedsResponse"));
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(
+                NotifyEVChargingNeedsRequest::ACTION_NAME,
+                "NotifyEVChargingNeeds"
+            );
+            assert_eq!(
+                NotifyEVChargingNeedsResponse::ACTION_NAME,
+                "NotifyEVChargingNeedsResponse"
+            );
         }
     }
 
