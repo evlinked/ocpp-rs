@@ -1329,6 +1329,39 @@ pub enum GetCertificateStatusEnumType {
     Failed,
 }
 
+/// Whether an ISO 15118 contract certificate needs to be freshly installed or
+/// an existing one updated.
+///
+/// Ports `CertificateActionEnumType` (`ocpp/v201/enums.py`). Carried by
+/// `Get15118EVCertificate.req` in its `action` field: the Charging Station
+/// relays the EV's raw EXI `CertificateInstallationReq` (`Install`) or
+/// certificate-update request (`Update`) up to the CSMS. Both wire values are
+/// PascalCase (`"Install"`, `"Update"`) and identical between the reference
+/// dataclass enum and the bundled OCPP 2.0.1 FINAL JSON Schema, so no
+/// `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CertificateActionEnumType {
+    Install,
+    Update,
+}
+
+/// Whether the CSMS could process a relayed ISO 15118 EV certificate request.
+///
+/// Ports `Iso15118EVCertificateStatusEnumType` (`ocpp/v201/enums.py`). Returned
+/// by `Get15118EVCertificate.conf`: `Accepted` means the CSMS produced the EXI
+/// `CertificateInstallationRes` (carried back in `exiResponse`), `Failed` means
+/// it could not. Both wire values are PascalCase (`"Accepted"`, `"Failed"`) and
+/// identical between the reference dataclass enum and the bundled OCPP 2.0.1
+/// FINAL JSON Schema, so no `#[serde(rename)]` is needed. Like
+/// [`GetCertificateStatusEnumType`] it pairs `Accepted` with `Failed` (not
+/// `Rejected`), but it reports the outcome of the plug-and-charge certificate
+/// exchange rather than an OCSP lookup, so it is kept as its own type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Iso15118EVCertificateStatusEnumType {
+    Accepted,
+    Failed,
+}
+
 /// The kind of log a Charging Station should collect and upload in response to
 /// a `GetLog.req`.
 ///
