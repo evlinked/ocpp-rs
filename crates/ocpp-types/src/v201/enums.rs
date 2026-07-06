@@ -1431,6 +1431,47 @@ pub enum CustomerInformationStatusEnumType {
     Invalid,
 }
 
+/// Mode of energy transfer an EV requests over ISO 15118, reported inside a
+/// [`ChargingNeedsType`](crate::v201::ChargingNeedsType).
+///
+/// Ports `EnergyTransferModeEnumType` (`ocpp/v201/enums.py`). The wire values
+/// carry underscores and an uppercase `DC`/`AC` prefix that are not idiomatic
+/// Rust identifiers, so every variant carries an explicit `#[serde(rename)]` to
+/// the verbatim OCPP 2.0.1 FINAL JSON Schema spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EnergyTransferModeEnumType {
+    /// DC charging.
+    #[serde(rename = "DC")]
+    Dc,
+    /// AC single phase charging.
+    #[serde(rename = "AC_single_phase")]
+    AcSinglePhase,
+    /// AC two phase charging.
+    #[serde(rename = "AC_two_phase")]
+    AcTwoPhase,
+    /// AC three phase charging.
+    #[serde(rename = "AC_three_phase")]
+    AcThreePhase,
+}
+
+/// Whether the CSMS could process a `NotifyEVChargingNeeds` message.
+///
+/// Ports `NotifyEVChargingNeedsStatusEnumType` (`ocpp/v201/enums.py`). Returned
+/// synchronously by `NotifyEVChargingNeeds.conf`: `Accepted` means an
+/// SASchedule will be provided momentarily, `Rejected` that the service is not
+/// available, and `Processing` that the CSMS is still gathering information to
+/// build the schedule. Per the spec the status reports only whether the message
+/// was processed — it does **not** imply the EV's charging needs can be met with
+/// the current charging profile. All three wire values are PascalCase and
+/// identical between the reference dataclass enum and the bundled OCPP 2.0.1
+/// FINAL JSON Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NotifyEVChargingNeedsStatusEnumType {
+    Accepted,
+    Rejected,
+    Processing,
+}
+
 /// OCPP version a Charging Station uses over a given network connection,
 /// carried by a `SetNetworkProfile`'s
 /// [`NetworkConnectionProfileType`](crate::v201::NetworkConnectionProfileType).

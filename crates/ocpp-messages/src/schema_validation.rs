@@ -804,6 +804,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         include_str!("../schemas/v201/Get15118EVCertificateResponse.json"),
     ),
     (
+        "NotifyEVChargingNeeds",
+        include_str!("../schemas/v201/NotifyEVChargingNeeds.json"),
+    ),
+    (
+        "NotifyEVChargingNeedsResponse",
+        include_str!("../schemas/v201/NotifyEVChargingNeedsResponse.json"),
+    ),
+    (
         "SetNetworkProfile",
         include_str!("../schemas/v201/SetNetworkProfile.json"),
     ),
