@@ -1430,3 +1430,106 @@ pub enum CustomerInformationStatusEnumType {
     Rejected,
     Invalid,
 }
+
+/// OCPP version a Charging Station uses over a given network connection,
+/// carried by a `SetNetworkProfile`'s
+/// [`NetworkConnectionProfileType`](crate::v201::NetworkConnectionProfileType).
+///
+/// Ports `OCPPVersionEnumType` (`ocpp/v201/enums.py`). Every wire value is an
+/// all-caps `OCPP<n>` token, so each variant is renamed from its idiomatic Rust
+/// spelling. Note the 2.0.1 schema tops out at `OCPP20` (there is no
+/// `OCPP201` value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OCPPVersionEnumType {
+    #[serde(rename = "OCPP12")]
+    Ocpp12,
+    #[serde(rename = "OCPP15")]
+    Ocpp15,
+    #[serde(rename = "OCPP16")]
+    Ocpp16,
+    #[serde(rename = "OCPP20")]
+    Ocpp20,
+}
+
+/// Transport protocol a Charging Station uses over a given network connection.
+///
+/// Ports `OCPPTransportEnumType` (`ocpp/v201/enums.py`). Both wire values are
+/// all-caps acronyms, so each variant is renamed from its idiomatic Rust
+/// spelling. `SOAP` is not used in OCPP 2.0 but the enum retains it for
+/// cross-version compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OCPPTransportEnumType {
+    #[serde(rename = "JSON")]
+    Json,
+    #[serde(rename = "SOAP")]
+    Soap,
+}
+
+/// Physical/logical network interface a Charging Station uses for a given
+/// network connection.
+///
+/// Ports `OCPPInterfaceEnumType` (`ocpp/v201/enums.py`). Every wire value is an
+/// idiomatic Rust identifier (`Wired0`…`Wired3`, `Wireless0`…`Wireless3`) and
+/// identical between the reference dataclass enum and the bundled OCPP 2.0.1
+/// FINAL JSON Schema, so no `#[serde(rename)]` is needed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OCPPInterfaceEnumType {
+    Wired0,
+    Wired1,
+    Wired2,
+    Wired3,
+    Wireless0,
+    Wireless1,
+    Wireless2,
+    Wireless3,
+}
+
+/// Authentication method used on a cellular data connection, carried by a
+/// `SetNetworkProfile`'s [`APNType`](crate::v201::APNType).
+///
+/// Ports `APNAuthenticationEnumType` (`ocpp/v201/enums.py`). All four wire
+/// values are all-caps, so each variant is renamed from its idiomatic Rust
+/// spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum APNAuthenticationEnumType {
+    #[serde(rename = "CHAP")]
+    Chap,
+    #[serde(rename = "NONE")]
+    None,
+    #[serde(rename = "PAP")]
+    Pap,
+    #[serde(rename = "AUTO")]
+    Auto,
+}
+
+/// VPN tunnelling protocol, carried by a `SetNetworkProfile`'s
+/// [`VPNType`](crate::v201::VPNType).
+///
+/// Ports `VPNEnumType` (`ocpp/v201/enums.py`). Every wire value carries
+/// non-idiomatic casing (`IKEv2`, `IPSec`, `L2TP`, `PPTP`), so each variant is
+/// renamed from its idiomatic Rust spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VPNEnumType {
+    #[serde(rename = "IKEv2")]
+    Ikev2,
+    #[serde(rename = "IPSec")]
+    Ipsec,
+    #[serde(rename = "L2TP")]
+    L2tp,
+    #[serde(rename = "PPTP")]
+    Pptp,
+}
+
+/// Result of a `SetNetworkProfile` request, reported by the Charging Station.
+///
+/// Ports `SetNetworkProfileStatusEnumType` (`ocpp/v201/enums.py`). All three
+/// wire values are PascalCase and identical between the reference dataclass
+/// enum and the bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]`
+/// is needed. `Failed` reports the station accepted the message but could not
+/// apply the profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SetNetworkProfileStatusEnumType {
+    Accepted,
+    Rejected,
+    Failed,
+}
