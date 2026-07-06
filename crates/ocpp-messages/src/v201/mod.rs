@@ -75,6 +75,7 @@ mod set_charging_profile;
 mod set_display_message;
 mod set_monitoring_base;
 mod set_monitoring_level;
+mod set_network_profile;
 mod set_variable_monitoring;
 mod set_variables;
 mod sign_certificate;
@@ -157,6 +158,7 @@ pub use set_charging_profile::{SetChargingProfileRequest, SetChargingProfileResp
 pub use set_display_message::{SetDisplayMessageRequest, SetDisplayMessageResponse};
 pub use set_monitoring_base::{SetMonitoringBaseRequest, SetMonitoringBaseResponse};
 pub use set_monitoring_level::{SetMonitoringLevelRequest, SetMonitoringLevelResponse};
+pub use set_network_profile::{SetNetworkProfileRequest, SetNetworkProfileResponse};
 pub use set_variable_monitoring::{SetVariableMonitoringRequest, SetVariableMonitoringResponse};
 pub use set_variables::{SetVariablesRequest, SetVariablesResponse};
 pub use sign_certificate::{SignCertificateRequest, SignCertificateResponse};
@@ -12086,6 +12088,395 @@ mod tests {
             assert_eq!(
                 NotifyEVChargingNeedsResponse::ACTION_NAME,
                 "NotifyEVChargingNeedsResponse"
+            );
+        }
+    }
+
+    /// `SetNetworkProfile` — the CSMS provisions a station's connectivity
+    /// (#240). CSMS → Charging Station: a numbered `configurationSlot` plus a
+    /// `NetworkConnectionProfileType` (OCPP version/transport, CSMS URL,
+    /// message timeout, security profile, network interface, and an optional
+    /// cellular `APNType` or `VPNType` bearer); the station acks with a
+    /// `SetNetworkProfileStatusEnumType` (`Accepted` / `Rejected` / `Failed`)
+    /// and an optional `StatusInfoType`. Three new datatypes + six new enums.
+    mod set_network_profile {
+        use super::*;
+        use crate::schema_validation::SchemaValidator;
+        use ocpp_types::v201::{
+            APNAuthenticationEnumType, APNType, CustomDataType, NetworkConnectionProfileType,
+            OCPPInterfaceEnumType, OCPPTransportEnumType, OCPPVersionEnumType,
+            SetNetworkProfileStatusEnumType, StatusInfoType, VPNEnumType, VPNType,
+        };
+
+        fn minimal_profile() -> NetworkConnectionProfileType {
+            NetworkConnectionProfileType {
+                ocpp_version: OCPPVersionEnumType::Ocpp20,
+                ocpp_transport: OCPPTransportEnumType::Json,
+                ocpp_csms_url: "wss://csms.example.com/ocpp".to_string(),
+                message_timeout: 30,
+                security_profile: 1,
+                ocpp_interface: OCPPInterfaceEnumType::Wireless0,
+                apn: None,
+                vpn: None,
+                custom_data: None,
+            }
+        }
+
+        fn full_profile() -> NetworkConnectionProfileType {
+            NetworkConnectionProfileType {
+                apn: Some(APNType {
+                    apn: "internet".to_string(),
+                    apn_user_name: Some("user".to_string()),
+                    apn_password: Some("pass".to_string()),
+                    sim_pin: Some(1234),
+                    preferred_network: Some("20404".to_string()),
+                    use_only_preferred_network: Some(true),
+                    apn_authentication: APNAuthenticationEnumType::Chap,
+                    custom_data: None,
+                }),
+                vpn: Some(VPNType {
+                    server: "vpn.example.com".to_string(),
+                    user: "vpnuser".to_string(),
+                    group: Some("grp".to_string()),
+                    password: "vpnpass".to_string(),
+                    key: "shared-secret".to_string(),
+                    vpn_type: VPNEnumType::Ikev2,
+                    custom_data: None,
+                }),
+                ..minimal_profile()
+            }
+        }
+
+        #[test]
+        fn request_minimal_matches_wire_json_and_validates() {
+            // `connectionData` carries only its six required fields; the two
+            // bearer blocks and `customData` stay off the wire.
+            let req = SetNetworkProfileRequest {
+                configuration_slot: 1,
+                connection_data: minimal_profile(),
+                custom_data: None,
+            };
+            let expected = json!({
+                "configurationSlot": 1,
+                "connectionData": {
+                    "ocppVersion": "OCPP20",
+                    "ocppTransport": "JSON",
+                    "ocppCsmsUrl": "wss://csms.example.com/ocpp",
+                    "messageTimeout": 30,
+                    "securityProfile": 1,
+                    "ocppInterface": "Wireless0"
+                }
+            });
+            assert_eq!(serde_json::to_value(&req).unwrap(), expected);
+            let conn = expected["connectionData"].as_object().unwrap();
+            assert!(!conn.contains_key("apn"));
+            assert!(!conn.contains_key("vpn"));
+            assert!(!expected.as_object().unwrap().contains_key("customData"));
+            assert!(SchemaValidator::v201()
+                .validate_call("SetNetworkProfile", &expected)
+                .is_ok());
+            let back: SetNetworkProfileRequest = serde_json::from_value(expected).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn request_with_full_connection_data_round_trips_and_validates() {
+            // Both `apn` and `vpn` present, plus a top-level `customData`.
+            let req = SetNetworkProfileRequest {
+                configuration_slot: 3,
+                connection_data: full_profile(),
+                custom_data: Some(CustomDataType {
+                    vendor_id: "com.example".to_string(),
+                    extra: Default::default(),
+                }),
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert_eq!(wire["connectionData"]["apn"]["apn"], json!("internet"));
+            assert_eq!(
+                wire["connectionData"]["apn"]["apnAuthentication"],
+                json!("CHAP")
+            );
+            assert_eq!(wire["connectionData"]["vpn"]["type"], json!("IKEv2"));
+            // `type` is renamed from the Rust `vpn_type` field.
+            assert!(wire["connectionData"]["vpn"]
+                .as_object()
+                .unwrap()
+                .contains_key("type"));
+            assert_eq!(wire["customData"]["vendorId"], json!("com.example"));
+            assert!(SchemaValidator::v201()
+                .validate_call("SetNetworkProfile", &wire)
+                .is_ok());
+            let back: SetNetworkProfileRequest = serde_json::from_value(wire).unwrap();
+            assert_eq!(back, req);
+        }
+
+        #[test]
+        fn integer_and_bool_fields_keep_their_json_types() {
+            let req = SetNetworkProfileRequest {
+                configuration_slot: 7,
+                connection_data: full_profile(),
+                custom_data: None,
+            };
+            let wire = serde_json::to_value(&req).unwrap();
+            assert!(wire["configurationSlot"].is_i64());
+            assert!(wire["connectionData"]["messageTimeout"].is_i64());
+            assert!(wire["connectionData"]["securityProfile"].is_i64());
+            assert!(wire["connectionData"]["apn"]["simPin"].is_i64());
+            assert_eq!(
+                wire["connectionData"]["apn"]["useOnlyPreferredNetwork"],
+                json!(true)
+            );
+            assert!(wire["connectionData"]["apn"]["useOnlyPreferredNetwork"].is_boolean());
+        }
+
+        #[test]
+        fn connection_enums_serialize_to_exact_wire_spellings_and_validate() {
+            let v = SchemaValidator::v201();
+            let base = |mutate: &dyn Fn(&mut NetworkConnectionProfileType)| {
+                let mut p = full_profile();
+                mutate(&mut p);
+                let req = SetNetworkProfileRequest {
+                    configuration_slot: 1,
+                    connection_data: p,
+                    custom_data: None,
+                };
+                serde_json::to_value(&req).unwrap()
+            };
+
+            for (variant, wire) in [
+                (OCPPVersionEnumType::Ocpp12, "OCPP12"),
+                (OCPPVersionEnumType::Ocpp15, "OCPP15"),
+                (OCPPVersionEnumType::Ocpp16, "OCPP16"),
+                (OCPPVersionEnumType::Ocpp20, "OCPP20"),
+            ] {
+                let val = base(&|p| p.ocpp_version = variant);
+                assert_eq!(val["connectionData"]["ocppVersion"], json!(wire));
+                assert!(v.validate_call("SetNetworkProfile", &val).is_ok());
+            }
+            for (variant, wire) in [
+                (OCPPTransportEnumType::Json, "JSON"),
+                (OCPPTransportEnumType::Soap, "SOAP"),
+            ] {
+                let val = base(&|p| p.ocpp_transport = variant);
+                assert_eq!(val["connectionData"]["ocppTransport"], json!(wire));
+                assert!(v.validate_call("SetNetworkProfile", &val).is_ok());
+            }
+            for (variant, wire) in [
+                (OCPPInterfaceEnumType::Wired0, "Wired0"),
+                (OCPPInterfaceEnumType::Wired3, "Wired3"),
+                (OCPPInterfaceEnumType::Wireless0, "Wireless0"),
+                (OCPPInterfaceEnumType::Wireless3, "Wireless3"),
+            ] {
+                let val = base(&|p| p.ocpp_interface = variant);
+                assert_eq!(val["connectionData"]["ocppInterface"], json!(wire));
+                assert!(v.validate_call("SetNetworkProfile", &val).is_ok());
+            }
+            for (variant, wire) in [
+                (APNAuthenticationEnumType::Chap, "CHAP"),
+                (APNAuthenticationEnumType::None, "NONE"),
+                (APNAuthenticationEnumType::Pap, "PAP"),
+                (APNAuthenticationEnumType::Auto, "AUTO"),
+            ] {
+                let val = base(&|p| p.apn.as_mut().unwrap().apn_authentication = variant);
+                assert_eq!(
+                    val["connectionData"]["apn"]["apnAuthentication"],
+                    json!(wire)
+                );
+                assert!(v.validate_call("SetNetworkProfile", &val).is_ok());
+            }
+            for (variant, wire) in [
+                (VPNEnumType::Ikev2, "IKEv2"),
+                (VPNEnumType::Ipsec, "IPSec"),
+                (VPNEnumType::L2tp, "L2TP"),
+                (VPNEnumType::Pptp, "PPTP"),
+            ] {
+                let val = base(&|p| p.vpn.as_mut().unwrap().vpn_type = variant);
+                assert_eq!(val["connectionData"]["vpn"]["type"], json!(wire));
+                assert!(v.validate_call("SetNetworkProfile", &val).is_ok());
+            }
+        }
+
+        #[test]
+        fn response_round_trips_and_validates() {
+            let v = SchemaValidator::v201();
+            for (variant, wire) in [
+                (SetNetworkProfileStatusEnumType::Accepted, "Accepted"),
+                (SetNetworkProfileStatusEnumType::Rejected, "Rejected"),
+                (SetNetworkProfileStatusEnumType::Failed, "Failed"),
+            ] {
+                let resp = SetNetworkProfileResponse {
+                    status: variant,
+                    status_info: None,
+                    custom_data: None,
+                };
+                let value = serde_json::to_value(&resp).unwrap();
+                assert_eq!(value, json!({ "status": wire }));
+                assert!(v.validate_call_result("SetNetworkProfile", &value).is_ok());
+                let back: SetNetworkProfileResponse = serde_json::from_value(value).unwrap();
+                assert_eq!(back, resp);
+            }
+        }
+
+        #[test]
+        fn response_with_status_info_round_trips_and_validates() {
+            let resp = SetNetworkProfileResponse {
+                status: SetNetworkProfileStatusEnumType::Failed,
+                status_info: Some(StatusInfoType {
+                    reason_code: "WriteError".to_string(),
+                    additional_info: Some("slot busy".to_string()),
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            let value = serde_json::to_value(&resp).unwrap();
+            assert_eq!(value["status"], json!("Failed"));
+            assert_eq!(value["statusInfo"]["reasonCode"], json!("WriteError"));
+            assert!(SchemaValidator::v201()
+                .validate_call_result("SetNetworkProfile", &value)
+                .is_ok());
+            let back: SetNetworkProfileResponse = serde_json::from_value(value).unwrap();
+            assert_eq!(back, resp);
+        }
+
+        #[test]
+        fn schema_rejects_missing_required_fields() {
+            let v = SchemaValidator::v201();
+            // Missing top-level `connectionData`.
+            assert!(v
+                .validate_call("SetNetworkProfile", &json!({ "configurationSlot": 1 }))
+                .is_err());
+            // Missing top-level `configurationSlot`.
+            let mut val = serde_json::to_value(&SetNetworkProfileRequest {
+                configuration_slot: 1,
+                connection_data: minimal_profile(),
+                custom_data: None,
+            })
+            .unwrap();
+            val.as_object_mut().unwrap().remove("configurationSlot");
+            assert!(v.validate_call("SetNetworkProfile", &val).is_err());
+            // Missing required `ocppVersion` inside `NetworkConnectionProfileType`.
+            let mut val = serde_json::to_value(&SetNetworkProfileRequest {
+                configuration_slot: 1,
+                connection_data: minimal_profile(),
+                custom_data: None,
+            })
+            .unwrap();
+            val["connectionData"]
+                .as_object_mut()
+                .unwrap()
+                .remove("ocppVersion");
+            assert!(v.validate_call("SetNetworkProfile", &val).is_err());
+            // Missing required `apn` inside `APNType`.
+            let mut val = serde_json::to_value(&SetNetworkProfileRequest {
+                configuration_slot: 1,
+                connection_data: full_profile(),
+                custom_data: None,
+            })
+            .unwrap();
+            val["connectionData"]["apn"]
+                .as_object_mut()
+                .unwrap()
+                .remove("apn");
+            assert!(v.validate_call("SetNetworkProfile", &val).is_err());
+            // Missing required `server` inside `VPNType`.
+            let mut val = serde_json::to_value(&SetNetworkProfileRequest {
+                configuration_slot: 1,
+                connection_data: full_profile(),
+                custom_data: None,
+            })
+            .unwrap();
+            val["connectionData"]["vpn"]
+                .as_object_mut()
+                .unwrap()
+                .remove("server");
+            assert!(v.validate_call("SetNetworkProfile", &val).is_err());
+            // Missing required `status` in the response.
+            assert!(v
+                .validate_call_result("SetNetworkProfile", &json!({}))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_wrong_types_and_unknown_enum() {
+            let v = SchemaValidator::v201();
+            // `configurationSlot` must be an integer, not a string.
+            let mut val = serde_json::to_value(&SetNetworkProfileRequest {
+                configuration_slot: 1,
+                connection_data: minimal_profile(),
+                custom_data: None,
+            })
+            .unwrap();
+            val["configurationSlot"] = json!("one");
+            assert!(v.validate_call("SetNetworkProfile", &val).is_err());
+            // Unknown `ocppVersion` enum value.
+            let mut val = serde_json::to_value(&SetNetworkProfileRequest {
+                configuration_slot: 1,
+                connection_data: minimal_profile(),
+                custom_data: None,
+            })
+            .unwrap();
+            val["connectionData"]["ocppVersion"] = json!("OCPP201");
+            assert!(v.validate_call("SetNetworkProfile", &val).is_err());
+            // Unknown response status.
+            assert!(v
+                .validate_call_result("SetNetworkProfile", &json!({ "status": "Maybe" }))
+                .is_err());
+        }
+
+        #[test]
+        fn schema_rejects_additional_properties() {
+            let v = SchemaValidator::v201();
+            // At the request root.
+            let mut val = serde_json::to_value(&SetNetworkProfileRequest {
+                configuration_slot: 1,
+                connection_data: minimal_profile(),
+                custom_data: None,
+            })
+            .unwrap();
+            val["bogus"] = json!(1);
+            assert!(v.validate_call("SetNetworkProfile", &val).is_err());
+            // Inside the nested `NetworkConnectionProfileType`.
+            let mut val = serde_json::to_value(&SetNetworkProfileRequest {
+                configuration_slot: 1,
+                connection_data: minimal_profile(),
+                custom_data: None,
+            })
+            .unwrap();
+            val["connectionData"]["bogus"] = json!(1);
+            assert!(v.validate_call("SetNetworkProfile", &val).is_err());
+            // Inside the nested `APNType`.
+            let mut val = serde_json::to_value(&SetNetworkProfileRequest {
+                configuration_slot: 1,
+                connection_data: full_profile(),
+                custom_data: None,
+            })
+            .unwrap();
+            val["connectionData"]["apn"]["bogus"] = json!(1);
+            assert!(v.validate_call("SetNetworkProfile", &val).is_err());
+        }
+
+        #[test]
+        fn serde_rejects_unknown_enum_values() {
+            // Unknown response status is rejected by serde independently of the
+            // schema.
+            let err =
+                serde_json::from_value::<SetNetworkProfileResponse>(json!({ "status": "Maybe" }))
+                    .unwrap_err();
+            assert!(err.to_string().contains("Maybe") || err.to_string().contains("variant"));
+            // Unknown VPN `type` inside a nested datatype.
+            let err = serde_json::from_value::<VPNType>(json!({
+                "server": "s", "user": "u", "password": "p", "key": "k", "type": "OpenVPN"
+            }))
+            .unwrap_err();
+            assert!(err.to_string().contains("OpenVPN") || err.to_string().contains("variant"));
+        }
+
+        #[test]
+        fn action_names_are_stable() {
+            assert_eq!(SetNetworkProfileRequest::ACTION_NAME, "SetNetworkProfile");
+            assert_eq!(
+                SetNetworkProfileResponse::ACTION_NAME,
+                "SetNetworkProfileResponse"
             );
         }
     }

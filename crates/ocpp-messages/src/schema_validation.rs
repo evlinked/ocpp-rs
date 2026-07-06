@@ -811,6 +811,14 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
         "NotifyEVChargingNeedsResponse",
         include_str!("../schemas/v201/NotifyEVChargingNeedsResponse.json"),
     ),
+    (
+        "SetNetworkProfile",
+        include_str!("../schemas/v201/SetNetworkProfile.json"),
+    ),
+    (
+        "SetNetworkProfileResponse",
+        include_str!("../schemas/v201/SetNetworkProfileResponse.json"),
+    ),
 ];
 
 /// Validates CALL and CALLRESULT payloads against the bundled OCPP 1.6J

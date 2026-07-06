@@ -1401,3 +1401,104 @@ pub struct ChargingNeedsType {
     #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
     pub custom_data: Option<CustomDataType>,
 }
+
+/// Configuration needed to make a data connection over a cellular network,
+/// carried by a [`NetworkConnectionProfileType`].
+///
+/// Ports `APNType`. `apn` (the Access Point Name URL, max length 512 per
+/// schema) and `apn_authentication` are required; everything else is optional.
+/// `use_only_preferred_network` defaults to `false` when absent on the wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct APNType {
+    /// The Access Point Name as a URL (max length 512).
+    pub apn: String,
+    /// APN username (max length 20).
+    #[serde(rename = "apnUserName", skip_serializing_if = "Option::is_none")]
+    pub apn_user_name: Option<String>,
+    /// APN password (max length 20).
+    #[serde(rename = "apnPassword", skip_serializing_if = "Option::is_none")]
+    pub apn_password: Option<String>,
+    /// SIM card PIN code.
+    #[serde(rename = "simPin", skip_serializing_if = "Option::is_none")]
+    pub sim_pin: Option<i32>,
+    /// Preferred network, written as MCC and MNC concatenated (max length 6).
+    #[serde(rename = "preferredNetwork", skip_serializing_if = "Option::is_none")]
+    pub preferred_network: Option<String>,
+    /// Use only the preferred network, refusing to dial in when it is
+    /// unavailable. Defaults to `false` when omitted.
+    #[serde(
+        rename = "useOnlyPreferredNetwork",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub use_only_preferred_network: Option<bool>,
+    /// Authentication method for the cellular connection.
+    #[serde(rename = "apnAuthentication")]
+    pub apn_authentication: APNAuthenticationEnumType,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// VPN configuration settings, carried by a [`NetworkConnectionProfileType`].
+///
+/// Ports `VPNType`. `server`, `user`, `password`, `key`, and `vpn_type` are all
+/// required; only `group` is optional. The `type` wire field is a Rust keyword,
+/// so it is exposed as `vpn_type` with an explicit `#[serde(rename = "type")]`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VPNType {
+    /// VPN server address (max length 512).
+    pub server: String,
+    /// VPN user (max length 20).
+    pub user: String,
+    /// VPN group (max length 20).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    /// VPN password (max length 20).
+    pub password: String,
+    /// VPN shared secret (max length 255).
+    pub key: String,
+    /// Tunnelling protocol. Serialized as `type` on the wire.
+    #[serde(rename = "type")]
+    pub vpn_type: VPNEnumType,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
+
+/// Functional and technical parameters of a Charging Station's communication
+/// link, carried by a `SetNetworkProfile` request.
+///
+/// Ports `NetworkConnectionProfileType`. The six connectivity parameters
+/// (`ocpp_version`, `ocpp_transport`, `ocpp_csms_url` — max length 512,
+/// `message_timeout`, `security_profile`, `ocpp_interface`) are required; the
+/// bearer-specific [`APNType`] / [`VPNType`] blocks are optional.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NetworkConnectionProfileType {
+    /// OCPP version used for this communication function.
+    #[serde(rename = "ocppVersion")]
+    pub ocpp_version: OCPPVersionEnumType,
+    /// Transport protocol used for this communication function.
+    #[serde(rename = "ocppTransport")]
+    pub ocpp_transport: OCPPTransportEnumType,
+    /// URL of the CSMS this Charging Station communicates with (max length 512).
+    #[serde(rename = "ocppCsmsUrl")]
+    pub ocpp_csms_url: String,
+    /// Seconds before a message sent over this connection times out.
+    #[serde(rename = "messageTimeout")]
+    pub message_timeout: i32,
+    /// Security profile used when connecting to the CSMS with this profile.
+    #[serde(rename = "securityProfile")]
+    pub security_profile: i32,
+    /// Network interface this connection uses.
+    #[serde(rename = "ocppInterface")]
+    pub ocpp_interface: OCPPInterfaceEnumType,
+    /// Cellular (APN) connection parameters, when the bearer is cellular.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub apn: Option<APNType>,
+    /// VPN connection parameters, when the connection is tunnelled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vpn: Option<VPNType>,
+    /// Vendor extension.
+    #[serde(rename = "customData", skip_serializing_if = "Option::is_none")]
+    pub custom_data: Option<CustomDataType>,
+}
