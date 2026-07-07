@@ -196,13 +196,37 @@ pub enum CallErrorCode {
     /// During the processing of Action a security issue occurred preventing receiver from completing the Action successfully
     SecurityError,
 
-    /// Payload for Action is syntactically incorrect or not conform the PDU structure for Action
+    /// Payload for Action is syntactically incorrect or not conform the PDU structure for Action.
+    ///
+    /// This is the strict **OCPP 1.6J** spelling — an errata-sheet typo the spec
+    /// declined to fix (`FormationViolationError` in the reference). For OCPP
+    /// 2.0.1 use [`CallErrorCode::FormatViolation`] instead.
     FormationViolation,
+
+    /// Payload for Action is syntactically incorrect or not conform the PDU structure for Action.
+    ///
+    /// This is the corrected **OCPP 2.0.1** spelling (`FormatViolationError` in
+    /// the reference). A 2.0.1 peer reporting a malformed payload sends this
+    /// code; [`CallErrorCode::FormationViolation`] is the 1.6J counterpart.
+    FormatViolation,
 
     /// Payload is syntactically correct but at least one field contains an invalid value
     PropertyConstraintViolation,
 
-    /// Payload for Action is syntactically correct but at least one of the fields violates occurrence constraints
+    /// Payload for Action is syntactically correct but at least one of the fields violates occurrence constraints.
+    ///
+    /// This is the strict **OCPP 1.6J + 2.0.1** spelling (single *"Occurence"* —
+    /// an errata-sheet typo, `OccurenceConstraintViolationError` in the
+    /// reference). [`CallErrorCode::OccurrenceConstraintViolation`] is the
+    /// corrected double-*r* spelling, which the reference marks valid only in
+    /// OCPP 2.1.
+    OccurenceConstraintViolation,
+
+    /// Payload for Action is syntactically correct but at least one of the fields violates occurrence constraints.
+    ///
+    /// This is the corrected double-*r* spelling, which the reference documents
+    /// as *"Not valid OCPP 2.0.1. Valid in OCPP 2.1"*. For 1.6J / 2.0.1 peers use
+    /// [`CallErrorCode::OccurenceConstraintViolation`].
     OccurrenceConstraintViolation,
 
     /// Payload for Action is syntactically correct but at least one of the fields violates data type constraints (e.g. "somestring": 12)
@@ -223,8 +247,12 @@ impl std::fmt::Display for CallErrorCode {
             CallErrorCode::ProtocolError => write!(f, "Protocol error"),
             CallErrorCode::SecurityError => write!(f, "Security error"),
             CallErrorCode::FormationViolation => write!(f, "Formation violation"),
+            CallErrorCode::FormatViolation => write!(f, "Format violation"),
             CallErrorCode::PropertyConstraintViolation => {
                 write!(f, "Property constraint violation")
+            }
+            CallErrorCode::OccurenceConstraintViolation => {
+                write!(f, "Occurence constraint violation")
             }
             CallErrorCode::OccurrenceConstraintViolation => {
                 write!(f, "Occurrence constraint violation")
@@ -245,7 +273,9 @@ impl CallErrorCode {
             CallErrorCode::ProtocolError => "ProtocolError",
             CallErrorCode::SecurityError => "SecurityError",
             CallErrorCode::FormationViolation => "FormationViolation",
+            CallErrorCode::FormatViolation => "FormatViolation",
             CallErrorCode::PropertyConstraintViolation => "PropertyConstraintViolation",
+            CallErrorCode::OccurenceConstraintViolation => "OccurenceConstraintViolation",
             CallErrorCode::OccurrenceConstraintViolation => "OccurrenceConstraintViolation",
             CallErrorCode::TypeConstraintViolation => "TypeConstraintViolation",
             CallErrorCode::GenericError => "GenericError",
@@ -275,6 +305,62 @@ mod tests {
 
         let deserialized: CallErrorCode = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized, CallErrorCode::NotImplemented);
+    }
+
+    /// The 12 CALLERROR codes defined by the reference `ocpp/exceptions.py`,
+    /// including both spelling variants of the format/occurrence codes.
+    const ALL_CALL_ERROR_CODES: [CallErrorCode; 12] = [
+        CallErrorCode::NotImplemented,
+        CallErrorCode::NotSupported,
+        CallErrorCode::InternalError,
+        CallErrorCode::ProtocolError,
+        CallErrorCode::SecurityError,
+        CallErrorCode::FormationViolation,
+        CallErrorCode::FormatViolation,
+        CallErrorCode::PropertyConstraintViolation,
+        CallErrorCode::OccurenceConstraintViolation,
+        CallErrorCode::OccurrenceConstraintViolation,
+        CallErrorCode::TypeConstraintViolation,
+        CallErrorCode::GenericError,
+    ];
+
+    #[test]
+    fn serde_pascal_case_matches_as_str_for_every_code() {
+        // The wire (de)serialization goes through two paths: `RawMessage` uses
+        // the hand-written `as_str()`, while a directly-serialized
+        // `CallErrorMessage` uses the serde `PascalCase` derive. They must agree
+        // byte-for-byte, otherwise the same code round-trips differently
+        // depending on which path built the frame.
+        for code in ALL_CALL_ERROR_CODES {
+            let via_serde = serde_json::to_string(&code).unwrap();
+            assert_eq!(
+                via_serde,
+                format!("\"{}\"", code.as_str()),
+                "serde spelling disagrees with as_str() for {code:?}"
+            );
+            let back: CallErrorCode = serde_json::from_str(&via_serde).unwrap();
+            assert_eq!(back, code);
+        }
+    }
+
+    #[test]
+    fn format_and_occurence_spelling_variants_are_distinct() {
+        // The 1.6J errata spellings and their corrected counterparts are
+        // separate codes on the wire and must not collapse into one another.
+        assert_ne!(
+            CallErrorCode::FormationViolation.as_str(),
+            CallErrorCode::FormatViolation.as_str()
+        );
+        assert_ne!(
+            CallErrorCode::OccurenceConstraintViolation.as_str(),
+            CallErrorCode::OccurrenceConstraintViolation.as_str()
+        );
+        // Exact wire spellings, pinned so a rename can't silently change them.
+        assert_eq!(CallErrorCode::FormatViolation.as_str(), "FormatViolation");
+        assert_eq!(
+            CallErrorCode::OccurenceConstraintViolation.as_str(),
+            "OccurenceConstraintViolation"
+        );
     }
 
     #[test]

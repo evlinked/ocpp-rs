@@ -246,7 +246,9 @@ impl RawMessage {
                     "ProtocolError" => CallErrorCode::ProtocolError,
                     "SecurityError" => CallErrorCode::SecurityError,
                     "FormationViolation" => CallErrorCode::FormationViolation,
+                    "FormatViolation" => CallErrorCode::FormatViolation,
                     "PropertyConstraintViolation" => CallErrorCode::PropertyConstraintViolation,
+                    "OccurenceConstraintViolation" => CallErrorCode::OccurenceConstraintViolation,
                     "OccurrenceConstraintViolation" => CallErrorCode::OccurrenceConstraintViolation,
                     "TypeConstraintViolation" => CallErrorCode::TypeConstraintViolation,
                     "GenericError" => CallErrorCode::GenericError,
@@ -389,6 +391,82 @@ mod tests {
             // Expected
         } else {
             panic!("Expected InvalidMessageType error");
+        }
+    }
+
+    /// Build a raw CALLERROR frame carrying `code` and parse it back, asserting
+    /// the error-code string round-trips to the same [`CallErrorCode`] variant.
+    fn parse_call_error_code(code: &str) -> OcppResult<CallErrorCode> {
+        let raw = RawMessage::CallError(
+            4,
+            "uid-1".to_string(),
+            code.to_string(),
+            "desc".to_string(),
+            json!({}),
+        );
+        match raw.into_message()? {
+            Message::CallError(msg) => Ok(msg.error_code),
+            other => panic!("expected CallError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn spec_defined_call_error_codes_all_round_trip() {
+        // Every code the reference `ocpp/exceptions.py` defines must survive
+        // as_str() -> wire -> into_message() -> same variant, so a peer's
+        // CALLERROR is never dropped as "unknown".
+        let codes = [
+            CallErrorCode::NotImplemented,
+            CallErrorCode::NotSupported,
+            CallErrorCode::InternalError,
+            CallErrorCode::ProtocolError,
+            CallErrorCode::SecurityError,
+            CallErrorCode::FormationViolation,
+            CallErrorCode::FormatViolation,
+            CallErrorCode::PropertyConstraintViolation,
+            CallErrorCode::OccurenceConstraintViolation,
+            CallErrorCode::OccurrenceConstraintViolation,
+            CallErrorCode::TypeConstraintViolation,
+            CallErrorCode::GenericError,
+        ];
+        for code in codes {
+            let parsed = parse_call_error_code(code.as_str())
+                .unwrap_or_else(|e| panic!("{} failed to parse: {e:?}", code.as_str()));
+            assert_eq!(parsed, code, "{} did not round-trip", code.as_str());
+        }
+    }
+
+    #[test]
+    fn incoming_2_0_1_format_violation_parses_instead_of_being_rejected() {
+        // Regression: a spec-compliant 2.0.1 peer reports a malformed payload
+        // with `FormatViolation` (the corrected 2.0.1 spelling). It must parse,
+        // not fall through to ProtocolViolation("Unknown error code").
+        assert_eq!(
+            parse_call_error_code("FormatViolation").unwrap(),
+            CallErrorCode::FormatViolation
+        );
+    }
+
+    #[test]
+    fn incoming_1_6j_occurence_constraint_violation_parses() {
+        // Regression: a 1.6J device using the errata spelling
+        // `OccurenceConstraintViolation` (single-r) must parse.
+        assert_eq!(
+            parse_call_error_code("OccurenceConstraintViolation").unwrap(),
+            CallErrorCode::OccurenceConstraintViolation
+        );
+    }
+
+    #[test]
+    fn genuinely_unknown_call_error_code_still_rejected() {
+        // Codes outside the spec must still be rejected (mirrors the reference's
+        // UnknownCallErrorCodeError), rather than silently accepted.
+        let err = parse_call_error_code("TotallyMadeUpCode").unwrap_err();
+        match err {
+            OcppError::ProtocolViolation { message } => {
+                assert!(message.contains("TotallyMadeUpCode"), "got: {message}");
+            }
+            other => panic!("expected ProtocolViolation, got {other:?}"),
         }
     }
 
