@@ -105,6 +105,12 @@ pub enum Measurand {
     /// Apparent energy exported
     #[serde(rename = "Energy.Active.Export.Interval")]
     EnergyActiveExportInterval,
+    /// Reactive energy imported over an interval
+    #[serde(rename = "Energy.Reactive.Import.Interval")]
+    EnergyReactiveImportInterval,
+    /// Reactive energy exported over an interval
+    #[serde(rename = "Energy.Reactive.Export.Interval")]
+    EnergyReactiveExportInterval,
     /// Active power imported
     #[serde(rename = "Power.Active.Import")]
     PowerActiveImport,
@@ -120,6 +126,9 @@ pub enum Measurand {
     /// Power factor
     #[serde(rename = "Power.Factor")]
     PowerFactor,
+    /// Maximum power offered to the EV
+    #[serde(rename = "Power.Offered")]
+    PowerOffered,
     /// Current imported
     #[serde(rename = "Current.Import")]
     CurrentImport,
