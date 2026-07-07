@@ -26,11 +26,6 @@
 //! - **`ConfigurationKey`** — the reference's ~50-member config-key enum is not
 //!   modelled as a Rust enum (config keys are handled as plain strings), so it
 //!   has no enum round-trip to port. Tracked for a follow-up.
-//! - **`Measurand`** — three reference measurands are not yet modelled in
-//!   `ocpp-types::common::Measurand`: `Energy.Reactive.Export.Interval`,
-//!   `Energy.Reactive.Import.Interval`, and `Power.Offered`. They are listed in
-//!   [`MISSING_MEASURANDS`] below so the gap is explicit; a follow-up issue
-//!   tracks adding them. The 18 measurands Rust does model are pinned here.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -80,16 +75,6 @@ fn pin_all<T: DeserializeOwned + Serialize>(wires: &[&str]) {
 fn type_name<T>() -> &'static str {
     std::any::type_name::<T>()
 }
-
-/// Reference measurands (`ocpp/v16/enums.py::Measurand`) that Rust's
-/// `ocpp-types::common::Measurand` does not model yet. Kept explicit so the
-/// coverage gap is visible rather than silently omitted. A follow-up issue
-/// tracks adding these; once modelled, move them into [`test_measurand`].
-const MISSING_MEASURANDS: &[&str] = &[
-    "Energy.Reactive.Export.Interval",
-    "Energy.Reactive.Import.Interval",
-    "Power.Offered",
-];
 
 #[test]
 fn test_authorization_status() {
@@ -238,10 +223,13 @@ fn test_measurand() {
         "Energy.Reactive.Import.Register",
         "Energy.Active.Export.Interval",
         "Energy.Active.Import.Interval",
+        "Energy.Reactive.Export.Interval",
+        "Energy.Reactive.Import.Interval",
         "Frequency",
         "Power.Active.Export",
         "Power.Active.Import",
         "Power.Factor",
+        "Power.Offered",
         "Power.Reactive.Export",
         "Power.Reactive.Import",
         "Current.Export",
@@ -252,16 +240,6 @@ fn test_measurand() {
         "Voltage",
         "Temperature",
     ]);
-
-    // Guard the documented gap: these reference measurands are intentionally
-    // absent from the Rust enum. If one is later added, `pin` will start
-    // succeeding and this assertion flips — the prompt to move it above.
-    for missing in MISSING_MEASURANDS {
-        assert!(
-            from_value::<Measurand>(json!(missing)).is_err(),
-            "{missing:?} is now modelled by Measurand — move it into the pinned set above",
-        );
-    }
 }
 
 #[test]
