@@ -235,6 +235,32 @@ pub enum ChargingStateEnumType {
     Idle,
 }
 
+/// The points in a transaction's lifecycle at which a station may start or stop
+/// metering a transaction, configured via the `TxCtrlr` device-model component's
+/// `TxStartPoint` / `TxStopPoint` variables.
+///
+/// Ports `TxStartStopPointEnumType` (`ocpp/v201/enums.py`). Unlike most 2.0.1
+/// enums this is *not* a field in any CALL/CALLRESULT payload schema — it is the
+/// value vocabulary of a device-model configuration variable — so it has no
+/// FINAL-JSON-Schema `enum` to stay aligned with. Wire values are PascalCase;
+/// `EVConnected` and `PowerPathClosed` carry embedded acronyms but need no
+/// rename (they already match their Rust spelling).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TxStartStopPointEnumType {
+    /// A valid `idToken` has been presented and authorized.
+    Authorized,
+    /// A signed meter value (e.g. an OCMF reading) has been received.
+    DataSigned,
+    /// Energy has begun flowing to/from the EV.
+    EnergyTransfer,
+    /// An EV is electrically connected to the EVSE.
+    EVConnected,
+    /// A vehicle is detected in the parking bay (sensor-based).
+    ParkingBayOccupancy,
+    /// The power path to the EV is closed (contactor/relay engaged).
+    PowerPathClosed,
+}
+
 /// Reason a transaction was stopped, reported on the `Ended` event.
 ///
 /// Ports `ReasonEnumType` (`ocpp/v201/enums.py`).
