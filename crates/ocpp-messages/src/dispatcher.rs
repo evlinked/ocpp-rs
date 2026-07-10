@@ -25,6 +25,22 @@ type HandlerFn = Box<dyn Fn(Value) -> BoxFuture<OcppResult<Value>> + Send + Sync
 /// Type-erased after-hook: `Value` payload in, fire-and-forget (`()`).
 type AfterFn = Box<dyn Fn(Value) -> BoxFuture<()> + Send + Sync>;
 
+/// A registered `@on` route: the handler plus its per-route options.
+///
+/// Ports the per-action entry `create_route_map()` builds in
+/// [`ocpp/routing.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/routing.py):
+/// each route stores its handler (`_on_action`) alongside a
+/// `_skip_schema_validation` flag (default `False`), which
+/// `_handle_call()` consults *per action* to decide whether to validate.
+struct Route {
+    handler: HandlerFn,
+    /// When `true`, `dispatch()` bypasses the dispatcher's [`SchemaValidator`]
+    /// for this action only — the port of `@on(action,
+    /// skip_schema_validation=True)`. Defaults to `false` (validate), matching
+    /// the reference.
+    skip_validation: bool,
+}
+
 /// Type-safe dispatcher for incoming OCPP CALL messages.
 ///
 /// ## Usage
@@ -49,11 +65,14 @@ type AfterFn = Box<dyn Fn(Value) -> BoxFuture<()> + Send + Sync>;
 /// `ActionDispatcher` is `Send + Sync` and can be wrapped in `Arc` for sharing
 /// across tasks once all handlers have been registered.
 pub struct ActionDispatcher {
-    handlers: HashMap<&'static str, HandlerFn>,
+    handlers: HashMap<&'static str, Route>,
     after_hooks: HashMap<&'static str, AfterFn>,
     /// Optional JSON Schema validator. When present, every incoming CALL
     /// payload is validated against its action schema before the handler is
-    /// invoked. Ports the `_validate()` call at the top of `_handle_call()` in
+    /// invoked — unless that action's route opted out via
+    /// [`on_skip_validation`](ActionDispatcher::on_skip_validation), consulted
+    /// per route (the port of `@on(action, skip_schema_validation=True)`). Ports
+    /// the `_validate()` call at the top of `_handle_call()` in
     /// [`ocpp/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py).
     /// Shared behind `Arc` so one validator (78 compiled schemas) can back
     /// several dispatchers without re-parsing.
@@ -89,7 +108,45 @@ impl ActionDispatcher {
     /// Replaces any previously registered handler for the same action.
     /// The closure receives a deserialised `Req` and must return
     /// `OcppResult<Req::Response>`.
+    ///
+    /// The route validates against the dispatcher's [`SchemaValidator`] (if
+    /// one is attached). To register a handler that bypasses validation, use
+    /// [`ActionDispatcher::on_skip_validation`].
     pub fn on<Req, Fut, F>(&mut self, handler: F)
+    where
+        Req: OcppAction + 'static,
+        Fut: Future<Output = OcppResult<Req::Response>> + Send + 'static,
+        F: Fn(Req) -> Fut + Send + Sync + Clone + 'static,
+    {
+        self.register::<Req, Fut, F>(handler, false);
+    }
+
+    /// Register a typed `@on` handler for `Req::ACTION_NAME` that **skips schema
+    /// validation** for this action only.
+    ///
+    /// Ports `@on(action, skip_schema_validation=True)` from
+    /// [`ocpp/routing.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/routing.py):
+    /// even when the dispatcher carries a [`SchemaValidator`], an incoming CALL
+    /// for this action bypasses it and goes straight to the handler. The flag is
+    /// recorded *per route*, so sibling actions on the same dispatcher are still
+    /// validated. Like [`ActionDispatcher::on`], this replaces any previously
+    /// registered handler for the same action (including its skip flag).
+    ///
+    /// With no validator attached the behaviour is identical to
+    /// [`ActionDispatcher::on`] (there is nothing to skip).
+    pub fn on_skip_validation<Req, Fut, F>(&mut self, handler: F)
+    where
+        Req: OcppAction + 'static,
+        Fut: Future<Output = OcppResult<Req::Response>> + Send + 'static,
+        F: Fn(Req) -> Fut + Send + Sync + Clone + 'static,
+    {
+        self.register::<Req, Fut, F>(handler, true);
+    }
+
+    /// Shared registration path for [`on`](Self::on) /
+    /// [`on_skip_validation`](Self::on_skip_validation): erase the typed handler
+    /// and store it under `Req::ACTION_NAME` with its per-route skip flag.
+    fn register<Req, Fut, F>(&mut self, handler: F, skip_validation: bool)
     where
         Req: OcppAction + 'static,
         Fut: Future<Output = OcppResult<Req::Response>> + Send + 'static,
@@ -107,7 +164,13 @@ impl ActionDispatcher {
                 })
             })
         });
-        self.handlers.insert(Req::ACTION_NAME, erased);
+        self.handlers.insert(
+            Req::ACTION_NAME,
+            Route {
+                handler: erased,
+                skip_validation,
+            },
+        );
     }
 
     /// Register a fire-and-forget `@after` hook for `Req::ACTION_NAME`.
@@ -144,23 +207,33 @@ impl ActionDispatcher {
     pub async fn dispatch(&self, call: &CallMessage) -> OcppResult<Value> {
         let action = call.action.as_str();
 
-        // Schema-validate the incoming payload before touching the handler,
-        // mirroring `_handle_call()` in charge_point.py which runs `_validate()`
-        // first and short-circuits to a CALLERROR on failure. A malformed
-        // payload therefore never reaches handler deserialization.
-        if let Some(validator) = &self.validator {
-            validator.validate_call(action, &call.payload)?;
-        }
-
-        let handler = self
+        // Resolve the route first: the per-route `skip_validation` flag decides
+        // whether the validator runs, so the lookup must precede validation.
+        // (For an unknown action, `validate_call` would itself return
+        // `NotSupported`, so this reordering yields the same error either way.)
+        let route = self
             .handlers
             .get(action)
             .ok_or_else(|| OcppError::NotSupported {
                 feature: action.to_string(),
             })?;
 
+        // Schema-validate the incoming payload before invoking the handler,
+        // mirroring `_handle_call()` in charge_point.py which runs `_validate()`
+        // first and short-circuits to a CALLERROR on failure — unless this route
+        // opted out via `on_skip_validation` (the port of
+        // `@on(action, skip_schema_validation=True)`), consulted per action so a
+        // sibling route on the same dispatcher is still validated. A malformed
+        // payload therefore never reaches handler deserialization on a validated
+        // route.
+        if let Some(validator) = &self.validator {
+            if !route.skip_validation {
+                validator.validate_call(action, &call.payload)?;
+            }
+        }
+
         let payload = call.payload.clone();
-        let response = handler(payload.clone()).await?;
+        let response = (route.handler)(payload.clone()).await?;
 
         if let Some(after) = self.after_hooks.get(action) {
             tokio::spawn(after(payload));
@@ -172,6 +245,18 @@ impl ActionDispatcher {
     /// Returns `true` if a handler is registered for `action`.
     pub fn has_handler(&self, action: &str) -> bool {
         self.handlers.contains_key(action)
+    }
+
+    /// Returns `true` if `action` is registered **and** its route opted out of
+    /// schema validation via [`on_skip_validation`](Self::on_skip_validation).
+    ///
+    /// Returns `false` for an unregistered action or a normally-registered one —
+    /// the port of reading a route's `_skip_schema_validation` flag (default
+    /// `False`).
+    pub fn skips_validation(&self, action: &str) -> bool {
+        self.handlers
+            .get(action)
+            .is_some_and(|route| route.skip_validation)
     }
 
     /// Returns the number of registered `@on` handlers.
@@ -411,7 +496,10 @@ mod tests {
     // (BootNotification) so the bundled schemas apply.
 
     use crate::schema_validation::SchemaValidator;
-    use crate::v16j::{BootNotificationRequest, BootNotificationResponse, RegistrationStatus};
+    use crate::v16j::{
+        BootNotificationRequest, BootNotificationResponse, HeartbeatRequest, HeartbeatResponse,
+        RegistrationStatus,
+    };
 
     fn validating_dispatcher() -> ActionDispatcher {
         ActionDispatcher::new().with_validator(Arc::new(SchemaValidator::v16j()))
@@ -508,6 +596,150 @@ mod tests {
             matches!(err, OcppError::Json { .. }),
             "expected Json (serde) error without a validator, got {err:?}"
         );
+    }
+
+    // --- per-handler skip_schema_validation (Issue #275) ---
+    //
+    // Python ref: `@on(action, skip_schema_validation=True)` in ocpp/routing.py
+    // records `_skip_schema_validation` per route; `_handle_call()` consults it
+    // per action. These tests use a real 1.6J validator so the bundled schemas
+    // apply. `chargePointVendor` carries `maxLength: 20`, so a 21-char vendor
+    // passes serde (a valid `String`) but fails schema validation — the
+    // discriminator between a "validated" and a "skipped" route.
+
+    fn overlong_boot() -> CallMessage {
+        CallMessage::new(
+            "BootNotification".to_string(),
+            serde_json::json!({
+                "chargePointVendor": "V".repeat(21),
+                "chargePointModel": "M",
+            }),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn on_skip_validation_bypasses_validator_for_that_route() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+
+        let mut d = validating_dispatcher();
+        d.on_skip_validation(move |_req: BootNotificationRequest| {
+            let r = r.clone();
+            async move {
+                r.store(true, Ordering::SeqCst);
+                Ok(boot_response_payload())
+            }
+        });
+
+        assert!(d.has_validator());
+        assert!(d.skips_validation("BootNotification"));
+
+        // A payload the global validator would reject (vendor over maxLength)
+        // reaches the handler untouched because this route opted out.
+        let resp = d.dispatch(&overlong_boot()).await.unwrap();
+        assert_eq!(resp["status"], "Accepted");
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "a skipped route must still run its handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn on_registers_a_validated_route_that_rejects_the_same_payload() {
+        // Control for the test above: the identical payload on a normally
+        // registered route IS rejected by the same validator.
+        let mut d = validating_dispatcher();
+        d.on(|_req: BootNotificationRequest| async move { Ok(boot_response_payload()) });
+
+        assert!(!d.skips_validation("BootNotification"));
+        let err = d.dispatch(&overlong_boot()).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                OcppError::SchemaViolation {
+                    keyword: ocpp_types::SchemaKeyword::MaxLength,
+                    ..
+                }
+            ),
+            "expected SchemaViolation(MaxLength), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_flag_is_per_route_sibling_still_validated() {
+        // One dispatcher, one validator: BootNotification skips, Heartbeat does
+        // not. The skip on one route must not leak to its sibling.
+        let mut d = validating_dispatcher();
+        d.on_skip_validation(
+            |_req: BootNotificationRequest| async move { Ok(boot_response_payload()) },
+        );
+        d.on(|_req: HeartbeatRequest| async move {
+            Ok(HeartbeatResponse {
+                current_time: chrono::Utc::now(),
+            })
+        });
+
+        assert!(d.skips_validation("BootNotification"));
+        assert!(!d.skips_validation("Heartbeat"));
+
+        // Skipped route: over-length vendor waved through.
+        let boot = d.dispatch(&overlong_boot()).await.unwrap();
+        assert_eq!(boot["status"], "Accepted");
+
+        // Validated sibling: a Heartbeat carrying an unexpected property is
+        // rejected by the still-active validator (additionalProperties: false).
+        let bad_hb = CallMessage::new(
+            "Heartbeat".to_string(),
+            serde_json::json!({ "unexpected": true }),
+        )
+        .unwrap();
+        let err = d.dispatch(&bad_hb).await.unwrap_err();
+        assert!(
+            matches!(err, OcppError::SchemaViolation { .. }),
+            "the sibling route must still be validated, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_without_validator_behaves_like_on() {
+        // With no validator there is nothing to skip: on_skip_validation is
+        // observationally identical to on.
+        let mut d = ActionDispatcher::new();
+        assert!(!d.has_validator());
+        d.on_skip_validation(
+            |_req: BootNotificationRequest| async move { Ok(boot_response_payload()) },
+        );
+        assert!(d.skips_validation("BootNotification"));
+
+        // A deserialisable payload reaches the handler (as it would under `on`).
+        let resp = d.dispatch(&overlong_boot()).await.unwrap();
+        assert_eq!(resp["status"], "Accepted");
+    }
+
+    #[tokio::test]
+    async fn re_registering_with_on_clears_the_skip_flag() {
+        // Last registration wins for the whole route, flag included — mirroring
+        // `on`'s documented "replaces any previously registered handler".
+        let mut d = validating_dispatcher();
+        d.on_skip_validation(
+            |_req: BootNotificationRequest| async move { Ok(boot_response_payload()) },
+        );
+        assert!(d.skips_validation("BootNotification"));
+
+        d.on(|_req: BootNotificationRequest| async move { Ok(boot_response_payload()) });
+        assert!(!d.skips_validation("BootNotification"));
+
+        // Validation is back on: the over-length payload is now rejected.
+        let err = d.dispatch(&overlong_boot()).await.unwrap_err();
+        assert!(matches!(err, OcppError::SchemaViolation { .. }));
+    }
+
+    #[tokio::test]
+    async fn skips_validation_is_false_for_unregistered_action() {
+        let d = validating_dispatcher();
+        assert!(!d.skips_validation("BootNotification"));
+        assert!(!d.skips_validation("NotAnAction"));
     }
 
     #[tokio::test]

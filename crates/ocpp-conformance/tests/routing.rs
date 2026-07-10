@@ -26,16 +26,20 @@
 //! `_handle_call()`), exactly as a spec-conformant peer would exercise it.
 //!
 //! Each test maps to the `test_routing.py` / `_handle_call()` behaviour it ports
-//! (see the per-test comments). Two faithful-port **gaps** surfaced by this
-//! audit are pinned as the *current* Rust behaviour and tracked as follow-ups:
+//! (see the per-test comments).
 //!
-//!   1. **No per-handler `skip_schema_validation`.** The reference records the
-//!      flag per route; the Rust [`ActionDispatcher`] carries at most one
-//!      *dispatcher-global* [`SchemaValidator`] (all-or-nothing). The closest
-//!      analog to `skip_schema_validation=True` is a dispatcher with no
-//!      validator attached. Pinned by [`validator_is_dispatcher_global_not_per_handler`]
-//!      and [`unvalidated_dispatcher_is_the_skip_validation_analog`]; tracked in
-//!      the follow-up filed alongside this suite.
+//!   1. **Per-handler `skip_schema_validation` (Issue #275, now implemented).**
+//!      The reference records the flag per route and `_handle_call()` consults
+//!      it per action. The Rust [`ActionDispatcher`] now mirrors this: a route
+//!      registered via `on_skip_validation` bypasses the dispatcher's
+//!      [`SchemaValidator`] for that action only, while sibling routes on the
+//!      same dispatcher are still validated. Pinned by
+//!      [`skip_schema_validation_is_per_route`] and
+//!      [`unvalidated_dispatcher_skips_all_routes`].
+//!
+//! One faithful-port **gap** surfaced by this audit remains pinned as the
+//! *current* Rust behaviour and tracked as a follow-up:
+//!
 //!   2. **Unregistered action always → `NotSupported`.** The reference's
 //!      `_raise_key_error()` distinguishes a *known* OCPP action with no handler
 //!      (`NotImplemented`) from an action the version doesn't define at all
@@ -292,64 +296,84 @@ async fn after_hook_does_not_fire_without_a_matching_on_handler() {
     );
 }
 
-// ─── skip_schema_validation — documented model gap (gap 1) ──────────────────
+// ─── skip_schema_validation — per-route flag (Issue #275) ───────────────────
 
-/// **Documented divergence (gap 1 in the module doc).** The reference records
-/// `_skip_schema_validation` *per route*, so one action can bypass validation
-/// while its siblings are still validated. The Rust [`ActionDispatcher`] has no
-/// per-handler flag: its optional [`SchemaValidator`] is *dispatcher-global*.
-///
-/// This test pins that all-or-nothing behaviour: with a validator attached,
-/// *every* registered action's incoming payload is validated — there is no way
-/// to skip validation for one handler while keeping it for another. Tracked in
-/// the follow-up filed with this suite.
+/// An over-length `BootNotification` CALL: `chargePointVendor` exceeds the
+/// schema's `maxLength: 20`, so the payload fails schema validation yet still
+/// deserialises into a valid `BootNotificationRequest` (it is a valid
+/// `String`). This is the discriminator between a *validated* route (rejects
+/// it) and a *skipped* route (runs the handler on it).
+fn overlong_boot_call() -> CallMessage {
+    CallMessage::new(
+        "BootNotification".to_string(),
+        json!({ "chargePointVendor": "V".repeat(21), "chargePointModel": "M" }),
+    )
+    .unwrap()
+}
+
+/// **Port of `@on(action, skip_schema_validation=True)`** (gap 1, now closed).
+/// The reference records `_skip_schema_validation` *per route*; `_handle_call()`
+/// consults it per action. This test pins that the Rust dispatcher does the
+/// same: on one dispatcher carrying a validator, a `BootNotification` route
+/// registered via `on_skip_validation` waves through a payload that its
+/// normally-registered `Heartbeat` sibling's validator would (and does) reject.
 #[tokio::test]
-async fn validator_is_dispatcher_global_not_per_handler() {
+async fn skip_schema_validation_is_per_route() {
     let boot_ran = Arc::new(AtomicBool::new(false));
     let b = boot_ran.clone();
 
     let mut d = ActionDispatcher::new().with_validator(Arc::new(SchemaValidator::v16j()));
-    d.on(move |_req: BootNotificationRequest| {
+    d.on_skip_validation(move |_req: BootNotificationRequest| {
         let b = b.clone();
         async move {
             b.store(true, Ordering::SeqCst);
             Ok(boot_response())
         }
     });
-    register_heartbeat(&mut d);
+    register_heartbeat(&mut d); // normal `on` → validated
 
     assert!(d.has_validator());
-
-    // A BootNotification missing the required `chargePointVendor` is rejected by
-    // the global validator before the handler runs — there is no per-handler
-    // skip flag that could wave it through.
-    let bad_boot = CallMessage::new(
-        "BootNotification".to_string(),
-        json!({ "chargePointModel": "M" }),
-    )
-    .unwrap();
-    let err = d.dispatch(&bad_boot).await.unwrap_err();
     assert!(
-        matches!(err, OcppError::SchemaViolation { .. }),
-        "the dispatcher-global validator must reject a malformed payload, got {err:?}"
+        d.skips_validation("BootNotification"),
+        "the BootNotification route opted out of validation"
     );
     assert!(
-        !boot_ran.load(Ordering::SeqCst),
-        "the handler must not run when the global validator rejects the payload"
+        !d.skips_validation("Heartbeat"),
+        "the sibling route did not opt out"
+    );
+
+    // Skipped route: the over-length vendor bypasses the validator and reaches
+    // the handler.
+    let resp = d.dispatch(&overlong_boot_call()).await.unwrap();
+    assert_eq!(resp["status"], "Accepted");
+    assert!(
+        boot_ran.load(Ordering::SeqCst),
+        "the skipped route must run its handler"
+    );
+
+    // Validated sibling: an unexpected property on a Heartbeat is still rejected
+    // by the same dispatcher's validator (additionalProperties: false) — the
+    // skip on one route did not leak to another.
+    let bad_hb = CallMessage::new("Heartbeat".to_string(), json!({ "unexpected": true })).unwrap();
+    let err = d.dispatch(&bad_hb).await.unwrap_err();
+    assert!(
+        matches!(err, OcppError::SchemaViolation { .. }),
+        "the sibling route must remain validated, got {err:?}"
     );
 }
 
-/// The closest current analog to the reference's `skip_schema_validation=True`
-/// is a dispatcher with **no** validator attached: the same payload the
-/// validating dispatcher rejects is accepted (and reaches the handler) when no
-/// validator is present. This pins the only granularity the Rust model offers
-/// today — per *dispatcher*, not per *route*.
+/// A dispatcher with **no** validator attached skips validation for *every*
+/// route — there is nothing to validate against. This pins that
+/// `on_skip_validation` is observationally identical to `on` in that case (the
+/// payload the validating dispatcher above rejects is accepted here) and that
+/// `skips_validation` still reports the per-route flag independently of whether
+/// a validator is present.
 #[tokio::test]
-async fn unvalidated_dispatcher_is_the_skip_validation_analog() {
+async fn unvalidated_dispatcher_skips_all_routes() {
     let ran = Arc::new(AtomicU32::new(0));
     let r = ran.clone();
 
-    let mut d = ActionDispatcher::new(); // no validator == "skip" for all routes
+    let mut d = ActionDispatcher::new(); // no validator
     assert!(!d.has_validator());
     d.on(move |_req: BootNotificationRequest| {
         let r = r.clone();
@@ -359,19 +383,17 @@ async fn unvalidated_dispatcher_is_the_skip_validation_analog() {
         }
     });
 
-    // A payload that would fail schema `required` validation still deserialises
-    // into a valid `BootNotificationRequest` (both fields present, just extra
-    // ones absent), so the handler runs — no schema gate blocks it.
-    let good = CallMessage::new(
-        "BootNotification".to_string(),
-        json!({ "chargePointVendor": "V", "chargePointModel": "M" }),
-    )
-    .unwrap();
-    let resp = d.dispatch(&good).await.unwrap();
+    // The over-length vendor would fail schema `maxLength` under a validator,
+    // but with none attached it deserialises and the handler runs.
+    let resp = d.dispatch(&overlong_boot_call()).await.unwrap();
     assert_eq!(resp["status"], "Accepted");
     assert_eq!(
         ran.load(Ordering::SeqCst),
         1,
         "the handler runs with no validator gating the route"
+    );
+    assert!(
+        !d.skips_validation("BootNotification"),
+        "a route registered via `on` reports its flag as false regardless of validator"
     );
 }
