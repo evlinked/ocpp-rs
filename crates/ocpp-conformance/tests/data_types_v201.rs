@@ -18,6 +18,14 @@
 //!   `SetVariableResultType`, `VariableAttributeType`,
 //!   `VariableCharacteristicsType`, `ReportDataType`, `APNType`, and
 //!   `NetworkConnectionProfileType` (+ nested `VPNType`).
+//! - **Slice 3a — the smart-charging / tariffs path** (#281): the datatypes
+//!   carried by `SetChargingProfile`, `NotifyEVChargingSchedule`,
+//!   `NotifyEVChargingNeeds`, and `GetCompositeSchedule`:
+//!   `ACChargingParametersType`, `DCChargingParametersType`, `CostType`,
+//!   `ConsumptionCostType`, `RelativeTimeIntervalType`,
+//!   `ChargingSchedulePeriodType`, `ChargingScheduleType`,
+//!   `ChargingProfileType`, `CompositeScheduleType`, `SalesTariffEntryType`,
+//!   `SalesTariffType`, and `ChargingNeedsType`.
 //!
 //! ## What is pinned, and why it is stronger than the reference
 //!
@@ -67,21 +75,32 @@
 //! - `StatusInfoType.reason_code` — the reference passes a `ReasonEnumType`
 //!   member; the schema (and Rust) field is a free `string` (max length 20).
 //!
-//! ## Deferred to later slices (tracked by a follow-up to #279)
+//! ### FINAL-schema-vs-Python-dataclass divergences pinned in slice 3a
 //!
-//! The reference file has ~40 datatype tests. Slices 1–2 cover the
-//! transaction/metering and device-model/provisioning paths. Still unpinned by a
-//! crate-boundary suite, in rough thematic groups for the next slices:
+//! - `ACChargingParametersType.energy_amount` / `ev_min_current` /
+//!   `ev_max_current` / `ev_max_voltage` — the reference passes *floats*
+//!   (`20.5` / `10.0` / `32.0` / `400`); every one is `integer` in the FINAL
+//!   schema (and Rust `i32`), so the wire values are integers.
+//! - `CostType.amount` — the reference passes the *float* `1.0`; the schema (and
+//!   Rust `i32`) type is `integer`.
+//! - `CostType.cost_kind` — the reference's `ConsumptionCostType` /
+//!   `SalesTariffEntryType` tests pass the raw string `"RelativePrice"`, which is
+//!   **not** a member of `CostKindEnumType` (the FINAL enum is
+//!   `CarbonDioxideEmission` / `RelativePricePercentage` /
+//!   `RenewableGenerationPercentage`). This suite pins the schema-valid
+//!   `RelativePricePercentage` instead.
+//!
+//! ## Deferred to slice 3b (tracked by a follow-up to #281)
+//!
+//! The reference file has ~40 datatype tests. Slices 1–3a cover the
+//! transaction/metering, device-model/provisioning, and smart-charging/tariffs
+//! paths. Still unpinned by a crate-boundary suite, in two thematic groups for
+//! the final slice:
 //!
 //! - **Monitoring / events:** `EventDataType`, `MonitoringDataType`,
 //!   `SetMonitoringDataType`/`ResultType`, `ClearMonitoringResultType`,
 //!   `VariableMonitoringType`, `MessageInfoType`.
-//! - **Smart charging / tariffs (slice 3):** `ChargingProfileType`,
-//!   `ChargingScheduleType`, `ChargingSchedulePeriodType`,
-//!   `CompositeScheduleType`, `SalesTariffEntryType`, `ConsumptionCostType`,
-//!   `CostType`, `ChargingNeedsType`, `AC/DCChargingParametersType`,
-//!   `RelativeTimeIntervalType`.
-//! - **Certificates / ISO 15118 (slice 3):** `CertificateHashDataType`/`ChainType`,
+//! - **Certificates / ISO 15118:** `CertificateHashDataType`/`ChainType`,
 //!   `OCSPRequestDataType`, `LogParametersType`, `FirmwareType`.
 
 use serde::de::DeserializeOwned;
@@ -89,13 +108,18 @@ use serde::Serialize;
 use serde_json::{from_value, to_value, Value};
 
 use ocpp_types::v201::{
-    APNAuthenticationEnumType, APNType, AdditionalInfoType, AttributeEnumType,
-    AuthorizationStatusEnumType, ChargingStateEnumType, ChargingStationType, ComponentType,
-    ComponentVariableType, DataEnumType, EvseType, GetVariableDataType, GetVariableResultType,
-    GetVariableStatusEnumType, IdTokenEnumType, IdTokenInfoType, IdTokenType, LocationEnumType,
-    MeasurandEnumType, MessageContentType, MessageFormatEnumType, MeterValueType, ModemType,
-    MutabilityEnumType, NetworkConnectionProfileType, OCPPInterfaceEnumType, OCPPTransportEnumType,
-    OCPPVersionEnumType, PhaseEnumType, ReadingContextEnumType, ReasonEnumType, ReportDataType,
+    ACChargingParametersType, APNAuthenticationEnumType, APNType, AdditionalInfoType,
+    AttributeEnumType, AuthorizationStatusEnumType, ChargingNeedsType, ChargingProfileKindEnumType,
+    ChargingProfilePurposeEnumType, ChargingProfileType, ChargingRateUnitEnumType,
+    ChargingSchedulePeriodType, ChargingScheduleType, ChargingStateEnumType, ChargingStationType,
+    ComponentType, ComponentVariableType, CompositeScheduleType, ConsumptionCostType,
+    CostKindEnumType, CostType, DCChargingParametersType, DataEnumType, EnergyTransferModeEnumType,
+    EvseType, GetVariableDataType, GetVariableResultType, GetVariableStatusEnumType,
+    IdTokenEnumType, IdTokenInfoType, IdTokenType, LocationEnumType, MeasurandEnumType,
+    MessageContentType, MessageFormatEnumType, MeterValueType, ModemType, MutabilityEnumType,
+    NetworkConnectionProfileType, OCPPInterfaceEnumType, OCPPTransportEnumType,
+    OCPPVersionEnumType, PhaseEnumType, ReadingContextEnumType, ReasonEnumType,
+    RelativeTimeIntervalType, ReportDataType, SalesTariffEntryType, SalesTariffType,
     SampledValueType, SetVariableResultType, SetVariableStatusEnumType, SignedMeterValueType,
     StatusInfoType, TransactionType, UnitOfMeasureType, VPNEnumType, VPNType,
     VariableAttributeType, VariableCharacteristicsType, VariableType,
@@ -1087,5 +1111,563 @@ fn network_connection_profile_type() {
                 "type": "IKEv2",
             },
         }),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice 3a — the smart-charging / tariffs path (#281).
+//
+// The datatypes carried by `SetChargingProfile`, `NotifyEVChargingSchedule`,
+// `NotifyEVChargingNeeds`, and `GetCompositeSchedule`. Verified against the
+// FINAL schemas named in each test's doc comment. The reference's dataclasses
+// are loose about numeric widths and enum membership; where the FINAL schema is
+// stricter, this suite pins the schema-valid shape and records the divergence
+// (see the module doc's "slice 3a" divergence list).
+// ---------------------------------------------------------------------------
+
+/// Ports `test_ac_charging_parameters_type`. All four fields are required and
+/// `integer` in the FINAL schema. Verified against
+/// `NotifyEVChargingNeeds.json`'s `ACChargingParametersType`.
+///
+/// Divergence pinned: the reference passes *floats*
+/// (`energy_amount=20.5`, `ev_min_current=10.0`, `ev_max_current=32.0`,
+/// `ev_max_voltage=400`); the schema (and Rust `i32`) type is `integer`.
+#[test]
+fn ac_charging_parameters_type() {
+    round_trip(
+        ACChargingParametersType {
+            energy_amount: 20,
+            ev_min_current: 10,
+            ev_max_current: 32,
+            ev_max_voltage: 400,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "energyAmount": 20,
+            "evMinCurrent": 10,
+            "evMaxCurrent": 32,
+            "evMaxVoltage": 400,
+        }),
+    );
+}
+
+/// `DCChargingParametersType` — constructed inside the reference's
+/// `test_charging_needs_type` (no standalone reference test). `evMaxCurrent` +
+/// `evMaxVoltage` required; pins the optional `energyAmount` / `evMaxPower` /
+/// `stateOfCharge` and their camelCase wire names. Verified against
+/// `NotifyEVChargingNeeds.json`'s `DCChargingParametersType`.
+#[test]
+fn dc_charging_parameters_type() {
+    round_trip(
+        DCChargingParametersType {
+            ev_max_current: 100,
+            ev_max_voltage: 500,
+            energy_amount: Some(50),
+            ev_max_power: Some(50000),
+            state_of_charge: Some(80),
+            ev_energy_capacity: None,
+            full_soc: None,
+            bulk_soc: None,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "evMaxCurrent": 100,
+            "evMaxVoltage": 500,
+            "energyAmount": 50,
+            "evMaxPower": 50000,
+            "stateOfCharge": 80,
+        }),
+    );
+
+    // required-only form: evMaxCurrent + evMaxVoltage, every optional omitted.
+    round_trip(
+        DCChargingParametersType {
+            ev_max_current: 32,
+            ev_max_voltage: 400,
+            energy_amount: None,
+            ev_max_power: None,
+            state_of_charge: None,
+            ev_energy_capacity: None,
+            full_soc: None,
+            bulk_soc: None,
+            custom_data: None,
+        },
+        serde_json::json!({ "evMaxCurrent": 32, "evMaxVoltage": 400 }),
+    );
+}
+
+/// Ports `test_cost_type`. `costKind` + `amount` required; pins the
+/// `CostKindEnumType` wire string and the optional `amountMultiplier`. Verified
+/// against `SetChargingProfile.json`'s `CostType`.
+///
+/// Divergence pinned: the reference passes the *float* `amount=1.0`; the schema
+/// (and Rust `i32`) type is `integer`, so the wire value is the integer `1`.
+#[test]
+fn cost_type() {
+    round_trip(
+        CostType {
+            cost_kind: CostKindEnumType::CarbonDioxideEmission,
+            amount: 1,
+            amount_multiplier: Some(0),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "costKind": "CarbonDioxideEmission",
+            "amount": 1,
+            "amountMultiplier": 0,
+        }),
+    );
+
+    // required-only form: amountMultiplier omitted.
+    round_trip(
+        CostType {
+            cost_kind: CostKindEnumType::RenewableGenerationPercentage,
+            amount: 42,
+            amount_multiplier: None,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "costKind": "RenewableGenerationPercentage",
+            "amount": 42,
+        }),
+    );
+}
+
+/// Ports `test_consumption_cost_type`. `startValue` (a `number`) + a non-empty
+/// `cost` array (schema: 1–3 items) required; pins the nested `CostType`.
+/// Verified against `SetChargingProfile.json`'s `ConsumptionCostType`.
+///
+/// Divergence pinned: the reference passes `cost_kind="RelativePrice"`, which is
+/// not a member of `CostKindEnumType`; this test pins the schema-valid
+/// `RelativePricePercentage`.
+#[test]
+fn consumption_cost_type() {
+    round_trip(
+        ConsumptionCostType {
+            start_value: 0.0,
+            cost: vec![CostType {
+                cost_kind: CostKindEnumType::RelativePricePercentage,
+                amount: 1,
+                amount_multiplier: Some(0),
+                custom_data: None,
+            }],
+            custom_data: None,
+        },
+        serde_json::json!({
+            "startValue": 0.0,
+            "cost": [
+                {
+                    "costKind": "RelativePricePercentage",
+                    "amount": 1,
+                    "amountMultiplier": 0,
+                }
+            ],
+        }),
+    );
+}
+
+/// Ports `test_relative_time_interval_type`. Only `start` is required;
+/// `duration` omitted when absent. Verified against
+/// `SetChargingProfile.json`'s `RelativeTimeIntervalType`.
+#[test]
+fn relative_time_interval_type() {
+    round_trip(
+        RelativeTimeIntervalType {
+            start: 0,
+            duration: Some(3600),
+            custom_data: None,
+        },
+        serde_json::json!({ "start": 0, "duration": 3600 }),
+    );
+
+    // start-only form: duration omitted, not null.
+    round_trip(
+        RelativeTimeIntervalType {
+            start: 900,
+            duration: None,
+            custom_data: None,
+        },
+        serde_json::json!({ "start": 900 }),
+    );
+}
+
+/// Ports `test_charging_schedule_period_type`. `startPeriod` + `limit` (a
+/// `number`) required; pins the optional `numberPhases` / `phaseToUse`. Verified
+/// against `SetChargingProfile.json`'s `ChargingSchedulePeriodType`.
+#[test]
+fn charging_schedule_period_type() {
+    round_trip(
+        ChargingSchedulePeriodType {
+            start_period: 0,
+            limit: 32.0,
+            number_phases: Some(3),
+            phase_to_use: Some(1),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "startPeriod": 0,
+            "limit": 32.0,
+            "numberPhases": 3,
+            "phaseToUse": 1,
+        }),
+    );
+
+    // required-only form: numberPhases (default 3) + phaseToUse omitted.
+    round_trip(
+        ChargingSchedulePeriodType {
+            start_period: 3600,
+            limit: 11000.0,
+            number_phases: None,
+            phase_to_use: None,
+            custom_data: None,
+        },
+        serde_json::json!({ "startPeriod": 3600, "limit": 11000.0 }),
+    );
+}
+
+/// `ChargingScheduleType` — constructed inside the reference's
+/// `test_charging_profile_type`. `id` + `chargingRateUnit` + a non-empty
+/// `chargingSchedulePeriod` array required; pins the `ChargingRateUnitEnumType`
+/// wire string (`"W"`), the optional `startSchedule` / `duration`, and the
+/// nested period objects. Verified against `SetChargingProfile.json`'s
+/// `ChargingScheduleType`.
+#[test]
+fn charging_schedule_type() {
+    round_trip(
+        ChargingScheduleType {
+            id: 1,
+            charging_rate_unit: ChargingRateUnitEnumType::W,
+            charging_schedule_period: vec![ChargingSchedulePeriodType {
+                start_period: 0,
+                limit: 11000.0,
+                number_phases: Some(3),
+                phase_to_use: None,
+                custom_data: None,
+            }],
+            start_schedule: Some("2024-01-01T10:00:00Z".to_string()),
+            duration: Some(3600),
+            min_charging_rate: None,
+            sales_tariff: None,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "id": 1,
+            "chargingRateUnit": "W",
+            "chargingSchedulePeriod": [
+                { "startPeriod": 0, "limit": 11000.0, "numberPhases": 3 }
+            ],
+            "startSchedule": "2024-01-01T10:00:00Z",
+            "duration": 3600,
+        }),
+    );
+
+    // required-only form: id + chargingRateUnit + one period; the absolute-time
+    // and tariff optionals all omitted.
+    round_trip(
+        ChargingScheduleType {
+            id: 2,
+            charging_rate_unit: ChargingRateUnitEnumType::A,
+            charging_schedule_period: vec![ChargingSchedulePeriodType {
+                start_period: 0,
+                limit: 16.0,
+                number_phases: None,
+                phase_to_use: None,
+                custom_data: None,
+            }],
+            start_schedule: None,
+            duration: None,
+            min_charging_rate: None,
+            sales_tariff: None,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "id": 2,
+            "chargingRateUnit": "A",
+            "chargingSchedulePeriod": [ { "startPeriod": 0, "limit": 16.0 } ],
+        }),
+    );
+}
+
+/// Ports `test_charging_profile_type`. `id` + `stackLevel` +
+/// `chargingProfilePurpose` + `chargingProfileKind` + a non-empty
+/// `chargingSchedule` array required; pins the two enum wire strings
+/// (`"TxDefaultProfile"`, `"Absolute"`), the optional `validFrom` / `validTo`,
+/// and the nested schedule. Verified against `SetChargingProfile.json`'s
+/// `ChargingProfileType`.
+#[test]
+fn charging_profile_type() {
+    round_trip(
+        ChargingProfileType {
+            id: 1,
+            stack_level: 0,
+            charging_profile_purpose: ChargingProfilePurposeEnumType::TxDefaultProfile,
+            charging_profile_kind: ChargingProfileKindEnumType::Absolute,
+            charging_schedule: vec![ChargingScheduleType {
+                id: 1,
+                charging_rate_unit: ChargingRateUnitEnumType::W,
+                charging_schedule_period: vec![ChargingSchedulePeriodType {
+                    start_period: 0,
+                    limit: 11000.0,
+                    number_phases: Some(3),
+                    phase_to_use: None,
+                    custom_data: None,
+                }],
+                start_schedule: Some("2024-01-01T10:00:00Z".to_string()),
+                duration: Some(3600),
+                min_charging_rate: None,
+                sales_tariff: None,
+                custom_data: None,
+            }],
+            recurrency_kind: None,
+            valid_from: Some("2024-01-01T00:00:00Z".to_string()),
+            valid_to: Some("2024-12-31T23:59:59Z".to_string()),
+            transaction_id: None,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "id": 1,
+            "stackLevel": 0,
+            "chargingProfilePurpose": "TxDefaultProfile",
+            "chargingProfileKind": "Absolute",
+            "chargingSchedule": [
+                {
+                    "id": 1,
+                    "chargingRateUnit": "W",
+                    "chargingSchedulePeriod": [
+                        { "startPeriod": 0, "limit": 11000.0, "numberPhases": 3 }
+                    ],
+                    "startSchedule": "2024-01-01T10:00:00Z",
+                    "duration": 3600,
+                }
+            ],
+            "validFrom": "2024-01-01T00:00:00Z",
+            "validTo": "2024-12-31T23:59:59Z",
+        }),
+    );
+}
+
+/// Ports `test_composite_schedule_type`. Every field is required: `evseId`,
+/// `duration`, `scheduleStart`, `chargingRateUnit`, and a non-empty
+/// `chargingSchedulePeriod` array. Pins the `ChargingRateUnitEnumType` wire
+/// string and the nested periods. Verified against
+/// `GetCompositeScheduleResponse.json`'s `CompositeScheduleType`.
+#[test]
+fn composite_schedule_type() {
+    round_trip(
+        CompositeScheduleType {
+            evse_id: 1,
+            duration: 3600,
+            schedule_start: "2024-01-01T10:00:00Z".to_string(),
+            charging_rate_unit: ChargingRateUnitEnumType::W,
+            charging_schedule_period: vec![ChargingSchedulePeriodType {
+                start_period: 0,
+                limit: 11000.0,
+                number_phases: Some(3),
+                phase_to_use: None,
+                custom_data: None,
+            }],
+            custom_data: None,
+        },
+        serde_json::json!({
+            "evseId": 1,
+            "duration": 3600,
+            "scheduleStart": "2024-01-01T10:00:00Z",
+            "chargingRateUnit": "W",
+            "chargingSchedulePeriod": [
+                { "startPeriod": 0, "limit": 11000.0, "numberPhases": 3 }
+            ],
+        }),
+    );
+}
+
+/// Ports `test_sales_tariff_entry_type`. Only `relativeTimeInterval` is
+/// required; pins the optional `ePriceLevel` and the deeply nested
+/// `consumptionCost[].cost[]` chain. Verified against
+/// `SetChargingProfile.json`'s `SalesTariffEntryType`.
+///
+/// Divergence pinned: the reference's nested cost passes
+/// `cost_kind="RelativePrice"` (not a `CostKindEnumType` member); this test pins
+/// the schema-valid `RelativePricePercentage`.
+#[test]
+fn sales_tariff_entry_type() {
+    round_trip(
+        SalesTariffEntryType {
+            relative_time_interval: RelativeTimeIntervalType {
+                start: 0,
+                duration: Some(3600),
+                custom_data: None,
+            },
+            e_price_level: Some(1),
+            consumption_cost: Some(vec![ConsumptionCostType {
+                start_value: 0.0,
+                cost: vec![CostType {
+                    cost_kind: CostKindEnumType::RelativePricePercentage,
+                    amount: 1,
+                    amount_multiplier: Some(0),
+                    custom_data: None,
+                }],
+                custom_data: None,
+            }]),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "relativeTimeInterval": { "start": 0, "duration": 3600 },
+            "ePriceLevel": 1,
+            "consumptionCost": [
+                {
+                    "startValue": 0.0,
+                    "cost": [
+                        {
+                            "costKind": "RelativePricePercentage",
+                            "amount": 1,
+                            "amountMultiplier": 0,
+                        }
+                    ],
+                }
+            ],
+        }),
+    );
+
+    // interval-only form: ePriceLevel + consumptionCost omitted.
+    round_trip(
+        SalesTariffEntryType {
+            relative_time_interval: RelativeTimeIntervalType {
+                start: 3600,
+                duration: None,
+                custom_data: None,
+            },
+            e_price_level: None,
+            consumption_cost: None,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "relativeTimeInterval": { "start": 3600 },
+        }),
+    );
+}
+
+/// `SalesTariffType` — the tariff container carried on `ChargingScheduleType`
+/// (no standalone reference test; the reference exercises only
+/// `SalesTariffEntryType`). `id` + a non-empty `salesTariffEntry` array
+/// required; pins the optional `salesTariffDescription` / `numEPriceLevels` and
+/// the nested entries. Verified against `SetChargingProfile.json`'s
+/// `SalesTariffType`.
+#[test]
+fn sales_tariff_type() {
+    round_trip(
+        SalesTariffType {
+            id: 1,
+            sales_tariff_entry: vec![SalesTariffEntryType {
+                relative_time_interval: RelativeTimeIntervalType {
+                    start: 0,
+                    duration: Some(3600),
+                    custom_data: None,
+                },
+                e_price_level: Some(1),
+                consumption_cost: None,
+                custom_data: None,
+            }],
+            sales_tariff_description: Some("Off-peak".to_string()),
+            num_e_price_levels: Some(2),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "id": 1,
+            "salesTariffEntry": [
+                {
+                    "relativeTimeInterval": { "start": 0, "duration": 3600 },
+                    "ePriceLevel": 1,
+                }
+            ],
+            "salesTariffDescription": "Off-peak",
+            "numEPriceLevels": 2,
+        }),
+    );
+
+    // required-only form: id + one entry, description/numEPriceLevels omitted.
+    round_trip(
+        SalesTariffType {
+            id: 2,
+            sales_tariff_entry: vec![SalesTariffEntryType {
+                relative_time_interval: RelativeTimeIntervalType {
+                    start: 0,
+                    duration: None,
+                    custom_data: None,
+                },
+                e_price_level: None,
+                consumption_cost: None,
+                custom_data: None,
+            }],
+            sales_tariff_description: None,
+            num_e_price_levels: None,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "id": 2,
+            "salesTariffEntry": [ { "relativeTimeInterval": { "start": 0 } } ],
+        }),
+    );
+}
+
+/// Ports `test_charging_needs_type`. Only `requestedEnergyTransfer` is required;
+/// pins the `EnergyTransferModeEnumType` wire string (`"DC"`), the optional
+/// `departureTime`, and the nested `acChargingParameters` /
+/// `dcChargingParameters` objects. Verified against
+/// `NotifyEVChargingNeeds.json`'s `ChargingNeedsType`.
+#[test]
+fn charging_needs_type() {
+    round_trip(
+        ChargingNeedsType {
+            requested_energy_transfer: EnergyTransferModeEnumType::Dc,
+            departure_time: Some("2024-01-01T10:00:00Z".to_string()),
+            ac_charging_parameters: Some(ACChargingParametersType {
+                energy_amount: 20,
+                ev_min_current: 10,
+                ev_max_current: 32,
+                ev_max_voltage: 400,
+                custom_data: None,
+            }),
+            dc_charging_parameters: Some(DCChargingParametersType {
+                ev_max_current: 100,
+                ev_max_voltage: 500,
+                energy_amount: Some(50),
+                ev_max_power: Some(50000),
+                state_of_charge: Some(80),
+                ev_energy_capacity: None,
+                full_soc: None,
+                bulk_soc: None,
+                custom_data: None,
+            }),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "requestedEnergyTransfer": "DC",
+            "departureTime": "2024-01-01T10:00:00Z",
+            "acChargingParameters": {
+                "energyAmount": 20,
+                "evMinCurrent": 10,
+                "evMaxCurrent": 32,
+                "evMaxVoltage": 400,
+            },
+            "dcChargingParameters": {
+                "evMaxCurrent": 100,
+                "evMaxVoltage": 500,
+                "energyAmount": 50,
+                "evMaxPower": 50000,
+                "stateOfCharge": 80,
+            },
+        }),
+    );
+
+    // required-only form: the mode alone, both parameter blocks omitted.
+    round_trip(
+        ChargingNeedsType {
+            requested_energy_transfer: EnergyTransferModeEnumType::AcThreePhase,
+            departure_time: None,
+            ac_charging_parameters: None,
+            dc_charging_parameters: None,
+            custom_data: None,
+        },
+        serde_json::json!({ "requestedEnergyTransfer": "AC_three_phase" }),
     );
 }
