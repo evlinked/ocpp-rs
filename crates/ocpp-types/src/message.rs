@@ -108,6 +108,31 @@ impl CallMessage {
         })
     }
 
+    /// Create a new Call message with a caller-supplied `unique_id`, used verbatim.
+    ///
+    /// Unlike [`CallMessage::new`] — which mints a fresh UUIDv4 — this preserves
+    /// the caller's id exactly as given, so the caller can correlate the
+    /// CALLRESULT it will later receive against an id it already owns (e.g. a job
+    /// id from its own queue). Mirrors the caller-supplied branch of the
+    /// mobilityhouse/ocpp reference's `ChargePoint.call(unique_id=…)`
+    /// (`ocpp/charge_point.py`), where `unique_id = unique_id if unique_id is not
+    /// None else str(self._unique_id_generator())`.
+    ///
+    /// The id is used exactly as passed — no normalization or truncation. The
+    /// schema-level `maxLength: 36` bound on message ids is enforced at the
+    /// wire/framing (schema-validation) layer, as elsewhere, not here.
+    pub fn with_id<T>(unique_id: String, action: String, payload: T) -> OcppResult<Self>
+    where
+        T: Serialize,
+    {
+        Ok(CallMessage {
+            message_type: MessageType::Call,
+            unique_id,
+            action,
+            payload: serde_json::to_value(payload)?,
+        })
+    }
+
     /// Extract the payload as a specific type
     pub fn payload_as<T>(&self) -> OcppResult<T>
     where
