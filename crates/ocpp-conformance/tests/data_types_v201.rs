@@ -26,6 +26,15 @@
 //!   `ChargingSchedulePeriodType`, `ChargingScheduleType`,
 //!   `ChargingProfileType`, `CompositeScheduleType`, `SalesTariffEntryType`,
 //!   `SalesTariffType`, and `ChargingNeedsType`.
+//! - **Slice 3b — the monitoring/events + certificates/ISO-15118 paths**
+//!   (#284): the datatypes carried by `NotifyEvent`, `NotifyMonitoringReport`,
+//!   `SetVariableMonitoring` / `ClearVariableMonitoring`, `SetDisplayMessage`,
+//!   `GetInstalledCertificateIds` / `DeleteCertificate`, `GetCertificateStatus`,
+//!   `GetLog`, and `PublishFirmware`: `EventDataType`, `VariableMonitoringType`,
+//!   `MonitoringDataType`, `SetMonitoringDataType`, `SetMonitoringResultType`,
+//!   `ClearMonitoringResultType`, `MessageInfoType`, `CertificateHashDataType`,
+//!   `CertificateHashDataChainType`, `OCSPRequestDataType`, `LogParametersType`,
+//!   and `FirmwareType`.
 //!
 //! ## What is pinned, and why it is stronger than the reference
 //!
@@ -90,18 +99,34 @@
 //!   `RenewableGenerationPercentage`). This suite pins the schema-valid
 //!   `RelativePricePercentage` instead.
 //!
-//! ## Deferred to slice 3b (tracked by a follow-up to #281)
+//! ### FINAL-schema-vs-Python-dataclass divergences pinned in slice 3b
 //!
-//! The reference file has ~40 datatype tests. Slices 1–3a cover the
-//! transaction/metering, device-model/provisioning, and smart-charging/tariffs
-//! paths. Still unpinned by a crate-boundary suite, in two thematic groups for
-//! the final slice:
+//! - `MonitoringDataType.variable_monitoring` — the reference passes a *single*
+//!   `VariableMonitoringType`; the FINAL schema (`NotifyMonitoringReport.json`)
+//!   and Rust type require an *array* (`minItems: 1`). Pinned as an array.
+//! - `MessageInfoType.priority` — the reference passes the integer `1`; the
+//!   schema and Rust type is the enum `MessagePriorityEnumType`. Pinned as the
+//!   valid member `AlwaysFront`.
+//! - `MessageInfoType.state` — the reference passes `ChargingStateEnumType`;
+//!   the schema and Rust field is `MessageStateEnumType`. The wire string
+//!   `"Charging"` is valid in both enums, so it is pinned as
+//!   `MessageStateEnumType::Charging`.
+//! - `CertificateHashDataChainType.certificate_type` — the reference passes
+//!   `"V2G"`, not a member of `GetCertificateIdUseEnumType`. Pinned as the valid
+//!   member `V2GRootCertificate`.
+//! - `SetMonitoringResultType` / `ClearMonitoringResultType` `statusInfo` —
+//!   `reasonCode` is a free `string` (the #278/#280 divergence), so the wire
+//!   value is the bare `"Other"` rather than a `ReasonEnumType` member.
 //!
-//! - **Monitoring / events:** `EventDataType`, `MonitoringDataType`,
-//!   `SetMonitoringDataType`/`ResultType`, `ClearMonitoringResultType`,
-//!   `VariableMonitoringType`, `MessageInfoType`.
-//! - **Certificates / ISO 15118:** `CertificateHashDataType`/`ChainType`,
-//!   `OCSPRequestDataType`, `LogParametersType`, `FirmwareType`.
+//! ## Datatype coverage of `test_v201_data_types.py`
+//!
+//! Slices 1–3b pin the full monitoring/events, certificate/ISO-15118,
+//! metering, device-model/provisioning, and smart-charging/tariffs datatype
+//! trees. Of the reference file's datatype tests, `AuthorizationData` is pinned
+//! by the local-list suite (`local_list.rs`). **Three smart-charging *control*
+//! datatypes remain unpinned by any crate-boundary suite** —
+//! `ChargingLimitType`, `ChargingProfileCriterionType`, and
+//! `ClearChargingProfileType` — tracked as slice 3c by a follow-up to #284.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -123,6 +148,15 @@ use ocpp_types::v201::{
     SampledValueType, SetVariableResultType, SetVariableStatusEnumType, SignedMeterValueType,
     StatusInfoType, TransactionType, UnitOfMeasureType, VPNEnumType, VPNType,
     VariableAttributeType, VariableCharacteristicsType, VariableType,
+};
+// Slice 3b — monitoring/events + certificates/ISO-15118 datatypes (#284).
+use ocpp_types::v201::{
+    CertificateHashDataChainType, CertificateHashDataType, ClearMonitoringResultType,
+    ClearMonitoringStatusEnumType, EventDataType, EventNotificationEnumType, EventTriggerEnumType,
+    FirmwareType, GetCertificateIdUseEnumType, HashAlgorithmEnumType, LogParametersType,
+    MessageInfoType, MessagePriorityEnumType, MessageStateEnumType, MonitorEnumType,
+    MonitoringDataType, OCSPRequestDataType, SetMonitoringDataType, SetMonitoringResultType,
+    SetMonitoringStatusEnumType, VariableMonitoringType,
 };
 
 /// Assert `value` serializes to *exactly* `expected` and that `expected`
@@ -1669,5 +1703,467 @@ fn charging_needs_type() {
             custom_data: None,
         },
         serde_json::json!({ "requestedEnergyTransfer": "AC_three_phase" }),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice 3b — monitoring / events + certificates / ISO 15118 (#284)
+//
+// Completes the datatype port of `test_v201_data_types.py` for the
+// monitoring/events (`NotifyEvent` / `NotifyMonitoringReport` /
+// `SetVariableMonitoring` / `ClearVariableMonitoring` / `SetDisplayMessage`)
+// and certificate/ISO-15118 (`GetInstalledCertificateIds` / `GetCertificateStatus`
+// / `GetLog` / `PublishFirmware`) families. Types below are imported in the
+// slice-3b `use` block near the top of the file.
+// ---------------------------------------------------------------------------
+
+/// Ports `test_event_data_type`. `trigger` and `eventNotificationType` carry
+/// their enum wire strings; `component` / `variable` nest; `cleared` is
+/// `Some(false)` so it is emitted (not omitted). Verified against
+/// `NotifyEvent.json`'s `EventDataType`.
+#[test]
+fn event_data_type() {
+    round_trip(
+        EventDataType {
+            event_id: 1,
+            timestamp: "2024-01-01T10:00:00Z".to_string(),
+            trigger: EventTriggerEnumType::Alerting,
+            actual_value: "High Temperature".to_string(),
+            event_notification_type: EventNotificationEnumType::HardWiredNotification,
+            component: ComponentType {
+                name: "MainController".to_string(),
+                instance: Some("instance1".to_string()),
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: "Temperature".to_string(),
+                instance: Some("instance1".to_string()),
+                custom_data: None,
+            },
+            cause: None,
+            tech_code: Some("TC001".to_string()),
+            tech_info: Some("Temperature sensor reading high".to_string()),
+            cleared: Some(false),
+            transaction_id: Some("TX001".to_string()),
+            variable_monitoring_id: Some(1),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "eventId": 1,
+            "timestamp": "2024-01-01T10:00:00Z",
+            "trigger": "Alerting",
+            "actualValue": "High Temperature",
+            "eventNotificationType": "HardWiredNotification",
+            "component": { "name": "MainController", "instance": "instance1" },
+            "variable": { "name": "Temperature", "instance": "instance1" },
+            "techCode": "TC001",
+            "techInfo": "Temperature sensor reading high",
+            "cleared": false,
+            "transactionId": "TX001",
+            "variableMonitoringId": 1,
+        }),
+    );
+}
+
+/// Ports `test_variable_monitoring_type`. All five fields required; `type`
+/// carries the `MonitorEnumType` wire string and Rust names it `kind`; `value`
+/// is a JSON number. Verified against `NotifyMonitoringReport.json`.
+#[test]
+fn variable_monitoring_type() {
+    round_trip(
+        VariableMonitoringType {
+            id: 1,
+            transaction: true,
+            value: 100.0,
+            kind: MonitorEnumType::UpperThreshold,
+            severity: 1,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "id": 1,
+            "transaction": true,
+            "value": 100.0,
+            "type": "UpperThreshold",
+            "severity": 1,
+        }),
+    );
+}
+
+/// Ports `test_monitoring_data_type`.
+///
+/// FINAL-schema-vs-Python-dataclass divergence: the reference passes a **single**
+/// `VariableMonitoringType` for `variable_monitoring`; the FINAL schema
+/// (`NotifyMonitoringReport.json`) and the Rust datatype require an **array**
+/// (`minItems: 1`). This suite pins the schema-valid array shape.
+#[test]
+fn monitoring_data_type() {
+    round_trip(
+        MonitoringDataType {
+            component: ComponentType {
+                name: "MainController".to_string(),
+                instance: Some("instance1".to_string()),
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: "Temperature".to_string(),
+                instance: Some("instance1".to_string()),
+                custom_data: None,
+            },
+            variable_monitoring: vec![VariableMonitoringType {
+                id: 1,
+                transaction: true,
+                value: 100.0,
+                kind: MonitorEnumType::UpperThreshold,
+                severity: 1,
+                custom_data: None,
+            }],
+            custom_data: None,
+        },
+        serde_json::json!({
+            "component": { "name": "MainController", "instance": "instance1" },
+            "variable": { "name": "Temperature", "instance": "instance1" },
+            "variableMonitoring": [
+                {
+                    "id": 1,
+                    "transaction": true,
+                    "value": 100.0,
+                    "type": "UpperThreshold",
+                    "severity": 1,
+                }
+            ],
+        }),
+    );
+}
+
+/// Ports `test_set_monitoring_data_type`. `id` / `transaction` are optional on
+/// the request; here `id` is set (replacing an existing monitor) and
+/// `transaction` omitted. Verified against `SetVariableMonitoring.json`'s
+/// `SetMonitoringDataType`.
+#[test]
+fn set_monitoring_data_type() {
+    round_trip(
+        SetMonitoringDataType {
+            id: Some(123456),
+            transaction: None,
+            value: 100.0,
+            kind: MonitorEnumType::UpperThreshold,
+            severity: 1,
+            component: ComponentType {
+                name: "MainController".to_string(),
+                instance: Some("instance1".to_string()),
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: "Temperature".to_string(),
+                instance: Some("instance1".to_string()),
+                custom_data: None,
+            },
+            custom_data: None,
+        },
+        serde_json::json!({
+            "id": 123456,
+            "value": 100.0,
+            "type": "UpperThreshold",
+            "severity": 1,
+            "component": { "name": "MainController", "instance": "instance1" },
+            "variable": { "name": "Temperature", "instance": "instance1" },
+        }),
+    );
+}
+
+/// Ports `test_set_monitoring_result_type`. Pins the nested `statusInfo`.
+///
+/// FINAL-schema-vs-Python-dataclass divergence (the #278/#280 `StatusInfoType`
+/// pattern): the reference passes `reason_code=ReasonEnumType.other`; the FINAL
+/// schema (`SetVariableMonitoringResponse.json`) and Rust type `reasonCode` as a
+/// free `string` (max length 20), so the wire value is the bare `"Other"`.
+#[test]
+fn set_monitoring_result_type() {
+    round_trip(
+        SetMonitoringResultType {
+            id: Some(123),
+            status: SetMonitoringStatusEnumType::Accepted,
+            kind: MonitorEnumType::UpperThreshold,
+            component: ComponentType {
+                name: "MainController".to_string(),
+                instance: Some("instance1".to_string()),
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: "Temperature".to_string(),
+                instance: Some("instance1".to_string()),
+                custom_data: None,
+            },
+            severity: 1,
+            status_info: Some(StatusInfoType {
+                reason_code: "Other".to_string(),
+                additional_info: Some("Successfully set monitoring".to_string()),
+                custom_data: None,
+            }),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "id": 123,
+            "status": "Accepted",
+            "type": "UpperThreshold",
+            "component": { "name": "MainController", "instance": "instance1" },
+            "variable": { "name": "Temperature", "instance": "instance1" },
+            "severity": 1,
+            "statusInfo": {
+                "reasonCode": "Other",
+                "additionalInfo": "Successfully set monitoring",
+            },
+        }),
+    );
+}
+
+/// Ports `test_clear_monitoring_result_type`. Pins the nested `statusInfo`
+/// (same free-`string` `reasonCode` divergence as `set_monitoring_result_type`).
+/// Verified against `ClearVariableMonitoringResponse.json`.
+#[test]
+fn clear_monitoring_result_type() {
+    round_trip(
+        ClearMonitoringResultType {
+            status: ClearMonitoringStatusEnumType::Accepted,
+            id: 123,
+            status_info: Some(StatusInfoType {
+                reason_code: "Other".to_string(),
+                additional_info: Some("Successfully cleared monitoring".to_string()),
+                custom_data: None,
+            }),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "status": "Accepted",
+            "id": 123,
+            "statusInfo": {
+                "reasonCode": "Other",
+                "additionalInfo": "Successfully cleared monitoring",
+            },
+        }),
+    );
+}
+
+/// Ports `test_message_info_type`. Pins the nested `message`
+/// (`MessageContentType`) and `display` (`ComponentType`).
+///
+/// Two FINAL-schema-vs-Python-dataclass divergences pinned here
+/// (`SetDisplayMessage.json` / `NotifyDisplayMessages.json`):
+/// - `priority` — the reference passes the integer `1`; the schema and Rust
+///   type is `MessagePriorityEnumType`, so a valid member (`AlwaysFront`) is
+///   pinned.
+/// - `state` — the reference passes `ChargingStateEnumType.charging` (the wrong
+///   enum); the schema and Rust field is `MessageStateEnumType`. The wire string
+///   `"Charging"` is a valid member of *both* enums, so it round-trips as
+///   `MessageStateEnumType::Charging`.
+#[test]
+fn message_info_type() {
+    round_trip(
+        MessageInfoType {
+            id: 1,
+            priority: MessagePriorityEnumType::AlwaysFront,
+            message: MessageContentType {
+                format: MessageFormatEnumType::Ascii,
+                content: "Important notice".to_string(),
+                language: Some("en".to_string()),
+                custom_data: None,
+            },
+            state: Some(MessageStateEnumType::Charging),
+            start_date_time: None,
+            end_date_time: None,
+            transaction_id: None,
+            display: Some(ComponentType {
+                name: "MainDisplay".to_string(),
+                instance: Some("instance1".to_string()),
+                evse: None,
+                custom_data: None,
+            }),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "id": 1,
+            "priority": "AlwaysFront",
+            "message": {
+                "format": "ASCII",
+                "content": "Important notice",
+                "language": "en",
+            },
+            "state": "Charging",
+            "display": { "name": "MainDisplay", "instance": "instance1" },
+        }),
+    );
+}
+
+/// Ports `test_certificate_hash_data_type`. All four fields required;
+/// `hashAlgorithm` carries the `HashAlgorithmEnumType` wire string (`"SHA256"`).
+/// Verified against `GetCertificateStatus.json` / `DeleteCertificate.json`'s
+/// `CertificateHashDataType`.
+#[test]
+fn certificate_hash_data_type() {
+    round_trip(
+        CertificateHashDataType {
+            hash_algorithm: HashAlgorithmEnumType::Sha256,
+            issuer_name_hash: "issuer_hash".to_string(),
+            issuer_key_hash: "key_hash".to_string(),
+            serial_number: "serial123".to_string(),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "hashAlgorithm": "SHA256",
+            "issuerNameHash": "issuer_hash",
+            "issuerKeyHash": "key_hash",
+            "serialNumber": "serial123",
+        }),
+    );
+}
+
+/// Ports `test_certificate_hash_data_chain_type`. Pins the nested
+/// `certificateHashData` and the `childCertificateHashData` array.
+///
+/// FINAL-schema-vs-Python-dataclass divergence: the reference passes
+/// `certificate_type="V2G"`, which is **not** a member of
+/// `GetCertificateIdUseEnumType` (the FINAL enum in
+/// `GetInstalledCertificateIdsResponse.json` is
+/// `V2GRootCertificate` / `MORootCertificate` / `CSMSRootCertificate` /
+/// `V2GCertificateChain` / `ManufacturerRootCertificate`). This suite pins the
+/// schema-valid `V2GRootCertificate`.
+#[test]
+fn certificate_hash_data_chain_type() {
+    round_trip(
+        CertificateHashDataChainType {
+            certificate_type: GetCertificateIdUseEnumType::V2GRootCertificate,
+            certificate_hash_data: CertificateHashDataType {
+                hash_algorithm: HashAlgorithmEnumType::Sha256,
+                issuer_name_hash: "issuer_hash".to_string(),
+                issuer_key_hash: "key_hash".to_string(),
+                serial_number: "serial123".to_string(),
+                custom_data: None,
+            },
+            child_certificate_hash_data: Some(vec![CertificateHashDataType {
+                hash_algorithm: HashAlgorithmEnumType::Sha256,
+                issuer_name_hash: "child_issuer_hash".to_string(),
+                issuer_key_hash: "child_key_hash".to_string(),
+                serial_number: "child_serial123".to_string(),
+                custom_data: None,
+            }]),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "certificateType": "V2GRootCertificate",
+            "certificateHashData": {
+                "hashAlgorithm": "SHA256",
+                "issuerNameHash": "issuer_hash",
+                "issuerKeyHash": "key_hash",
+                "serialNumber": "serial123",
+            },
+            "childCertificateHashData": [
+                {
+                    "hashAlgorithm": "SHA256",
+                    "issuerNameHash": "child_issuer_hash",
+                    "issuerKeyHash": "child_key_hash",
+                    "serialNumber": "child_serial123",
+                }
+            ],
+        }),
+    );
+}
+
+/// Ports `test_ocsp_request_data_type`. Note `responder_url` renames to the
+/// upper-cased wire key `responderURL`. Verified against
+/// `GetCertificateStatus.json`'s `OCSPRequestDataType`.
+#[test]
+fn ocsp_request_data_type() {
+    round_trip(
+        OCSPRequestDataType {
+            hash_algorithm: HashAlgorithmEnumType::Sha256,
+            issuer_name_hash: "issuer_hash_value".to_string(),
+            issuer_key_hash: "issuer_key_hash_value".to_string(),
+            serial_number: "serial123".to_string(),
+            responder_url: "https://ocsp.example.com".to_string(),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "hashAlgorithm": "SHA256",
+            "issuerNameHash": "issuer_hash_value",
+            "issuerKeyHash": "issuer_key_hash_value",
+            "serialNumber": "serial123",
+            "responderURL": "https://ocsp.example.com",
+        }),
+    );
+}
+
+/// Ports `test_log_parameters_type`. `oldestTimestamp` / `latestTimestamp` are
+/// optional; the full and minimal (`remoteLocation` only) forms are pinned to
+/// catch a dropped `skip_serializing_if`. Verified against `GetLog.json`.
+#[test]
+fn log_parameters_type() {
+    round_trip(
+        LogParametersType {
+            remote_location: "https://logs.example.com".to_string(),
+            oldest_timestamp: Some("2024-01-01T00:00:00Z".to_string()),
+            latest_timestamp: Some("2024-01-01T23:59:59Z".to_string()),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "remoteLocation": "https://logs.example.com",
+            "oldestTimestamp": "2024-01-01T00:00:00Z",
+            "latestTimestamp": "2024-01-01T23:59:59Z",
+        }),
+    );
+
+    // required-only form: both timestamps omitted.
+    round_trip(
+        LogParametersType {
+            remote_location: "https://logs.example.com".to_string(),
+            oldest_timestamp: None,
+            latest_timestamp: None,
+            custom_data: None,
+        },
+        serde_json::json!({ "remoteLocation": "https://logs.example.com" }),
+    );
+}
+
+/// Ports `test_firmware_type`. `location` / `retrieveDateTime` are required;
+/// `installDateTime` / `signingCertificate` / `signature` are optional. The full
+/// and required-only forms are pinned. Verified against `PublishFirmware.json` /
+/// `UpdateFirmware.json`'s `FirmwareType`.
+#[test]
+fn firmware_type() {
+    round_trip(
+        FirmwareType {
+            location: "https://firmware.example.com/v1.2.3".to_string(),
+            retrieve_date_time: "2024-01-01T10:00:00Z".to_string(),
+            install_date_time: Some("2024-01-01T11:00:00Z".to_string()),
+            signing_certificate: Some("MIIB...".to_string()),
+            signature: Some("SHA256...".to_string()),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "location": "https://firmware.example.com/v1.2.3",
+            "retrieveDateTime": "2024-01-01T10:00:00Z",
+            "installDateTime": "2024-01-01T11:00:00Z",
+            "signingCertificate": "MIIB...",
+            "signature": "SHA256...",
+        }),
+    );
+
+    // required-only form: the three optional fields omitted.
+    round_trip(
+        FirmwareType {
+            location: "https://firmware.example.com/v1.2.3".to_string(),
+            retrieve_date_time: "2024-01-01T10:00:00Z".to_string(),
+            install_date_time: None,
+            signing_certificate: None,
+            signature: None,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "location": "https://firmware.example.com/v1.2.3",
+            "retrieveDateTime": "2024-01-01T10:00:00Z",
+        }),
     );
 }
