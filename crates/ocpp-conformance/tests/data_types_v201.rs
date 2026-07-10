@@ -1,14 +1,23 @@
-//! OCPP 2.0.1 datatype wire-shape conformance suite — **slice 1: the
-//! transaction / metering hot path**.
+//! OCPP 2.0.1 datatype wire-shape conformance suite.
 //!
 //! A port of the mobilityhouse/ocpp reference's
 //! [`tests/v201/test_v201_data_types.py`](https://github.com/mobilityhouse/ocpp/blob/master/tests/v201/test_v201_data_types.py),
-//! restricted to the datatypes that ride the `TransactionEvent` / `MeterValues`
-//! path: `AdditionalInfoType`, `IdTokenType`, `IdTokenInfoType`
-//! (+ `MessageContentType`), `SampledValueType`, `UnitOfMeasureType`,
-//! `SignedMeterValueType`, `MeterValueType`, `EvseType`, and `TransactionType`.
-//! This is the datatype-level analog of the enum suite `enums_v201.rs`
-//! (#268 / #271) and the first of ~3 slices tracked by #273.
+//! grown one thematic slice at a time. This is the datatype-level analog of the
+//! enum suite `enums_v201.rs` (#268 / #271); slices are tracked from #273.
+//!
+//! - **Slice 1 — the transaction / metering hot path** (#273): the datatypes
+//!   that ride `TransactionEvent` / `MeterValues`: `AdditionalInfoType`,
+//!   `IdTokenType`, `IdTokenInfoType` (+ `MessageContentType`),
+//!   `SampledValueType`, `UnitOfMeasureType`, `SignedMeterValueType`,
+//!   `MeterValueType`, `EvseType`, and `TransactionType`.
+//! - **Slice 2 — the device-model / provisioning path** (#279): the datatypes
+//!   carried by `BootNotification`, `NotifyReport`, `GetVariables` /
+//!   `SetVariables`, and `SetNetworkProfile`: `ModemType`,
+//!   `ChargingStationType`, `ComponentType`, `VariableType`,
+//!   `ComponentVariableType`, `GetVariableDataType` / `GetVariableResultType`,
+//!   `SetVariableResultType`, `VariableAttributeType`,
+//!   `VariableCharacteristicsType`, `ReportDataType`, `APNType`, and
+//!   `NetworkConnectionProfileType` (+ nested `VPNType`).
 //!
 //! ## What is pinned, and why it is stronger than the reference
 //!
@@ -31,43 +40,65 @@
 //! discipline that surfaced the `cChaoJi` / `passwordString` divergence in
 //! #271 — not merely against the Python dataclass. The metering datatypes are
 //! verified against `schemas/v201/TransactionEvent.json`; `IdTokenInfoType` and
-//! `MessageContentType` against `schemas/v201/AuthorizeResponse.json`. Each test
-//! notes the `test_v201_data_types.py` function it ports.
+//! `MessageContentType` against `schemas/v201/AuthorizeResponse.json`. Slice 2's
+//! device-model / provisioning datatypes are verified against
+//! `schemas/v201/NotifyReport.json` (`ComponentType`, `VariableType`,
+//! `ReportDataType`, `VariableAttributeType`, `VariableCharacteristicsType`),
+//! `GetVariablesResponse.json` / `SetVariablesResponse.json` (the
+//! get/set-variable result datatypes), `BootNotification.json`
+//! (`ChargingStationType`, `ModemType`), and `SetNetworkProfile.json` (`APNType`,
+//! `NetworkConnectionProfileType`, `VPNType`). Each test notes the
+//! `test_v201_data_types.py` function it ports.
 //!
-//! ## Deferred to slices 2+ (tracked by a follow-up to #273)
+//! ### FINAL-schema-vs-Python-dataclass divergences pinned in slice 2
 //!
-//! The reference file has ~40 datatype tests. This slice deliberately covers
-//! only the transaction/metering path above. Still unpinned by a crate-boundary
-//! suite, in rough thematic groups for the next slices:
+//! The reference's slice-2 tests construct several fields with shapes the FINAL
+//! schemas reject; the Python dataclasses don't validate, so the looseness is
+//! invisible there. This suite pins the **schema-valid** shape (matching the
+//! Rust datatypes) and records the divergence, matching the #271 discipline:
 //!
-//! - **Device model / provisioning:** `ComponentType`, `VariableType`,
-//!   `ComponentVariableType`, `ReportDataType`, `VariableAttributeType`,
-//!   `VariableCharacteristicsType`, `GetVariableDataType`/`ResultType`,
-//!   `SetVariableResultType`, `ChargingStationType`, `ModemType`, `APNType`,
-//!   `NetworkConnectionProfileType`.
+//! - `VariableCharacteristicsType.min_limit` / `max_limit` — the reference passes
+//!   *strings* (`"-20"` / `"50"`); the schema (and Rust) type is `number`.
+//! - `VariableCharacteristicsType.values_list` — the reference passes a *list*
+//!   (`["10","20","30"]`); the schema (and Rust) type is a single CSV `string`.
+//! - `NetworkConnectionProfileType.vpn` — the reference passes a bare
+//!   `VPNEnumType` member; the schema (and Rust) field is a nested `VPNType`
+//!   *object* (whose `type` field is the enum).
+//! - `StatusInfoType.reason_code` — the reference passes a `ReasonEnumType`
+//!   member; the schema (and Rust) field is a free `string` (max length 20).
+//!
+//! ## Deferred to later slices (tracked by a follow-up to #279)
+//!
+//! The reference file has ~40 datatype tests. Slices 1–2 cover the
+//! transaction/metering and device-model/provisioning paths. Still unpinned by a
+//! crate-boundary suite, in rough thematic groups for the next slices:
+//!
 //! - **Monitoring / events:** `EventDataType`, `MonitoringDataType`,
 //!   `SetMonitoringDataType`/`ResultType`, `ClearMonitoringResultType`,
 //!   `VariableMonitoringType`, `MessageInfoType`.
-//! - **Smart charging / tariffs:** `ChargingProfileType`,
+//! - **Smart charging / tariffs (slice 3):** `ChargingProfileType`,
 //!   `ChargingScheduleType`, `ChargingSchedulePeriodType`,
 //!   `CompositeScheduleType`, `SalesTariffEntryType`, `ConsumptionCostType`,
 //!   `CostType`, `ChargingNeedsType`, `AC/DCChargingParametersType`,
 //!   `RelativeTimeIntervalType`.
-//! - **Certificates / ISO 15118:** `CertificateHashDataType`/`ChainType`,
+//! - **Certificates / ISO 15118 (slice 3):** `CertificateHashDataType`/`ChainType`,
 //!   `OCSPRequestDataType`, `LogParametersType`, `FirmwareType`.
-//!
-//! Deferred set filed as the slice-2 follow-up on #273.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{from_value, to_value, Value};
 
 use ocpp_types::v201::{
-    AdditionalInfoType, AuthorizationStatusEnumType, ChargingStateEnumType, EvseType,
-    IdTokenEnumType, IdTokenInfoType, IdTokenType, LocationEnumType, MeasurandEnumType,
-    MessageContentType, MessageFormatEnumType, MeterValueType, PhaseEnumType,
-    ReadingContextEnumType, ReasonEnumType, SampledValueType, SignedMeterValueType,
-    TransactionType, UnitOfMeasureType,
+    APNAuthenticationEnumType, APNType, AdditionalInfoType, AttributeEnumType,
+    AuthorizationStatusEnumType, ChargingStateEnumType, ChargingStationType, ComponentType,
+    ComponentVariableType, DataEnumType, EvseType, GetVariableDataType, GetVariableResultType,
+    GetVariableStatusEnumType, IdTokenEnumType, IdTokenInfoType, IdTokenType, LocationEnumType,
+    MeasurandEnumType, MessageContentType, MessageFormatEnumType, MeterValueType, ModemType,
+    MutabilityEnumType, NetworkConnectionProfileType, OCPPInterfaceEnumType, OCPPTransportEnumType,
+    OCPPVersionEnumType, PhaseEnumType, ReadingContextEnumType, ReasonEnumType, ReportDataType,
+    SampledValueType, SetVariableResultType, SetVariableStatusEnumType, SignedMeterValueType,
+    StatusInfoType, TransactionType, UnitOfMeasureType, VPNEnumType, VPNType,
+    VariableAttributeType, VariableCharacteristicsType, VariableType,
 };
 
 /// Assert `value` serializes to *exactly* `expected` and that `expected`
@@ -411,5 +442,650 @@ fn transaction_type() {
             custom_data: None,
         },
         serde_json::json!({ "transactionId": "tx-0002" }),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Slice 2 — the device-model / provisioning path (#279).
+//
+// The datatypes carried by `BootNotification`, `NotifyReport`,
+// `GetVariables`/`SetVariables`, and `SetNetworkProfile`. Verified against the
+// FINAL schemas named in each test's doc comment.
+// ---------------------------------------------------------------------------
+
+/// Ports `test_modem_type`. Both fields optional; an empty `ModemType`
+/// serializes to `{}`. Verified against `BootNotification.json`'s `ModemType`
+/// (the `iccid` / `imsi` field names, not renamed).
+#[test]
+fn modem_type() {
+    round_trip(
+        ModemType {
+            iccid: Some("89012345678901234567".to_string()),
+            imsi: Some("123456789012345".to_string()),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "iccid": "89012345678901234567",
+            "imsi": "123456789012345",
+        }),
+    );
+
+    // both-optional form: `{}` (never `null`s).
+    round_trip(
+        ModemType {
+            iccid: None,
+            imsi: None,
+            custom_data: None,
+        },
+        serde_json::json!({}),
+    );
+}
+
+/// Ports `test_charging_station_type`. `model` + `vendorName` required; pins the
+/// optional `serialNumber` / `firmwareVersion` and the nested `modem`
+/// (`ModemType`) object. Verified against `BootNotification.json`'s
+/// `ChargingStationType` — note the wire name is `vendorName`, not `vendor_name`.
+#[test]
+fn charging_station_type() {
+    round_trip(
+        ChargingStationType {
+            vendor_name: "Vendor ABC".to_string(),
+            model: "Station Model X".to_string(),
+            serial_number: Some("SN123456".to_string()),
+            firmware_version: Some("1.2.3".to_string()),
+            modem: Some(ModemType {
+                iccid: Some("89001234567890123456".to_string()),
+                imsi: Some("123456789012345".to_string()),
+                custom_data: None,
+            }),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "vendorName": "Vendor ABC",
+            "model": "Station Model X",
+            "serialNumber": "SN123456",
+            "firmwareVersion": "1.2.3",
+            "modem": {
+                "iccid": "89001234567890123456",
+                "imsi": "123456789012345",
+            },
+        }),
+    );
+
+    // required-only form: model + vendorName, everything else omitted.
+    round_trip(
+        ChargingStationType {
+            vendor_name: "V".to_string(),
+            model: "M".to_string(),
+            serial_number: None,
+            firmware_version: None,
+            modem: None,
+            custom_data: None,
+        },
+        serde_json::json!({ "vendorName": "V", "model": "M" }),
+    );
+}
+
+/// Ports `test_component_type`. Only `name` is required; pins the optional
+/// `instance` and the nested `evse` (`EvseType`) object. Verified against
+/// `NotifyReport.json`'s `ComponentType`.
+#[test]
+fn component_type() {
+    round_trip(
+        ComponentType {
+            name: "MainController".to_string(),
+            instance: Some("instance1".to_string()),
+            evse: Some(EvseType {
+                id: 1,
+                connector_id: Some(2),
+                custom_data: None,
+            }),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "name": "MainController",
+            "instance": "instance1",
+            "evse": { "id": 1, "connectorId": 2 },
+        }),
+    );
+
+    // name-only form: instance + evse omitted.
+    round_trip(
+        ComponentType {
+            name: "MainController".to_string(),
+            instance: None,
+            evse: None,
+            custom_data: None,
+        },
+        serde_json::json!({ "name": "MainController" }),
+    );
+}
+
+/// `VariableType` — the variable-reference datatype the reference constructs
+/// inline in `test_component_variable_type` / `test_get_variable_*`. Only `name`
+/// is required; `instance` omitted when absent. Verified against
+/// `NotifyReport.json`'s `VariableType`.
+#[test]
+fn variable_type() {
+    round_trip(
+        VariableType {
+            name: "CurrentLimit".to_string(),
+            instance: Some("instance1".to_string()),
+            custom_data: None,
+        },
+        serde_json::json!({ "name": "CurrentLimit", "instance": "instance1" }),
+    );
+
+    round_trip(
+        VariableType {
+            name: "CurrentLimit".to_string(),
+            instance: None,
+            custom_data: None,
+        },
+        serde_json::json!({ "name": "CurrentLimit" }),
+    );
+}
+
+/// Ports `test_component_variable_type`. Pins the nested `component`
+/// (`ComponentType`) + optional `variable` (`VariableType`) — the narrowing key
+/// carried by `GetReport`. Verified against `NotifyReport.json`.
+#[test]
+fn component_variable_type() {
+    round_trip(
+        ComponentVariableType {
+            component: ComponentType {
+                name: "MainController".to_string(),
+                instance: Some("instance1".to_string()),
+                evse: None,
+                custom_data: None,
+            },
+            variable: Some(VariableType {
+                name: "CurrentLimit".to_string(),
+                instance: Some("instance1".to_string()),
+                custom_data: None,
+            }),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "component": { "name": "MainController", "instance": "instance1" },
+            "variable": { "name": "CurrentLimit", "instance": "instance1" },
+        }),
+    );
+
+    // component-only form: the whole component is referenced (`variable` omitted).
+    round_trip(
+        ComponentVariableType {
+            component: ComponentType {
+                name: "MainController".to_string(),
+                instance: None,
+                evse: None,
+                custom_data: None,
+            },
+            variable: None,
+            custom_data: None,
+        },
+        serde_json::json!({ "component": { "name": "MainController" } }),
+    );
+}
+
+/// Ports `test_get_variable_data_type`. One entry in a `GetVariables` request:
+/// `component` + `variable` required, `attributeType` omitted means `Actual`.
+/// Verified against `GetVariables` request schema (shared `AttributeEnumType`).
+#[test]
+fn get_variable_data_type() {
+    round_trip(
+        GetVariableDataType {
+            component: ComponentType {
+                name: "MainController".to_string(),
+                instance: Some("instance1".to_string()),
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: "CurrentLimit".to_string(),
+                instance: Some("instance1".to_string()),
+                custom_data: None,
+            },
+            attribute_type: Some(AttributeEnumType::Actual),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "component": { "name": "MainController", "instance": "instance1" },
+            "variable": { "name": "CurrentLimit", "instance": "instance1" },
+            "attributeType": "Actual",
+        }),
+    );
+
+    // attributeType omitted → defaults to Actual on the peer.
+    round_trip(
+        GetVariableDataType {
+            component: ComponentType {
+                name: "C".to_string(),
+                instance: None,
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: "V".to_string(),
+                instance: None,
+                custom_data: None,
+            },
+            attribute_type: None,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "component": { "name": "C" },
+            "variable": { "name": "V" },
+        }),
+    );
+}
+
+/// Ports `test_get_variable_result_type`. One entry in a `GetVariables`
+/// response: pins the `attributeStatus` (`GetVariableStatusEnumType`) +
+/// `attributeType` enum strings, the optional `attributeValue`, and the nested
+/// `component`/`variable`. Verified against `GetVariablesResponse.json`.
+#[test]
+fn get_variable_result_type() {
+    round_trip(
+        GetVariableResultType {
+            attribute_status: GetVariableStatusEnumType::Accepted,
+            component: ComponentType {
+                name: "MainController".to_string(),
+                instance: Some("instance1".to_string()),
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: "CurrentLimit".to_string(),
+                instance: Some("instance1".to_string()),
+                custom_data: None,
+            },
+            attribute_type: Some(AttributeEnumType::Actual),
+            attribute_value: Some("100".to_string()),
+            attribute_status_info: None,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "attributeStatus": "Accepted",
+            "component": { "name": "MainController", "instance": "instance1" },
+            "variable": { "name": "CurrentLimit", "instance": "instance1" },
+            "attributeType": "Actual",
+            "attributeValue": "100",
+        }),
+    );
+
+    // Rejected read: no value echoed, optional attributeType omitted.
+    round_trip(
+        GetVariableResultType {
+            attribute_status: GetVariableStatusEnumType::UnknownVariable,
+            component: ComponentType {
+                name: "C".to_string(),
+                instance: None,
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: "V".to_string(),
+                instance: None,
+                custom_data: None,
+            },
+            attribute_type: None,
+            attribute_value: None,
+            attribute_status_info: None,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "attributeStatus": "UnknownVariable",
+            "component": { "name": "C" },
+            "variable": { "name": "V" },
+        }),
+    );
+}
+
+/// Ports `test_set_variable_result_type`. The write-path counterpart to
+/// `GetVariableResultType` — echoes a `SetVariableStatusEnumType` and no value.
+/// Pins the nested `attributeStatusInfo` (`StatusInfoType`). Verified against
+/// `SetVariablesResponse.json`.
+///
+/// Divergence pinned: the reference passes `reason_code=ReasonEnumType.other`,
+/// but `StatusInfoType.reasonCode` is a free `string` (max length 20) in the
+/// FINAL schema — so the wire value is the plain string `"Other"`.
+#[test]
+fn set_variable_result_type() {
+    round_trip(
+        SetVariableResultType {
+            attribute_status: SetVariableStatusEnumType::Accepted,
+            component: ComponentType {
+                name: "MainController".to_string(),
+                instance: Some("instance1".to_string()),
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: "CurrentLimit".to_string(),
+                instance: Some("instance1".to_string()),
+                custom_data: None,
+            },
+            attribute_type: Some(AttributeEnumType::Actual),
+            attribute_status_info: Some(StatusInfoType {
+                reason_code: "Other".to_string(),
+                additional_info: Some("Successfully set variable".to_string()),
+                custom_data: None,
+            }),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "attributeStatus": "Accepted",
+            "component": { "name": "MainController", "instance": "instance1" },
+            "variable": { "name": "CurrentLimit", "instance": "instance1" },
+            "attributeType": "Actual",
+            "attributeStatusInfo": {
+                "reasonCode": "Other",
+                "additionalInfo": "Successfully set variable",
+            },
+        }),
+    );
+
+    // RebootRequired write: status only, every optional omitted.
+    round_trip(
+        SetVariableResultType {
+            attribute_status: SetVariableStatusEnumType::RebootRequired,
+            component: ComponentType {
+                name: "C".to_string(),
+                instance: None,
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: "V".to_string(),
+                instance: None,
+                custom_data: None,
+            },
+            attribute_type: None,
+            attribute_status_info: None,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "attributeStatus": "RebootRequired",
+            "component": { "name": "C" },
+            "variable": { "name": "V" },
+        }),
+    );
+}
+
+/// Ports `test_variable_attribute_type`. Every field is optional: pins the
+/// `type` (`AttributeEnumType`) + `mutability` (`MutabilityEnumType`) enum
+/// strings and the `persistent` / `constant` booleans. Verified against
+/// `NotifyReport.json`'s `VariableAttributeType`.
+#[test]
+fn variable_attribute_type() {
+    round_trip(
+        VariableAttributeType {
+            kind: Some(AttributeEnumType::Actual),
+            value: Some("25.5".to_string()),
+            mutability: Some(MutabilityEnumType::ReadWrite),
+            persistent: Some(true),
+            constant: Some(false),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "type": "Actual",
+            "value": "25.5",
+            "mutability": "ReadWrite",
+            "persistent": true,
+            "constant": false,
+        }),
+    );
+
+    // all-optional form: `{}` — proves every field is `skip_serializing_if`.
+    round_trip(
+        VariableAttributeType {
+            kind: None,
+            value: None,
+            mutability: None,
+            persistent: None,
+            constant: None,
+            custom_data: None,
+        },
+        serde_json::json!({}),
+    );
+}
+
+/// Ports `test_variable_characteristics_type`. `dataType` +
+/// `supportsMonitoring` required; pins the `DataEnumType` wire string (note the
+/// lowercase `"decimal"`). Verified against `NotifyReport.json`'s
+/// `VariableCharacteristicsType`.
+///
+/// Divergences pinned (the reference's dataclass is loose; the FINAL schema is
+/// not): `minLimit` / `maxLimit` are `number` here (the reference passes the
+/// strings `"-20"` / `"50"`), and `valuesList` is a single CSV `string` (the
+/// reference passes the list `["10","20","30"]`).
+#[test]
+fn variable_characteristics_type() {
+    round_trip(
+        VariableCharacteristicsType {
+            unit: Some("Celsius".to_string()),
+            data_type: DataEnumType::Decimal,
+            min_limit: Some(-20.0),
+            max_limit: Some(50.0),
+            values_list: Some("10,20,30".to_string()),
+            supports_monitoring: true,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "unit": "Celsius",
+            "dataType": "decimal",
+            "minLimit": -20.0,
+            "maxLimit": 50.0,
+            "valuesList": "10,20,30",
+            "supportsMonitoring": true,
+        }),
+    );
+
+    // required-only form: dataType + supportsMonitoring, everything else omitted.
+    round_trip(
+        VariableCharacteristicsType {
+            unit: None,
+            data_type: DataEnumType::Boolean,
+            min_limit: None,
+            max_limit: None,
+            values_list: None,
+            supports_monitoring: false,
+            custom_data: None,
+        },
+        serde_json::json!({ "dataType": "boolean", "supportsMonitoring": false }),
+    );
+}
+
+/// Ports `test_report_data_type`. One entry in a `NotifyReport`: pins the nested
+/// `component` / `variable`, the non-empty `variableAttribute` array (schema:
+/// 1–4 items), and the optional `variableCharacteristics`. Verified against
+/// `NotifyReport.json`'s `ReportDataType`.
+#[test]
+fn report_data_type() {
+    round_trip(
+        ReportDataType {
+            component: ComponentType {
+                name: "MainController".to_string(),
+                instance: Some("instance1".to_string()),
+                evse: None,
+                custom_data: None,
+            },
+            variable: VariableType {
+                name: "Temperature".to_string(),
+                instance: Some("instance1".to_string()),
+                custom_data: None,
+            },
+            variable_attribute: vec![VariableAttributeType {
+                kind: Some(AttributeEnumType::Actual),
+                value: Some("25.5".to_string()),
+                mutability: Some(MutabilityEnumType::ReadWrite),
+                persistent: Some(true),
+                constant: Some(false),
+                custom_data: None,
+            }],
+            variable_characteristics: Some(VariableCharacteristicsType {
+                unit: Some("Celsius".to_string()),
+                data_type: DataEnumType::Decimal,
+                min_limit: Some(-20.0),
+                max_limit: Some(50.0),
+                values_list: Some("10,20,30".to_string()),
+                supports_monitoring: true,
+                custom_data: None,
+            }),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "component": { "name": "MainController", "instance": "instance1" },
+            "variable": { "name": "Temperature", "instance": "instance1" },
+            "variableAttribute": [
+                {
+                    "type": "Actual",
+                    "value": "25.5",
+                    "mutability": "ReadWrite",
+                    "persistent": true,
+                    "constant": false,
+                }
+            ],
+            "variableCharacteristics": {
+                "unit": "Celsius",
+                "dataType": "decimal",
+                "minLimit": -20.0,
+                "maxLimit": 50.0,
+                "valuesList": "10,20,30",
+                "supportsMonitoring": true,
+            },
+        }),
+    );
+}
+
+/// Ports `test_apn_type`. `apn` + `apnAuthentication` required; pins every
+/// optional (`apnUserName`, `apnPassword`, `simPin`, `preferredNetwork`,
+/// `useOnlyPreferredNetwork`) and the `APNAuthenticationEnumType` wire string
+/// (`"AUTO"`). Verified against `SetNetworkProfile.json`'s `APNType`.
+#[test]
+fn apn_type() {
+    round_trip(
+        APNType {
+            apn: "internet.example.com".to_string(),
+            apn_user_name: Some("username".to_string()),
+            apn_password: Some("password".to_string()),
+            sim_pin: Some(1234),
+            preferred_network: Some("preferred".to_string()),
+            use_only_preferred_network: Some(true),
+            apn_authentication: APNAuthenticationEnumType::Auto,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "apn": "internet.example.com",
+            "apnUserName": "username",
+            "apnPassword": "password",
+            "simPin": 1234,
+            "preferredNetwork": "preferred",
+            "useOnlyPreferredNetwork": true,
+            "apnAuthentication": "AUTO",
+        }),
+    );
+
+    // required-only form: apn + apnAuthentication, everything else omitted.
+    round_trip(
+        APNType {
+            apn: "a".to_string(),
+            apn_user_name: None,
+            apn_password: None,
+            sim_pin: None,
+            preferred_network: None,
+            use_only_preferred_network: None,
+            apn_authentication: APNAuthenticationEnumType::None,
+            custom_data: None,
+        },
+        serde_json::json!({ "apn": "a", "apnAuthentication": "NONE" }),
+    );
+}
+
+/// Ports `test_network_connection_profile_type`. Pins the six required
+/// connectivity parameters and their enum wire strings
+/// (`OCPPVersionEnumType` = `"OCPP20"`, `OCPPTransportEnumType` = `"JSON"`,
+/// `OCPPInterfaceEnumType` = `"Wired0"`) plus the optional bearer blocks.
+/// Verified against `SetNetworkProfile.json`'s `NetworkConnectionProfileType`.
+///
+/// Divergence pinned: the reference passes `vpn=VPNEnumType.ikev2` (a bare enum
+/// member), but the FINAL schema's `vpn` field is a nested `VPNType` *object*
+/// whose own `type` field carries the enum — so this test builds the full
+/// object (`"type": "IKEv2"`).
+#[test]
+fn network_connection_profile_type() {
+    // required-only form: the six connectivity params, no bearer blocks.
+    round_trip(
+        NetworkConnectionProfileType {
+            ocpp_version: OCPPVersionEnumType::Ocpp20,
+            ocpp_transport: OCPPTransportEnumType::Json,
+            ocpp_csms_url: "wss://example.com/ocpp".to_string(),
+            message_timeout: 30,
+            security_profile: 1,
+            ocpp_interface: OCPPInterfaceEnumType::Wired0,
+            apn: None,
+            vpn: None,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "ocppVersion": "OCPP20",
+            "ocppTransport": "JSON",
+            "ocppCsmsUrl": "wss://example.com/ocpp",
+            "messageTimeout": 30,
+            "securityProfile": 1,
+            "ocppInterface": "Wired0",
+        }),
+    );
+
+    // full form: both bearer blocks present, `vpn` as a proper `VPNType` object.
+    round_trip(
+        NetworkConnectionProfileType {
+            ocpp_version: OCPPVersionEnumType::Ocpp20,
+            ocpp_transport: OCPPTransportEnumType::Json,
+            ocpp_csms_url: "wss://example.com/ocpp".to_string(),
+            message_timeout: 30,
+            security_profile: 1,
+            ocpp_interface: OCPPInterfaceEnumType::Wired0,
+            apn: Some(APNType {
+                apn: "internet.example.com".to_string(),
+                apn_user_name: None,
+                apn_password: None,
+                sim_pin: None,
+                preferred_network: None,
+                use_only_preferred_network: None,
+                apn_authentication: APNAuthenticationEnumType::Auto,
+                custom_data: None,
+            }),
+            vpn: Some(VPNType {
+                server: "vpn.example.com".to_string(),
+                user: "vpnuser".to_string(),
+                group: None,
+                password: "secret".to_string(),
+                key: "sharedkey".to_string(),
+                vpn_type: VPNEnumType::Ikev2,
+                custom_data: None,
+            }),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "ocppVersion": "OCPP20",
+            "ocppTransport": "JSON",
+            "ocppCsmsUrl": "wss://example.com/ocpp",
+            "messageTimeout": 30,
+            "securityProfile": 1,
+            "ocppInterface": "Wired0",
+            "apn": {
+                "apn": "internet.example.com",
+                "apnAuthentication": "AUTO",
+            },
+            "vpn": {
+                "server": "vpn.example.com",
+                "user": "vpnuser",
+                "password": "secret",
+                "key": "sharedkey",
+                "type": "IKEv2",
+            },
+        }),
     );
 }
