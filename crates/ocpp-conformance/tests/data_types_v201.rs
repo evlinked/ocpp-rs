@@ -35,6 +35,13 @@
 //!   `ClearMonitoringResultType`, `MessageInfoType`, `CertificateHashDataType`,
 //!   `CertificateHashDataChainType`, `OCSPRequestDataType`, `LogParametersType`,
 //!   and `FirmwareType`.
+//! - **Slice 3c — the smart-charging *control* datatypes** (#285): the three
+//!   remaining smart-charging datatypes that sit on the command side rather than
+//!   the tariff side slice 3a covered — the *externally-imposed limit* reported
+//!   by `NotifyChargingLimit` and the two *profile-selection filters* used by
+//!   `GetChargingProfiles` / `ClearChargingProfile`: `ChargingLimitType`,
+//!   `ChargingProfileCriterionType`, and `ClearChargingProfileType`. This closes
+//!   full datatype coverage of `test_v201_data_types.py`.
 //!
 //! ## What is pinned, and why it is stronger than the reference
 //!
@@ -120,13 +127,16 @@
 //!
 //! ## Datatype coverage of `test_v201_data_types.py`
 //!
-//! Slices 1–3b pin the full monitoring/events, certificate/ISO-15118,
-//! metering, device-model/provisioning, and smart-charging/tariffs datatype
-//! trees. Of the reference file's datatype tests, `AuthorizationData` is pinned
-//! by the local-list suite (`local_list.rs`). **Three smart-charging *control*
-//! datatypes remain unpinned by any crate-boundary suite** —
-//! `ChargingLimitType`, `ChargingProfileCriterionType`, and
-//! `ClearChargingProfileType` — tracked as slice 3c by a follow-up to #284.
+//! Slices 1–3c pin the full metering, device-model/provisioning,
+//! smart-charging/tariffs, monitoring/events, certificate/ISO-15118, and
+//! smart-charging/control datatype trees. Together with `AuthorizationData`
+//! (pinned by the local-list suite `local_list.rs`), **every datatype exercised
+//! by `test_v201_data_types.py` is now pinned by a crate-boundary suite** — the
+//! port of the reference file's datatype tests is complete. Slice 3c found no
+//! new Python-dataclass-vs-FINAL-schema divergence: the reference constructs
+//! schema-valid values for all three control datatypes, and the Rust structs,
+//! Python dataclasses, and FINAL schemas (`NotifyChargingLimit.json`,
+//! `GetChargingProfiles.json`, `ClearChargingProfile.json`) agree field-for-field.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -157,6 +167,11 @@ use ocpp_types::v201::{
     MessageInfoType, MessagePriorityEnumType, MessageStateEnumType, MonitorEnumType,
     MonitoringDataType, OCSPRequestDataType, SetMonitoringDataType, SetMonitoringResultType,
     SetMonitoringStatusEnumType, VariableMonitoringType,
+};
+// Slice 3c — smart-charging *control* datatypes (#285).
+use ocpp_types::v201::{
+    ChargingLimitSourceEnumType, ChargingLimitType, ChargingProfileCriterionType,
+    ClearChargingProfileType,
 };
 
 /// Assert `value` serializes to *exactly* `expected` and that `expected`
@@ -2165,5 +2180,159 @@ fn firmware_type() {
             "location": "https://firmware.example.com/v1.2.3",
             "retrieveDateTime": "2024-01-01T10:00:00Z",
         }),
+    );
+}
+
+// --- Slice 3c: smart-charging *control* datatypes (#285) ---------------------
+//
+// The three datatypes that ride the smart-charging *command* messages rather
+// than the tariff schedules slice 3a covered: the externally-imposed limit
+// reported by `NotifyChargingLimit`, and the two profile-selection *filters*
+// carried by `GetChargingProfiles` / `ClearChargingProfile`. Verified against
+// `NotifyChargingLimit.json`, `GetChargingProfiles.json`, and
+// `ClearChargingProfile.json`. The reference constructs schema-valid values for
+// all three, so — unlike slices 2/3a/3b — no dataclass-vs-FINAL-schema
+// divergence surfaced here; the structs, dataclasses, and schemas agree.
+
+/// Ports `test_charging_limit_type`. `chargingLimitSource` (the origin of the
+/// limit) is required; `isGridCritical` is optional. The enum's `Ems` /`So` /
+/// `Cso` variants carry acronym renames (`"EMS"` / `"SO"` / `"CSO"`) that this
+/// test pins. Verified against `NotifyChargingLimit.json`'s `ChargingLimitType`
+/// (`required: ["chargingLimitSource"]`) and its `ChargingLimitSourceEnumType`
+/// (`["EMS", "Other", "SO", "CSO"]`).
+#[test]
+fn charging_limit_type() {
+    // The reference case: source "EMS" + is_grid_critical=True.
+    round_trip(
+        ChargingLimitType {
+            charging_limit_source: ChargingLimitSourceEnumType::Ems,
+            is_grid_critical: Some(true),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "chargingLimitSource": "EMS",
+            "isGridCritical": true,
+        }),
+    );
+
+    // Required-only form: the optional `isGridCritical` omitted, and a plain
+    // (un-renamed) `Other` source to pin that branch too.
+    round_trip(
+        ChargingLimitType {
+            charging_limit_source: ChargingLimitSourceEnumType::Other,
+            is_grid_critical: None,
+            custom_data: None,
+        },
+        serde_json::json!({ "chargingLimitSource": "Other" }),
+    );
+}
+
+/// Ports `test_charging_profile_criterion_type`. A *filter* for
+/// `GetChargingProfiles`: every field is optional and an empty `{}` matches every
+/// installed profile. Verified against `GetChargingProfiles.json`'s
+/// `ChargingProfileCriterionType` — the two list fields have `minItems: 1` (and
+/// `chargingLimitSource` additionally `maxItems: 4`), enforced at the schema
+/// layer; here we pin the wire shape (camelCase names, nested arrays, enum
+/// strings, and optional omission).
+#[test]
+fn charging_profile_criterion_type() {
+    // The reference case: purpose + stack level + an id list (no source filter).
+    round_trip(
+        ChargingProfileCriterionType {
+            charging_profile_purpose: Some(ChargingProfilePurposeEnumType::TxDefaultProfile),
+            stack_level: Some(0),
+            charging_profile_id: Some(vec![1, 2, 3]),
+            charging_limit_source: None,
+            custom_data: None,
+        },
+        serde_json::json!({
+            "chargingProfilePurpose": "TxDefaultProfile",
+            "stackLevel": 0,
+            "chargingProfileId": [1, 2, 3],
+        }),
+    );
+
+    // Full form: additionally pin the `chargingLimitSource` list-of-enum at its
+    // `maxItems: 4` ceiling, which also exercises the three acronym renames
+    // (`EMS` / `SO` / `CSO`) inside a nested array.
+    round_trip(
+        ChargingProfileCriterionType {
+            charging_profile_purpose: Some(ChargingProfilePurposeEnumType::TxProfile),
+            stack_level: Some(7),
+            charging_profile_id: Some(vec![42]),
+            charging_limit_source: Some(vec![
+                ChargingLimitSourceEnumType::Ems,
+                ChargingLimitSourceEnumType::So,
+                ChargingLimitSourceEnumType::Cso,
+                ChargingLimitSourceEnumType::Other,
+            ]),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "chargingProfilePurpose": "TxProfile",
+            "stackLevel": 7,
+            "chargingProfileId": [42],
+            "chargingLimitSource": ["EMS", "SO", "CSO", "Other"],
+        }),
+    );
+
+    // Empty criterion: every field optional → an empty wire object, matching
+    // "report every installed profile".
+    round_trip(
+        ChargingProfileCriterionType {
+            charging_profile_purpose: None,
+            stack_level: None,
+            charging_profile_id: None,
+            charging_limit_source: None,
+            custom_data: None,
+        },
+        serde_json::json!({}),
+    );
+}
+
+/// Ports `test_clear_charging_profile_type`. A *filter* for
+/// `ClearChargingProfile`: every field is optional and a profile is cleared only
+/// if it matches all criteria present; an `evseId` of `0` targets the
+/// station-wide profile and an empty `{}` clears every profile. Verified against
+/// `ClearChargingProfile.json`'s `ClearChargingProfileType` (no `required` list).
+#[test]
+fn clear_charging_profile_type() {
+    // The reference case: evse_id=1, purpose, stack level=0.
+    round_trip(
+        ClearChargingProfileType {
+            evse_id: Some(1),
+            charging_profile_purpose: Some(ChargingProfilePurposeEnumType::TxDefaultProfile),
+            stack_level: Some(0),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "evseId": 1,
+            "chargingProfilePurpose": "TxDefaultProfile",
+            "stackLevel": 0,
+        }),
+    );
+
+    // Station-wide target: `evseId: 0` (the overall Charging Station), other
+    // criteria omitted.
+    round_trip(
+        ClearChargingProfileType {
+            evse_id: Some(0),
+            charging_profile_purpose: None,
+            stack_level: None,
+            custom_data: None,
+        },
+        serde_json::json!({ "evseId": 0 }),
+    );
+
+    // Empty filter: every field optional → an empty wire object, matching "clear
+    // every installed profile".
+    round_trip(
+        ClearChargingProfileType {
+            evse_id: None,
+            charging_profile_purpose: None,
+            stack_level: None,
+            custom_data: None,
+        },
+        serde_json::json!({}),
     );
 }
