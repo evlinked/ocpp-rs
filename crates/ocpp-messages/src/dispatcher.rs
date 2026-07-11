@@ -198,9 +198,12 @@ impl ActionDispatcher {
 
     /// Dispatch an incoming [`CallMessage`] to the registered `@on` handler.
     ///
-    /// Returns the serialised response `Value` to wrap in a CALLRESULT, or
-    /// `OcppError::NotSupported` when no handler is registered for
-    /// `call.action`.
+    /// Returns the serialised response `Value` to wrap in a CALLRESULT. When no
+    /// handler is registered for `call.action`, the error mirrors the
+    /// reference's `_raise_key_error` split: a *known* action for the negotiated
+    /// version yields [`OcppError::NotImplemented`], while an action the version
+    /// does not define yields [`OcppError::NotSupported`] (see
+    /// [`unrouted_action_error`](Self::unrouted_action_error)).
     ///
     /// If an `@after` hook is registered, it is spawned via `tokio::spawn`
     /// after the handler returns successfully (non-blocking).
@@ -209,14 +212,12 @@ impl ActionDispatcher {
 
         // Resolve the route first: the per-route `skip_validation` flag decides
         // whether the validator runs, so the lookup must precede validation.
-        // (For an unknown action, `validate_call` would itself return
-        // `NotSupported`, so this reordering yields the same error either way.)
-        let route = self
-            .handlers
-            .get(action)
-            .ok_or_else(|| OcppError::NotSupported {
-                feature: action.to_string(),
-            })?;
+        // (For an unrouted action, `unrouted_action_error` selects the reference
+        // NotImplemented/NotSupported split before any validation would run.)
+        let route = match self.handlers.get(action) {
+            Some(route) => route,
+            None => return Err(self.unrouted_action_error(action)),
+        };
 
         // Schema-validate the incoming payload before invoking the handler,
         // mirroring `_handle_call()` in charge_point.py which runs `_validate()`
@@ -240,6 +241,44 @@ impl ActionDispatcher {
         }
 
         Ok(response)
+    }
+
+    /// Select the error for a CALL whose action has no registered handler,
+    /// porting `_raise_key_error(action, version)` from
+    /// [`ocpp/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py):
+    ///
+    /// - a **known** action for the negotiated version (the reference's
+    ///   `v16_Action(action)` / `v201_Action(action)` succeeds) → no handler is
+    ///   registered → [`OcppError::NotImplemented`] ("No handler registered");
+    /// - an action the version **does not define** → [`OcppError::NotSupported`].
+    ///
+    /// The [`ActionDispatcher`] is deliberately version-generic, so its attached
+    /// [`SchemaValidator`] supplies the version context: the validator's bundled
+    /// schema set is the version-scoped known-action registry that stands in for
+    /// the reference's per-version `Action` enum. With **no** validator attached
+    /// there is no version context to consult, so we conservatively report
+    /// `NotSupported` (the dispatcher's prior behaviour) rather than guess that
+    /// an action is "known".
+    ///
+    /// Note: for OCPP 2.0.1 the `v201()` validator currently bundles a subset of
+    /// schemas, so a valid-but-not-yet-bundled 2.0.1 action is reported as
+    /// `NotSupported`; it upgrades to `NotImplemented` automatically as more
+    /// schemas land. This tracks "what this validator knows", which is the most
+    /// faithful signal available to a version-generic dispatcher.
+    fn unrouted_action_error(&self, action: &str) -> OcppError {
+        let known_for_version = self
+            .validator
+            .as_ref()
+            .is_some_and(|v| v.has_schema(action));
+        if known_for_version {
+            OcppError::NotImplemented {
+                feature: action.to_string(),
+            }
+        } else {
+            OcppError::NotSupported {
+                feature: action.to_string(),
+            }
+        }
     }
 
     /// Returns `true` if a handler is registered for `action`.
@@ -595,6 +634,57 @@ mod tests {
         assert!(
             matches!(err, OcppError::Json { .. }),
             "expected Json (serde) error without a validator, got {err:?}"
+        );
+    }
+
+    // --- unrouted-action split: NotImplemented vs NotSupported (Issue #276) ---
+    //
+    // Python ref: `_raise_key_error(action, version)` in ocpp/charge_point.py
+    // returns NotImplemented for a *known* action with no handler and
+    // NotSupported for an action the version does not define. The attached
+    // validator (its bundled schema set) is the version-scoped known-action
+    // registry that stands in for the reference's `v16_Action` enum.
+
+    #[tokio::test]
+    async fn unrouted_known_action_with_validator_is_not_implemented() {
+        // BootNotification is a valid 1.6J action (the validator has its schema)
+        // but no handler is registered → NotImplemented.
+        let d = validating_dispatcher();
+        assert!(!d.has_handler("BootNotification"));
+
+        let call = CallMessage::new("BootNotification".to_string(), serde_json::json!({})).unwrap();
+        let err = d.dispatch(&call).await.unwrap_err();
+        assert!(
+            matches!(err, OcppError::NotImplemented { ref feature } if feature == "BootNotification"),
+            "expected NotImplemented for a known-but-unregistered action, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrouted_unknown_action_with_validator_is_not_supported() {
+        // An action the version does not define (no schema) → NotSupported, even
+        // with a validator attached.
+        let d = validating_dispatcher();
+        let call =
+            CallMessage::new("TotallyUnknownAction".to_string(), serde_json::json!({})).unwrap();
+        let err = d.dispatch(&call).await.unwrap_err();
+        assert!(
+            matches!(err, OcppError::NotSupported { ref feature } if feature == "TotallyUnknownAction"),
+            "expected NotSupported for an action the version does not define, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unrouted_action_without_validator_stays_not_supported() {
+        // No validator → no version context → the conservative NotSupported, so
+        // even a valid 1.6J action name cannot be reported as NotImplemented.
+        let d = ActionDispatcher::new();
+        assert!(!d.has_validator());
+        let call = CallMessage::new("BootNotification".to_string(), serde_json::json!({})).unwrap();
+        let err = d.dispatch(&call).await.unwrap_err();
+        assert!(
+            matches!(err, OcppError::NotSupported { ref feature } if feature == "BootNotification"),
+            "without a validator a missing handler must yield NotSupported, got {err:?}"
         );
     }
 

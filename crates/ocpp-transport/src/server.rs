@@ -1045,6 +1045,10 @@ async fn handle_cp_socket(socket: WebSocket, charge_point_id: String, state: Arc
 pub(crate) fn build_call_error(unique_id: &str, error: &OcppError) -> Message {
     let code = match error {
         OcppError::NotSupported { .. } => CallErrorCode::NotSupported,
+        // A known action for the negotiated version with no registered handler —
+        // the `NotImplementedError` branch of `_raise_key_error` in
+        // `ocpp/charge_point.py`.
+        OcppError::NotImplemented { .. } => CallErrorCode::NotImplemented,
         // Keyword-granular code from the failing JSON-Schema keyword, per
         // `_validate_payload()` in `ocpp/messages.py`.
         OcppError::SchemaViolation { keyword, .. } => keyword.call_error_code(),

@@ -199,7 +199,10 @@ async fn v201_malformed_payload_short_circuits_before_handler() {
 }
 
 /// Multiple v201 handlers on one dispatcher route to the correct one with no
-/// cross-talk, and an unregistered v201 action yields `NotSupported`.
+/// cross-talk. Ports the `_raise_key_error(action, "2.0.1")` split (Issue #276):
+/// an unregistered *known* v201 action (the `v201()` validator has its schema)
+/// yields `NotImplemented`, while an action the version does not define yields
+/// `NotSupported`.
 #[tokio::test]
 async fn v201_handlers_route_to_the_correct_action() {
     let mut d = v201_dispatcher();
@@ -236,8 +239,10 @@ async fn v201_handlers_route_to_the_correct_action() {
     let boot_resp = d.dispatch(&boot).await.unwrap();
     assert_eq!(boot_resp["status"], "Accepted");
 
-    // A v201 action with no registered handler → NotSupported (the schema is
-    // bundled, so validation passes first, then dispatch finds no handler).
+    // A *known* v201 action with no registered handler → NotImplemented: the
+    // `v201()` validator has the Authorize schema, so it is a valid 2.0.1 action
+    // the dispatcher simply has no handler for (the `NotImplementedError` branch
+    // of `_raise_key_error`).
     let authorize = CallMessage::new(
         "Authorize".to_string(),
         json!({ "idToken": { "idToken": "abc", "type": "ISO14443" } }),
@@ -245,8 +250,17 @@ async fn v201_handlers_route_to_the_correct_action() {
     .unwrap();
     let err = d.dispatch(&authorize).await.unwrap_err();
     assert!(
-        matches!(err, OcppError::NotSupported { ref feature } if feature == "Authorize"),
-        "unregistered v201 action must be NotSupported, got {err:?}"
+        matches!(err, OcppError::NotImplemented { ref feature } if feature == "Authorize"),
+        "a known-but-unregistered v201 action must be NotImplemented, got {err:?}"
+    );
+
+    // An action the version does not define (no bundled schema) → NotSupported,
+    // the `NotSupportedError` branch of the same split.
+    let undefined = CallMessage::new("NoSuchV201Action".to_string(), json!({})).unwrap();
+    let err = d.dispatch(&undefined).await.unwrap_err();
+    assert!(
+        matches!(err, OcppError::NotSupported { ref feature } if feature == "NoSuchV201Action"),
+        "an action the version does not define must be NotSupported, got {err:?}"
     );
 }
 
