@@ -100,9 +100,27 @@ pub mod utils {
         Uuid::new_v4().to_string()
     }
 
-    /// Create a Call message from an action
+    /// Create a Call message from an action, minting a fresh `unique_id`
+    /// (UUIDv4). This is the default, auto-generate branch of the reference's
+    /// `ChargePoint.call()` (mobilityhouse/ocpp `ocpp/charge_point.py`) — use
+    /// [`create_call_with_id`] when the caller already owns the id.
     pub fn create_call<T: OcppAction>(action: T) -> OcppResult<CallMessage> {
         CallMessage::new(T::ACTION_NAME.to_string(), action)
+    }
+
+    /// Create a Call message from an action, using a **caller-supplied**
+    /// `unique_id` verbatim.
+    ///
+    /// Mirrors the caller-supplied branch of the reference's
+    /// `ChargePoint.call(payload, unique_id=…)` (`ocpp/charge_point.py`): the
+    /// caller can correlate the CALLRESULT it will later receive against an id it
+    /// already owns, instead of having a fresh UUID forced on it. The
+    /// auto-generate [`create_call`] remains the default when no id is supplied.
+    pub fn create_call_with_id<T: OcppAction>(
+        unique_id: String,
+        action: T,
+    ) -> OcppResult<CallMessage> {
+        CallMessage::with_id(unique_id, T::ACTION_NAME.to_string(), action)
     }
 
     /// Create a CallResult message from a response
@@ -204,6 +222,35 @@ mod tests {
 
         let extracted: TestAction = utils::extract_payload(&call).unwrap();
         assert_eq!(extracted, action);
+    }
+
+    #[test]
+    fn test_create_call_with_id_uses_id_verbatim() {
+        let action = TestAction {
+            test_field: "test_value".to_string(),
+        };
+
+        let call = utils::create_call_with_id("12345".to_string(), action.clone()).unwrap();
+
+        // The caller-supplied id is used exactly as given.
+        assert_eq!(call.unique_id, "12345");
+        assert_eq!(call.action, "TestAction");
+
+        let extracted: TestAction = utils::extract_payload(&call).unwrap();
+        assert_eq!(extracted, action);
+    }
+
+    #[test]
+    fn test_create_call_default_id_is_fresh() {
+        // The auto-generate path stays the default: each CALL gets a distinct id.
+        let a = TestAction {
+            test_field: "a".to_string(),
+        };
+        let call1 = utils::create_call(a.clone()).unwrap();
+        let call2 = utils::create_call(a).unwrap();
+
+        assert!(!call1.unique_id.is_empty());
+        assert_ne!(call1.unique_id, call2.unique_id);
     }
 
     #[test]
