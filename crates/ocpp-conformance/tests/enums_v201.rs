@@ -33,15 +33,36 @@
 //! behavior is documented and regression-guarded. If a future OCPP errata folds
 //! these into the FINAL schema, the `reject` calls fail loudly and flag the
 //! model + schema for update together.
+//!
+//! ## Sweep of the remaining v201 enums (#274)
+//!
+//! Beyond the reference's hand-picked high-risk set, #274 sweeps every
+//! `*EnumType` this crate models, split into domain slices. Slice 1 (#297)
+//! covered the security / certificate / ISO-15118 / network-transport domain.
+//! **Slice 2 (this change, #298)** covers the command/operation-status +
+//! transaction/registration lifecycle domain — the reply-status vocabularies a
+//! CSMS reads off every command CALLRESULT, plus the request-side lifecycle
+//! discriminators. Each swept enum is cross-checked against the bundled FINAL
+//! schema named in its test's doc comment; divergences are pinned with
+//! [`reject`], never dropped.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{from_value, json, to_value};
 
 use ocpp_types::v201::{
-    ChargingStateEnumType, ConnectorEnumType, ConnectorStatusEnumType, DataEnumType,
-    LocationEnumType, MeasurandEnumType, PhaseEnumType, ReadingContextEnumType, ReasonEnumType,
-    TriggerReasonEnumType, TxStartStopPointEnumType,
+    BootReasonEnumType, CancelReservationStatusEnumType, ChangeAvailabilityStatusEnumType,
+    ChargingStateEnumType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
+    ClearMessageStatusEnumType, ConnectorEnumType, ConnectorStatusEnumType,
+    CustomerInformationStatusEnumType, DataEnumType, DataTransferStatusEnumType,
+    DisplayMessageStatusEnumType, GenericStatusEnumType, GetChargingProfileStatusEnumType,
+    GetDisplayMessagesStatusEnumType, LocationEnumType, MeasurandEnumType,
+    NotifyEVChargingNeedsStatusEnumType, OperationalStatusEnumType, PhaseEnumType,
+    ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType,
+    RequestStartStopStatusEnumType, ReservationUpdateStatusEnumType, ReserveNowStatusEnumType,
+    ResetEnumType, ResetStatusEnumType, SendLocalListStatusEnumType, TransactionEventEnumType,
+    TriggerMessageStatusEnumType, TriggerReasonEnumType, TxStartStopPointEnumType,
+    UnlockStatusEnumType,
 };
 
 /// Assert that `wire` deserializes into `T` and re-serializes back to the
@@ -318,5 +339,233 @@ fn test_charging_state() {
         "SuspendedEV",
         "SuspendedEVSE",
         "Idle",
+    ]);
+}
+
+// ---------------------------------------------------------------------------
+// Slice 2 of #274 — command/operation-status + transaction/registration
+// lifecycle enums. These are the reply-status vocabularies a CSMS reads off
+// every command CALLRESULT, plus the request-side lifecycle discriminators
+// (`BootReason`, `TransactionEvent`, `Reset`, `OperationalStatus`).
+//
+// Every wire string below was verified against `ocpp/v201/enums.py` (source of
+// truth) AND cross-checked against the named bundled FINAL schema in
+// `crates/ocpp-messages/schemas/v201/*.json` (the vocabulary
+// `SchemaValidator::v201()` actually enforces). For all 24, model == reference
+// == FINAL schema — so, like slice 1, this slice pins no `reject` divergences.
+// Each test's doc comment names the FINAL schema it was cross-checked against.
+// ---------------------------------------------------------------------------
+
+/// `BootReasonEnumType` — the `reason` discriminator a Charging Station sends in
+/// every `BootNotification`. Cross-checked against `BootNotification.json`.
+#[test]
+fn test_boot_reason() {
+    pin_all::<BootReasonEnumType>(&[
+        "ApplicationReset",
+        "FirmwareUpdate",
+        "LocalReset",
+        "PowerUp",
+        "RemoteReset",
+        "ScheduledReset",
+        "Triggered",
+        "Unknown",
+        "Watchdog",
+    ]);
+}
+
+/// `RegistrationStatusEnumType` — the CSMS's boot verdict. `Pending` gates the
+/// station into the provisioning state machine, so a rename would strand it.
+/// Cross-checked against `BootNotificationResponse.json`.
+#[test]
+fn test_registration_status() {
+    pin_all::<RegistrationStatusEnumType>(&["Accepted", "Pending", "Rejected"]);
+}
+
+/// `CancelReservationStatusEnumType`. Cross-checked against
+/// `CancelReservationResponse.json`.
+#[test]
+fn test_cancel_reservation_status() {
+    pin_all::<CancelReservationStatusEnumType>(&["Accepted", "Rejected"]);
+}
+
+/// `ChangeAvailabilityStatusEnumType` — `Scheduled` defers the availability
+/// change until the transaction ends. Cross-checked against
+/// `ChangeAvailabilityResponse.json`.
+#[test]
+fn test_change_availability_status() {
+    pin_all::<ChangeAvailabilityStatusEnumType>(&["Accepted", "Rejected", "Scheduled"]);
+}
+
+/// `OperationalStatusEnumType` — the request-side target state of a
+/// `ChangeAvailability`. Cross-checked against `ChangeAvailability.json`.
+#[test]
+fn test_operational_status() {
+    pin_all::<OperationalStatusEnumType>(&["Inoperative", "Operative"]);
+}
+
+/// `ClearCacheStatusEnumType`. Cross-checked against `ClearCacheResponse.json`.
+#[test]
+fn test_clear_cache_status() {
+    pin_all::<ClearCacheStatusEnumType>(&["Accepted", "Rejected"]);
+}
+
+/// `ClearChargingProfileStatusEnumType` — `Unknown` (not `Rejected`) is the
+/// no-match verdict here, a per-command divergence worth pinning. Cross-checked
+/// against `ClearChargingProfileResponse.json`.
+#[test]
+fn test_clear_charging_profile_status() {
+    pin_all::<ClearChargingProfileStatusEnumType>(&["Accepted", "Unknown"]);
+}
+
+/// `ClearMessageStatusEnumType` — the `ClearDisplayMessage` verdict; likewise
+/// `Unknown` rather than `Rejected`. Cross-checked against
+/// `ClearDisplayMessageResponse.json`.
+#[test]
+fn test_clear_message_status() {
+    pin_all::<ClearMessageStatusEnumType>(&["Accepted", "Unknown"]);
+}
+
+/// `CustomerInformationStatusEnumType` — carries `Invalid` beyond the usual
+/// accept/reject pair. Cross-checked against `CustomerInformationResponse.json`.
+#[test]
+fn test_customer_information_status() {
+    pin_all::<CustomerInformationStatusEnumType>(&["Accepted", "Rejected", "Invalid"]);
+}
+
+/// `DataTransferStatusEnumType` — the concatenated-acronym verdicts
+/// `UnknownMessageId` / `UnknownVendorId` are the rename risk. Cross-checked
+/// against `DataTransferResponse.json`.
+#[test]
+fn test_data_transfer_status() {
+    pin_all::<DataTransferStatusEnumType>(&[
+        "Accepted",
+        "Rejected",
+        "UnknownMessageId",
+        "UnknownVendorId",
+    ]);
+}
+
+/// `DisplayMessageStatusEnumType` — the `NotSupported*` family plus
+/// `UnknownTransaction` are all embedded-word strings that must serialize
+/// verbatim. Cross-checked against `SetDisplayMessageResponse.json`.
+#[test]
+fn test_display_message_status() {
+    pin_all::<DisplayMessageStatusEnumType>(&[
+        "Accepted",
+        "NotSupportedMessageFormat",
+        "Rejected",
+        "NotSupportedPriority",
+        "NotSupportedState",
+        "UnknownTransaction",
+    ]);
+}
+
+/// `GenericStatusEnumType` — the shared accept/reject verdict reused by
+/// `GetCompositeSchedule`, `NotifyEVChargingSchedule`, `PublishFirmware`,
+/// `SetMonitoringLevel`, and `SignCertificate`. Cross-checked against
+/// `GetCompositeScheduleResponse.json`.
+#[test]
+fn test_generic_status() {
+    pin_all::<GenericStatusEnumType>(&["Accepted", "Rejected"]);
+}
+
+/// `GetChargingProfileStatusEnumType` — `NoProfiles` is the empty-result
+/// verdict. Cross-checked against `GetChargingProfilesResponse.json`.
+#[test]
+fn test_get_charging_profile_status() {
+    pin_all::<GetChargingProfileStatusEnumType>(&["Accepted", "NoProfiles"]);
+}
+
+/// `GetDisplayMessagesStatusEnumType`. Cross-checked against
+/// `GetDisplayMessagesResponse.json`.
+#[test]
+fn test_get_display_messages_status() {
+    pin_all::<GetDisplayMessagesStatusEnumType>(&["Accepted", "Unknown"]);
+}
+
+/// `NotifyEVChargingNeedsStatusEnumType` — `Processing` is the deferred verdict.
+/// Cross-checked against `NotifyEVChargingNeedsResponse.json`.
+#[test]
+fn test_notify_ev_charging_needs_status() {
+    pin_all::<NotifyEVChargingNeedsStatusEnumType>(&["Accepted", "Rejected", "Processing"]);
+}
+
+/// `RequestStartStopStatusEnumType` — the shared verdict for
+/// `RequestStartTransaction` and `RequestStopTransaction`. Cross-checked against
+/// `RequestStartTransactionResponse.json`.
+#[test]
+fn test_request_start_stop_status() {
+    pin_all::<RequestStartStopStatusEnumType>(&["Accepted", "Rejected"]);
+}
+
+/// `ReservationUpdateStatusEnumType` — the request-side status a station reports
+/// in `ReservationStatusUpdate`. Cross-checked against
+/// `ReservationStatusUpdate.json`.
+#[test]
+fn test_reservation_update_status() {
+    pin_all::<ReservationUpdateStatusEnumType>(&["Expired", "Removed"]);
+}
+
+/// `ReserveNowStatusEnumType` — the connector-availability verdicts (`Faulted`,
+/// `Occupied`, `Unavailable`) beyond accept/reject. Cross-checked against
+/// `ReserveNowResponse.json`.
+#[test]
+fn test_reserve_now_status() {
+    pin_all::<ReserveNowStatusEnumType>(&[
+        "Accepted",
+        "Faulted",
+        "Occupied",
+        "Rejected",
+        "Unavailable",
+    ]);
+}
+
+/// `ResetEnumType` — the request-side reset kind; `OnIdle` defers until the
+/// transaction ends. Cross-checked against `Reset.json`.
+#[test]
+fn test_reset_type() {
+    pin_all::<ResetEnumType>(&["Immediate", "OnIdle"]);
+}
+
+/// `ResetStatusEnumType` — the reset verdict; `Scheduled` mirrors an `OnIdle`
+/// request. Cross-checked against `ResetResponse.json`.
+#[test]
+fn test_reset_status() {
+    pin_all::<ResetStatusEnumType>(&["Accepted", "Rejected", "Scheduled"]);
+}
+
+/// `SendLocalListStatusEnumType` — `VersionMismatch` guards the local-auth-list
+/// versioning protocol. Cross-checked against `SendLocalListResponse.json`.
+#[test]
+fn test_send_local_list_status() {
+    pin_all::<SendLocalListStatusEnumType>(&["Accepted", "Failed", "VersionMismatch"]);
+}
+
+/// `TransactionEventEnumType` — the `eventType` discriminator on every
+/// `TransactionEvent` CALL (`Started` / `Updated` / `Ended` drive the CSMS
+/// transaction state machine). Cross-checked against `TransactionEvent.json`.
+#[test]
+fn test_transaction_event() {
+    pin_all::<TransactionEventEnumType>(&["Ended", "Started", "Updated"]);
+}
+
+/// `TriggerMessageStatusEnumType` — `NotImplemented` is distinct from
+/// `Rejected` (the CSMS asked for a message the station cannot emit).
+/// Cross-checked against `TriggerMessageResponse.json`.
+#[test]
+fn test_trigger_message_status() {
+    pin_all::<TriggerMessageStatusEnumType>(&["Accepted", "Rejected", "NotImplemented"]);
+}
+
+/// `UnlockStatusEnumType` — the multi-word verdicts `UnlockFailed`,
+/// `OngoingAuthorizedTransaction`, `UnknownConnector` must serialize verbatim.
+/// Cross-checked against `UnlockConnectorResponse.json`.
+#[test]
+fn test_unlock_status() {
+    pin_all::<UnlockStatusEnumType>(&[
+        "Unlocked",
+        "UnlockFailed",
+        "OngoingAuthorizedTransaction",
+        "UnknownConnector",
     ]);
 }
