@@ -33,15 +33,33 @@
 //! behavior is documented and regression-guarded. If a future OCPP errata folds
 //! these into the FINAL schema, the `reject` calls fail loudly and flag the
 //! model + schema for update together.
+//!
+//! ## Sweep of the remaining v201 enums (issue #274)
+//!
+//! Beyond the three reference-pinned enums and the dotted/hyphenated extras
+//! below, this suite sweeps the remaining `*EnumType`s in
+//! `ocpp-types::v201::enums` so a stray rename in any of them fails a test.
+//! Slice 1 (this file) covers the **security / certificate / ISO-15118 /
+//! network-transport / identity** domain; later slices cover the command-status,
+//! device-model/monitoring, and firmware/log domains. Every swept enum's wire
+//! strings are verified against both `ocpp/v201/enums.py` and the bundled FINAL
+//! `crates/ocpp-messages/schemas/v201/*.json`.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{from_value, json, to_value};
 
 use ocpp_types::v201::{
+    APNAuthenticationEnumType, AuthorizationStatusEnumType, AuthorizeCertificateStatusEnumType,
+    CertificateActionEnumType, CertificateSignedStatusEnumType, CertificateSigningUseEnumType,
     ChargingStateEnumType, ConnectorEnumType, ConnectorStatusEnumType, DataEnumType,
-    LocationEnumType, MeasurandEnumType, PhaseEnumType, ReadingContextEnumType, ReasonEnumType,
-    TriggerReasonEnumType, TxStartStopPointEnumType,
+    DeleteCertificateStatusEnumType, EnergyTransferModeEnumType, GetCertificateIdUseEnumType,
+    GetCertificateStatusEnumType, GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType,
+    IdTokenEnumType, InstallCertificateStatusEnumType, InstallCertificateUseEnumType,
+    Iso15118EVCertificateStatusEnumType, LocationEnumType, MeasurandEnumType,
+    OCPPInterfaceEnumType, OCPPTransportEnumType, OCPPVersionEnumType, PhaseEnumType,
+    ReadingContextEnumType, ReasonEnumType, TriggerReasonEnumType, TxStartStopPointEnumType,
+    VPNEnumType,
 };
 
 /// Assert that `wire` deserializes into `T` and re-serializes back to the
@@ -318,5 +336,223 @@ fn test_charging_state() {
         "SuspendedEV",
         "SuspendedEVSE",
         "Idle",
+    ]);
+}
+
+// ---------------------------------------------------------------------------
+// Sweep of the remaining v201 `*EnumType`s (issue #274) — slice 1: the
+// security / certificate / ISO-15118 / network-transport / identity domain.
+//
+// Every enum below is a FINAL-schema field. Each expected wire string is
+// verified against BOTH `ocpp/v201/enums.py` (the reference dataclass) AND the
+// bundled `crates/ocpp-messages/schemas/v201/*.json` (the FINAL schema
+// `SchemaValidator::v201()` enforces). For all 20, model == reference ==
+// schema, so — unlike `ConnectorEnumType` / `DataEnumType` above — this slice
+// pins no `reject` divergences. The schema file named in each doc comment is
+// the FINAL source cross-checked (an enum may recur in several schemas with an
+// identical member list; one representative is named).
+// ---------------------------------------------------------------------------
+
+/// `APNAuthenticationEnumType` — all-caps acronyms (`CHAP`, `PAP`, `AUTO`) that
+/// must serialize verbatim, never title-cased. Schema: `SetNetworkProfile.json`.
+#[test]
+fn test_apn_authentication() {
+    pin_all::<APNAuthenticationEnumType>(&["CHAP", "NONE", "PAP", "AUTO"]);
+}
+
+/// `AuthorizationStatusEnumType` — the id-token authorization vocabulary; the
+/// embedded-acronym `NotAllowedTypeEVSE` and the `ConcurrentTx` case are the
+/// drift risk. Schema: `AuthorizeResponse.json` (also `TransactionEventResponse`,
+/// `SendLocalList`).
+#[test]
+fn test_authorization_status() {
+    pin_all::<AuthorizationStatusEnumType>(&[
+        "Accepted",
+        "Blocked",
+        "ConcurrentTx",
+        "Expired",
+        "Invalid",
+        "NoCredit",
+        "NotAllowedTypeEVSE",
+        "NotAtThisLocation",
+        "NotAtThisTime",
+        "Unknown",
+    ]);
+}
+
+/// `AuthorizeCertificateStatusEnumType` — ISO-15118 contract-certificate status;
+/// `CertChainError` (abbreviated) and `SignatureError` must serialize verbatim.
+/// Schema: `AuthorizeResponse.json`.
+#[test]
+fn test_authorize_certificate_status() {
+    pin_all::<AuthorizeCertificateStatusEnumType>(&[
+        "Accepted",
+        "SignatureError",
+        "CertificateExpired",
+        "CertificateRevoked",
+        "NoCertificateAvailable",
+        "CertChainError",
+        "ContractCancelled",
+    ]);
+}
+
+/// `CertificateActionEnumType` — Install/Update for the ISO-15118 EV certificate
+/// flow. Schema: `Get15118EVCertificate.json`.
+#[test]
+fn test_certificate_action() {
+    pin_all::<CertificateActionEnumType>(&["Install", "Update"]);
+}
+
+/// `CertificateSignedStatusEnumType` — Accepted/Rejected on a signed cert.
+/// Schema: `CertificateSignedResponse.json`.
+#[test]
+fn test_certificate_signed_status() {
+    pin_all::<CertificateSignedStatusEnumType>(&["Accepted", "Rejected"]);
+}
+
+/// `CertificateSigningUseEnumType` — the `V2GCertificate` acronym case must
+/// serialize verbatim. Schema: `CertificateSigned.json` (also
+/// `SignCertificate.json`).
+#[test]
+fn test_certificate_signing_use() {
+    pin_all::<CertificateSigningUseEnumType>(&["ChargingStationCertificate", "V2GCertificate"]);
+}
+
+/// `DeleteCertificateStatusEnumType` — Accepted/Failed/NotFound. Schema:
+/// `DeleteCertificateResponse.json`.
+#[test]
+fn test_delete_certificate_status() {
+    pin_all::<DeleteCertificateStatusEnumType>(&["Accepted", "Failed", "NotFound"]);
+}
+
+/// `GetCertificateIdUseEnumType` — root-certificate selector with the `V2G` /
+/// `MO` / `CSMS` acronym prefixes. Schema: `GetInstalledCertificateIds.json`.
+#[test]
+fn test_get_certificate_id_use() {
+    pin_all::<GetCertificateIdUseEnumType>(&[
+        "V2GRootCertificate",
+        "MORootCertificate",
+        "CSMSRootCertificate",
+        "V2GCertificateChain",
+        "ManufacturerRootCertificate",
+    ]);
+}
+
+/// `GetCertificateStatusEnumType` — Accepted/Failed on an OCSP status fetch.
+/// Schema: `GetCertificateStatusResponse.json`.
+#[test]
+fn test_get_certificate_status() {
+    pin_all::<GetCertificateStatusEnumType>(&["Accepted", "Failed"]);
+}
+
+/// `GetInstalledCertificateStatusEnumType` — Accepted/NotFound. Schema:
+/// `GetInstalledCertificateIdsResponse.json`.
+#[test]
+fn test_get_installed_certificate_status() {
+    pin_all::<GetInstalledCertificateStatusEnumType>(&["Accepted", "NotFound"]);
+}
+
+/// `HashAlgorithmEnumType` — the digit-suffixed `SHA256` / `SHA384` / `SHA512`
+/// must serialize verbatim (a `rename_all` mistake would lower-case them).
+/// Schema: `Authorize.json` (recurs across the certificate-hash schemas).
+#[test]
+fn test_hash_algorithm() {
+    pin_all::<HashAlgorithmEnumType>(&["SHA256", "SHA384", "SHA512"]);
+}
+
+/// `IdTokenEnumType` — the id-token medium; the acronym / digit cases
+/// (`eMAID`, `ISO14443`, `ISO15693`) are exactly the rename risk. Schema:
+/// `Authorize.json` (recurs in every schema carrying an `IdTokenType`).
+#[test]
+fn test_id_token() {
+    pin_all::<IdTokenEnumType>(&[
+        "Central",
+        "eMAID",
+        "ISO14443",
+        "ISO15693",
+        "KeyCode",
+        "Local",
+        "MacAddress",
+        "NoAuthorization",
+    ]);
+}
+
+/// `InstallCertificateStatusEnumType` — Accepted/Rejected/Failed. Schema:
+/// `InstallCertificateResponse.json`.
+#[test]
+fn test_install_certificate_status() {
+    pin_all::<InstallCertificateStatusEnumType>(&["Accepted", "Rejected", "Failed"]);
+}
+
+/// `InstallCertificateUseEnumType` — root-certificate selector (the
+/// `GetCertificateIdUse` set minus `V2GCertificateChain`). Schema:
+/// `InstallCertificate.json`.
+#[test]
+fn test_install_certificate_use() {
+    pin_all::<InstallCertificateUseEnumType>(&[
+        "V2GRootCertificate",
+        "MORootCertificate",
+        "CSMSRootCertificate",
+        "ManufacturerRootCertificate",
+    ]);
+}
+
+/// `Iso15118EVCertificateStatusEnumType` — Accepted/Failed on the 15118 EV
+/// certificate exchange. Schema: `Get15118EVCertificateResponse.json`.
+#[test]
+fn test_iso15118_ev_certificate_status() {
+    pin_all::<Iso15118EVCertificateStatusEnumType>(&["Accepted", "Failed"]);
+}
+
+/// `OCPPInterfaceEnumType` — digit-suffixed network interfaces (`Wired0`…
+/// `Wireless3`); an off-by-one rename would silently mis-route a network
+/// profile. Schema: `SetNetworkProfile.json`.
+#[test]
+fn test_ocpp_interface() {
+    pin_all::<OCPPInterfaceEnumType>(&[
+        "Wired0",
+        "Wired1",
+        "Wired2",
+        "Wired3",
+        "Wireless0",
+        "Wireless1",
+        "Wireless2",
+        "Wireless3",
+    ]);
+}
+
+/// `OCPPTransportEnumType` — the all-caps `JSON` / `SOAP`. Schema:
+/// `SetNetworkProfile.json`.
+#[test]
+fn test_ocpp_transport() {
+    pin_all::<OCPPTransportEnumType>(&["JSON", "SOAP"]);
+}
+
+/// `OCPPVersionEnumType` — the digit-packed `OCPP12`…`OCPP20` (note: the FINAL
+/// 2.0.1 schema uses no dotted form and stops at `OCPP20`). Schema:
+/// `SetNetworkProfile.json`.
+#[test]
+fn test_ocpp_version() {
+    pin_all::<OCPPVersionEnumType>(&["OCPP12", "OCPP15", "OCPP16", "OCPP20"]);
+}
+
+/// `VPNEnumType` — mixed-case / acronym VPN types (`IKEv2`, `IPSec`, `L2TP`,
+/// `PPTP`) that must serialize verbatim. Schema: `SetNetworkProfile.json`.
+#[test]
+fn test_vpn() {
+    pin_all::<VPNEnumType>(&["IKEv2", "IPSec", "L2TP", "PPTP"]);
+}
+
+/// `EnergyTransferModeEnumType` — the underscore-joined `AC_single_phase` /
+/// `AC_two_phase` / `AC_three_phase` and bare `DC`; serde must keep the
+/// underscores (a `rename_all = "camelCase"` slip would drop them). Schema:
+/// `NotifyEVChargingNeeds.json`.
+#[test]
+fn test_energy_transfer_mode() {
+    pin_all::<EnergyTransferModeEnumType>(&[
+        "DC",
+        "AC_single_phase",
+        "AC_two_phase",
+        "AC_three_phase",
     ]);
 }
