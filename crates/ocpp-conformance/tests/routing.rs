@@ -37,15 +37,19 @@
 //!      [`skip_schema_validation_is_per_route`] and
 //!      [`unvalidated_dispatcher_skips_all_routes`].
 //!
-//! One faithful-port **gap** surfaced by this audit remains pinned as the
-//! *current* Rust behaviour and tracked as a follow-up:
-//!
-//!   2. **Unregistered action always → `NotSupported`.** The reference's
+//!   2. **Unrouted-action split (Issue #276, now implemented).** The reference's
 //!      `_raise_key_error()` distinguishes a *known* OCPP action with no handler
 //!      (`NotImplemented`) from an action the version doesn't define at all
-//!      (`NotSupported`). The Rust dispatcher returns `NotSupported` for *both*.
-//!      Pinned by [`unregistered_action_yields_not_supported_callerror`]; the
-//!      `NotImplemented` distinction is tracked as a follow-up.
+//!      (`NotSupported`). The Rust [`ActionDispatcher`] now mirrors this: its
+//!      attached [`SchemaValidator`] supplies the version context (its bundled
+//!      schema set is the version-scoped known-action registry standing in for
+//!      the reference's `v16_Action`/`v201_Action` enum), so a known-but-
+//!      unregistered action yields `NotImplemented` while an undefined action
+//!      yields `NotSupported`. With no validator attached there is no version
+//!      context, so the dispatcher conservatively reports `NotSupported`. Pinned
+//!      by [`unrouted_known_action_is_not_implemented`],
+//!      [`unrouted_unknown_action_is_not_supported`], and
+//!      [`unrouted_action_without_version_context_is_not_supported`].
 //!
 //! The `@after` hook *does* exist in the Rust model (spawned after the
 //! CALLRESULT), so it is asserted directly rather than filed as a gap.
@@ -193,34 +197,94 @@ async fn undecorated_action_is_not_routed() {
     );
 }
 
-/// Ports the `_handle_call()` KeyError path: a CALL for an unregistered action
-/// must yield a CALLERROR — never a panic or a silently dropped frame.
-///
-/// **Documented divergence (gap 2 in the module doc):** the reference's
-/// `_raise_key_error()` returns `NotImplemented` for a *known* OCPP action with
-/// no handler and `NotSupported` only for an unknown one. The Rust dispatcher
-/// collapses both into `NotSupported`; this test pins that *current* behaviour
-/// (cross-checked against the wire spelling in `exceptions_v16.rs`). The
-/// `NotImplemented` distinction is tracked in a follow-up filed with this suite.
-#[tokio::test]
-async fn unregistered_action_yields_not_supported_callerror() {
-    // `Heartbeat` is a valid OCPP 1.6J action, but no handler is registered.
-    let d = ActionDispatcher::new();
+/// A validator-backed dispatcher with **no** handlers registered: the version
+/// context (1.6J) is present, so the unrouted-action split can distinguish a
+/// known action from an undefined one — but every action still misses.
+fn v16j_validating_dispatcher() -> ActionDispatcher {
+    ActionDispatcher::new().with_validator(Arc::new(SchemaValidator::v16j()))
+}
 
-    // At the dispatcher API: an `Err(NotSupported)`, not a panic.
+/// Ports the `NotImplementedError` branch of `_raise_key_error(action, version)`:
+/// a CALL for a *known* OCPP action with no registered handler yields a
+/// `NotImplemented` CALLERROR — never a panic or a silently dropped frame.
+///
+/// `Heartbeat` is a valid 1.6J action (the attached `v16j` validator has its
+/// schema), so the version-generic dispatcher can tell it is *known-but-
+/// unhandled*. Asserted at both the dispatcher API and the transport frame; the
+/// `NotImplemented` wire spelling is pinned in `exceptions_v16.rs`.
+#[tokio::test]
+async fn unrouted_known_action_is_not_implemented() {
+    let d = v16j_validating_dispatcher();
+    assert!(!d.has_handler("Heartbeat"));
+
+    // At the dispatcher API: an `Err(NotImplemented)`, not a panic.
     let err = d.dispatch(&heartbeat_call()).await.unwrap_err();
     assert!(
-        matches!(err, OcppError::NotSupported { ref feature } if feature == "Heartbeat"),
-        "expected NotSupported for an unregistered action, got {err:?}"
+        matches!(err, OcppError::NotImplemented { ref feature } if feature == "Heartbeat"),
+        "expected NotImplemented for a known-but-unregistered action, got {err:?}"
     );
 
     // At the transport layer: a real CALLERROR frame carrying the spec code.
     let call = heartbeat_call();
     let unique_id = call.unique_id.clone();
-    match route_frame(ActionDispatcher::new(), call).await {
+    match route_frame(v16j_validating_dispatcher(), call).await {
+        Message::CallError(e) => {
+            assert_eq!(e.unique_id, unique_id);
+            assert_eq!(e.error_code, CallErrorCode::NotImplemented);
+        }
+        other => panic!("expected a CALLERROR frame, got {other:?}"),
+    }
+}
+
+/// Ports the `NotSupportedError` branch of `_raise_key_error`: a CALL for an
+/// action the version does **not** define yields a `NotSupported` CALLERROR,
+/// even when a validator (version context) is attached — the validator simply
+/// has no schema for it.
+#[tokio::test]
+async fn unrouted_unknown_action_is_not_supported() {
+    let d = v16j_validating_dispatcher();
+    let unknown = CallMessage::new("TotallyUnknownAction".to_string(), json!({})).unwrap();
+
+    let err = d.dispatch(&unknown).await.unwrap_err();
+    assert!(
+        matches!(err, OcppError::NotSupported { ref feature } if feature == "TotallyUnknownAction"),
+        "expected NotSupported for an action the version does not define, got {err:?}"
+    );
+
+    let call = CallMessage::new("TotallyUnknownAction".to_string(), json!({})).unwrap();
+    let unique_id = call.unique_id.clone();
+    match route_frame(v16j_validating_dispatcher(), call).await {
         Message::CallError(e) => {
             assert_eq!(e.unique_id, unique_id);
             // Wire spelling pinned in exceptions_v16.rs: "NotSupported".
+            assert_eq!(e.error_code, CallErrorCode::NotSupported);
+        }
+        other => panic!("expected a CALLERROR frame, got {other:?}"),
+    }
+}
+
+/// The version-generic dispatcher has no version context without a validator, so
+/// it cannot know whether a missing-handler action is "known". It then
+/// conservatively reports `NotSupported` — even for `Heartbeat`, a valid 1.6J
+/// action — rather than guess `NotImplemented`. This pins that the split is
+/// gated on the injected version context, matching the reference where
+/// `_raise_key_error` always receives an explicit `version`.
+#[tokio::test]
+async fn unrouted_action_without_version_context_is_not_supported() {
+    let d = ActionDispatcher::new();
+    assert!(!d.has_validator());
+
+    let err = d.dispatch(&heartbeat_call()).await.unwrap_err();
+    assert!(
+        matches!(err, OcppError::NotSupported { ref feature } if feature == "Heartbeat"),
+        "without version context a missing handler must yield NotSupported, got {err:?}"
+    );
+
+    let call = heartbeat_call();
+    let unique_id = call.unique_id.clone();
+    match route_frame(ActionDispatcher::new(), call).await {
+        Message::CallError(e) => {
+            assert_eq!(e.unique_id, unique_id);
             assert_eq!(e.error_code, CallErrorCode::NotSupported);
         }
         other => panic!("expected a CALLERROR frame, got {other:?}"),

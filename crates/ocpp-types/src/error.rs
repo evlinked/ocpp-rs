@@ -64,6 +64,19 @@ pub enum OcppError {
     #[error("Feature not supported: {feature}")]
     NotSupported { feature: String },
 
+    /// Action is a known/valid OCPP action for the negotiated version, but no
+    /// handler is registered for it.
+    ///
+    /// Ports `NotImplementedError` from
+    /// [`ocpp/exceptions.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/exceptions.py),
+    /// which `_raise_key_error` raises when `v16_Action(action)` /
+    /// `v201_Action(action)` succeeds (the action *is* defined by the version)
+    /// but dispatch found no handler. Distinct from [`OcppError::NotSupported`],
+    /// which is for an action the version does not define at all. Maps to
+    /// [`CallErrorCode::NotImplemented`] on the wire.
+    #[error("Feature not implemented: {feature}")]
+    NotImplemented { feature: String },
+
     /// Resource not found
     #[error("Resource not found: {resource}")]
     NotFound { resource: String },
@@ -395,6 +408,22 @@ mod tests {
         };
         let cloned = error.clone();
         assert_eq!(error, cloned);
+    }
+
+    #[test]
+    fn not_implemented_is_distinct_from_not_supported() {
+        // The two unrouted-action variants (`_raise_key_error` split) must not
+        // be equal and must render distinct messages.
+        let ni = OcppError::NotImplemented {
+            feature: "Reset".to_string(),
+        };
+        let ns = OcppError::NotSupported {
+            feature: "Reset".to_string(),
+        };
+        assert_ne!(ni, ns);
+        assert_eq!(ni.to_string(), "Feature not implemented: Reset");
+        assert_eq!(ns.to_string(), "Feature not supported: Reset");
+        assert_eq!(ni.clone(), ni);
     }
 
     #[test]
