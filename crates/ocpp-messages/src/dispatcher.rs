@@ -202,8 +202,8 @@ impl ActionDispatcher {
     /// handler is registered for `call.action`, the error mirrors the
     /// reference's `_raise_key_error` split: a *known* action for the negotiated
     /// version yields [`OcppError::NotImplemented`], while an action the version
-    /// does not define yields [`OcppError::NotSupported`] (see
-    /// [`unrouted_action_error`](Self::unrouted_action_error)).
+    /// does not define yields [`OcppError::NotSupported`] (see the private
+    /// `unrouted_action_error` helper).
     ///
     /// If an `@after` hook is registered, it is spawned via `tokio::spawn`
     /// after the handler returns successfully (non-blocking).
