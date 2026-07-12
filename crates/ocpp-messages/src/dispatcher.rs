@@ -19,11 +19,22 @@ use crate::{CallMessage, OcppAction};
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
-/// Type-erased on-handler: `Value` payload in, serialised response `Value` out.
-type HandlerFn = Box<dyn Fn(Value) -> BoxFuture<OcppResult<Value>> + Send + Sync>;
+/// Type-erased on-handler: `(payload Value, triggering CALL's unique_id)` in,
+/// serialised response `Value` out.
+///
+/// The `unique_id` arg is the port of the reference's optional `call_unique_id`
+/// handler parameter (`_handle_call()` in `ocpp/charge_point.py`): id-aware
+/// handlers registered via [`ActionDispatcher::on_with_id`] consume it, while the
+/// plain [`ActionDispatcher::on`] erasure ignores it. Threading it through the
+/// erased signature (rather than storing two handler variants) keeps a single
+/// route type and lets `dispatch()` supply the id unconditionally.
+type HandlerFn = Box<dyn Fn(Value, String) -> BoxFuture<OcppResult<Value>> + Send + Sync>;
 
-/// Type-erased after-hook: `Value` payload in, fire-and-forget (`()`).
-type AfterFn = Box<dyn Fn(Value) -> BoxFuture<()> + Send + Sync>;
+/// Type-erased after-hook: `(payload Value, triggering CALL's unique_id)` in,
+/// fire-and-forget (`()`). As with [`HandlerFn`], the `unique_id` is consumed by
+/// id-aware hooks ([`ActionDispatcher::after_with_id`]) and ignored by the plain
+/// [`ActionDispatcher::after`] erasure.
+type AfterFn = Box<dyn Fn(Value, String) -> BoxFuture<()> + Send + Sync>;
 
 /// A registered `@on` route: the handler plus its per-route options.
 ///
@@ -152,7 +163,7 @@ impl ActionDispatcher {
         Fut: Future<Output = OcppResult<Req::Response>> + Send + 'static,
         F: Fn(Req) -> Fut + Send + Sync + Clone + 'static,
     {
-        let erased: HandlerFn = Box::new(move |raw: Value| {
+        let erased: HandlerFn = Box::new(move |raw: Value, _unique_id: String| {
             let h = handler.clone();
             Box::pin(async move {
                 let req: Req = serde_json::from_value(raw).map_err(|e| OcppError::Json {
@@ -173,6 +184,49 @@ impl ActionDispatcher {
         );
     }
 
+    /// Register a typed `@on` handler for `Req::ACTION_NAME` that additionally
+    /// receives the **triggering CALL's `unique_id`** as a second argument.
+    ///
+    /// Ports the reference's opt-in `call_unique_id` handler parameter: in
+    /// `_handle_call()` (`ocpp/charge_point.py`), a handler that declares a
+    /// `call_unique_id` parameter is passed the CALL's id, while one that does not
+    /// is called without it. Rust has no runtime signature reflection, so the
+    /// opt-in is expressed by *choosing the builder*: use [`on`](Self::on) for a
+    /// plain handler, `on_with_id` for one that needs the id (e.g. to correlate a
+    /// side effect back to the originating message). The plain builder is
+    /// unaffected — its handler never sees the id.
+    ///
+    /// The handler closure receives `(Req, String)` and, like [`on`](Self::on),
+    /// returns `OcppResult<Req::Response>`. The route is schema-validated by the
+    /// dispatcher's [`SchemaValidator`] (if attached), identical to [`on`](Self::on),
+    /// and replaces any previously registered handler for the same action.
+    pub fn on_with_id<Req, Fut, F>(&mut self, handler: F)
+    where
+        Req: OcppAction + 'static,
+        Fut: Future<Output = OcppResult<Req::Response>> + Send + 'static,
+        F: Fn(Req, String) -> Fut + Send + Sync + Clone + 'static,
+    {
+        let erased: HandlerFn = Box::new(move |raw: Value, unique_id: String| {
+            let h = handler.clone();
+            Box::pin(async move {
+                let req: Req = serde_json::from_value(raw).map_err(|e| OcppError::Json {
+                    message: e.to_string(),
+                })?;
+                let resp = h(req, unique_id).await?;
+                serde_json::to_value(resp).map_err(|e| OcppError::Json {
+                    message: e.to_string(),
+                })
+            })
+        });
+        self.handlers.insert(
+            Req::ACTION_NAME,
+            Route {
+                handler: erased,
+                skip_validation: false,
+            },
+        );
+    }
+
     /// Register a fire-and-forget `@after` hook for `Req::ACTION_NAME`.
     ///
     /// The hook receives the same deserialised request as the `@on` handler.
@@ -185,11 +239,40 @@ impl ActionDispatcher {
         Fut: Future<Output = ()> + Send + 'static,
         F: Fn(Req) -> Fut + Send + Sync + Clone + 'static,
     {
-        let erased: AfterFn = Box::new(move |raw: Value| {
+        let erased: AfterFn = Box::new(move |raw: Value, _unique_id: String| {
             let h = hook.clone();
             Box::pin(async move {
                 if let Ok(req) = serde_json::from_value::<Req>(raw) {
                     h(req).await;
+                }
+            })
+        });
+        self.after_hooks.insert(Req::ACTION_NAME, erased);
+    }
+
+    /// Register a fire-and-forget `@after` hook for `Req::ACTION_NAME` that
+    /// additionally receives the **triggering CALL's `unique_id`** as a second
+    /// argument.
+    ///
+    /// The id-aware counterpart of [`after`](Self::after), and the natural home
+    /// for the reference's opt-in `call_unique_id` on an `@after` hook (e.g.
+    /// correlating a post-response side effect back to the original CALL, or
+    /// logging which message triggered it). Like [`after`](Self::after), the hook
+    /// is spawned via [`tokio::spawn`] after the handler returns successfully,
+    /// does not block the CALLRESULT path, and is silently skipped if the payload
+    /// fails to deserialise. The plain [`after`](Self::after) builder is
+    /// unaffected — its hook never sees the id.
+    pub fn after_with_id<Req, Fut, F>(&mut self, hook: F)
+    where
+        Req: OcppAction + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+        F: Fn(Req, String) -> Fut + Send + Sync + Clone + 'static,
+    {
+        let erased: AfterFn = Box::new(move |raw: Value, unique_id: String| {
+            let h = hook.clone();
+            Box::pin(async move {
+                if let Ok(req) = serde_json::from_value::<Req>(raw) {
+                    h(req, unique_id).await;
                 }
             })
         });
@@ -233,11 +316,16 @@ impl ActionDispatcher {
             }
         }
 
+        // Thread the triggering CALL's `unique_id` to both the handler and the
+        // after-hook, mirroring `_handle_call()` which makes `call_unique_id`
+        // available to any handler that opts into it. Plain `on`/`after`
+        // erasures ignore it; `on_with_id`/`after_with_id` consume it.
         let payload = call.payload.clone();
-        let response = (route.handler)(payload.clone()).await?;
+        let unique_id = call.unique_id.clone();
+        let response = (route.handler)(payload.clone(), unique_id.clone()).await?;
 
         if let Some(after) = self.after_hooks.get(action) {
-            tokio::spawn(after(payload));
+            tokio::spawn(after(payload, unique_id));
         }
 
         Ok(response)
@@ -859,5 +947,100 @@ mod tests {
             h.await.unwrap();
         }
         assert_eq!(counter.load(Ordering::SeqCst), 10);
+    }
+
+    // --- id-aware handlers: on_with_id / after_with_id (Issue #317) ---
+    //
+    // Python ref: `_handle_call()` in ocpp/charge_point.py passes the triggering
+    // CALL's `unique_id` to any handler that declares a `call_unique_id`
+    // parameter. Rust expresses the opt-in by choosing the builder — `on_with_id`
+    // / `after_with_id` receive the id; plain `on`/`after` never see it.
+
+    fn ping_call_with_id(id: &str, nonce: u32) -> CallMessage {
+        CallMessage::with_id(
+            id.to_string(),
+            "Ping".to_string(),
+            serde_json::json!({ "nonce": nonce }),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn on_with_id_receives_triggering_unique_id() {
+        let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+        let s = seen.clone();
+
+        let mut d = ActionDispatcher::new();
+        d.on_with_id(move |req: PingRequest, unique_id: String| {
+            let s = s.clone();
+            async move {
+                *s.lock().unwrap() = Some(unique_id);
+                Ok(PingResponse { echoed: req.nonce })
+            }
+        });
+
+        let resp = d.dispatch(&ping_call_with_id("call-42", 7)).await.unwrap();
+        assert_eq!(
+            resp["echoed"], 7,
+            "the id-aware handler still runs normally"
+        );
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some("call-42"),
+            "on_with_id must see the triggering CALL's exact unique_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_with_id_receives_triggering_unique_id() {
+        let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+        let s = seen.clone();
+        let notify = Arc::new(Notify::new());
+        let n = notify.clone();
+
+        let mut d = ActionDispatcher::new();
+        d.on(|req: PingRequest| async move { Ok(PingResponse { echoed: req.nonce }) });
+        d.after_with_id(move |_req: PingRequest, unique_id: String| {
+            let s = s.clone();
+            let n = n.clone();
+            async move {
+                *s.lock().unwrap() = Some(unique_id);
+                n.notify_one();
+            }
+        });
+
+        d.dispatch(&ping_call_with_id("call-99", 1)).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("the after_with_id hook must fire after a successful dispatch");
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some("call-99"),
+            "after_with_id must see the triggering CALL's exact unique_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_on_and_after_are_unaffected_by_id_threading() {
+        // The plain `on`/`after` builders keep working unchanged: the id is
+        // threaded through `dispatch()` but their erasures ignore it.
+        let notify = Arc::new(Notify::new());
+        let n = notify.clone();
+
+        let mut d = ActionDispatcher::new();
+        d.on(|req: PingRequest| async move { Ok(PingResponse { echoed: req.nonce }) });
+        d.after(move |_req: PingRequest| {
+            let n = n.clone();
+            async move {
+                n.notify_one();
+            }
+        });
+
+        let resp = d.dispatch(&ping_call_with_id("ignored", 3)).await.unwrap();
+        assert_eq!(resp["echoed"], 3);
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("a plain @after hook must still fire when the id is threaded");
     }
 }
