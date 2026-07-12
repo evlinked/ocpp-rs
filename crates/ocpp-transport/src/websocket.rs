@@ -299,6 +299,37 @@ pub mod server {
         ))
     }
 
+    /// Extract the charge-point identity from a WebSocket connect path.
+    ///
+    /// Ported from the mobilityhouse/ocpp reference `extract_charge_point_id`
+    /// (`ocpp/charge_point.py`). The connect path is an attacker-influenceable
+    /// trust boundary — the returned id becomes the routing key for every
+    /// subsequent CALL — so parsing is deliberately strict:
+    ///
+    /// * query strings (`?…`) and fragments (`#…`) are stripped (the `urlparse`
+    ///   `.path` component),
+    /// * the path is split on `/` and empty segments are discarded, which
+    ///   collapses leading, trailing and repeated slashes,
+    /// * the last non-empty segment is taken and trimmed of surrounding
+    ///   whitespace,
+    /// * a path with no usable segment — or a whitespace-only segment — yields
+    ///   `None` (rejected) rather than becoming a live routing key.
+    ///
+    /// The returned slice borrows from `path`. Rust has no nullable `&str`, so
+    /// the reference's `None`-input row maps to the empty-string row here (both
+    /// return `None`).
+    pub fn extract_charge_point_id(path: &str) -> Option<&str> {
+        // urlparse(path).path — drop any query string / fragment.
+        let clean = path.split(['?', '#']).next().unwrap_or(path);
+
+        // Last non-empty segment, whitespace-trimmed; empty ⇒ None.
+        clean
+            .split('/')
+            .rfind(|segment| !segment.is_empty())
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+    }
+
     /// Validate WebSocket handshake request
     pub fn validate_handshake_request(
         request: &tungstenite::http::Request<()>,
@@ -306,16 +337,17 @@ pub mod server {
     ) -> Result<Option<String>, String> {
         // Extract path and validate charge point ID
         let path = request.uri().path();
-        if !path.starts_with("/ocpp/") {
-            return Err("Invalid path: must start with /ocpp/".to_string());
-        }
+        // Connect-contract policy (option B): the charge-point id must sit
+        // under the `/ocpp/` prefix. Robust extraction of the id itself is
+        // delegated to `extract_charge_point_id`, which rejects whitespace-only
+        // / empty segments so they can never become a routing key.
+        let remainder = path
+            .strip_prefix("/ocpp/")
+            .ok_or_else(|| "Invalid path: must start with /ocpp/".to_string())?;
 
-        let parts: Vec<&str> = path.split('/').collect();
-        if parts.len() < 3 || parts[2].is_empty() {
-            return Err("Invalid path: missing charge point ID".to_string());
-        }
+        let charge_point_id = extract_charge_point_id(remainder)
+            .ok_or_else(|| "Invalid path: missing charge point ID".to_string())?;
 
-        let charge_point_id = parts[2];
         if charge_point_id.len() > 20 {
             return Err("Invalid charge point ID: too long".to_string());
         }
@@ -454,5 +486,121 @@ mod tests {
 
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("No supported subprotocol"));
+    }
+
+    /// Trust-boundary regression: the `/ocpp/` prefix with no usable id — bare
+    /// or (once a segment survives URI parsing) whitespace-only — must be
+    /// rejected, not accepted as a live routing key. Previously a `/ocpp/   `
+    /// path passed the only guard (`len() > 20`). Whitespace-only rejection is
+    /// pinned directly on the helper below (`…whitespace_only_segment`), since a
+    /// raw-whitespace segment is not expressible through `http::Uri`; here we
+    /// pin the reachable sibling: the bare `/ocpp/` prefix with no id.
+    #[test]
+    fn test_validate_handshake_request_missing_id_rejected() {
+        use tungstenite::http::{Request, Uri};
+
+        let uri = Uri::from_static("/ocpp/");
+        let request = Request::builder()
+            .uri(uri)
+            .header("sec-websocket-protocol", "ocpp1.6")
+            .body(())
+            .unwrap();
+
+        let allowed_protocols = vec!["ocpp1.6".to_string()];
+        let result = server::validate_handshake_request(&request, &allowed_protocols);
+
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("missing charge point ID"));
+    }
+
+    // --- Ported from mobilityhouse/ocpp tests/test_charge_point_connection.py
+    //     (TestExtractChargePointId). One assertion per reference row, plus the
+    //     trust-boundary negatives. `extract_charge_point_id` is the faithful
+    //     reference contract; `validate_handshake_request` layers the `/ocpp/`
+    //     policy on top of it. Rust has no nullable `&str`, so the reference's
+    //     `None`-input row folds into the empty-string row.
+
+    #[test]
+    fn test_extract_charge_point_id_simple_path() {
+        assert_eq!(server::extract_charge_point_id("/CP001"), Some("CP001"));
+    }
+
+    #[test]
+    fn test_extract_charge_point_id_nested_path() {
+        assert_eq!(
+            server::extract_charge_point_id("/ocpp/CP001"),
+            Some("CP001")
+        );
+    }
+
+    #[test]
+    fn test_extract_charge_point_id_deeply_nested_path() {
+        assert_eq!(
+            server::extract_charge_point_id("/api/v1/ocpp/CP001"),
+            Some("CP001")
+        );
+    }
+
+    #[test]
+    fn test_extract_charge_point_id_trailing_slash() {
+        assert_eq!(server::extract_charge_point_id("/CP001/"), Some("CP001"));
+    }
+
+    #[test]
+    fn test_extract_charge_point_id_root_path_returns_none() {
+        assert_eq!(server::extract_charge_point_id("/"), None);
+    }
+
+    #[test]
+    fn test_extract_charge_point_id_empty_string_returns_none() {
+        // Also covers the reference's `None`-input row (no nullable &str in Rust).
+        assert_eq!(server::extract_charge_point_id(""), None);
+    }
+
+    #[test]
+    fn test_extract_charge_point_id_path_without_leading_slash() {
+        assert_eq!(server::extract_charge_point_id("CP001"), Some("CP001"));
+    }
+
+    #[test]
+    fn test_extract_charge_point_id_path_with_query_string() {
+        assert_eq!(
+            server::extract_charge_point_id("/CP001?token=abc123"),
+            Some("CP001")
+        );
+    }
+
+    #[test]
+    fn test_extract_charge_point_id_path_with_fragment() {
+        assert_eq!(
+            server::extract_charge_point_id("/CP001#section"),
+            Some("CP001")
+        );
+    }
+
+    #[test]
+    fn test_extract_charge_point_id_whitespace_only_segment() {
+        assert_eq!(server::extract_charge_point_id("/   "), None);
+    }
+
+    #[test]
+    fn test_extract_charge_point_id_with_special_chars() {
+        assert_eq!(
+            server::extract_charge_point_id("/CP-001_v2"),
+            Some("CP-001_v2")
+        );
+    }
+
+    #[test]
+    fn test_extract_charge_point_id_with_dots() {
+        assert_eq!(
+            server::extract_charge_point_id("/EVB-P12354.00.01"),
+            Some("EVB-P12354.00.01")
+        );
+    }
+
+    #[test]
+    fn test_extract_charge_point_id_multiple_slashes() {
+        assert_eq!(server::extract_charge_point_id("///CP001"), Some("CP001"));
     }
 }
