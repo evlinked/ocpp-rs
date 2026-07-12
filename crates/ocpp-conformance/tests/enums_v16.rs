@@ -21,11 +21,23 @@
 //! wire string. This catches both a *missing* variant (deserialize fails) and
 //! *rename drift* (re-serialize differs), without hand-naming Rust variants.
 //!
+//! The security-extension / firmware / logging family (`CertificateSignedStatus`,
+//! `CertificateUse`, `DeleteCertificateStatus`, `GenericStatus`,
+//! `UpdateFirmwareStatus`, `UploadLogStatus`) is pinned too (#304); every
+//! schema-backed member is additionally cross-checked against the bundled FINAL
+//! 1.6J schema named in each test's doc comment.
+//!
 //! ## Known gaps (documented, not silently dropped)
 //!
 //! - **`ConfigurationKey`** — the reference's ~50-member config-key enum is not
 //!   modelled as a Rust enum (config keys are handled as plain strings), so it
 //!   has no enum round-trip to port. Tracked for a follow-up.
+//! - **Unmodelled reference enums** — a handful of 1.6J reference enums have no
+//!   Rust counterpart yet, so there is no round-trip to pin: `CertificateStatus`,
+//!   `GetInstalledCertificateStatus`, `HashAlgorithm`, `Log`, `LogStatus` (the
+//!   other half of the security-extension / certificate family whose peers *are*
+//!   modelled). Whether to model them is a model decision, not test-only work —
+//!   tracked in the residual note on #304.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -36,12 +48,13 @@ use ocpp_types::common::{
     ReadingContext, Reason, UnitOfMeasure, ValueFormat,
 };
 use ocpp_types::v16j::{
-    CancelReservationStatus, ChargePointErrorCode, ChargePointStatus, ChargingProfileKindType,
-    ChargingProfilePurposeType, ChargingProfileStatus, ChargingRateUnitType, ClearCacheStatus,
-    ClearChargingProfileStatus, ConfigurationStatus, DataTransferStatus, DiagnosticsStatus,
-    FirmwareStatus, GetCompositeScheduleStatus, MessageTrigger, RecurrencyKindType,
-    RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus,
-    UnlockStatus, UpdateStatus, UpdateType,
+    CancelReservationStatus, CertificateSignedStatus, CertificateUse, ChargePointErrorCode,
+    ChargePointStatus, ChargingProfileKindType, ChargingProfilePurposeType, ChargingProfileStatus,
+    ChargingRateUnitType, ClearCacheStatus, ClearChargingProfileStatus, ConfigurationStatus,
+    DataTransferStatus, DeleteCertificateStatus, DiagnosticsStatus, FirmwareStatus, GenericStatus,
+    GetCompositeScheduleStatus, MessageTrigger, RecurrencyKindType, RemoteStartStopStatus,
+    ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus, UnlockStatus,
+    UpdateFirmwareStatus, UpdateStatus, UpdateType, UploadLogStatus,
 };
 
 use ocpp_messages::v16j::RegistrationStatus;
@@ -367,4 +380,76 @@ fn test_update_type() {
 #[test]
 fn test_value_format() {
     pin_all::<ValueFormat>(&["Raw", "SignedData"]);
+}
+
+// --- Security-extension / firmware / logging enums (#304) ---
+//
+// The already-modelled tail of the 1.6J enum sweep. Wire strings verified
+// against the reference `ocpp/v16/enums.py`; every enum that is a field in a
+// bundled 1.6J schema is additionally cross-checked against
+// `crates/ocpp-messages/schemas/v16j/*.json` (named per test). For all six,
+// model == reference == FINAL schema — no divergence to `reject`.
+
+#[test]
+fn test_certificate_signed_status() {
+    // Reference `CertificateSignedStatus`; cross-checked against
+    // `CertificateSignedResponse.json` (`CertificateSignedStatusEnumType`).
+    pin_all::<CertificateSignedStatus>(&["Accepted", "Rejected"]);
+}
+
+#[test]
+fn test_certificate_use() {
+    // Reference `CertificateUse`; cross-checked against
+    // `GetInstalledCertificateIds.json` / `InstallCertificate.json`
+    // (`CertificateUseEnumType`).
+    pin_all::<CertificateUse>(&[
+        "CentralSystemRootCertificate",
+        "ManufacturerRootCertificate",
+    ]);
+}
+
+#[test]
+fn test_delete_certificate_status() {
+    // Reference `DeleteCertificateStatus`; cross-checked against
+    // `DeleteCertificateResponse.json` (`DeleteCertificateStatusEnumType`).
+    pin_all::<DeleteCertificateStatus>(&["Accepted", "Failed", "NotFound"]);
+}
+
+#[test]
+fn test_generic_status() {
+    // Reference `GenericStatus`; cross-checked against
+    // `SignCertificateResponse.json` (`GenericStatusEnumType`).
+    pin_all::<GenericStatus>(&["Accepted", "Rejected"]);
+}
+
+#[test]
+fn test_update_firmware_status() {
+    // Reference `UpdateFirmwareStatus` (used by `SignedUpdateFirmware.conf`);
+    // cross-checked against `SignedUpdateFirmwareResponse.json`
+    // (`UpdateFirmwareStatusEnumType`). Watch `AcceptedCanceled` (single-l US
+    // spelling, not `AcceptedCancelled`).
+    pin_all::<UpdateFirmwareStatus>(&[
+        "Accepted",
+        "Rejected",
+        "AcceptedCanceled",
+        "InvalidCertificate",
+        "RevokedCertificate",
+    ]);
+}
+
+#[test]
+fn test_upload_log_status() {
+    // Reference `UploadLogStatus` (used by `LogStatusNotification.req`);
+    // cross-checked against `LogStatusNotification.json`
+    // (`UploadLogStatusEnumType`). Watch `NotSupportedOperation` (not
+    // `NotSupported`) and `UploadFailure` (not `UploadFailed`).
+    pin_all::<UploadLogStatus>(&[
+        "BadMessage",
+        "Idle",
+        "NotSupportedOperation",
+        "PermissionDenied",
+        "Uploaded",
+        "UploadFailure",
+        "Uploading",
+    ]);
 }
