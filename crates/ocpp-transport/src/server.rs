@@ -33,7 +33,7 @@ use ocpp_types::v16j::{
     ConfigurationStatus, MessageTrigger, RemoteStartStopStatus, ReservationStatus, ResetStatus,
     ResetType, TriggerMessageStatus, UnlockStatus, UpdateStatus, UpdateType,
 };
-use ocpp_types::{CallErrorCode, DateTime, OcppError, OcppResult, Utc};
+use ocpp_types::{CallErrorCode, DateTime, OcppError, OcppResult, SchemaKeyword, Utc};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{error, info, warn};
@@ -1080,10 +1080,31 @@ pub(crate) fn build_call_error(unique_id: &str, error: &OcppError) -> Message {
                     "cause": format!("{feature} not supported by receiver."),
                 })),
             ),
-            // Keyword-granular code from the failing JSON-Schema keyword, per
-            // `_validate_payload()` in `ocpp/messages.py`.
-            OcppError::SchemaViolation { keyword, .. } => {
-                (keyword.call_error_code(), error.to_string(), None)
+            // A JSON-Schema validation failure. The code is the keyword-granular
+            // one from `_validate_payload()` in `ocpp/messages.py`; the `details`
+            // surface the triggering-message context the reference attaches to the
+            // raised `OCPPError`
+            // (`tests/test_exceptions.py::test_exception_show_triggered_*`).
+            //
+            // The reference stores the whole triggering `Call` under an
+            // `ocpp_message` key (a Python `repr` that also echoes the payload).
+            // Echoing a peer's own payload back is redundant and can be large, so
+            // we surface just the offending `action` name plus a machine-readable
+            // `cause` (the schema-violation message, the equivalent of the
+            // reference's `e.message`) — the idiomatic port (see issue #313).
+            // Faithful to the reference's per-keyword split, the `required` branch
+            // — which raises `ProtocolError` with only a `{"cause": …}` detail and
+            // *no* `ocpp_message` — omits the action.
+            OcppError::SchemaViolation {
+                keyword,
+                message,
+                action,
+            } => {
+                let details = match keyword {
+                    SchemaKeyword::Required => serde_json::json!({ "cause": message }),
+                    _ => serde_json::json!({ "action": action, "cause": message }),
+                };
+                (keyword.call_error_code(), error.to_string(), Some(details))
             }
             OcppError::ValidationError { .. } | OcppError::Json { .. } => {
                 (CallErrorCode::FormationViolation, error.to_string(), None)

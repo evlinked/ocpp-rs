@@ -195,7 +195,9 @@ fn assert_error_serializes_to_call_error(
         .expect_err("payload must fail validation");
 
     let (keyword, description) = match err {
-        OcppError::SchemaViolation { keyword, message } => (keyword, message),
+        OcppError::SchemaViolation {
+            keyword, message, ..
+        } => (keyword, message),
         other => panic!("expected SchemaViolation for {action}, got {other:?}"),
     };
     assert_eq!(keyword, expected_keyword, "{action} keyword");

@@ -461,9 +461,9 @@ fn ocpp_error_to_callerror_code(e: &OcppError) -> (CallErrorCode, String) {
         // keyword-granular CALLERROR code per `_validate_payload()` in
         // `ocpp/messages.py` (`type`/`maxLength` → TypeConstraintViolation,
         // `required` → ProtocolError, else → FormationViolation).
-        OcppError::SchemaViolation { keyword, message } => {
-            (keyword.call_error_code(), message.clone())
-        }
+        OcppError::SchemaViolation {
+            keyword, message, ..
+        } => (keyword.call_error_code(), message.clone()),
         // Manual (non-schema) validation failures keep the default bucket.
         OcppError::ValidationError { message } => {
             (CallErrorCode::FormationViolation, message.clone())
