@@ -48,9 +48,10 @@
 //!   `OperationalStatus`).
 //! - **Slice 3** (#301) — device-model / monitoring / variables / messaging
 //!   domain.
-//! - **Slice 4** (#302) — smart-charging + firmware/log domain (remaining).
+//! - **Slice 4** (#302) — smart-charging + firmware/log domain.
 //!
-//! Every swept enum's wire strings are verified against both
+//! With all four slices landed, every one of the 89 `*EnumType`s this crate
+//! models is pinned. Every swept enum's wire strings are verified against both
 //! `ocpp/v201/enums.py` and the bundled FINAL
 //! `crates/ocpp-messages/schemas/v201/*.json`; each divergence is pinned with
 //! [`reject`] (or a documented `pin`), never dropped.
@@ -63,26 +64,32 @@ use ocpp_types::v201::{
     APNAuthenticationEnumType, AttributeEnumType, AuthorizationStatusEnumType,
     AuthorizeCertificateStatusEnumType, BootReasonEnumType, CancelReservationStatusEnumType,
     CertificateActionEnumType, CertificateSignedStatusEnumType, CertificateSigningUseEnumType,
-    ChangeAvailabilityStatusEnumType, ChargingStateEnumType, ClearCacheStatusEnumType,
-    ClearChargingProfileStatusEnumType, ClearMessageStatusEnumType, ClearMonitoringStatusEnumType,
-    ComponentCriterionEnumType, ConnectorEnumType, ConnectorStatusEnumType,
+    ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType, ChargingProfileKindEnumType,
+    ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingRateUnitEnumType,
+    ChargingStateEnumType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
+    ClearMessageStatusEnumType, ClearMonitoringStatusEnumType, ComponentCriterionEnumType,
+    ConnectorEnumType, ConnectorStatusEnumType, CostKindEnumType,
     CustomerInformationStatusEnumType, DataEnumType, DataTransferStatusEnumType,
     DeleteCertificateStatusEnumType, DisplayMessageStatusEnumType, EnergyTransferModeEnumType,
-    EventNotificationEnumType, EventTriggerEnumType, GenericDeviceModelStatusEnumType,
-    GenericStatusEnumType, GetCertificateIdUseEnumType, GetCertificateStatusEnumType,
-    GetChargingProfileStatusEnumType, GetDisplayMessagesStatusEnumType,
-    GetInstalledCertificateStatusEnumType, GetVariableStatusEnumType, HashAlgorithmEnumType,
-    IdTokenEnumType, InstallCertificateStatusEnumType, InstallCertificateUseEnumType,
-    Iso15118EVCertificateStatusEnumType, LocationEnumType, MeasurandEnumType,
-    MessageFormatEnumType, MessagePriorityEnumType, MessageStateEnumType, MessageTriggerEnumType,
-    MonitorBaseEnumType, MonitorEnumType, MonitoringCriterionEnumType, MutabilityEnumType,
-    NotifyEVChargingNeedsStatusEnumType, OCPPInterfaceEnumType, OCPPTransportEnumType,
-    OCPPVersionEnumType, OperationalStatusEnumType, PhaseEnumType, ReadingContextEnumType,
-    ReasonEnumType, RegistrationStatusEnumType, ReportBaseEnumType, RequestStartStopStatusEnumType,
+    EventNotificationEnumType, EventTriggerEnumType, FirmwareStatusEnumType,
+    GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetCertificateIdUseEnumType,
+    GetCertificateStatusEnumType, GetChargingProfileStatusEnumType,
+    GetDisplayMessagesStatusEnumType, GetInstalledCertificateStatusEnumType,
+    GetVariableStatusEnumType, HashAlgorithmEnumType, IdTokenEnumType,
+    InstallCertificateStatusEnumType, InstallCertificateUseEnumType,
+    Iso15118EVCertificateStatusEnumType, LocationEnumType, LogEnumType, LogStatusEnumType,
+    MeasurandEnumType, MessageFormatEnumType, MessagePriorityEnumType, MessageStateEnumType,
+    MessageTriggerEnumType, MonitorBaseEnumType, MonitorEnumType, MonitoringCriterionEnumType,
+    MutabilityEnumType, NotifyEVChargingNeedsStatusEnumType, OCPPInterfaceEnumType,
+    OCPPTransportEnumType, OCPPVersionEnumType, OperationalStatusEnumType, PhaseEnumType,
+    PublishFirmwareStatusEnumType, ReadingContextEnumType, ReasonEnumType, RecurrencyKindEnumType,
+    RegistrationStatusEnumType, ReportBaseEnumType, RequestStartStopStatusEnumType,
     ReservationUpdateStatusEnumType, ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType,
     SendLocalListStatusEnumType, SetMonitoringStatusEnumType, SetNetworkProfileStatusEnumType,
     SetVariableStatusEnumType, TransactionEventEnumType, TriggerMessageStatusEnumType,
-    TriggerReasonEnumType, TxStartStopPointEnumType, UnlockStatusEnumType, VPNEnumType,
+    TriggerReasonEnumType, TxStartStopPointEnumType, UnlockStatusEnumType,
+    UnpublishFirmwareStatusEnumType, UpdateEnumType, UpdateFirmwareStatusEnumType,
+    UploadLogStatusEnumType, VPNEnumType,
 };
 
 /// Assert that `wire` deserializes into `T` and re-serializes back to the
@@ -1046,5 +1053,221 @@ fn test_set_variable_status() {
         "UnknownVariable",
         "NotSupportedAttributeType",
         "RebootRequired",
+    ]);
+}
+
+// ---------------------------------------------------------------------------
+// Sweep of the remaining v201 `*EnumType`s (issue #274) — slice 4 (final): the
+// smart-charging (charging-profile / charging-schedule) and firmware / log
+// domains. These vocabularies drive `SetChargingProfile` / `GetChargingProfiles`
+// / `ClearChargingProfile` / `ReportChargingProfiles` / `GetCompositeSchedule` /
+// `NotifyChargingLimit`, and the firmware-update (`UpdateFirmware`,
+// `FirmwareStatusNotification`, `PublishFirmware` / `UnpublishFirmware`) and
+// diagnostics-log (`GetLog`, `LogStatusNotification`) flows.
+//
+// With this slice all 89 v201 `*EnumType`s are pinned and #274 closes.
+//
+// As in slices 1 and 3, every enum below is cross-checked against BOTH
+// `ocpp/v201/enums.py` (the reference dataclass) AND the bundled FINAL
+// `crates/ocpp-messages/schemas/v201/*.json` (what `SchemaValidator::v201()`
+// enforces). For 14 of the 15, model == reference == FINAL schema.
+//
+// ## Divergence pinned, not dropped — `ChargingProfilePurposeEnumType`
+//
+// The FINAL 2.0.1 `ChargingProfilePurposeEnumType` (bundled
+// `SetChargingProfile.json`, `GetChargingProfiles.json`,
+// `ClearChargingProfile.json`, `ReportChargingProfiles.json`,
+// `RequestStartTransaction.json` — all five agree) defines **four** members —
+// `ChargingStationExternalConstraints`, `ChargingStationMaxProfile`,
+// `TxDefaultProfile`, `TxProfile` — and this crate models all four. The
+// reference *dataclass* omits `ChargingStationExternalConstraints`, so it lags
+// the FINAL schema here. This is the same shape as slice 3's
+// `MessageStateEnumType`: the schema carries a member the reference drops.
+// Rather than port only the reference's three, `test_charging_profile_purpose`
+// pins all four — a value the crate must accept because `SchemaValidator::v201()`
+// accepts it — and documents why the fourth is present. No `reject` cases in
+// this slice: no reference member is absent from the FINAL schema.
+// ---------------------------------------------------------------------------
+
+/// `ChargingLimitSourceEnumType` — the origin of an external charging limit; the
+/// all-caps acronyms (`EMS`, `SO`, `CSO`) carry `#[serde(rename)]` overrides and
+/// must serialize verbatim, never title-cased. Schema:
+/// `ClearedChargingLimit.json` (also `NotifyChargingLimit.json`,
+/// `ReportChargingProfiles.json`).
+#[test]
+fn test_charging_limit_source() {
+    pin_all::<ChargingLimitSourceEnumType>(&["EMS", "Other", "SO", "CSO"]);
+}
+
+/// `ChargingProfileKindEnumType` — whether a profile's schedule is `Absolute`,
+/// `Recurring`, or `Relative` to the transaction start. Schema:
+/// `ReportChargingProfiles.json` (recurs across the charging-profile schemas via
+/// `ChargingProfileType`).
+#[test]
+fn test_charging_profile_kind() {
+    pin_all::<ChargingProfileKindEnumType>(&["Absolute", "Recurring", "Relative"]);
+}
+
+/// `ChargingProfilePurposeEnumType` — the role a charging profile plays. The
+/// FINAL schema carries **four** members; the reference dataclass omits
+/// `ChargingStationExternalConstraints`, so this suite pins the crate's
+/// schema-faithful superset (see the section header for why the fourth member is
+/// present). Schema: `ClearChargingProfile.json` (also `SetChargingProfile.json`,
+/// `GetChargingProfiles.json`, `ReportChargingProfiles.json`,
+/// `RequestStartTransaction.json`).
+#[test]
+fn test_charging_profile_purpose() {
+    pin_all::<ChargingProfilePurposeEnumType>(&[
+        "ChargingStationExternalConstraints",
+        "ChargingStationMaxProfile",
+        "TxDefaultProfile",
+        "TxProfile",
+    ]);
+}
+
+/// `ChargingProfileStatusEnumType` — the `SetChargingProfile` reply status.
+/// Schema: `SetChargingProfileResponse.json`.
+#[test]
+fn test_charging_profile_status() {
+    pin_all::<ChargingProfileStatusEnumType>(&["Accepted", "Rejected"]);
+}
+
+/// `ChargingRateUnitEnumType` — the unit of a charging-schedule limit: the
+/// single-letter wire values `W` (watts) / `A` (amperes). These are valid Rust
+/// identifiers modelled with no rename, so the round-trip catches a wrong
+/// variant name or a stray `rename_all` that would lower-case them. Schema:
+/// `GetCompositeSchedule.json` (recurs across the charging-schedule schemas).
+#[test]
+fn test_charging_rate_unit() {
+    pin_all::<ChargingRateUnitEnumType>(&["W", "A"]);
+}
+
+/// `CostKindEnumType` — the kind of cost in a sales-tariff cost entry; the
+/// compound `CarbonDioxideEmission` / `RelativePricePercentage` /
+/// `RenewableGenerationPercentage` are the drift risk. Schema:
+/// `NotifyChargingLimit.json` (recurs wherever a `SalesTariff` / `CostType`
+/// appears, e.g. `SetChargingProfile.json`).
+#[test]
+fn test_cost_kind() {
+    pin_all::<CostKindEnumType>(&[
+        "CarbonDioxideEmission",
+        "RelativePricePercentage",
+        "RenewableGenerationPercentage",
+    ]);
+}
+
+/// `RecurrencyKindEnumType` — the recurrence period of a `Recurring` profile:
+/// `Daily` / `Weekly`. Schema: `ReportChargingProfiles.json` (recurs via
+/// `ChargingProfileType`).
+#[test]
+fn test_recurrency_kind() {
+    pin_all::<RecurrencyKindEnumType>(&["Daily", "Weekly"]);
+}
+
+/// `FirmwareStatusEnumType` — the firmware-update lifecycle reported in
+/// `FirmwareStatusNotification.req`; the compound download / install states
+/// (`DownloadScheduled`, `InstallRebooting`, `InstallVerificationFailed`,
+/// `SignatureVerified`) are the drift risk. Schema:
+/// `FirmwareStatusNotification.json`.
+#[test]
+fn test_firmware_status() {
+    pin_all::<FirmwareStatusEnumType>(&[
+        "Downloaded",
+        "DownloadFailed",
+        "Downloading",
+        "DownloadScheduled",
+        "DownloadPaused",
+        "Idle",
+        "InstallationFailed",
+        "Installing",
+        "Installed",
+        "InstallRebooting",
+        "InstallScheduled",
+        "InstallVerificationFailed",
+        "InvalidSignature",
+        "SignatureVerified",
+    ]);
+}
+
+/// `LogEnumType` — which log a `GetLog` request asks for: `DiagnosticsLog` or
+/// `SecurityLog`. Schema: `GetLog.json`.
+#[test]
+fn test_log() {
+    pin_all::<LogEnumType>(&["DiagnosticsLog", "SecurityLog"]);
+}
+
+/// `LogStatusEnumType` — the synchronous `GetLog` accept/reject ack;
+/// `AcceptedCanceled` (a running upload was canceled to serve this one) must
+/// serialize verbatim. Schema: `GetLogResponse.json`.
+#[test]
+fn test_log_status() {
+    pin_all::<LogStatusEnumType>(&["Accepted", "Rejected", "AcceptedCanceled"]);
+}
+
+/// `PublishFirmwareStatusEnumType` — the publish-to-local-cache lifecycle
+/// reported in `PublishFirmwareStatusNotification.req`; the compound
+/// `DownloadScheduled` / `InvalidChecksum` / `ChecksumVerified` / `PublishFailed`
+/// are the drift risk. Schema: `PublishFirmwareStatusNotification.json`.
+#[test]
+fn test_publish_firmware_status() {
+    pin_all::<PublishFirmwareStatusEnumType>(&[
+        "Idle",
+        "DownloadScheduled",
+        "Downloading",
+        "Downloaded",
+        "Published",
+        "DownloadFailed",
+        "DownloadPaused",
+        "InvalidChecksum",
+        "ChecksumVerified",
+        "PublishFailed",
+    ]);
+}
+
+/// `UnpublishFirmwareStatusEnumType` — the `UnpublishFirmware` reply:
+/// `DownloadOngoing` / `NoFirmware` / `Unpublished`. Schema:
+/// `UnpublishFirmwareResponse.json`.
+#[test]
+fn test_unpublish_firmware_status() {
+    pin_all::<UnpublishFirmwareStatusEnumType>(&["DownloadOngoing", "NoFirmware", "Unpublished"]);
+}
+
+/// `UpdateEnumType` — the `SendLocalList` update mode: `Differential` or `Full`.
+/// Schema: `SendLocalList.json`.
+#[test]
+fn test_update() {
+    pin_all::<UpdateEnumType>(&["Differential", "Full"]);
+}
+
+/// `UpdateFirmwareStatusEnumType` — the `UpdateFirmware` reply; the compound
+/// `AcceptedCanceled` / `InvalidCertificate` / `RevokedCertificate` are the drift
+/// risk. Schema: `UpdateFirmwareResponse.json`.
+#[test]
+fn test_update_firmware_status() {
+    pin_all::<UpdateFirmwareStatusEnumType>(&[
+        "Accepted",
+        "Rejected",
+        "AcceptedCanceled",
+        "InvalidCertificate",
+        "RevokedCertificate",
+    ]);
+}
+
+/// `UploadLogStatusEnumType` — the log-upload *progress* reported in
+/// `LogStatusNotification.req` while a `GetLog` flow proceeds; the compound
+/// `BadMessage` / `NotSupportedOperation` / `PermissionDenied` / `UploadFailure`
+/// / `AcceptedCanceled` are the drift risk. Distinct from [`LogStatusEnumType`],
+/// the synchronous `GetLog` ack. Schema: `LogStatusNotification.json`.
+#[test]
+fn test_upload_log_status() {
+    pin_all::<UploadLogStatusEnumType>(&[
+        "BadMessage",
+        "Idle",
+        "NotSupportedOperation",
+        "PermissionDenied",
+        "Uploaded",
+        "UploadFailure",
+        "Uploading",
+        "AcceptedCanceled",
     ]);
 }
