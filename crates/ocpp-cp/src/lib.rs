@@ -1751,13 +1751,18 @@ impl ChargePoint {
         let unique_id = Uuid::new_v4().to_string();
 
         // 1. Register before sending to avoid the race where the CALLRESULT
-        //    arrives before we have a receiver in the map.
-        let rx = {
+        //    arrives before we have a receiver in the map. `register_guarded`
+        //    returns an RAII guard that prunes the entry when this future
+        //    returns (or is cancelled), so a call that times out — or bails on
+        //    the transport error below — leaves no stale sender behind
+        //    (Issue #323). On the happy path the recv loop already removed the
+        //    entry, so the guard's drop is a harmless no-op.
+        let (rx, _prune_guard) = {
             let client_guard = self.client.read().await;
             let client = client_guard.as_ref().ok_or_else(|| OcppError::Transport {
                 message: "Not connected to central system".to_string(),
             })?;
-            client.pending_calls().register(unique_id.clone())
+            client.pending_calls().register_guarded(unique_id.clone())
         };
 
         // 2. Build the CALL frame with the same unique_id.
@@ -3058,6 +3063,51 @@ mod tests {
             }
             other => panic!("expected Transport error, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn timed_out_call_prunes_pending_entry_no_leak() {
+        // Issue #323: a CALL the CSMS never answers must not leak its entry in
+        // PendingCallMap. Drive the *real* call() path against a mock that
+        // accepts the socket but replies to nothing, and assert the pending map
+        // returns to its pre-call size — across repeated timeouts.
+        // Answer BootNotification (needed for connect()) but nothing else, so
+        // every later Heartbeat CALL runs out the timeout.
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            call_timeout: 1, // keep the test fast
+            ..Default::default()
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        // Grab the shared pending map so we can observe its size directly.
+        let pending = {
+            let guard = cp.client.read().await;
+            guard.as_ref().expect("connected").pending_calls()
+        };
+        assert_eq!(pending.len(), 0, "no in-flight calls before");
+
+        for _ in 0..3 {
+            let result = cp.call(HeartbeatRequest {}).await;
+            assert!(
+                matches!(result, Err(OcppError::Timeout { .. })),
+                "swallowed reply must time out, got {result:?}"
+            );
+            assert_eq!(
+                pending.len(),
+                0,
+                "a timed-out call() must leave no residue in PendingCallMap"
+            );
+        }
+
+        cp.disconnect().await.ok();
     }
 
     // --- dispatcher wiring tests ---
