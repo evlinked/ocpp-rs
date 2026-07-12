@@ -887,7 +887,7 @@ impl SchemaValidator {
     ///   action (unknown action name).
     pub fn validate_call(&self, action: &str, payload: &Value) -> OcppResult<()> {
         let schema = self.get_schema(action)?;
-        Self::run_validation(schema, payload)
+        Self::run_validation(schema, payload, action)
     }
 
     /// Validate a CALLRESULT payload against the `{action}Response` schema.
@@ -896,7 +896,10 @@ impl SchemaValidator {
     pub fn validate_call_result(&self, action: &str, payload: &Value) -> OcppResult<()> {
         let key = format!("{}Response", action);
         let schema = self.get_schema(&key)?;
-        Self::run_validation(schema, payload)
+        // A CALLRESULT failure names the base action (not the `…Response`
+        // schema key) in its context, matching the reference, whose
+        // `_validate_payload` reports `message.action` for both directions.
+        Self::run_validation(schema, payload, action)
     }
 
     /// Number of loaded schemas.  For OCPP 1.6J this is always 78.
@@ -931,7 +934,7 @@ impl SchemaValidator {
         }
     }
 
-    fn run_validation(schema: &Value, payload: &Value) -> OcppResult<()> {
+    fn run_validation(schema: &Value, payload: &Value, action: &str) -> OcppResult<()> {
         let compiled = jsonschema::JSONSchema::options()
             .with_draft(Self::draft_for(schema))
             .compile(schema)
@@ -972,6 +975,7 @@ impl SchemaValidator {
                 return Err(OcppError::SchemaViolation {
                     keyword,
                     message: messages.join("; "),
+                    action: action.to_string(),
                 });
             }
         }

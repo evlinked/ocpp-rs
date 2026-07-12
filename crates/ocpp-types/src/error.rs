@@ -30,10 +30,18 @@ pub enum OcppError {
     /// CALLERROR code (`type`/`maxLength` → `TypeConstraintViolation`,
     /// `required` → `ProtocolError`, everything else → `FormationViolation`),
     /// mirroring the `e.validator` switch in `ocpp/messages.py::_validate_payload`.
+    ///
+    /// `action` names the offending message so the CALLERROR-build layer can
+    /// surface the triggering-message context in its `details` — the port of the
+    /// `ocpp_message` context `_validate_payload` attaches to the raised
+    /// `OCPPError` (`tests/test_exceptions.py::test_exception_show_triggered_*`).
+    /// It carries only the action name, not the full payload echo the reference's
+    /// Python `repr` embeds (see issue #313).
     #[error("Schema validation error ({keyword}): {message}")]
     SchemaViolation {
         keyword: SchemaKeyword,
         message: String,
+        action: String,
     },
 
     /// Transport error
