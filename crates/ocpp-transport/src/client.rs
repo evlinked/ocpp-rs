@@ -145,12 +145,9 @@ impl WebSocketClient {
                                                 }
                                             }
                                             Message::CallError(e) => {
-                                                let err = OcppError::CallError {
-                                                    code: e.error_code.clone(),
-                                                    description: e.error_description.clone(),
-                                                    details: e.error_details.clone(),
-                                                };
-                                                if !pending_calls.reject(&e.unique_id, err) {
+                                                if !pending_calls
+                                                    .reject(&e.unique_id, OcppError::from(e))
+                                                {
                                                     warn!(
                                                         "CALLERROR for unknown unique_id '{}'",
                                                         e.unique_id

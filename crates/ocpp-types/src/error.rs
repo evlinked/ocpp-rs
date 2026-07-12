@@ -198,6 +198,27 @@ impl From<anyhow::Error> for OcppError {
     }
 }
 
+impl From<&crate::message::CallErrorMessage> for OcppError {
+    /// Translate an inbound CALLERROR frame into the error an outstanding
+    /// `call()` surfaces to its caller, preserving the wire `error_code`,
+    /// `error_description`, and `error_details` verbatim.
+    ///
+    /// This is the single mapping the transport recv loop applies when it
+    /// rejects a pending CALL (`crates/ocpp-transport/src/client.rs`), ported
+    /// from `_handle_call_error()` in
+    /// [`ocpp/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py),
+    /// which resolves the matching future with a `CallError` carrying the
+    /// error code and description. Taking `&CallErrorMessage` lets the caller
+    /// build the error without consuming the frame it still needs for logging.
+    fn from(msg: &crate::message::CallErrorMessage) -> Self {
+        OcppError::CallError {
+            code: msg.error_code.clone(),
+            description: msg.error_description.clone(),
+            details: msg.error_details.clone(),
+        }
+    }
+}
+
 /// OCPP Call Error codes as defined in the specification
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -454,5 +475,33 @@ mod tests {
             details: serde_json::json!({"hint": "see logs"}),
         };
         assert_eq!(err.clone(), err);
+    }
+
+    #[test]
+    fn from_call_error_message_preserves_wire_fields() {
+        use crate::message::CallErrorMessage;
+
+        let frame = CallErrorMessage::new(
+            "unique-42".to_string(),
+            CallErrorCode::InternalError,
+            "central system exploded".to_string(),
+            Some(serde_json::json!({"trace": "abc"})),
+        );
+
+        // The recv loop translates by reference; the frame is still usable after.
+        let err = OcppError::from(&frame);
+
+        assert_eq!(
+            err,
+            OcppError::CallError {
+                code: CallErrorCode::InternalError,
+                description: "central system exploded".to_string(),
+                details: serde_json::json!({"trace": "abc"}),
+            }
+        );
+        // The `unique_id` is intentionally *not* part of the surfaced error —
+        // it is the correlation key the caller already holds, matching the
+        // reference's `_handle_call_error`.
+        assert_eq!(frame.unique_id, "unique-42");
     }
 }
