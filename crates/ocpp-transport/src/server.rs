@@ -1037,27 +1037,60 @@ async fn handle_cp_socket(socket: WebSocket, charge_point_id: String, state: Arc
     info!("ChargePoint '{}' disconnected", charge_point_id);
 }
 
-/// Map an `OcppError` to the appropriate OCPP error code for a CALLERROR frame.
+/// Build the outgoing CALLERROR frame for an `OcppError` — its error code,
+/// human-readable description, and `details` map.
 ///
 /// Shared with [`DispatchHandler`](crate::dispatch_handler::DispatchHandler) so
-/// server-side routing produces the same CALLERROR codes as the inline server
-/// receive loop.
+/// server-side routing produces the same CALLERROR frames as the inline server
+/// receive loop. Unrouted-action errors (`NotImplemented`/`NotSupported`) carry
+/// the reference's spec-canonical description and a `{"cause": …}` detail; every
+/// other variant keeps its `Display` text and empty details.
 pub(crate) fn build_call_error(unique_id: &str, error: &OcppError) -> Message {
-    let code = match error {
-        OcppError::NotSupported { .. } => CallErrorCode::NotSupported,
-        // A known action for the negotiated version with no registered handler —
-        // the `NotImplementedError` branch of `_raise_key_error` in
-        // `ocpp/charge_point.py`.
-        OcppError::NotImplemented { .. } => CallErrorCode::NotImplemented,
-        // Keyword-granular code from the failing JSON-Schema keyword, per
-        // `_validate_payload()` in `ocpp/messages.py`.
-        OcppError::SchemaViolation { keyword, .. } => keyword.call_error_code(),
-        OcppError::ValidationError { .. } | OcppError::Json { .. } => {
-            CallErrorCode::FormationViolation
-        }
-        _ => CallErrorCode::InternalError,
-    };
-    Message::call_error(unique_id.to_string(), code, error.to_string(), None)
+    // Port of `_raise_key_error` + `create_call_error` from
+    // `ocpp/charge_point.py`: the two unrouted-action errors carry the
+    // spec-canonical `default_description` (from `ocpp/exceptions.py`) and a
+    // machine-readable `{"cause": …}` detail — the operator-facing reason a peer's
+    // CALL was refused at the routing trust boundary. Every other variant keeps
+    // its `Display` text and empty (`{}`) details, exactly as before.
+    let (code, description, details): (CallErrorCode, String, Option<serde_json::Value>) =
+        match error {
+            // A known action for the negotiated version with no registered
+            // handler — the `NotImplementedError` branch of `_raise_key_error`,
+            // which raises `details={"cause": f"No handler for {action}
+            // registered."}`. This variant is constructed *only* by
+            // `ActionDispatcher::unrouted_action_error`, so `feature` is always
+            // the bare action name and the cause is unambiguous.
+            OcppError::NotImplemented { feature } => (
+                CallErrorCode::NotImplemented,
+                "Request Action is recognized but not supported by the receiver".to_string(),
+                Some(serde_json::json!({
+                    "cause": format!("No handler for {feature} registered."),
+                })),
+            ),
+            // An action the negotiated version does not define — the
+            // `NotSupportedError` branch of `_raise_key_error`. The reference
+            // cause embeds the OCPP version (`… not supported by OCPP2.0.1.`),
+            // which isn't threaded to this layer, and the same variant is also
+            // raised for a missing bundled schema; so we emit a version-agnostic
+            // cause here (see issue #311). The canonical description matches.
+            OcppError::NotSupported { feature } => (
+                CallErrorCode::NotSupported,
+                "Requested Action is not known by receiver".to_string(),
+                Some(serde_json::json!({
+                    "cause": format!("{feature} not supported by receiver."),
+                })),
+            ),
+            // Keyword-granular code from the failing JSON-Schema keyword, per
+            // `_validate_payload()` in `ocpp/messages.py`.
+            OcppError::SchemaViolation { keyword, .. } => {
+                (keyword.call_error_code(), error.to_string(), None)
+            }
+            OcppError::ValidationError { .. } | OcppError::Json { .. } => {
+                (CallErrorCode::FormationViolation, error.to_string(), None)
+            }
+            _ => (CallErrorCode::InternalError, error.to_string(), None),
+        };
+    Message::call_error(unique_id.to_string(), code, description, details)
 }
 
 // ─── Public types ─────────────────────────────────────────────────────────────
