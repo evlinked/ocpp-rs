@@ -4,8 +4,18 @@ use crate::{CallErrorCode, MessageType, OcppError, OcppResult};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// OCPP message envelope that wraps all message types
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// OCPP message envelope that wraps all message types.
+///
+/// Serializes (via the `untagged` derive) as the inner variant's object, whose
+/// `"0"` key carries the [`MessageType`] discriminator (`"CALL"` / `"CALLRESULT"`
+/// / `"CALLERROR"`). Deserialization is **hand-written** to dispatch on that
+/// discriminator rather than a `serde(untagged)` first-match: the three variants
+/// share the `"0".."3"` key prefix, and a `CALLERROR`'s `"2"` is a string error
+/// code that also satisfies `CallMessage`'s `"2"` action string — so an untagged
+/// decode silently mis-reads every inbound `CALLERROR` as a `Call`, leaving the
+/// real CALLERROR uncorrelated to its pending call. Dispatching on `"0"` keeps
+/// each frame on its own variant (Issue #321).
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum Message {
     /// Call message (request)
@@ -14,6 +24,35 @@ pub enum Message {
     CallResult(CallResultMessage),
     /// CallError message (error response)
     CallError(CallErrorMessage),
+}
+
+impl<'de> Deserialize<'de> for Message {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        // Buffer the frame, then dispatch on the `"0"` message-type
+        // discriminator. JSON (the only wire format for OCPP here) is
+        // self-describing, so buffering into a `Value` is sound.
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value.get("0").and_then(|t| t.as_str()) {
+            Some("CALL") => serde_json::from_value(value)
+                .map(Message::Call)
+                .map_err(D::Error::custom),
+            Some("CALLRESULT") => serde_json::from_value(value)
+                .map(Message::CallResult)
+                .map_err(D::Error::custom),
+            Some("CALLERROR") => serde_json::from_value(value)
+                .map(Message::CallError)
+                .map_err(D::Error::custom),
+            _ => Err(D::Error::custom(
+                "OCPP message: missing or unknown message-type discriminator at key \"0\" \
+                 (expected \"CALL\", \"CALLRESULT\", or \"CALLERROR\")",
+            )),
+        }
+    }
 }
 
 impl Message {
@@ -360,6 +399,55 @@ mod tests {
 
         assert_eq!(msg.message_type(), MessageType::Call);
         assert!(!msg.unique_id().is_empty());
+    }
+
+    /// Each `Message` variant must round-trip through `serde_json` back to the
+    /// *same* variant. The regression guarded here (Issue #321): a `CALLERROR`
+    /// deserialized to `Message::Call` under the old `untagged` first-match,
+    /// because its `"2"` string error code satisfied `CallMessage`'s action
+    /// field — so an inbound CALLERROR was never correlated to its pending call.
+    #[test]
+    fn message_variants_round_trip_by_discriminator() {
+        let call = Message::Call(
+            CallMessage::new("Heartbeat".to_string(), json!({"idTag": "T1"})).unwrap(),
+        );
+        let call_result =
+            Message::CallResult(CallResultMessage::new("id-1".to_string(), json!({})).unwrap());
+        let call_error = Message::call_error(
+            "id-2".to_string(),
+            CallErrorCode::InternalError,
+            "central system unavailable".to_string(),
+            Some(json!({"retryAfter": 30})),
+        );
+
+        for msg in [&call, &call_result, &call_error] {
+            let text = serde_json::to_string(msg).unwrap();
+            let back: Message = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                &back, msg,
+                "variant must survive a serde round-trip: {text}"
+            );
+        }
+
+        // The specific regression: a CALLERROR frame decodes as CallError, with
+        // its error code + description + details intact — not as a Call.
+        let text = serde_json::to_string(&call_error).unwrap();
+        match serde_json::from_str::<Message>(&text).unwrap() {
+            Message::CallError(e) => {
+                assert_eq!(e.error_code, CallErrorCode::InternalError);
+                assert_eq!(e.error_description, "central system unavailable");
+                assert_eq!(e.error_details, json!({"retryAfter": 30}));
+            }
+            other => panic!("a CALLERROR must decode as Message::CallError, got {other:?}"),
+        }
+    }
+
+    /// A frame whose `"0"` discriminator is missing or unrecognized is rejected,
+    /// rather than silently coerced onto a variant.
+    #[test]
+    fn message_rejects_unknown_discriminator() {
+        assert!(serde_json::from_str::<Message>(r#"{"0":"NOPE","1":"x"}"#).is_err());
+        assert!(serde_json::from_str::<Message>(r#"{"1":"x"}"#).is_err());
     }
 
     #[test]

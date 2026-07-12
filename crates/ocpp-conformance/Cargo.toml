@@ -27,4 +27,7 @@ ocpp-transport = { path = "../ocpp-transport" }
 ocpp-cp = { path = "../ocpp-cp" }
 tokio = { workspace = true, features = ["test-util", "macros"] }
 chrono = { workspace = true }
+# Test-only: implement a scripted `MessageHandler` that swallows one action to
+# drive `ChargePoint::call()`'s timeout path end-to-end (charge_point_call_e2e).
+async-trait = "0.1"
 

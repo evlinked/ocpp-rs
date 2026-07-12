@@ -40,6 +40,19 @@
 //! `call()`'s await-half at `lib.rs` §"Await the CALLRESULT (or CALLERROR)"),
 //! so each test drives the *same* resolution logic the real client uses.
 //!
+//! ## Companion end-to-end suite
+//!
+//! This suite is the **unit-level** check: it pins each branch of `call()`'s
+//! resolution against the primitives in isolation — including two the transport
+//! can't easily reproduce, the disconnect→`Transport` branch
+//! ([`dropped_sender_surfaces_as_transport_error`]) and the virtual-time timer
+//! ([`timeout_does_not_wedge_subsequent_calls`], `start_paused`). The
+//! higher-fidelity companion, `charge_point_call_e2e.rs`, drives the **real**
+//! `ChargePoint::call()` end-to-end over an in-process loopback `OcppServer`
+//! (framing, `unique_id` correlation, and the recv loop's CALLERROR translation
+//! all exercised for real). Keep both: this one for the isolated branches, the
+//! e2e one for the integrated path (Issue #321).
+//!
 //! ## Idiomatic divergences from the Python reference (pinned, not ported)
 //!
 //!   - **`suppress` flag.** Rust's `call()` returns `OcppResult<Response>`, so
