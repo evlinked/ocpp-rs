@@ -55,6 +55,28 @@ impl<'de> Deserialize<'de> for Message {
     }
 }
 
+/// Human-readable frame representation, faithfully adapting the
+/// mobilityhouse/ocpp reference's `Call`/`CallResult`/`CallError` `__repr__`
+/// (`ocpp/messages.py`) — the `<Kind - field=…, …>` envelope its
+/// `test_messages.py` representation tests pin. Delegates to the active
+/// variant, so `format!("{message}")` renders whichever frame it holds.
+///
+/// See the per-variant `Display` impls below for the two faithful-adaptation
+/// divergences from the Python `repr`: the payload is rendered as **compact
+/// JSON** (Rust payloads are `serde_json::Value`, not Python dicts), and the
+/// `CallResult` envelope omits `action` (the OCPP `[3, unique_id, payload]`
+/// wire frame carries none — unlike the reference's in-memory `CallResult`
+/// attribute).
+impl std::fmt::Display for Message {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Message::Call(msg) => msg.fmt(f),
+            Message::CallResult(msg) => msg.fmt(f),
+            Message::CallError(msg) => msg.fmt(f),
+        }
+    }
+}
+
 impl Message {
     /// Get the message type
     pub fn message_type(&self) -> MessageType {
@@ -181,6 +203,24 @@ impl CallMessage {
     }
 }
 
+/// Human-readable CALL frame, adapting the reference's
+/// `Call.__repr__` — `<Call - unique_id=…, action=…, payload=…>`
+/// ([`ocpp/messages.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/messages.py),
+/// pinned by `test_messages.py::test_call_representation`).
+///
+/// Faithful-adaptation divergence: the payload is a [`serde_json::Value`], so
+/// it renders as **compact JSON** (`{}`, `{"idTag":"T1"}`) via `Value`'s own
+/// `Display`, not the reference's Python dict-repr (`{'idTag': 'T1'}`).
+impl std::fmt::Display for CallMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "<Call - unique_id={}, action={}, payload={}>",
+            self.unique_id, self.action, self.payload
+        )
+    }
+}
+
 /// OCPP CallResult message (successful response)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CallResultMessage {
@@ -214,6 +254,31 @@ impl CallResultMessage {
         T: for<'de> Deserialize<'de>,
     {
         Ok(serde_json::from_value(self.payload.clone())?)
+    }
+}
+
+/// Human-readable CALLRESULT frame, adapting the reference's
+/// `CallResult.__repr__`
+/// ([`ocpp/messages.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/messages.py),
+/// pinned by `test_messages.py::test_call_result_representation`).
+///
+/// Two faithful-adaptation divergences from the Python `repr`:
+/// - **No `action`.** The OCPP CALLRESULT wire frame is `[3, unique_id,
+///   payload]` and carries no action; [`CallResultMessage`] models exactly that
+///   and has no `action` field. The reference keeps `action` only as an
+///   in-memory attribute on its `CallResult` object (set by the caller that
+///   knows which CALL it answers), so rendering it here would mean inventing
+///   data the envelope does not hold. The envelope therefore renders
+///   `<CallResult - unique_id=…, payload=…>`.
+/// - **Compact JSON payload**, as for [`CallMessage`] above (`{"status":
+///   "Accepted"}` → `{"status":"Accepted"}`), not Python dict-repr.
+impl std::fmt::Display for CallResultMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "<CallResult - unique_id={}, payload={}>",
+            self.unique_id, self.payload
+        )
     }
 }
 
@@ -252,6 +317,29 @@ impl CallErrorMessage {
             error_description,
             error_details: error_details.unwrap_or(serde_json::Value::Object(Default::default())),
         }
+    }
+}
+
+/// Human-readable CALLERROR frame, adapting the reference's
+/// `CallError.__repr__` — `<CallError - unique_id=…, error_code=…,
+/// error_description=…, error_details=…>`
+/// ([`ocpp/messages.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/messages.py),
+/// pinned by `test_messages.py::test_call_error_representation`).
+///
+/// The `error_code` renders as its **wire spelling** (`GenericError`) via
+/// [`CallErrorCode::as_str`], matching the reference — not the human `Display`
+/// (`Generic error`) used in log/error text elsewhere. `error_details` renders
+/// as compact JSON, the same divergence as the other frames.
+impl std::fmt::Display for CallErrorMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "<CallError - unique_id={}, error_code={}, error_description={}, error_details={}>",
+            self.unique_id,
+            self.error_code.as_str(),
+            self.error_description,
+            self.error_details
+        )
     }
 }
 
