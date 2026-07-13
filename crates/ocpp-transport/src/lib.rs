@@ -314,16 +314,14 @@ pub mod utils {
         matches!(protocol, "ocpp1.6" | "ocpp2.0" | "ocpp2.0.1")
     }
 
-    /// Extract charge point ID from WebSocket path
-    pub fn extract_charge_point_id(path: &str) -> Option<&str> {
-        // Expected format: /ocpp/{charge_point_id}
-        let parts: Vec<&str> = path.split('/').collect();
-        if parts.len() >= 3 && parts[1] == "ocpp" {
-            Some(parts[2])
-        } else {
-            None
-        }
-    }
+    // NOTE: charge-point-id extraction lives in exactly one place —
+    // `websocket::server::extract_charge_point_id`, the hardened, reference-
+    // faithful port (`ocpp/charge_point.py`). A second, naive copy used to live
+    // here; it returned `Some("")` for `/ocpp/` (an empty routing key), leaked
+    // query strings / fragments into the id, and rejected nested paths — a
+    // trust-boundary foot-gun that shadowed the safe version by name. It was
+    // unused in production and has been removed. Do not reintroduce it: call
+    // `websocket::server::extract_charge_point_id` instead.
 
     /// Create WebSocket URL for charge point
     pub fn create_websocket_url(base_url: &str, charge_point_id: &str) -> String {
@@ -415,9 +413,6 @@ mod tests {
         assert!(utils::validate_subprotocol("ocpp1.6"));
         assert!(utils::validate_subprotocol("ocpp2.0"));
         assert!(!utils::validate_subprotocol("invalid"));
-
-        assert_eq!(utils::extract_charge_point_id("/ocpp/CP001"), Some("CP001"));
-        assert_eq!(utils::extract_charge_point_id("/invalid/path"), None);
 
         assert_eq!(
             utils::create_websocket_url("ws://localhost:8080", "CP001"),
