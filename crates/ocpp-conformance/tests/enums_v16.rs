@@ -21,23 +21,28 @@
 //! wire string. This catches both a *missing* variant (deserialize fails) and
 //! *rename drift* (re-serialize differs), without hand-naming Rust variants.
 //!
-//! The security-extension / firmware / logging family (`CertificateSignedStatus`,
-//! `CertificateUse`, `DeleteCertificateStatus`, `GenericStatus`,
-//! `UpdateFirmwareStatus`, `UploadLogStatus`) is pinned too (#304); every
-//! schema-backed member is additionally cross-checked against the bundled FINAL
-//! 1.6J schema named in each test's doc comment.
+//! The security-extension / firmware / logging family is pinned too — the
+//! initial set in #304 (`CertificateSignedStatus`, `CertificateUse`,
+//! `DeleteCertificateStatus`, `GenericStatus`, `UpdateFirmwareStatus`,
+//! `UploadLogStatus`) plus the remaining members from #307 (`HashAlgorithmType`,
+//! `LogType`, `LogStatus`, `GetInstalledCertificatesStatus`,
+//! `InstallCertificateStatus`) — so every 1.6J enum modelled as a Rust enum now
+//! has a round-trip pin. Every schema-backed member is additionally
+//! cross-checked against the bundled FINAL 1.6J schema named in each test's doc
+//! comment.
 //!
 //! ## Known gaps (documented, not silently dropped)
 //!
 //! - **`ConfigurationKey`** — the reference's ~50-member config-key enum is not
 //!   modelled as a Rust enum (config keys are handled as plain strings), so it
 //!   has no enum round-trip to port. Tracked for a follow-up.
-//! - **Unmodelled reference enums** — a handful of 1.6J reference enums have no
-//!   Rust counterpart yet, so there is no round-trip to pin: `CertificateStatus`,
-//!   `GetInstalledCertificateStatus`, `HashAlgorithm`, `Log`, `LogStatus` (the
-//!   other half of the security-extension / certificate family whose peers *are*
-//!   modelled). Whether to model them is a model decision, not test-only work —
-//!   tracked in the residual note on #304.
+//!
+//! The #307 "unmodelled residual" is closed: four of its five enums were
+//! already modelled under Rust-idiomatic names (`CertificateStatus` →
+//! `InstallCertificateStatus`, `GetInstalledCertificateStatus` →
+//! `GetInstalledCertificatesStatus`, `HashAlgorithm` → `HashAlgorithmType`,
+//! `Log` → `LogType`) and are now pinned above; the genuinely-missing fifth,
+//! `LogStatus` (`GetLog.conf`), is now modelled and pinned.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -52,9 +57,10 @@ use ocpp_types::v16j::{
     ChargePointStatus, ChargingProfileKindType, ChargingProfilePurposeType, ChargingProfileStatus,
     ChargingRateUnitType, ClearCacheStatus, ClearChargingProfileStatus, ConfigurationStatus,
     DataTransferStatus, DeleteCertificateStatus, DiagnosticsStatus, FirmwareStatus, GenericStatus,
-    GetCompositeScheduleStatus, MessageTrigger, RecurrencyKindType, RemoteStartStopStatus,
-    ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus, UnlockStatus,
-    UpdateFirmwareStatus, UpdateStatus, UpdateType, UploadLogStatus,
+    GetCompositeScheduleStatus, GetInstalledCertificatesStatus, HashAlgorithmType,
+    InstallCertificateStatus, LogStatus, LogType, MessageTrigger, RecurrencyKindType,
+    RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus,
+    UnlockStatus, UpdateFirmwareStatus, UpdateStatus, UpdateType, UploadLogStatus,
 };
 
 use ocpp_messages::v16j::RegistrationStatus;
@@ -452,4 +458,44 @@ fn test_upload_log_status() {
         "UploadFailure",
         "Uploading",
     ]);
+}
+
+#[test]
+fn test_log_status() {
+    // Reference `LogStatus` (used by `GetLog.conf`); cross-checked against
+    // `GetLogResponse.json` (`LogStatusEnumType`). This is *not* the
+    // upload-progress `UploadLogStatus` above (`LogStatusNotification.req`) —
+    // the two are disjoint. Watch `AcceptedCanceled` (single-l US spelling).
+    pin_all::<LogStatus>(&["Accepted", "Rejected", "AcceptedCanceled"]);
+}
+
+#[test]
+fn test_log_type() {
+    // Reference `Log` (used by `GetLog.req`); cross-checked against
+    // `GetLog.json` (`LogEnumType`).
+    pin_all::<LogType>(&["DiagnosticsLog", "SecurityLog"]);
+}
+
+#[test]
+fn test_hash_algorithm() {
+    // Reference `HashAlgorithm` (certificate hash data); cross-checked against
+    // `GetInstalledCertificateIdsResponse.json` (`HashAlgorithmEnumType`).
+    // Values are the raw acronyms (no PascalCase rename).
+    pin_all::<HashAlgorithmType>(&["SHA256", "SHA384", "SHA512"]);
+}
+
+#[test]
+fn test_get_installed_certificates_status() {
+    // Reference `GetInstalledCertificateStatus`; cross-checked against
+    // `GetInstalledCertificateIdsResponse.json`
+    // (`GetInstalledCertificateStatusEnumType`).
+    pin_all::<GetInstalledCertificatesStatus>(&["Accepted", "NotFound"]);
+}
+
+#[test]
+fn test_install_certificate_status() {
+    // Reference `CertificateStatus` (used by `InstallCertificate.conf`);
+    // cross-checked against `InstallCertificateResponse.json`
+    // (`InstallCertificateStatusEnumType`: Accepted / Rejected / Failed).
+    pin_all::<InstallCertificateStatus>(&["Accepted", "Rejected", "Failed"]);
 }
