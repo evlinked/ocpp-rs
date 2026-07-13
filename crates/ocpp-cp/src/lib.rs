@@ -1748,6 +1748,26 @@ impl ChargePoint {
     /// configured timeout, and `OcppError::CallError` if the server replies
     /// with a CALLERROR frame.
     pub async fn call<Req: OcppAction>(&self, request: Req) -> OcppResult<Req::Response> {
+        // Serialize the typed request up front so it can be schema-validated
+        // *before* any pending-call registration or network I/O.
+        let payload = serde_json::to_value(&request).map_err(OcppError::from)?;
+
+        // Validate the OUTGOING request against the `{action}` schema before
+        // sending, mirroring `call()` in charge_point.py, which runs
+        // `validate_payload(call)` prior to `_send`. A strongly-typed request
+        // can still be schema-invalid (e.g. a `String` field exceeding its
+        // `maxLength`); the reference rejects such a payload locally rather
+        // than putting a malformed CALL on the wire
+        // (`test_v16_charge_point.py::test_send_invalid_call`). Gated by
+        // `config.validate_payloads`, whose off state is the Rust analog of the
+        // reference's `skip_schema_validation=True`. This runs before the
+        // connection check so a schema-invalid request surfaces as a
+        // `SchemaViolation` regardless of link state, matching the reference's
+        // validate-before-`_send` ordering.
+        if let Some(validator) = &self.validator {
+            validator.validate_call(Req::ACTION_NAME, &payload)?;
+        }
+
         let unique_id = Uuid::new_v4().to_string();
 
         // 1. Register before sending to avoid the race where the CALLRESULT
@@ -1765,12 +1785,13 @@ impl ChargePoint {
             client.pending_calls().register_guarded(unique_id.clone())
         };
 
-        // 2. Build the CALL frame with the same unique_id.
+        // 2. Build the CALL frame with the same unique_id, reusing the payload
+        //    serialized (and validated) above.
         let call_msg = CallMessage {
             message_type: MessageType::Call,
             unique_id: unique_id.clone(),
             action: Req::ACTION_NAME.to_string(),
-            payload: serde_json::to_value(&request).map_err(OcppError::from)?,
+            payload,
         };
 
         // 3. Send the frame.
@@ -4116,6 +4137,77 @@ mod tests {
 
         let info = cp.authorize("TAG001").await.unwrap();
         assert_eq!(info.status, AuthorizationStatus::Accepted);
+    }
+
+    #[tokio::test]
+    async fn call_validates_outbound_request_before_send() {
+        // Port of `test_v16_charge_point.py::test_send_invalid_call`: a
+        // schema-invalid request must be rejected locally by `call()` before it
+        // reaches the wire. The reference builds `Reset(type="Medium")`; the
+        // strongly-typed Rust model can't express that, so we use the
+        // equivalent schema-but-not-type violation — an `idTag` longer than the
+        // Authorize schema's `maxLength: 20`.
+        //
+        // The charge point is intentionally NOT connected: outbound validation
+        // runs before the connection check, so an invalid payload surfaces as a
+        // `SchemaViolation` rather than the "Not connected" transport error.
+        // Getting `SchemaViolation` (not `Transport`) is exactly what proves the
+        // request was validated *before* any send attempt.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        let err = cp
+            .call(AuthorizeRequest {
+                id_tag: "A".repeat(21), // 21 chars > maxLength 20
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OcppError::SchemaViolation { .. }),
+            "expected SchemaViolation for an over-long idTag, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_valid_outbound_request_passes_validation_then_hits_transport() {
+        // A schema-valid, non-trivial request must clear outbound validation and
+        // proceed to the send path — where, on a disconnected charge point, it
+        // fails with the transport "Not connected" error. This proves outbound
+        // validation does not reject well-formed requests.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        let err = cp
+            .call(AuthorizeRequest {
+                id_tag: "TAG001".to_string(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OcppError::Transport { .. }),
+            "expected Transport error for a valid request on a disconnected CP, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn call_outbound_validation_skipped_when_disabled() {
+        // With `validate_payloads: false` — the Rust analog of the reference's
+        // `skip_schema_validation=True`
+        // (`test_v16_charge_point.py::test_call_skip_schema_validation`) — the
+        // same over-long idTag is NOT rejected locally: `call()` skips outbound
+        // validation and proceeds to the send path, failing only with the
+        // transport error. Proves the gate is honored in both directions.
+        let cp = ChargePoint::new(ChargePointConfig {
+            validate_payloads: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let err = cp
+            .call(AuthorizeRequest {
+                id_tag: "A".repeat(21),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, OcppError::Transport { .. }),
+            "expected Transport error (validation skipped), got: {err:?}"
+        );
     }
 
     /// Spawn a mock CSMS that responds to each BootNotification CALL with a
