@@ -5,6 +5,7 @@
 //! client (Charge Point) and server (Central System) sides.
 
 pub mod central_system;
+pub mod central_system_v201;
 pub mod client;
 pub mod dispatch_handler;
 pub mod error;
@@ -15,6 +16,11 @@ pub mod websocket;
 pub use central_system::{
     central_system_dispatcher, central_system_dispatcher_with, register_default_handlers,
     CentralSystemConfig,
+};
+pub use central_system_v201::{
+    central_system_dispatcher_v201, central_system_dispatcher_v201_with,
+    central_system_handler_v201, central_system_handler_v201_with, register_default_handlers_v201,
+    CentralSystemConfigV201,
 };
 pub use client::WebSocketClient;
 pub use dispatch_handler::DispatchHandler;
