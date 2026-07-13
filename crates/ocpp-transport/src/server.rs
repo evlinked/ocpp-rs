@@ -793,7 +793,17 @@ async fn ws_handler(
     State(state): State<Arc<ServerState>>,
     headers: HeaderMap,
 ) -> Result<Response, StatusCode> {
-    // OCPP 1.6J §3.1 — charge-point IDs are ≤ 48 characters (CiString48)
+    // The connect path is an attacker-influenceable trust boundary: whatever we
+    // accept here becomes the routing key for every subsequent CALL on this
+    // socket. Mirror the hardened pure parser `websocket::server::extract_charge_point_id`
+    // (ported from mobilityhouse/ocpp `charge_point.py`), which trims surrounding
+    // whitespace and refuses an empty / whitespace-only segment — so the live
+    // handshake and the pinned pure-function contract agree (issue #330). The
+    // axum `Path` param is percent-decoded, so `/ocpp/%20%20` arrives here as
+    // `"   "`; trimming collapses it to empty and the id is rejected rather than
+    // registered as a whitespace-only routing key.
+    let charge_point_id = charge_point_id.trim();
+    // OCPP 1.6J §3.1 — charge-point IDs are ≤ 48 characters (CiString48).
     if charge_point_id.is_empty() || charge_point_id.len() > 48 {
         warn!(
             "Rejected connection: invalid charge_point_id '{}'",
@@ -801,6 +811,10 @@ async fn ws_handler(
         );
         return Err(StatusCode::BAD_REQUEST);
     }
+    // A space-padded but non-empty id (e.g. `/ocpp/%20CP001%20`) is accepted as
+    // its trimmed form `CP001` — matching the pure parser — so the routing key
+    // stored in `cp_handles` is exactly what the CSMS `call()` API addresses.
+    let charge_point_id = charge_point_id.to_string();
 
     // Require Sec-WebSocket-Protocol: ocpp1.6; reject anything else with HTTP 400
     let offers_ocpp16 = headers
@@ -1309,6 +1323,68 @@ mod tests {
         assert!(
             result.is_err(),
             "expected rejection for unsupported subprotocol"
+        );
+
+        server.stop().await.unwrap();
+    }
+
+    /// A percent-encoded **whitespace-only** charge-point id (`/ocpp/%20%20%20`,
+    /// which axum decodes to `"   "`) is refused at the handshake with HTTP 400 —
+    /// it must never become a live routing key. This pins the live-server side
+    /// of the pure `extract_charge_point_id("/   ") == None` contract, closing
+    /// the runtime/pure-function divergence (issue #330). The subprotocol header
+    /// is present and valid, so the *only* reason for rejection is the id.
+    #[tokio::test]
+    async fn server_rejects_whitespace_only_charge_point_id() {
+        let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
+
+        // `%20` is a space; the decoded id "   " trims to empty and is refused.
+        let result = connect_async(ocpp_request(addr, "%20%20%20")).await;
+        assert!(
+            result.is_err(),
+            "expected HTTP 400 for a whitespace-only charge-point id"
+        );
+
+        // Trust-boundary negative: give any erroneously-accepted per-CP task a
+        // moment to register, then confirm nothing did.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            server.connection_count(),
+            0,
+            "a refused whitespace-only id must not register a connection"
+        );
+        assert!(
+            server.connected_cp_ids().is_empty(),
+            "a refused whitespace-only id must not become a routing key"
+        );
+
+        server.stop().await.unwrap();
+    }
+
+    /// A space-padded but non-empty id (`/ocpp/%20CP001%20` → `" CP001 "`) is
+    /// accepted as its **trimmed** form `CP001`, matching the pure parser — so
+    /// the routing key stored in `cp_handles` is exactly what the CSMS `call()`
+    /// API addresses, with no surprising whitespace (issue #330).
+    #[tokio::test]
+    async fn server_trims_space_padded_charge_point_id() {
+        let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
+
+        connect_async(ocpp_request(addr, "%20CP001%20"))
+            .await
+            .expect("a space-padded id should connect as its trimmed form");
+
+        let start = tokio::time::Instant::now();
+        while !server.is_cp_connected("CP001") && start.elapsed() < Duration::from_millis(500) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            server.is_cp_connected("CP001"),
+            "the CP must be registered under the trimmed id 'CP001'"
+        );
+        assert_eq!(
+            server.connected_cp_ids(),
+            vec!["CP001".to_string()],
+            "the routing key must be the trimmed id, not the padded one"
         );
 
         server.stop().await.unwrap();
