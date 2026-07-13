@@ -324,6 +324,32 @@ impl ActionDispatcher {
         let unique_id = call.unique_id.clone();
         let response = (route.handler)(payload.clone(), unique_id.clone()).await?;
 
+        // Schema-validate the *outgoing* CALLRESULT before returning it, the
+        // symmetric port of `_handle_call()`'s second `validate_payload(response,
+        // …)` in charge_point.py — gated by the *same* per-route
+        // `skip_validation` flag as the request-side check above. A handler that
+        // produces a schema-invalid response must never put an invalid frame on
+        // the wire: returning `Err` here lets the caller emit a CALLERROR instead
+        // (mirroring `route_message`'s `except OCPPError → create_call_error`),
+        // exactly as a rejected *request* already does. Because the check runs
+        // before the `@after` spawn and short-circuits via `?`, a failed response
+        // validation also skips the after-hook — matching the reference, which
+        // raises before reaching its after block.
+        //
+        // `validate_call_result` keys the `{action}Response` schema. The bundled
+        // 1.6J and 2.0.1 schema sets are request/response-symmetric (every action
+        // ships both `X.json` and `XResponse.json`), so an action whose request
+        // just validated always has a response schema — no missing-schema guard
+        // is needed, keeping this symmetric with the request-side branch. A
+        // `skip_validation` route bypasses the check, so its handler may return
+        // an out-of-schema response unaltered (ports
+        // `test_route_message_without_validation`).
+        if let Some(validator) = &self.validator {
+            if !route.skip_validation {
+                validator.validate_call_result(action, &response)?;
+            }
+        }
+
         if let Some(after) = self.after_hooks.get(action) {
             tokio::spawn(after(payload, unique_id));
         }
@@ -918,6 +944,144 @@ mod tests {
         let d = validating_dispatcher();
         assert!(!d.skips_validation("BootNotification"));
         assert!(!d.skips_validation("NotAnAction"));
+    }
+
+    // --- outbound CALLRESULT validation (Issue #334) ---
+    //
+    // Python ref: `_handle_call()` in ocpp/charge_point.py validates the payload
+    // a *second* time — the outgoing CALLRESULT — before `_send`, gated by the
+    // same `_skip_schema_validation` flag as the request-side check. A failure
+    // raises an OCPPError that `route_message()` turns into a CALLERROR.
+    // `dispatch()` mirrors this: the response is validated after the handler
+    // returns and before the `@after` hook, so an invalid response becomes an
+    // `Err` (→ CALLERROR) rather than an invalid frame — unless the route skips.
+    //
+    // A stand-in `BootNotification` action whose response carries a free-form
+    // `status: String` lets a handler emit an out-of-enum value (`"Yolo"`,
+    // straight from `test_route_message_without_validation`) that the typed
+    // `BootNotificationResponse` could never produce. Its ACTION_NAME is
+    // `BootNotification`, so the bundled 1.6J request *and* response schemas both
+    // apply.
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct RawBootRequest {
+        #[serde(rename = "chargePointVendor")]
+        vendor: String,
+        #[serde(rename = "chargePointModel")]
+        model: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct RawBootResponse {
+        #[serde(rename = "currentTime")]
+        current_time: String,
+        interval: i64,
+        status: String,
+    }
+
+    impl OcppAction for RawBootRequest {
+        const ACTION_NAME: &'static str = "BootNotification";
+        type Response = RawBootResponse;
+    }
+
+    impl OcppAction for RawBootResponse {
+        const ACTION_NAME: &'static str = "BootNotificationResponse";
+        type Response = RawBootResponse;
+    }
+
+    impl OcppResponse for RawBootResponse {}
+
+    /// A valid `BootNotification` CALL — the request always passes so these
+    /// tests isolate the *response* side.
+    fn valid_boot_call() -> CallMessage {
+        CallMessage::new(
+            "BootNotification".to_string(),
+            serde_json::json!({ "chargePointVendor": "V", "chargePointModel": "M" }),
+        )
+        .unwrap()
+    }
+
+    fn raw_boot_response(status: &str) -> RawBootResponse {
+        RawBootResponse {
+            // A schema-valid RFC3339 `date-time` (the response schema enforces
+            // the format), so the only schema violation in the reject test is the
+            // `status` value itself.
+            current_time: "2018-05-29T17:37:05.495259Z".to_string(),
+            interval: 350,
+            status: status.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_a_schema_invalid_response() {
+        // The corollary of `test_route_message_without_validation`: with
+        // validation ON (the default route), a handler that returns an
+        // out-of-enum `status` must NOT be sent — dispatch returns Err so the
+        // caller emits a CALLERROR.
+        let after_ran = Arc::new(AtomicBool::new(false));
+        let a = after_ran.clone();
+
+        let mut d = validating_dispatcher();
+        d.on(|_req: RawBootRequest| async move { Ok(raw_boot_response("Yolo")) });
+        d.after(move |_req: RawBootRequest| {
+            let a = a.clone();
+            async move {
+                a.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let err = d.dispatch(&valid_boot_call()).await.unwrap_err();
+        assert!(
+            matches!(err, OcppError::SchemaViolation { .. }),
+            "an out-of-enum response `status` must fail response validation, got {err:?}"
+        );
+
+        // The reference validates the response *before* its after block, so a
+        // failed response validation must skip the `@after` hook. Give any
+        // (incorrectly) spawned hook a chance to run before asserting.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !after_ran.load(Ordering::SeqCst),
+            "the @after hook must not run when response validation fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn skip_route_passes_an_invalid_response_through() {
+        // Direct port of `test_route_message_without_validation`: a
+        // `skip_schema_validation=True` route lets the handler's invalid `"Yolo"`
+        // response through unaltered.
+        let mut d = validating_dispatcher();
+        d.on_skip_validation(|_req: RawBootRequest| async move { Ok(raw_boot_response("Yolo")) });
+
+        let resp = d.dispatch(&valid_boot_call()).await.unwrap();
+        assert_eq!(
+            resp["status"], "Yolo",
+            "a skip route must return the handler's response unvalidated"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_accepts_a_schema_valid_response() {
+        // A response that satisfies the `BootNotificationResponse` schema passes
+        // the new outbound check and flows through unchanged.
+        let mut d = validating_dispatcher();
+        d.on(|_req: RawBootRequest| async move { Ok(raw_boot_response("Accepted")) });
+
+        let resp = d.dispatch(&valid_boot_call()).await.unwrap();
+        assert_eq!(resp["status"], "Accepted");
+    }
+
+    #[tokio::test]
+    async fn without_validator_response_is_not_validated() {
+        // Symmetric with the request side: with no validator attached there is
+        // no schema context, so even an out-of-enum response flows through.
+        let mut d = ActionDispatcher::new();
+        assert!(!d.has_validator());
+        d.on(|_req: RawBootRequest| async move { Ok(raw_boot_response("Yolo")) });
+
+        let resp = d.dispatch(&valid_boot_call()).await.unwrap();
+        assert_eq!(resp["status"], "Yolo");
     }
 
     #[tokio::test]
