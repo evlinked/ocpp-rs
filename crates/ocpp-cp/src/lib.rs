@@ -241,7 +241,16 @@ impl Default for ChargePointConfig {
             firmware_update_outcome: FirmwareUpdateOutcome::Succeed,
             unlock_connector_outcome: UnlockConnectorOutcome::Unlock,
             local_auth_list_max_length: local_list::DEFAULT_LOCAL_AUTH_LIST_MAX_LENGTH,
-            transport_config: TransportConfig::default(),
+            // This simulator speaks OCPP 1.6J only, so it offers exactly
+            // `ocpp1.6` in the WebSocket handshake — advertising `ocpp2.0.1`
+            // (which the transport default now also lists for the *server*
+            // side) would let a 2.0.1-only CSMS negotiate a version this CP
+            // cannot actually speak. Narrow the offered set to keep the client
+            // honest; widen it here when/if the CP learns 2.0.1.
+            transport_config: TransportConfig {
+                sub_protocols: vec!["ocpp1.6".to_string()],
+                ..TransportConfig::default()
+            },
         }
     }
 }

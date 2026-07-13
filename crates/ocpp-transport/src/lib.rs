@@ -44,7 +44,19 @@ pub struct TransportConfig {
     pub message_buffer_size: usize,
     /// Enable message compression
     pub enable_compression: bool,
-    /// WebSocket sub-protocols
+    /// OCPP-J WebSocket subprotocol identifiers.
+    ///
+    /// Dual-purpose by role:
+    /// * **Client** ([`WebSocketClient`]) — the set offered to the CSMS in the
+    ///   `Sec-WebSocket-Protocol` handshake header.
+    /// * **Server** ([`OcppServer`](crate::server::OcppServer)) — the set the
+    ///   CSMS *accepts*; the handshake negotiates the first entry (server
+    ///   preference order) that the station also offered and rejects the
+    ///   upgrade (HTTP 400) when the intersection is empty.
+    ///
+    /// The default lists both spec identifiers (`ocpp1.6`, `ocpp2.0.1`) so a
+    /// default `OcppServer` accepts either version; a client that speaks only
+    /// one version should narrow this to that single identifier.
     pub sub_protocols: Vec<String>,
 }
 
@@ -57,7 +69,10 @@ impl Default for TransportConfig {
             keep_alive_interval: Duration::from_secs(60),
             message_buffer_size: 1000,
             enable_compression: false,
-            sub_protocols: vec!["ocpp1.6".to_string()],
+            // Spec OCPP-J subprotocol identifiers, in server-preference order
+            // (1.6 first). `ocpp2.0` is intentionally absent — it is not a
+            // valid OCPP-J identifier (2.0.1 negotiates as `ocpp2.0.1`).
+            sub_protocols: vec!["ocpp1.6".to_string(), "ocpp2.0.1".to_string()],
         }
     }
 }
@@ -342,7 +357,10 @@ mod tests {
         let config = TransportConfig::default();
         assert_eq!(config.max_message_size, 65536);
         assert_eq!(config.connection_timeout, Duration::from_secs(30));
-        assert!(config.sub_protocols.contains(&"ocpp1.6".to_string()));
+        // Server accepts both spec OCPP-J identifiers by default; `ocpp1.6` is
+        // listed first (server-preference order), `ocpp2.0` is not a valid
+        // identifier and is absent.
+        assert_eq!(config.sub_protocols, vec!["ocpp1.6", "ocpp2.0.1"]);
     }
 
     #[test]
