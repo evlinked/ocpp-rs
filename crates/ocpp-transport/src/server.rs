@@ -816,24 +816,56 @@ async fn ws_handler(
     // stored in `cp_handles` is exactly what the CSMS `call()` API addresses.
     let charge_point_id = charge_point_id.to_string();
 
-    // Require Sec-WebSocket-Protocol: ocpp1.6; reject anything else with HTTP 400
-    let offers_ocpp16 = headers
+    // Negotiate the OCPP-J subprotocol against the server's configured accepted
+    // set (`TransportConfig::sub_protocols`, e.g. `["ocpp1.6", "ocpp2.0.1"]`) —
+    // no hardcoded `ocpp1.6` literal. A station offering `ocpp2.0.1` is accepted
+    // and echoed back `ocpp2.0.1`; one offering nothing supported (or a bogus
+    // token like `ocpp2.0`) is rejected with HTTP 400.
+    let offered = headers
         .get("sec-websocket-protocol")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').map(str::trim).any(|p| p == "ocpp1.6"))
-        .unwrap_or(false);
-
-    if !offers_ocpp16 {
+        .and_then(|v| v.to_str().ok());
+    let Some(sub_protocol) = negotiate_subprotocol(offered, &state.config.sub_protocols) else {
         warn!(
-            "Rejected '{}': Sec-WebSocket-Protocol: ocpp1.6 not offered",
-            charge_point_id
+            "Rejected '{}': no supported Sec-WebSocket-Protocol offered (server supports {:?}, client offered {:?})",
+            charge_point_id, state.config.sub_protocols, offered
         );
         return Err(StatusCode::BAD_REQUEST);
-    }
+    };
 
     Ok(ws
-        .protocols(["ocpp1.6"])
-        .on_upgrade(move |socket| handle_cp_socket(socket, charge_point_id, state)))
+        .protocols([sub_protocol.clone()])
+        .on_upgrade(move |socket| handle_cp_socket(socket, charge_point_id, sub_protocol, state)))
+}
+
+/// Choose the WebSocket subprotocol to answer an incoming CSMS handshake with.
+///
+/// OCPP-J negotiation: the charging station offers one or more
+/// `Sec-WebSocket-Protocol` tokens (comma-separated) and the CSMS replies with
+/// the single subprotocol it selected. This mirrors the mobilityhouse/ocpp
+/// example servers, which pass the version's identifier to
+/// `websockets.serve(subprotocols=[...])` while the connection handling itself
+/// stays version-agnostic — the same shape as this crate's version-generic
+/// [`DispatchHandler`](crate::DispatchHandler) + `ActionDispatcher`.
+///
+/// Selection is by **server preference order**: the first entry in `supported`
+/// that the station also offered. This makes the outcome deterministic when a
+/// station offers several (e.g. `ocpp1.6, ocpp2.0.1` → `ocpp1.6`, since the
+/// default `supported` lists 1.6 first).
+///
+/// Returns `None` — meaning "reject the upgrade with HTTP 400" — when the header
+/// is absent/empty or the offered∩supported intersection is empty (a bogus
+/// token such as `ocpp2.0`, which is *not* a valid OCPP-J identifier, is thus
+/// rejected). `supported` is the configured accepted set, never a literal.
+fn negotiate_subprotocol(header: Option<&str>, supported: &[String]) -> Option<String> {
+    let offered: Vec<&str> = header?
+        .split(',')
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+        .collect();
+    supported
+        .iter()
+        .find(|proto| offered.contains(&proto.as_str()))
+        .cloned()
 }
 
 /// Classify an incoming text frame into a typed [`Message`].
@@ -869,9 +901,17 @@ fn classify_frame(text: &str) -> Option<Message> {
 /// design used by [`WebSocketClient`](crate::WebSocketClient) and avoids a
 /// send/receive deadlock. On close or any WS error the connection and its
 /// routing handle are removed and pending CALLs are cancelled.
-async fn handle_cp_socket(socket: WebSocket, charge_point_id: String, state: Arc<ServerState>) {
+async fn handle_cp_socket(
+    socket: WebSocket,
+    charge_point_id: String,
+    sub_protocol: String,
+    state: Arc<ServerState>,
+) {
     let mut info = ConnectionInfo::new(charge_point_id.clone(), "csms".to_string());
-    info.sub_protocol = Some("ocpp1.6".to_string());
+    // Record the *negotiated* subprotocol (e.g. `ocpp2.0.1` for a 2.0.1
+    // station), not a hardcoded `ocpp1.6`, so `ConnectionInfo::sub_protocol`
+    // reflects the version this session actually speaks.
+    info.sub_protocol = Some(sub_protocol);
     let connection_id = info.id;
 
     // Outbound channel: `OcppServer::call` pushes CALL frames here; this loop
@@ -1326,6 +1366,138 @@ mod tests {
         );
 
         server.stop().await.unwrap();
+    }
+
+    /// Build a WS upgrade request offering an arbitrary `Sec-WebSocket-Protocol`
+    /// value (may be a comma-separated list), for exercising negotiation.
+    fn request_offering(addr: SocketAddr, cp_id: &str, offered: &str) -> Request<()> {
+        let mut req = format!("ws://{}/ocpp/{}", addr, cp_id)
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("sec-websocket-protocol", offered.parse().unwrap());
+        req
+    }
+
+    /// A station offering the spec `ocpp2.0.1` identifier is **accepted** (the
+    /// M7 handshake blocker, issue #338): the upgrade succeeds, the response
+    /// echoes `ocpp2.0.1`, and the recorded `ConnectionInfo.sub_protocol`
+    /// reflects the negotiated version — not a hardcoded `ocpp1.6`.
+    #[tokio::test]
+    async fn server_accepts_ocpp201_subprotocol() {
+        let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
+
+        let (_ws, response) = connect_async(request_offering(addr, "CP201", "ocpp2.0.1"))
+            .await
+            .expect("should connect with ocpp2.0.1 subprotocol");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok()),
+            Some("ocpp2.0.1"),
+            "server must echo the negotiated ocpp2.0.1 subprotocol"
+        );
+
+        // The per-CP task records the negotiated protocol in ConnectionInfo.
+        let start = tokio::time::Instant::now();
+        while server.connection_count() == 0 && start.elapsed() < Duration::from_millis(500) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let conns = server.get_all_connections();
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].sub_protocol.as_deref(), Some("ocpp2.0.1"));
+
+        server.stop().await.unwrap();
+    }
+
+    /// A station offering **both** identifiers gets a deterministic,
+    /// server-preferred choice: the default accepted set lists `ocpp1.6` first,
+    /// so `ocpp1.6, ocpp2.0.1` negotiates `ocpp1.6`.
+    #[tokio::test]
+    async fn server_negotiates_server_preferred_when_both_offered() {
+        let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
+
+        let (_ws, response) = connect_async(request_offering(addr, "CPBOTH", "ocpp1.6, ocpp2.0.1"))
+            .await
+            .expect("should connect when offering both");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok()),
+            Some("ocpp1.6"),
+            "server preference (1.6 first) must win when both are offered"
+        );
+
+        server.stop().await.unwrap();
+    }
+
+    /// An `ocpp1.6` connection still negotiates and records `ocpp1.6` — guards
+    /// against a regression where the negotiated value was hardcoded.
+    #[tokio::test]
+    async fn server_reports_negotiated_ocpp16() {
+        let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
+
+        let (_ws, response) = connect_async(ocpp_request(addr, "CP16"))
+            .await
+            .expect("should connect with ocpp1.6");
+
+        assert_eq!(
+            response
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok()),
+            Some("ocpp1.6"),
+        );
+
+        let start = tokio::time::Instant::now();
+        while server.connection_count() == 0 && start.elapsed() < Duration::from_millis(500) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let conns = server.get_all_connections();
+        assert_eq!(conns[0].sub_protocol.as_deref(), Some("ocpp1.6"));
+
+        server.stop().await.unwrap();
+    }
+
+    #[test]
+    fn negotiate_subprotocol_selects_and_rejects() {
+        let supported = vec!["ocpp1.6".to_string(), "ocpp2.0.1".to_string()];
+
+        // Single supported offer is selected.
+        assert_eq!(
+            negotiate_subprotocol(Some("ocpp2.0.1"), &supported).as_deref(),
+            Some("ocpp2.0.1")
+        );
+        assert_eq!(
+            negotiate_subprotocol(Some("ocpp1.6"), &supported).as_deref(),
+            Some("ocpp1.6")
+        );
+
+        // Both offered → server preference order (1.6 listed first) wins,
+        // regardless of the order the client lists them.
+        assert_eq!(
+            negotiate_subprotocol(Some("ocpp1.6, ocpp2.0.1"), &supported).as_deref(),
+            Some("ocpp1.6")
+        );
+        assert_eq!(
+            negotiate_subprotocol(Some("ocpp2.0.1,ocpp1.6"), &supported).as_deref(),
+            Some("ocpp1.6")
+        );
+
+        // Bogus / absent / empty → reject (None). `ocpp2.0` is NOT a valid
+        // OCPP-J identifier and must not be accepted.
+        assert_eq!(negotiate_subprotocol(Some("ocpp2.0"), &supported), None);
+        assert_eq!(negotiate_subprotocol(None, &supported), None);
+        assert_eq!(negotiate_subprotocol(Some(""), &supported), None);
+        assert_eq!(negotiate_subprotocol(Some("  , "), &supported), None);
+
+        // A server configured for a single version rejects the other.
+        let only16 = vec!["ocpp1.6".to_string()];
+        assert_eq!(negotiate_subprotocol(Some("ocpp2.0.1"), &only16), None);
     }
 
     /// A percent-encoded **whitespace-only** charge-point id (`/ocpp/%20%20%20`,

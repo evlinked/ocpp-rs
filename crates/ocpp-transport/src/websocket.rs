@@ -185,9 +185,10 @@ pub mod client {
 
         // Build the handshake request and offer the configured OCPP
         // subprotocols via `Sec-WebSocket-Protocol`. An OCPP CSMS (and the
-        // `OcppServer` in this crate) rejects the upgrade with HTTP 400 if the
-        // client does not offer `ocpp1.6`, so this header is mandatory rather
-        // than cosmetic.
+        // `OcppServer` in this crate) rejects the upgrade with HTTP 400 unless
+        // the client offers a subprotocol the server accepts (its configured
+        // set, e.g. `ocpp1.6` / `ocpp2.0.1`), so this header is mandatory
+        // rather than cosmetic.
         let mut request =
             url.as_str()
                 .into_client_request()
