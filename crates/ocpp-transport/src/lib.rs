@@ -19,7 +19,7 @@ pub use central_system::{
 pub use client::WebSocketClient;
 pub use dispatch_handler::DispatchHandler;
 pub use error::*;
-pub use pending::PendingCallMap;
+pub use pending::{PendingCallMap, PendingGuard};
 
 use ocpp_messages::Message;
 use ocpp_types::v16j::ChargePointStatus;
