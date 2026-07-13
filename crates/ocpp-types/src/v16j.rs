@@ -557,6 +557,23 @@ pub enum LogType {
     SecurityLog,
 }
 
+/// Accept/reject status returned synchronously in a `GetLog.conf`.
+///
+/// This is the `LogStatusEnumType` of `GetLog.conf` (`Accepted` / `Rejected` /
+/// `AcceptedCanceled`) — distinct from [`UploadLogStatus`], which reports
+/// upload *progress* asynchronously in `LogStatusNotification.req`. Ports the
+/// reference `ocpp.v16.enums.LogStatus`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum LogStatus {
+    /// Accepted; the Charge Point will upload the requested log.
+    Accepted,
+    /// Rejected; the Charge Point will not upload the log.
+    Rejected,
+    /// A previously ongoing log upload was accepted and cancelled.
+    AcceptedCanceled,
+}
+
 /// Upload status reported by LogStatusNotification
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum UploadLogStatus {
@@ -1001,5 +1018,23 @@ mod tests {
             serde_json::to_string(&UpdateFirmwareStatus::RevokedCertificate).unwrap(),
             "\"RevokedCertificate\""
         );
+    }
+
+    #[test]
+    fn test_log_status_get_log_conf() {
+        // `GetLog.conf`'s `LogStatusEnumType` — Accepted / Rejected /
+        // AcceptedCanceled. Note the single-l US spelling of `Canceled`.
+        for (variant, wire) in [
+            (LogStatus::Accepted, "\"Accepted\""),
+            (LogStatus::Rejected, "\"Rejected\""),
+            (LogStatus::AcceptedCanceled, "\"AcceptedCanceled\""),
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            assert_eq!(json, wire);
+            assert_eq!(serde_json::from_str::<LogStatus>(wire).unwrap(), variant);
+        }
+        // `LogStatus` and `UploadLogStatus` are deliberately disjoint: a
+        // `GetLog.conf` status must not accept an upload-progress value.
+        assert!(serde_json::from_str::<LogStatus>("\"Uploading\"").is_err());
     }
 }

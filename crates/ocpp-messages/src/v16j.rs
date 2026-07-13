@@ -1114,8 +1114,11 @@ impl OcppAction for GetLogRequest {
 /// GetLog response
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GetLogResponse {
-    /// Upload status
-    pub status: UploadLogStatus,
+    /// Whether the Charge Point accepts the request (`GetLog.conf`'s
+    /// `LogStatusEnumType`: Accepted / Rejected / AcceptedCanceled). Distinct
+    /// from [`UploadLogStatus`], which reports upload progress asynchronously
+    /// via `LogStatusNotification.req`.
+    pub status: LogStatus,
     /// Filename of the log (optional)
     #[serde(rename = "filename", skip_serializing_if = "Option::is_none")]
     pub filename: Option<String>,
@@ -1841,20 +1844,27 @@ mod tests {
         assert_eq!(req, d);
 
         let resp = GetLogResponse {
-            status: UploadLogStatus::Uploading,
+            status: LogStatus::AcceptedCanceled,
             filename: Some("security.log".to_string()),
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("filename"));
+        assert!(json.contains("AcceptedCanceled"));
         let d: GetLogResponse = serde_json::from_str(&json).unwrap();
         assert_eq!(resp, d);
 
         let resp_no_file = GetLogResponse {
-            status: UploadLogStatus::Idle,
+            status: LogStatus::Accepted,
             filename: None,
         };
         let json = serde_json::to_string(&resp_no_file).unwrap();
         assert!(!json.contains("filename"));
+
+        // Regression for the enum mix-up: `GetLog.conf` status is
+        // `LogStatusEnumType`, not the upload-progress `UploadLogStatus`, so an
+        // upload-progress value must no longer deserialize into it.
+        assert!(serde_json::from_str::<GetLogResponse>(r#"{"status":"Uploading"}"#).is_err());
+        assert!(serde_json::from_str::<GetLogResponse>(r#"{"status":"Accepted"}"#).is_ok());
     }
 
     #[test]
