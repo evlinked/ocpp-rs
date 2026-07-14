@@ -18,14 +18,14 @@ use axum::{
 use dashmap::DashMap;
 use futures_util::{SinkExt, StreamExt};
 use ocpp_messages::v16j::{
-    CancelReservationRequest, ChangeConfigurationRequest, ClearCacheRequest,
-    ClearChargingProfileRequest, GetCompositeScheduleRequest, GetCompositeScheduleResponse,
-    GetConfigurationRequest, GetConfigurationResponse, GetDiagnosticsRequest,
-    GetDiagnosticsResponse, GetLocalListVersionRequest, RemoteStartTransactionRequest,
-    RemoteStopTransactionRequest, ReserveNowRequest, ResetRequest, SendLocalListRequest,
-    SetChargingProfileRequest, StartTransactionRequest, StartTransactionResponse,
-    StatusNotificationRequest, StopTransactionRequest, TriggerMessageRequest,
-    UnlockConnectorRequest, UpdateFirmwareRequest, UpdateFirmwareResponse,
+    BootNotificationRequest, CancelReservationRequest, ChangeConfigurationRequest,
+    ClearCacheRequest, ClearChargingProfileRequest, GetCompositeScheduleRequest,
+    GetCompositeScheduleResponse, GetConfigurationRequest, GetConfigurationResponse,
+    GetDiagnosticsRequest, GetDiagnosticsResponse, GetLocalListVersionRequest, MeterValuesRequest,
+    RemoteStartTransactionRequest, RemoteStopTransactionRequest, ReserveNowRequest, ResetRequest,
+    SendLocalListRequest, SetChargingProfileRequest, StartTransactionRequest,
+    StartTransactionResponse, StatusNotificationRequest, StopTransactionRequest,
+    TriggerMessageRequest, UnlockConnectorRequest, UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
 use ocpp_types::v16j::{
@@ -991,6 +991,15 @@ async fn handle_cp_socket(
                         let txn_request = (call.action == StartTransactionRequest::ACTION_NAME
                             || call.action == StopTransactionRequest::ACTION_NAME)
                             .then(|| (call.action.clone(), call.payload.clone()));
+                        // Snapshot BootNotification / MeterValues the same way
+                        // (#345): both carry all their event fields in the
+                        // *request*, but — like the transaction events — we emit
+                        // only on an accepted CALLRESULT so a refused CALL
+                        // surfaces nothing.
+                        let lifecycle_request = (call.action
+                            == BootNotificationRequest::ACTION_NAME
+                            || call.action == MeterValuesRequest::ACTION_NAME)
+                            .then(|| (call.action.clone(), call.payload.clone()));
                         let msg = Message::Call(call);
 
                         let _ = state.event_tx.send(TransportEvent::MessageReceived {
@@ -1044,6 +1053,20 @@ async fn handle_cp_socket(
                                 &action,
                                 &req_payload,
                                 &result.payload,
+                            );
+                        }
+
+                        // BootNotification / MeterValues events (#345): same
+                        // acceptance gate as the transaction events — only a real
+                        // CALLRESULT, never a CALLERROR, surfaces an event.
+                        if let (Some((action, req_payload)), Ok(Some(Message::CallResult(_)))) =
+                            (lifecycle_request, &dispatch_result)
+                        {
+                            emit_lifecycle_event(
+                                &state.event_tx,
+                                &charge_point_id,
+                                &action,
+                                &req_payload,
                             );
                         }
 
@@ -1254,6 +1277,64 @@ fn emit_transaction_event(
             timestamp: req.timestamp,
             reason: req.reason,
             id_tag: req.id_tag,
+        });
+    }
+}
+
+/// Emit the semantic [`TransportEvent`] for an accepted `BootNotification` /
+/// `MeterValues` CALL (issue #345, part of the charge-hub embeddable-CSMS
+/// surface #66).
+///
+/// Both actions carry all their event fields in the *request* (unlike
+/// `StartTransaction`, whose id lives in the response), but — like the
+/// transaction-lifecycle events — the event is emitted only for an accepted
+/// CALLRESULT, so a CALL the CSMS refuses surfaces nothing. The `cp_id` is
+/// bridged from the connection layer. A payload that nonetheless fails to
+/// deserialize is logged and skipped rather than panicking the receive loop.
+///
+/// Mirrors the reference's `@on('BootNotification')` / `@on('MeterValues')`
+/// central-system handlers
+/// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+fn emit_lifecycle_event(
+    event_tx: &mpsc::UnboundedSender<TransportEvent>,
+    cp_id: &str,
+    action: &str,
+    request_payload: &serde_json::Value,
+) {
+    if action == BootNotificationRequest::ACTION_NAME {
+        let Ok(req) = serde_json::from_value::<BootNotificationRequest>(request_payload.clone())
+        else {
+            warn!("Accepted BootNotification from '{cp_id}' failed to decode for event");
+            return;
+        };
+        info!(
+            "ChargePoint '{}' booted (vendor '{}', model '{}')",
+            cp_id, req.charge_point_vendor, req.charge_point_model
+        );
+        let _ = event_tx.send(TransportEvent::BootNotification {
+            cp_id: cp_id.to_string(),
+            vendor: req.charge_point_vendor,
+            model: req.charge_point_model,
+            serial_number: req.charge_point_serial_number,
+            firmware_version: req.firmware_version,
+        });
+    } else if action == MeterValuesRequest::ACTION_NAME {
+        let Ok(req) = serde_json::from_value::<MeterValuesRequest>(request_payload.clone()) else {
+            warn!("Accepted MeterValues from '{cp_id}' failed to decode for event");
+            return;
+        };
+        info!(
+            "ChargePoint '{}' reported {} meter value(s) on connector {} (txn {:?})",
+            cp_id,
+            req.meter_values.len(),
+            req.connector_id,
+            req.transaction_id
+        );
+        let _ = event_tx.send(TransportEvent::MeterValues {
+            cp_id: cp_id.to_string(),
+            connector_id: req.connector_id,
+            transaction_id: req.transaction_id,
+            meter_values: req.meter_values,
         });
     }
 }
