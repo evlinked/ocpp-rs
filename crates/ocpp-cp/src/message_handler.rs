@@ -686,6 +686,30 @@ impl TransportMessageHandler for MessageHandler {
                     cp_id, connector_id, status
                 );
             }
+            // CSMS-side transaction-lifecycle observability events (#66): these
+            // are emitted by the *server* receive loop for a connected CP's
+            // Start/StopTransaction, so a CP simulator never receives them — log
+            // if one somehow arrives.
+            ocpp_transport::TransportEvent::TransactionStarted {
+                cp_id,
+                transaction_id,
+                ..
+            } => {
+                debug!(
+                    "TransactionStarted event for {} (txn {})",
+                    cp_id, transaction_id
+                );
+            }
+            ocpp_transport::TransportEvent::TransactionStopped {
+                cp_id,
+                transaction_id,
+                ..
+            } => {
+                debug!(
+                    "TransactionStopped event for {} (txn {})",
+                    cp_id, transaction_id
+                );
+            }
             ocpp_transport::TransportEvent::Error {
                 connection_id,
                 error,
