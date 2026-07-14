@@ -710,6 +710,28 @@ impl TransportMessageHandler for MessageHandler {
                     cp_id, transaction_id
                 );
             }
+            ocpp_transport::TransportEvent::MeterValues {
+                cp_id,
+                connector_id,
+                transaction_id,
+                ..
+            } => {
+                debug!(
+                    "MeterValues event for {} connector {} (txn {:?})",
+                    cp_id, connector_id, transaction_id
+                );
+            }
+            ocpp_transport::TransportEvent::BootNotification {
+                cp_id,
+                vendor,
+                model,
+                ..
+            } => {
+                debug!(
+                    "BootNotification event for {} (vendor {}, model {})",
+                    cp_id, vendor, model
+                );
+            }
             ocpp_transport::TransportEvent::Error {
                 connection_id,
                 error,

@@ -29,7 +29,7 @@ pub use pending::{PendingCallMap, PendingGuard};
 
 use chrono::{DateTime, Utc};
 use ocpp_messages::Message;
-use ocpp_types::common::Reason;
+use ocpp_types::common::{MeterValue, Reason};
 use ocpp_types::v16j::ChargePointStatus;
 use ocpp_types::OcppResult;
 use std::time::Duration;
@@ -191,6 +191,55 @@ pub enum TransportEvent {
         reason: Option<Reason>,
         /// The id tag that stopped the transaction, when the CP supplies one.
         id_tag: Option<String>,
+    },
+    /// A connected charge point reported periodic metering (`MeterValues`).
+    ///
+    /// Emitted by the server's per-CP receive loop after the registered handler
+    /// accepts the CALL (like [`TransactionStarted`](Self::TransactionStarted),
+    /// only on an accepted CALLRESULT — a refused CALL surfaces nothing). Unlike
+    /// the transaction bookends, `MeterValues` recurs *during* an active
+    /// transaction, so subscribers can build sub-session energy curves and do
+    /// interim billing rather than only reconciling start/stop meter readings.
+    ///
+    /// All fields come from the request; the originating `cp_id` is bridged from
+    /// the connection layer. `transaction_id` is optional in 1.6J `MeterValues`
+    /// (a CP may report connector metering outside a transaction), so it is
+    /// threaded through only when the CP supplies it. Mirrors the reference's
+    /// `@on('MeterValues')` central-system handler
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    MeterValues {
+        /// Charge-point id (the WebSocket path segment) that reported the values.
+        cp_id: String,
+        /// Connector the readings apply to (`0` = the charge point as a whole).
+        connector_id: u32,
+        /// Transaction the readings belong to, when reported during one.
+        transaction_id: Option<i32>,
+        /// The reported meter values (each a timestamp + sampled values). Carried
+        /// as the full list `MeterValues` sends, not flattened, so a subscriber
+        /// sees every sample in one event.
+        meter_values: Vec<MeterValue>,
+    },
+    /// A connected charge point announced itself on connect (`BootNotification`).
+    ///
+    /// Emitted by the server's per-CP receive loop after the registered handler
+    /// accepts the CALL (only on an accepted CALLRESULT). Carries the CP's
+    /// self-reported identity so a host embedding the CSMS can synthesize
+    /// Location / EVSE inventory (e.g. derive OCPI Locations) without parsing raw
+    /// frames (issue #66). The originating `cp_id` is bridged from the connection
+    /// layer; the vendor/model/serial/firmware fields come from the request.
+    /// Mirrors the reference's `@on('BootNotification')` central-system handler
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    BootNotification {
+        /// Charge-point id (the WebSocket path segment) that announced itself.
+        cp_id: String,
+        /// Charge-point vendor identification (`chargePointVendor`).
+        vendor: String,
+        /// Charge-point model identification (`chargePointModel`).
+        model: String,
+        /// Charge-point serial number, when the CP supplies one.
+        serial_number: Option<String>,
+        /// Firmware version, when the CP supplies one.
+        firmware_version: Option<String>,
     },
     /// Error occurred
     Error {
