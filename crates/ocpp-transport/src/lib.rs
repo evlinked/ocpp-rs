@@ -27,7 +27,9 @@ pub use dispatch_handler::DispatchHandler;
 pub use error::*;
 pub use pending::{PendingCallMap, PendingGuard};
 
+use chrono::{DateTime, Utc};
 use ocpp_messages::Message;
+use ocpp_types::common::Reason;
 use ocpp_types::v16j::ChargePointStatus;
 use ocpp_types::OcppResult;
 use std::time::Duration;
@@ -137,6 +139,58 @@ pub enum TransportEvent {
         connector_id: u32,
         /// The reported connector status.
         status: ChargePointStatus,
+    },
+    /// A connected charge point started a transaction (`StartTransaction`).
+    ///
+    /// Emitted by the server's per-CP receive loop *after* the registered
+    /// handler accepts the CALL and the CSMS assigns a `transaction_id` — so the
+    /// event carries that id, the key a subscriber correlates the later
+    /// [`TransactionStopped`](Self::TransactionStopped) against. The id lives in
+    /// the *response* (not the request the dispatcher deserializes), so it is
+    /// bridged from there. Mirrors the Python reference's `@on('StartTransaction')`
+    /// central-system handler
+    /// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+    ///
+    /// Like [`StatusNotification`](Self::StatusNotification), it carries the
+    /// originating `cp_id` (which lives at the connection layer, not the payload)
+    /// so a host embedding the CSMS can attribute the transaction to a charge
+    /// point and synthesize Sessions / CDRs from the lifecycle without parsing
+    /// raw frames (issue #66).
+    TransactionStarted {
+        /// Charge-point id (the WebSocket path segment) that started the transaction.
+        cp_id: String,
+        /// Connector the transaction runs on.
+        connector_id: u32,
+        /// The id tag (RFID / token) that authorized the transaction.
+        id_tag: String,
+        /// Meter reading (Wh) at transaction start.
+        meter_start: i32,
+        /// Charge-point-reported timestamp of the start.
+        timestamp: DateTime<Utc>,
+        /// CSMS-assigned transaction id (from the `StartTransaction` response),
+        /// echoed by the CP in the paired `StopTransaction`.
+        transaction_id: i32,
+    },
+    /// A connected charge point stopped a transaction (`StopTransaction`).
+    ///
+    /// Emitted after the registered handler accepts the CALL. `transaction_id`
+    /// matches the one from the paired
+    /// [`TransactionStarted`](Self::TransactionStarted); `meter_stop − meter_start`
+    /// over that pair is the energy (Wh) delivered — the basis of a Charge Detail
+    /// Record. Mirrors the reference's `@on('StopTransaction')` handler.
+    TransactionStopped {
+        /// Charge-point id (the WebSocket path segment) that stopped the transaction.
+        cp_id: String,
+        /// Transaction id being stopped (matches the paired `TransactionStarted`).
+        transaction_id: i32,
+        /// Meter reading (Wh) at transaction stop.
+        meter_stop: i32,
+        /// Charge-point-reported timestamp of the stop.
+        timestamp: DateTime<Utc>,
+        /// Reason the transaction stopped, when the CP supplies one.
+        reason: Option<Reason>,
+        /// The id tag that stopped the transaction, when the CP supplies one.
+        id_tag: Option<String>,
     },
     /// Error occurred
     Error {

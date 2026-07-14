@@ -23,7 +23,8 @@ use ocpp_messages::v16j::{
     GetConfigurationRequest, GetConfigurationResponse, GetDiagnosticsRequest,
     GetDiagnosticsResponse, GetLocalListVersionRequest, RemoteStartTransactionRequest,
     RemoteStopTransactionRequest, ReserveNowRequest, ResetRequest, SendLocalListRequest,
-    SetChargingProfileRequest, StatusNotificationRequest, TriggerMessageRequest,
+    SetChargingProfileRequest, StartTransactionRequest, StartTransactionResponse,
+    StatusNotificationRequest, StopTransactionRequest, TriggerMessageRequest,
     UnlockConnectorRequest, UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
@@ -982,6 +983,14 @@ async fn handle_cp_socket(
                         let status_payload = (call.action
                             == StatusNotificationRequest::ACTION_NAME)
                             .then(|| call.payload.clone());
+                        // Snapshot Start/StopTransaction requests the same way:
+                        // the transaction-lifecycle events (#66) need the request
+                        // fields, and — for StartTransaction — the CSMS-assigned
+                        // `transactionId` from the *response*, so we emit only
+                        // after an accepted CALLRESULT (below).
+                        let txn_request = (call.action == StartTransactionRequest::ACTION_NAME
+                            || call.action == StopTransactionRequest::ACTION_NAME)
+                            .then(|| (call.action.clone(), call.payload.clone()));
                         let msg = Message::Call(call);
 
                         let _ = state.event_tx.send(TransportEvent::MessageReceived {
@@ -1017,6 +1026,25 @@ async fn handle_cp_socket(
                                     ),
                                 }
                             }
+                        }
+
+                        // Transaction-lifecycle events (#66): emit only when the
+                        // handler *accepted* the CALL (a real CALLRESULT, not a
+                        // CALLERROR), reading the CSMS-assigned `transactionId`
+                        // out of the StartTransaction response. A rejected CALL —
+                        // which comes back as `Ok(Some(Message::CallError))` from
+                        // `DispatchHandler`, or `Err(..)` from a bespoke handler —
+                        // produces no event.
+                        if let (Some((action, req_payload)), Ok(Some(Message::CallResult(result)))) =
+                            (txn_request, &dispatch_result)
+                        {
+                            emit_transaction_event(
+                                &state.event_tx,
+                                &charge_point_id,
+                                &action,
+                                &req_payload,
+                                &result.payload,
+                            );
                         }
 
                         let response_text = match dispatch_result {
@@ -1166,6 +1194,68 @@ pub(crate) fn build_call_error(unique_id: &str, error: &OcppError) -> Message {
             _ => (CallErrorCode::InternalError, error.to_string(), None),
         };
     Message::call_error(unique_id.to_string(), code, description, details)
+}
+
+/// Emit the semantic transaction-lifecycle [`TransportEvent`] for an accepted
+/// `StartTransaction` / `StopTransaction` CALL.
+///
+/// Two pieces of context the version-generic dispatcher can't see are bridged
+/// into a typed event for hosts that embed the CSMS (issue #66): the `cp_id`
+/// (which lives at the connection layer, not the payload) and, for
+/// `StartTransaction`, the CSMS-assigned `transactionId` (which lives in the
+/// *response*, not the request). Called only for an accepted CALLRESULT, so a
+/// rejected transaction never surfaces an event; a payload that nonetheless
+/// fails to deserialize is skipped rather than panicking the receive loop.
+///
+/// Mirrors the reference's `@on('StartTransaction')` / `@on('StopTransaction')`
+/// central-system handlers
+/// ([`examples/v16/central_system.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/central_system.py)).
+fn emit_transaction_event(
+    event_tx: &mpsc::UnboundedSender<TransportEvent>,
+    cp_id: &str,
+    action: &str,
+    request_payload: &serde_json::Value,
+    response_payload: &serde_json::Value,
+) {
+    if action == StartTransactionRequest::ACTION_NAME {
+        let (Ok(req), Ok(resp)) = (
+            serde_json::from_value::<StartTransactionRequest>(request_payload.clone()),
+            serde_json::from_value::<StartTransactionResponse>(response_payload.clone()),
+        ) else {
+            warn!("Accepted StartTransaction from '{cp_id}' failed to decode for event");
+            return;
+        };
+        info!(
+            "ChargePoint '{}' started transaction {} on connector {}",
+            cp_id, resp.transaction_id, req.connector_id
+        );
+        let _ = event_tx.send(TransportEvent::TransactionStarted {
+            cp_id: cp_id.to_string(),
+            connector_id: req.connector_id,
+            id_tag: req.id_tag,
+            meter_start: req.meter_start,
+            timestamp: req.timestamp,
+            transaction_id: resp.transaction_id,
+        });
+    } else if action == StopTransactionRequest::ACTION_NAME {
+        let Ok(req) = serde_json::from_value::<StopTransactionRequest>(request_payload.clone())
+        else {
+            warn!("Accepted StopTransaction from '{cp_id}' failed to decode for event");
+            return;
+        };
+        info!(
+            "ChargePoint '{}' stopped transaction {} (meterStop {})",
+            cp_id, req.transaction_id, req.meter_stop
+        );
+        let _ = event_tx.send(TransportEvent::TransactionStopped {
+            cp_id: cp_id.to_string(),
+            transaction_id: req.transaction_id,
+            meter_stop: req.meter_stop,
+            timestamp: req.timestamp,
+            reason: req.reason,
+            id_tag: req.id_tag,
+        });
+    }
 }
 
 // ─── Public types ─────────────────────────────────────────────────────────────
