@@ -33,9 +33,10 @@
 //!
 //! ## Known gaps (documented, not silently dropped)
 //!
-//! - **`ConfigurationKey`** — the reference's ~50-member config-key enum is not
-//!   modelled as a Rust enum (config keys are handled as plain strings), so it
-//!   has no enum round-trip to port. Tracked for a follow-up.
+//! None remaining for the modelled 1.6J enum set. The last documented gap —
+//! **`ConfigurationKey`**, the reference's 54-member config-key enum — is now
+//! modelled in `ocpp-types::v16j` and pinned by [`test_configuration_keys`]
+//! below (#349).
 //!
 //! The #307 "unmodelled residual" is closed: four of its five enums were
 //! already modelled under Rust-idiomatic names (`CertificateStatus` →
@@ -55,12 +56,13 @@ use ocpp_types::common::{
 use ocpp_types::v16j::{
     CancelReservationStatus, CertificateSignedStatus, CertificateUse, ChargePointErrorCode,
     ChargePointStatus, ChargingProfileKindType, ChargingProfilePurposeType, ChargingProfileStatus,
-    ChargingRateUnitType, ClearCacheStatus, ClearChargingProfileStatus, ConfigurationStatus,
-    DataTransferStatus, DeleteCertificateStatus, DiagnosticsStatus, FirmwareStatus, GenericStatus,
-    GetCompositeScheduleStatus, GetInstalledCertificatesStatus, HashAlgorithmType,
-    InstallCertificateStatus, LogStatus, LogType, MessageTrigger, RecurrencyKindType,
-    RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType, TriggerMessageStatus,
-    UnlockStatus, UpdateFirmwareStatus, UpdateStatus, UpdateType, UploadLogStatus,
+    ChargingRateUnitType, ClearCacheStatus, ClearChargingProfileStatus, ConfigurationKey,
+    ConfigurationStatus, DataTransferStatus, DeleteCertificateStatus, DiagnosticsStatus,
+    FirmwareStatus, GenericStatus, GetCompositeScheduleStatus, GetInstalledCertificatesStatus,
+    HashAlgorithmType, InstallCertificateStatus, LogStatus, LogType, MessageTrigger,
+    RecurrencyKindType, RemoteStartStopStatus, ReservationStatus, ResetStatus, ResetType,
+    TriggerMessageStatus, UnlockStatus, UpdateFirmwareStatus, UpdateStatus, UpdateType,
+    UploadLogStatus,
 };
 
 use ocpp_messages::v16j::RegistrationStatus;
@@ -498,4 +500,78 @@ fn test_install_certificate_status() {
     // cross-checked against `InstallCertificateResponse.json`
     // (`InstallCertificateStatusEnumType`: Accepted / Rejected / Failed).
     pin_all::<InstallCertificateStatus>(&["Accepted", "Rejected", "Failed"]);
+}
+
+#[test]
+fn test_configuration_keys() {
+    // Direct port of `test_v16_enums.py::test_configuration_keys` — pins every
+    // one of the 54 standard 1.6J configuration keys to its exact wire string.
+    // Config keys are free-form strings on the wire (not schema-constrained), so
+    // this pins the `ConfigurationKey` vocabulary rather than cross-checking a
+    // bundled schema. Watch the acronym / mixed-case members that PascalCase
+    // renaming must preserve verbatim: `StopTransactionOnEVSideDisconnect`,
+    // `UnlockConnectorOnEVSideDisconnect`, `WebSocketPingInterval`,
+    // `ISO15118PnCEnabled`, `ConnectorSwitch3to1PhaseSupported`, `CpoName`.
+    pin_all::<ConfigurationKey>(&[
+        // 9.1 Core Profile
+        "AllowOfflineTxForUnknownId",
+        "AuthorizationCacheEnabled",
+        "AuthorizeRemoteTxRequests",
+        "BlinkRepeat",
+        "ClockAlignedDataInterval",
+        "ConnectionTimeOut",
+        "ConnectorPhaseRotation",
+        "ConnectorPhaseRotationMaxLength",
+        "GetConfigurationMaxKeys",
+        "HeartbeatInterval",
+        "LightIntensity",
+        "LocalAuthorizeOffline",
+        "LocalPreAuthorize",
+        "MaxEnergyOnInvalidId",
+        "MeterValuesAlignedData",
+        "MeterValuesAlignedDataMaxLength",
+        "MeterValuesSampledData",
+        "MeterValuesSampledDataMaxLength",
+        "MeterValueSampleInterval",
+        "MinimumStatusDuration",
+        "NumberOfConnectors",
+        "ResetRetries",
+        "StopTransactionOnEVSideDisconnect",
+        "StopTransactionOnInvalidId",
+        "StopTxnAlignedData",
+        "StopTxnAlignedDataMaxLength",
+        "StopTxnSampledData",
+        "StopTxnSampledDataMaxLength",
+        "SupportedFeatureProfiles",
+        "SupportedFeatureProfilesMaxLength",
+        "TransactionMessageAttempts",
+        "TransactionMessageRetryInterval",
+        "UnlockConnectorOnEVSideDisconnect",
+        "WebSocketPingInterval",
+        // 9.2 Local Auth List Management Profile
+        "LocalAuthListEnabled",
+        "LocalAuthListMaxLength",
+        "SendLocalListMaxLength",
+        // 9.3 Reservation Profile
+        "ReserveConnectorZeroSupported",
+        // 9.4 Smart Charging Profile
+        "ChargeProfileMaxStackLevel",
+        "ChargingScheduleAllowedChargingRateUnit",
+        "ChargingScheduleMaxPeriods",
+        "ConnectorSwitch3to1PhaseSupported",
+        "MaxChargingProfilesInstalled",
+        // OCPP 1.6 ISO 15118 v10 added configuration keys
+        "CentralContractValidationAllowed",
+        "CertificateSignedMaxChainSize",
+        "CertSigningWaitMinimum",
+        "CertSigningRepeatTimes",
+        "CertificateStoreMaxLength",
+        "ContractValidationOffline",
+        "ISO15118PnCEnabled",
+        // OCPP security whitepaper added configuration keys
+        "AdditionalRootCertificateCheck",
+        "AuthorizationKey",
+        "CpoName",
+        "SecurityProfile",
+    ]);
 }

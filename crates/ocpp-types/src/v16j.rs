@@ -215,6 +215,145 @@ pub enum ConfigurationStatus {
     NotSupported,
 }
 
+/// Standard OCPP 1.6 configuration key names.
+///
+/// The keys a Central System reads/writes via `GetConfiguration` /
+/// `ChangeConfiguration`. On the wire these are free-form strings (a charge
+/// point may expose vendor-specific keys too), so this enum is an
+/// available-but-not-forced vocabulary of the spec-defined keys — mirroring the
+/// reference's `ConfigurationKey(StrEnum)`, not a hard schema constraint.
+///
+/// Grouped by feature profile, as in the OCPP 1.6 specification (§9) and the
+/// mobilityhouse/ocpp reference `ocpp/v16/enums.py`.
+///
+/// Every variant is named identically to its wire string, so
+/// `rename_all = "PascalCase"` is a faithful no-op that preserves the acronym /
+/// mixed-case members exactly (`StopTransactionOnEVSideDisconnect`,
+/// `WebSocketPingInterval`, `ISO15118PnCEnabled`, `ConnectorSwitch3to1PhaseSupported`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+pub enum ConfigurationKey {
+    // 9.1 Core Profile
+    /// Whether an unknown idTag may start an offline transaction.
+    AllowOfflineTxForUnknownId,
+    /// Whether the authorization cache is enabled.
+    AuthorizationCacheEnabled,
+    /// Whether remote-start transactions require authorization.
+    AuthorizeRemoteTxRequests,
+    /// Number of times to blink the indicator per notification.
+    BlinkRepeat,
+    /// Interval (s) between clock-aligned meter samples.
+    ClockAlignedDataInterval,
+    /// Timeout (s) waiting for the EV to plug in / present idTag.
+    ConnectionTimeOut,
+    /// Connector phase rotation relative to grid.
+    ConnectorPhaseRotation,
+    /// Max length of the `ConnectorPhaseRotation` list.
+    ConnectorPhaseRotationMaxLength,
+    /// Max number of keys `GetConfiguration` returns in one message.
+    GetConfigurationMaxKeys,
+    /// Heartbeat interval (s).
+    HeartbeatInterval,
+    /// Indicator light intensity (%).
+    LightIntensity,
+    /// Whether local authorization is allowed while offline.
+    LocalAuthorizeOffline,
+    /// Whether to pre-authorize locally before the CSMS answers.
+    LocalPreAuthorize,
+    /// Max energy (Wh) delivered for an unauthorized transaction.
+    MaxEnergyOnInvalidId,
+    /// Measurands sampled at clock-aligned intervals.
+    MeterValuesAlignedData,
+    /// Max length of the `MeterValuesAlignedData` list.
+    MeterValuesAlignedDataMaxLength,
+    /// Measurands sampled at `MeterValueSampleInterval`.
+    MeterValuesSampledData,
+    /// Max length of the `MeterValuesSampledData` list.
+    MeterValuesSampledDataMaxLength,
+    /// Interval (s) between sampled meter values.
+    MeterValueSampleInterval,
+    /// Minimum duration (s) a status must hold before reporting.
+    MinimumStatusDuration,
+    /// Number of physical connectors on this charge point.
+    NumberOfConnectors,
+    /// Number of Reset retries before giving up.
+    ResetRetries,
+    /// Stop the transaction when the EV side disconnects.
+    StopTransactionOnEVSideDisconnect,
+    /// Stop the transaction when the idTag becomes invalid.
+    StopTransactionOnInvalidId,
+    /// Measurands in `StopTransaction` clock-aligned data.
+    StopTxnAlignedData,
+    /// Max length of the `StopTxnAlignedData` list.
+    StopTxnAlignedDataMaxLength,
+    /// Measurands in `StopTransaction` sampled data.
+    StopTxnSampledData,
+    /// Max length of the `StopTxnSampledData` list.
+    StopTxnSampledDataMaxLength,
+    /// Supported feature profiles.
+    SupportedFeatureProfiles,
+    /// Max length of the `SupportedFeatureProfiles` list.
+    SupportedFeatureProfilesMaxLength,
+    /// Number of times to retry sending a transaction-related message.
+    TransactionMessageAttempts,
+    /// Interval (s) between transaction-message retries.
+    TransactionMessageRetryInterval,
+    /// Unlock the connector when the EV side disconnects.
+    UnlockConnectorOnEVSideDisconnect,
+    /// WebSocket ping interval (s).
+    WebSocketPingInterval,
+
+    // 9.2 Local Auth List Management Profile
+    /// Whether the local authorization list is enabled.
+    LocalAuthListEnabled,
+    /// Max number of entries in the local authorization list.
+    LocalAuthListMaxLength,
+    /// Max number of entries in a single `SendLocalList`.
+    SendLocalListMaxLength,
+
+    // 9.3 Reservation Profile
+    /// Whether reserving connector 0 (the whole charge point) is supported.
+    ReserveConnectorZeroSupported,
+
+    // 9.4 Smart Charging Profile
+    /// Max stack level of installed charging profiles.
+    ChargeProfileMaxStackLevel,
+    /// Allowed charging-rate units for charging schedules.
+    ChargingScheduleAllowedChargingRateUnit,
+    /// Max number of periods in a charging schedule.
+    ChargingScheduleMaxPeriods,
+    /// Whether switching between 3-phase and 1-phase is supported.
+    ConnectorSwitch3to1PhaseSupported,
+    /// Max number of charging profiles that can be installed.
+    MaxChargingProfilesInstalled,
+
+    // OCPP 1.6 ISO 15118 v10 added configuration keys
+    /// Whether central contract validation is allowed.
+    CentralContractValidationAllowed,
+    /// Max chain size for `CertificateSigned`.
+    CertificateSignedMaxChainSize,
+    /// Minimum wait (s) before signing a certificate.
+    CertSigningWaitMinimum,
+    /// Number of times to repeat certificate signing.
+    CertSigningRepeatTimes,
+    /// Max length of the certificate store.
+    CertificateStoreMaxLength,
+    /// Whether contract validation is allowed offline.
+    ContractValidationOffline,
+    /// Whether ISO 15118 Plug & Charge is enabled.
+    ISO15118PnCEnabled,
+
+    // OCPP security whitepaper added configuration keys
+    /// Whether an additional root certificate check is performed.
+    AdditionalRootCertificateCheck,
+    /// The pre-shared authorization key.
+    AuthorizationKey,
+    /// The Charge Point Operator name.
+    CpoName,
+    /// The active security profile.
+    SecurityProfile,
+}
+
 /// Update type for firmware updates
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
