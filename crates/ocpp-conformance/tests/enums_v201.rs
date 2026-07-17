@@ -66,6 +66,10 @@
 //!
 //! - `SecurityEventType` (#357) — the 20 OCPP 2.0.1 Part 2 Appendix-1 security
 //!   event names, backing the open `SecurityEventNotification.type` field.
+//! - `ControllerComponentName` / `PhysicalComponentName` /
+//!   `StandardizedVariableName` (#359 slice 1) — the OCPP 2.0.1 Part 2
+//!   Appendix-3 device-model name catalogs, backing the open
+//!   `ComponentType.name` / `VariableType.name` fields.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -79,7 +83,7 @@ use ocpp_types::v201::{
     ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingRateUnitEnumType,
     ChargingStateEnumType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
     ClearMessageStatusEnumType, ClearMonitoringStatusEnumType, ComponentCriterionEnumType,
-    ConnectorEnumType, ConnectorStatusEnumType, CostKindEnumType,
+    ConnectorEnumType, ConnectorStatusEnumType, ControllerComponentName, CostKindEnumType,
     CustomerInformationStatusEnumType, DataEnumType, DataTransferStatusEnumType,
     DeleteCertificateStatusEnumType, DisplayMessageStatusEnumType, EnergyTransferModeEnumType,
     EventNotificationEnumType, EventTriggerEnumType, FirmwareStatusEnumType,
@@ -93,14 +97,15 @@ use ocpp_types::v201::{
     MessageTriggerEnumType, MonitorBaseEnumType, MonitorEnumType, MonitoringCriterionEnumType,
     MutabilityEnumType, NotifyEVChargingNeedsStatusEnumType, OCPPInterfaceEnumType,
     OCPPTransportEnumType, OCPPVersionEnumType, OperationalStatusEnumType, PhaseEnumType,
-    PublishFirmwareStatusEnumType, ReadingContextEnumType, ReasonEnumType, RecurrencyKindEnumType,
-    RegistrationStatusEnumType, ReportBaseEnumType, RequestStartStopStatusEnumType,
-    ReservationUpdateStatusEnumType, ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType,
-    SecurityEventType, SendLocalListStatusEnumType, SetMonitoringStatusEnumType,
-    SetNetworkProfileStatusEnumType, SetVariableStatusEnumType, TransactionEventEnumType,
-    TriggerMessageStatusEnumType, TriggerReasonEnumType, TxStartStopPointEnumType,
-    UnlockStatusEnumType, UnpublishFirmwareStatusEnumType, UpdateEnumType,
-    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType, VPNEnumType,
+    PhysicalComponentName, PublishFirmwareStatusEnumType, ReadingContextEnumType, ReasonEnumType,
+    RecurrencyKindEnumType, RegistrationStatusEnumType, ReportBaseEnumType,
+    RequestStartStopStatusEnumType, ReservationUpdateStatusEnumType, ReserveNowStatusEnumType,
+    ResetEnumType, ResetStatusEnumType, SecurityEventType, SendLocalListStatusEnumType,
+    SetMonitoringStatusEnumType, SetNetworkProfileStatusEnumType, SetVariableStatusEnumType,
+    StandardizedVariableName, TransactionEventEnumType, TriggerMessageStatusEnumType,
+    TriggerReasonEnumType, TxStartStopPointEnumType, UnlockStatusEnumType,
+    UnpublishFirmwareStatusEnumType, UpdateEnumType, UpdateFirmwareStatusEnumType,
+    UploadLogStatusEnumType, VPNEnumType,
 };
 
 /// Assert that `wire` deserializes into `T` and re-serializes back to the
@@ -1318,5 +1323,211 @@ fn test_security_event_type() {
         "InvalidTLSCipherSuite",
         "MaintenanceLoginAccepted",
         "MaintenanceLoginFailed",
+    ]);
+}
+
+/// `ControllerComponentName` — the 18 standardized *logical* (controller)
+/// component names of the OCPP 2.0.1 device model (Part 2 Appendix 3.1 v1.3),
+/// backing the open `ComponentType.name` field.
+///
+/// Like [`SecurityEventType`], this is an open recommendation vocabulary, not a
+/// FINAL-schema `enum` — `ComponentType.name` is an open `string`, so this pins
+/// the *catalog* wire spellings with no [`reject`] calls. The drift risks are
+/// the acronym spellings that must serialize verbatim: `CHAdeMOCtrlr`,
+/// `ISO15118Ctrlr`, `OCPPCommCtrlr`.
+#[test]
+fn test_controller_component_name() {
+    pin_all::<ControllerComponentName>(&[
+        "AlignedDataCtrlr",
+        "AuthCacheCtrlr",
+        "AuthCtrlr",
+        "CHAdeMOCtrlr",
+        "ClockCtrlr",
+        "CustomizationCtrlr",
+        "DeviceDataCtrlr",
+        "DisplayMessageCtrlr",
+        "ISO15118Ctrlr",
+        "LocalAuthListCtrlr",
+        "MonitoringCtrlr",
+        "OCPPCommCtrlr",
+        "ReservationCtrlr",
+        "SampledDataCtrlr",
+        "SecurityCtrlr",
+        "SmartChargingCtrlr",
+        "TariffCostCtrlr",
+        "TxCtrlr",
+    ]);
+}
+
+/// `PhysicalComponentName` — the 56 standardized *physical* component names of
+/// the OCPP 2.0.1 device model (Part 2 Appendix 3.2 v1.3), backing the open
+/// `ComponentType.name` field.
+///
+/// Open recommendation vocabulary (no [`reject`]). The drift risks are the
+/// acronym / compound spellings that must serialize verbatim: `AcDcConverter`,
+/// `CPPWMController`, `ELVSupply`, `EVSE`, `RCD`, `RCDRecloser`, `UIInput`.
+#[test]
+fn test_physical_component_name() {
+    pin_all::<PhysicalComponentName>(&[
+        "AccessBarrier",
+        "AcDcConverter",
+        "AcPhaseSelector",
+        "Actuator",
+        "AirCoolingSystem",
+        "AreaVentilation",
+        "BayOccupancySensor",
+        "BeaconLighting",
+        "CableBreakawaySensor",
+        "CaseAccessSensor",
+        "ChargingStation",
+        "ChargingStatusIndicator",
+        "ConnectedEV",
+        "Connector",
+        "ConnectorHolsterRelease",
+        "ConnectorHolsterSensor",
+        "ConnectorPlugRetentionLock",
+        "ConnectorProtectionRelease",
+        "Controller",
+        "ControlMetering",
+        "CPPWMController",
+        "DataLink",
+        "Display",
+        "DistributionPanel",
+        "ElectricalFeed",
+        "ELVSupply",
+        "EmergencyStopSensor",
+        "EnvironmentalLighting",
+        "EVRetentionLock",
+        "EVSE",
+        "ExternalTemperatureSensor",
+        "FiscalMetering",
+        "FloodSensor",
+        "GroundIsolationProtection",
+        "Heater",
+        "HumiditySensor",
+        "LightSensor",
+        "LiquidCoolingSystem",
+        "LocalAvailabilitySensor",
+        "LocalController",
+        "LocalEnergyStorage",
+        "OverCurrentProtection",
+        "OverCurrentProtectionRecloser",
+        "PowerContactor",
+        "RCD",
+        "RCDRecloser",
+        "RealTimeClock",
+        "ShockSensor",
+        "SpacesCountSignage",
+        "Switch",
+        "TemperatureSensor",
+        "TiltSensor",
+        "TokenReader",
+        "UIInput",
+        "UpstreamProtectionTrigger",
+        "VehicleIdSensor",
+    ]);
+}
+
+/// `StandardizedVariableName` — the 91 standardized (component-non-specific)
+/// variable names of the OCPP 2.0.1 device model (Part 2 Appendix 3 v1.3),
+/// backing the open `VariableType.name` field.
+///
+/// Open recommendation vocabulary (no [`reject`]). The drift risks are the
+/// acronym spellings that must serialize verbatim: `ACCurrent`, `ACVoltage`,
+/// `DCCurrent`, `DCVoltage`, `ICCID`, `IMSI`, `ISO15118EvseId`, `SeccId`.
+#[test]
+fn test_standardized_variable_name() {
+    pin_all::<StandardizedVariableName>(&[
+        "ACCurrent",
+        "Active",
+        "ACVoltage",
+        "AllowReset",
+        "Angle",
+        "Attempts",
+        "AvailabilityState",
+        "Available",
+        "Certificate",
+        "ChargeProtocol",
+        "ChargingCompleteBulk",
+        "ChargingCompleteFull",
+        "ChargingTime",
+        "Color",
+        "Complete",
+        "ConnectedTime",
+        "ConnectorType",
+        "Count",
+        "Currency",
+        "CurrentImbalance",
+        "DataText",
+        "DateTime",
+        "DCCurrent",
+        "DCVoltage",
+        "DepartureTime",
+        "ECVariant",
+        "Enabled",
+        "Energy",
+        "EnergyCapacity",
+        "EnergyExport",
+        "EnergyExportRegister",
+        "EnergyImport",
+        "EnergyImportRegister",
+        "Entries",
+        "EvseId",
+        "Fallback",
+        "FanSpeed",
+        "FirmwareVersion",
+        "Force",
+        "Formats",
+        "Frequency",
+        "FuseRating",
+        "Height",
+        "Humidity",
+        "Hysteresis",
+        "ICCID",
+        "Impedance",
+        "IMSI",
+        "Interval",
+        "ISO15118EvseId",
+        "Length",
+        "Light",
+        "Manufacturer",
+        "Message",
+        "MinimumStatusDuration",
+        "Mode",
+        "Model",
+        "NetworkAddress",
+        "Operated",
+        "OperatingTimes",
+        "Overload",
+        "Percent",
+        "PhaseRotation",
+        "PostChargingTime",
+        "Power",
+        "Problem",
+        "Protecting",
+        "RemainingTimeBulk",
+        "RemainingTimeFull",
+        "SeccId",
+        "SerialNumber",
+        "SignalStrength",
+        "State",
+        "StateOfCharge",
+        "StateOfChargeBulk",
+        "Storage",
+        "SupplyPhases",
+        "Suspending",
+        "Suspension",
+        "Temperature",
+        "Time",
+        "TimeOffset",
+        "Timeout",
+        "Token",
+        "TokenType",
+        "Tries",
+        "Tripped",
+        "VehicleId",
+        "VersionDate",
+        "VersionNumber",
+        "VoltageImbalance",
     ]);
 }
