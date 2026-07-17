@@ -16,7 +16,7 @@ Target protocols: **OCPP 1.6J** first, then **OCPP 2.0.1** modules incrementally
 | Version | Status |
 | --- | --- |
 | OCPP **1.6J** | Implemented — framing, CSMS, transactions, CP simulator, commands, hardening (M1–M6) |
-| OCPP **2.0.1** | 🚧 In progress (M7) — message-type coverage complete: all 64 CALL messages ported & draft-06 schema-validated; routing & simulator wiring next |
+| OCPP **2.0.1** | 🚧 In progress (M7) — message-type coverage complete (all 64 CALL messages ported & draft-06 schema-validated); routing + server-side wiring landed; **CP-simulator wiring** is the sole remaining M7 item |
 
 ---
 
@@ -46,7 +46,7 @@ Target protocols: **OCPP 1.6J** first, then **OCPP 2.0.1** modules incrementally
 - [x] **M4**: CP simulator (scenarios, jitter, reconnect storm)
 - [x] **M5**: Commands & control (RemoteStartTransaction, Reset)
 - [x] **M6**: Hardening (drain, rate limits, security)
-- [ ] **M7**: OCPP 2.0.1 — 🚧 **in progress** (message-type coverage complete; routing & simulator wiring next)
+- [ ] **M7**: OCPP 2.0.1 — 🚧 **in progress** (message-type coverage complete; routing + server-side wiring landed; CP-simulator wiring is the sole remaining item)
 
   **Message coverage — all 64 CALL messages ported.** All message
   types, payload datatypes, and enums are ported from the
@@ -66,8 +66,10 @@ Target protocols: **OCPP 1.6J** first, then **OCPP 2.0.1** modules incrementally
   - [x] **Diagnostics & logging** — GetLog, LogStatusNotification
   - [x] **Customer information** — CustomerInformation, NotifyCustomerInformation
 
-  **Remaining before M7 completes:**
-  - [ ] Wire 2.0.1 end-to-end through routing and the CP simulator (next-track direction tracked in [#256](https://github.com/EVLinked/ocpp-rs/issues/256))
+  **M7 wiring progress:**
+  - [x] Route 2.0.1 CALLs through the version-generic dispatcher against `SchemaValidator::v201()` ([#259](https://github.com/EVLinked/ocpp-rs/issues/259))
+  - [x] Negotiate `ocpp2.0.1` in the CSMS handshake ([#338](https://github.com/EVLinked/ocpp-rs/issues/338)) and round-trip a 2.0.1 `BootNotification`/`Heartbeat` CALL→CALLRESULT over a real `OcppServer` ([#342](https://github.com/EVLinked/ocpp-rs/issues/342)), plus a batteries-included v201 CSMS builder ([#343](https://github.com/EVLinked/ocpp-rs/issues/343))
+  - [ ] Teach the `ocpp-cp` Charge Point simulator to speak 2.0.1 (the `sub_protocols: vec!["ocpp1.6"]` seam in `crates/ocpp-cp/src/lib.rs`) — **sole remaining M7 item**; direction tracked in [#256](https://github.com/EVLinked/ocpp-rs/issues/256)
 - [ ] **M8**: Conformance & docs
 
 ¹ The `main` CI badge currently shows red only because of the GitHub Pages
