@@ -10,7 +10,10 @@
 //!
 //! The `type` field is an open string in the FINAL schema — the predefined
 //! security-event names are not a closed `enum` — so it is modelled as a
-//! [`String`], not an enum.
+//! [`String`], not an enum. The 20 standardized event names (OCPP 2.0.1 Part 2,
+//! Appendix 1) are available as the recommendation vocabulary
+//! [`ocpp_types::v201::SecurityEventType`] for callers that want to avoid
+//! stringly-typed typos; it does not constrain the wire field.
 
 use crate::{OcppAction, OcppResponse};
 use ocpp_types::v201::CustomDataType;

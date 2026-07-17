@@ -55,6 +55,17 @@
 //! `ocpp/v201/enums.py` and the bundled FINAL
 //! `crates/ocpp-messages/schemas/v201/*.json`; each divergence is pinned with
 //! [`reject`] (or a documented `pin`), never dropped.
+//!
+//! ## Recommendation catalogs (#357)
+//!
+//! Beyond the FINAL-schema `*EnumType`s, this suite also pins the reference's
+//! standardized-name *catalogs* that back **open** wire strings rather than
+//! closed schema `enum`s — the v201 analog of the 1.6J `ConfigurationKey`
+//! sweep (#350). These are pinned as vocabularies (`pin` only, no `reject`,
+//! since an unlisted value is a valid open-string value, not a rejected one):
+//!
+//! - `SecurityEventType` (#357) — the 20 OCPP 2.0.1 Part 2 Appendix-1 security
+//!   event names, backing the open `SecurityEventNotification.type` field.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -85,11 +96,11 @@ use ocpp_types::v201::{
     PublishFirmwareStatusEnumType, ReadingContextEnumType, ReasonEnumType, RecurrencyKindEnumType,
     RegistrationStatusEnumType, ReportBaseEnumType, RequestStartStopStatusEnumType,
     ReservationUpdateStatusEnumType, ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType,
-    SendLocalListStatusEnumType, SetMonitoringStatusEnumType, SetNetworkProfileStatusEnumType,
-    SetVariableStatusEnumType, TransactionEventEnumType, TriggerMessageStatusEnumType,
-    TriggerReasonEnumType, TxStartStopPointEnumType, UnlockStatusEnumType,
-    UnpublishFirmwareStatusEnumType, UpdateEnumType, UpdateFirmwareStatusEnumType,
-    UploadLogStatusEnumType, VPNEnumType,
+    SecurityEventType, SendLocalListStatusEnumType, SetMonitoringStatusEnumType,
+    SetNetworkProfileStatusEnumType, SetVariableStatusEnumType, TransactionEventEnumType,
+    TriggerMessageStatusEnumType, TriggerReasonEnumType, TxStartStopPointEnumType,
+    UnlockStatusEnumType, UnpublishFirmwareStatusEnumType, UpdateEnumType,
+    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType, VPNEnumType,
 };
 
 /// Assert that `wire` deserializes into `T` and re-serializes back to the
@@ -1269,5 +1280,43 @@ fn test_upload_log_status() {
         "UploadFailure",
         "Uploading",
         "AcceptedCanceled",
+    ]);
+}
+
+/// `SecurityEventType` — the 20 standardized security-event names of OCPP 2.0.1
+/// Part 2, Appendix 1 (v1.3), reported by `SecurityEventNotification`.
+///
+/// Unlike every other enum in this suite, `SecurityEventType` is **not** a
+/// FINAL-schema `enum`: the message's `type` field is an open `string`
+/// (`maxLength: 50`), and this enum is an available-but-not-forced recommendation
+/// vocabulary (the v201 analog of the 1.6J `ConfigurationKey`, #350). So this
+/// pins the *catalog* wire spellings rather than cross-checking a schema `enum`,
+/// and there are deliberately no [`reject`] calls — an unlisted event name is a
+/// valid open-string value, not a rejected one. The drift risks are the
+/// acronym / compound spellings: `InvalidTLSVersion`, `InvalidTLSCipherSuite`,
+/// `FailedToAuthenticateAtCsms`, `CsmsFailedToAuthenticate`.
+#[test]
+fn test_security_event_type() {
+    pin_all::<SecurityEventType>(&[
+        "FirmwareUpdated",
+        "FailedToAuthenticateAtCsms",
+        "CsmsFailedToAuthenticate",
+        "SettingSystemTime",
+        "StartupOfTheDevice",
+        "ResetOrReboot",
+        "SecurityLogWasCleared",
+        "ReconfigurationOfSecurityParameters",
+        "MemoryExhaustion",
+        "InvalidMessages",
+        "AttemptedReplayAttacks",
+        "TamperDetectionActivated",
+        "InvalidFirmwareSignature",
+        "InvalidFirmwareSigningCertificate",
+        "InvalidCsmsCertificate",
+        "InvalidChargingStationCertificate",
+        "InvalidTLSVersion",
+        "InvalidTLSCipherSuite",
+        "MaintenanceLoginAccepted",
+        "MaintenanceLoginFailed",
     ]);
 }
