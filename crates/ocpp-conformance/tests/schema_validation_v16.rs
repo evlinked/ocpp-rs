@@ -168,6 +168,27 @@ fn additional_properties_is_format_violation() {
     );
 }
 
+/// Ports `test_v16_charge_point.py::test_send_invalid_call` (reference:
+/// `validate_payload` raising on the schema's `enum` keyword). A `Reset` CALL
+/// whose `type` is `"Medium"` — a well-typed string that is not one of the
+/// schema's `enum` members `Hard`/`Soft` — trips `enum`. No dedicated OCPP
+/// keyword exists for `enum`, so the validator folds it into
+/// [`SchemaKeyword::Other`], which resolves to `FormationViolation`. All other
+/// constraints pass (`type` is present and a string), so `enum` is the sole
+/// violation. On the typed Rust API this value is unconstructable, but the
+/// validator still guards raw inbound frames — so this pins the `enum` →
+/// `FormationViolation` classification the reference asserts.
+#[test]
+fn out_of_enum_value_is_format_violation() {
+    let payload = json!({ "type": "Medium" }); // only Hard/Soft are valid
+    expect_call_keyword("Reset", &payload, SchemaKeyword::Other);
+    assert_eq!(
+        SchemaKeyword::Other.call_error_code().as_str(),
+        "FormationViolation",
+        "an out-of-enum value must map to the FormatViolationError analog",
+    );
+}
+
 /// Ports `test_validate_payload_with_invalid_type_payload` (reference:
 /// `TypeConstraintViolationError`). A `StartTransaction` CALL whose `meterStart`
 /// is a string where an integer is required trips `type`. All required fields are
