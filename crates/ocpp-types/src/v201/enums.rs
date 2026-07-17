@@ -1617,7 +1617,7 @@ pub enum SetNetworkProfileStatusEnumType {
 /// `maxLength: 50`), **not** an `enum`, so a station may legitimately report a
 /// vendor-specific event name outside this set. Accordingly the
 /// `SecurityEventNotification` message's `event_type` field stays a
-/// [`String`](std::string::String) — this type exists so callers can name the
+/// [`String`] — this type exists so callers can name the
 /// standardized events without stringly-typed typos, not to narrow the field.
 ///
 /// Every wire value is already a valid Rust PascalCase identifier, so variants
