@@ -42,6 +42,11 @@
 //!   `GetChargingProfiles` / `ClearChargingProfile`: `ChargingLimitType`,
 //!   `ChargingProfileCriterionType`, and `ClearChargingProfileType`. This closes
 //!   full datatype coverage of `test_v201_data_types.py`.
+//! - **`AuthorizationData`** (#353): the final unpinned per-type case in
+//!   `test_v201_data_types.py` (`test_authorization_data`) — the local-auth-list
+//!   entry carried by `SendLocalList`. Pins the full nested tree and the
+//!   differential-removal shape (absent `idTokenInfo`). With this in, the
+//!   reference's per-type 2.0.1 data-type suite is at 1:1 parity (42/42).
 //!
 //! ## What is pinned, and why it is stronger than the reference
 //!
@@ -144,14 +149,15 @@ use serde_json::{from_value, to_value, Value};
 
 use ocpp_types::v201::{
     ACChargingParametersType, APNAuthenticationEnumType, APNType, AdditionalInfoType,
-    AttributeEnumType, AuthorizationStatusEnumType, ChargingNeedsType, ChargingProfileKindEnumType,
-    ChargingProfilePurposeEnumType, ChargingProfileType, ChargingRateUnitEnumType,
-    ChargingSchedulePeriodType, ChargingScheduleType, ChargingStateEnumType, ChargingStationType,
-    ComponentType, ComponentVariableType, CompositeScheduleType, ConsumptionCostType,
-    CostKindEnumType, CostType, DCChargingParametersType, DataEnumType, EnergyTransferModeEnumType,
-    EvseType, GetVariableDataType, GetVariableResultType, GetVariableStatusEnumType,
-    IdTokenEnumType, IdTokenInfoType, IdTokenType, LocationEnumType, MeasurandEnumType,
-    MessageContentType, MessageFormatEnumType, MeterValueType, ModemType, MutabilityEnumType,
+    AttributeEnumType, AuthorizationData, AuthorizationStatusEnumType, ChargingNeedsType,
+    ChargingProfileKindEnumType, ChargingProfilePurposeEnumType, ChargingProfileType,
+    ChargingRateUnitEnumType, ChargingSchedulePeriodType, ChargingScheduleType,
+    ChargingStateEnumType, ChargingStationType, ComponentType, ComponentVariableType,
+    CompositeScheduleType, ConsumptionCostType, CostKindEnumType, CostType,
+    DCChargingParametersType, DataEnumType, EnergyTransferModeEnumType, EvseType,
+    GetVariableDataType, GetVariableResultType, GetVariableStatusEnumType, IdTokenEnumType,
+    IdTokenInfoType, IdTokenType, LocationEnumType, MeasurandEnumType, MessageContentType,
+    MessageFormatEnumType, MeterValueType, ModemType, MutabilityEnumType,
     NetworkConnectionProfileType, OCPPInterfaceEnumType, OCPPTransportEnumType,
     OCPPVersionEnumType, PhaseEnumType, ReadingContextEnumType, ReasonEnumType,
     RelativeTimeIntervalType, ReportDataType, SalesTariffEntryType, SalesTariffType,
@@ -315,6 +321,100 @@ fn id_token_info_type_status_only() {
             custom_data: None,
         },
         serde_json::json!({ "status": "Invalid" }),
+    );
+}
+
+/// Ports `test_authorization_data` — the one per-type case in
+/// `test_v201_data_types.py` still unpinned in this suite, and the last
+/// datatype needed for full 1:1 per-type parity (#353). `AuthorizationData` is
+/// carried by `SendLocalList.req`; this pins its full nested tree — a
+/// fully-populated `IdTokenInfoType` (`status`, `cacheExpiryDateTime`,
+/// `chargingPriority`, `language1`, `language2`, nested `groupIdToken`) hanging
+/// off a top-level `IdTokenType`.
+///
+/// ### FINAL-schema-vs-Python-dataclass divergence pinned here
+///
+/// The reference dataclass declares `AuthorizationData.id_token: IdTokenType`,
+/// but `test_authorization_data` constructs it with `id_token=IdTokenEnumType`
+/// — a bare enum member, not an `IdTokenType` object. The dataclass doesn't
+/// validate, so the mismatch is invisible there. The FINAL schema
+/// (`SendLocalList.json`, `AuthorizationData.idToken` → `$ref IdTokenType`) and
+/// the Rust type both require a nested `IdTokenType` *object*, so this suite
+/// pins the schema-valid shape, matching the #271 discipline recorded above.
+#[test]
+fn authorization_data_type() {
+    let group_id_token = IdTokenType {
+        id_token: "1234567890".to_string(),
+        kind: IdTokenEnumType::Central,
+        additional_info: None,
+        custom_data: None,
+    };
+    round_trip(
+        AuthorizationData {
+            id_token: IdTokenType {
+                id_token: "1234567890".to_string(),
+                kind: IdTokenEnumType::Central,
+                additional_info: None,
+                custom_data: None,
+            },
+            id_token_info: Some(IdTokenInfoType {
+                status: AuthorizationStatusEnumType::Accepted,
+                cache_expiry_date_time: Some("2024-01-01T10:00:00Z".to_string()),
+                charging_priority: Some(1),
+                language1: Some("en".to_string()),
+                evse_id: None,
+                language2: Some("fr".to_string()),
+                group_id_token: Some(group_id_token),
+                personal_message: None,
+                custom_data: None,
+            }),
+            custom_data: None,
+        },
+        serde_json::json!({
+            "idToken": { "idToken": "1234567890", "type": "Central" },
+            "idTokenInfo": {
+                "status": "Accepted",
+                "cacheExpiryDateTime": "2024-01-01T10:00:00Z",
+                "chargingPriority": 1,
+                "language1": "en",
+                "language2": "fr",
+                "groupIdToken": { "idToken": "1234567890", "type": "Central" },
+            },
+        }),
+    );
+}
+
+/// The differential-update shape of `AuthorizationData`: an entry whose
+/// `idTokenInfo` is absent signals "remove this token from the local list". The
+/// load-bearing semantic is that `skip_serializing_if = "Option::is_none"` must
+/// drop the key *entirely* — emitting `"idTokenInfo": null` instead would be a
+/// distinct wire object the CSMS could misread as "set an empty status". Pins
+/// both the round-trip and, explicitly, the absence of the key.
+#[test]
+fn authorization_data_type_differential_removal() {
+    let value = AuthorizationData {
+        id_token: IdTokenType {
+            id_token: "removed-token".to_string(),
+            kind: IdTokenEnumType::Central,
+            additional_info: None,
+            custom_data: None,
+        },
+        id_token_info: None,
+        custom_data: None,
+    };
+
+    // The key must be omitted, never serialized as `null`.
+    let wire = to_value(&value).expect("serialize");
+    assert!(
+        wire.get("idTokenInfo").is_none(),
+        "absent idTokenInfo must drop the key entirely, not emit null: {wire}"
+    );
+
+    round_trip(
+        value,
+        serde_json::json!({
+            "idToken": { "idToken": "removed-token", "type": "Central" },
+        }),
     );
 }
 
