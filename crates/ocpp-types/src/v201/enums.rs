@@ -1600,3 +1600,68 @@ pub enum SetNetworkProfileStatusEnumType {
     Rejected,
     Failed,
 }
+
+/// Standardized security-event names a Charging Station reports via
+/// `SecurityEventNotification`.
+///
+/// Ports `SecurityEventType` (`ocpp/v201/enums.py`) — the 20 events listed in
+/// OCPP 2.0.1 Part 2, Appendix 1 (Security Events), v1.3.
+///
+/// # An open vocabulary, not a schema constraint
+///
+/// This enum is an **available-but-not-forced** vocabulary of the spec-defined
+/// event names — the direct 2.0.1 analog of the 1.6J
+/// [`ConfigurationKey`](crate::v16j::ConfigurationKey). On the wire the field is
+/// an *open* string: the OCPP 2.0.1 FINAL schema types
+/// `SecurityEventNotificationRequest.type` as `string` (bounded at
+/// `maxLength: 50`), **not** an `enum`, so a station may legitimately report a
+/// vendor-specific event name outside this set. Accordingly the
+/// `SecurityEventNotification` message's `event_type` field stays a
+/// [`String`] — this type exists so callers can name the
+/// standardized events without stringly-typed typos, not to narrow the field.
+///
+/// Every wire value is already a valid Rust PascalCase identifier, so variants
+/// are named verbatim and need no `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SecurityEventType {
+    /// The firmware was updated.
+    FirmwareUpdated,
+    /// The Charging Station failed to authenticate to the CSMS.
+    FailedToAuthenticateAtCsms,
+    /// The CSMS failed to authenticate to the Charging Station.
+    CsmsFailedToAuthenticate,
+    /// The system time was set (e.g. via a network time sync).
+    SettingSystemTime,
+    /// The device started up.
+    StartupOfTheDevice,
+    /// The device was reset or rebooted.
+    ResetOrReboot,
+    /// The security log was cleared.
+    SecurityLogWasCleared,
+    /// One or more security parameters were reconfigured.
+    ReconfigurationOfSecurityParameters,
+    /// Available memory was (nearly) exhausted.
+    MemoryExhaustion,
+    /// One or more invalid messages were received.
+    InvalidMessages,
+    /// A replay attack was attempted.
+    AttemptedReplayAttacks,
+    /// Physical tamper detection was activated.
+    TamperDetectionActivated,
+    /// A firmware signature was invalid.
+    InvalidFirmwareSignature,
+    /// A firmware signing certificate was invalid.
+    InvalidFirmwareSigningCertificate,
+    /// The CSMS certificate was invalid.
+    InvalidCsmsCertificate,
+    /// The Charging Station certificate was invalid.
+    InvalidChargingStationCertificate,
+    /// A negotiated TLS version was invalid.
+    InvalidTLSVersion,
+    /// A negotiated TLS cipher suite was invalid.
+    InvalidTLSCipherSuite,
+    /// A maintenance login was accepted.
+    MaintenanceLoginAccepted,
+    /// A maintenance login failed.
+    MaintenanceLoginFailed,
+}
