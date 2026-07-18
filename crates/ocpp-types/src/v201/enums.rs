@@ -1666,6 +1666,210 @@ pub enum SecurityEventType {
     MaintenanceLoginFailed,
 }
 
+// ===========================================================================
+// Device-model controller variable-/instance-name catalogs (Appendix 3)
+// ===========================================================================
+//
+// The enums below are the per-controller *variable-name* and *instance-name*
+// sets from OCPP 2.0.1 Part 2 Appendix 3 (the standardized device model). They
+// port the `*CtrlrVariableName` / `*CtrlrInstanceName` `StrEnum`s of
+// `ocpp/v201/enums.py` and are the controller half of the device-model name
+// catalogs tracked by #359 (slice 1, the three top-level `*ComponentName` /
+// `StandardizedVariableName` catalogs, landed in #360).
+//
+// # An open vocabulary, not a schema constraint
+//
+// Exactly like [`SecurityEventType`] and the 1.6J
+// [`ConfigurationKey`](crate::v16j::ConfigurationKey): the device model puts
+// these names in the *open* `ComponentType.name` / `VariableType.name` /
+// `EVSEType`… wire fields, which the OCPP 2.0.1 FINAL schema types as `string`
+// (`maxLength: 50`), **not** `enum`. A station may legitimately expose
+// vendor-specific components and variables outside these sets, so the message /
+// datatype `name` fields stay [`String`]. These enums exist so callers can name
+// the standardized variables without stringly-typed typos — they do not narrow
+// any field.
+//
+// Every wire value is a valid Rust PascalCase identifier and is named verbatim,
+// except the settable-selftest marker `"SelftestActive(Set)"`, whose
+// parenthesized wire spelling is not a Rust identifier and so carries an
+// explicit `#[serde(rename)]`.
+
+/// Standardized variable names of the `AlignedDataCtrlr` component
+/// (clock-aligned meter data). Ports `AlignedDataCtrlrVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AlignedDataCtrlrVariableName {
+    Available,
+    Enabled,
+    Interval,
+    Measurands,
+    SendDuringIdle,
+    SignReadings,
+    TxEndedInterval,
+    TxEndedMeasurands,
+}
+
+/// Standardized variable names of the `AuthCacheCtrlr` component
+/// (authorization cache). Ports `AuthCacheCtrlrVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AuthCacheCtrlrVariableName {
+    Available,
+    Enabled,
+    LifeTime,
+    Policy,
+    Storage,
+    DisablePostAuthorize,
+}
+
+/// Standardized variable names of the `AuthCtrlr` component (authorization).
+/// Ports `AuthCtrlrVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AuthCtrlrVariableName {
+    AdditionalInfoItemsPerMessage,
+    AuthorizeRemoteStart,
+    Enabled,
+    LocalAuthorizeOffline,
+    LocalPreAuthorize,
+    MasterPassGroupId,
+    OfflineTxForUnknownIdEnabled,
+    DisableRemoteAuthorization,
+}
+
+/// Standardized variable names of the `CHAdeMOCtrlr` component (CHAdeMO DC).
+/// Ports `CHAdeMOCtrlrVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CHAdeMOCtrlrVariableName {
+    Enabled,
+    Active,
+    Complete,
+    Tripped,
+    Problem,
+    SelftestActive,
+    /// Wire value `"SelftestActive(Set)"` — the settable selftest flag.
+    #[serde(rename = "SelftestActive(Set)")]
+    SelftestActiveSet,
+    CHAdeMOProtocolNumber,
+    VehicleStatus,
+    DynamicControl,
+    HighCurrentControl,
+    HighVoltageControl,
+    AutoManufacturerCode,
+}
+
+/// Standardized variable names of the `ClockCtrlr` component (real-time clock).
+/// Ports `ClockCtrlrVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ClockCtrlrVariableName {
+    DateTime,
+    NextTimeOffsetTransitionDateTime,
+    NtpServerUri,
+    NtpSource,
+    TimeAdjustmentReportingThreshold,
+    TimeOffset,
+    TimeSource,
+    TimeZone,
+}
+
+/// Standardized variable names of the `CustomizationCtrlr` component.
+/// Ports `CustomizationCtrlrVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CustomizationCtrlrVariableName {
+    CustomImplementationEnabled,
+}
+
+/// Standardized variable names of the `DeviceDataCtrlr` component
+/// (device-model reporting). Ports `DeviceDataCtrlrVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeviceDataCtrlrVariableName {
+    BytesPerMessage,
+    ConfigurationValueSize,
+    ItemsPerMessage,
+    ReportingValueSize,
+    ValueSize,
+}
+
+/// Standardized instance names of the `DeviceDataCtrlr` component — the
+/// per-message instances the `BytesPerMessage` / `ItemsPerMessage` limits apply
+/// to. Ports `DeviceDataCtrlrInstanceName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DeviceDataCtrlrInstanceName {
+    GetReport,
+    GetVariables,
+    SetVariables,
+}
+
+/// Standardized variable names of the `DisplayMessageCtrlr` component.
+/// Ports `DisplayMessageCtrlrVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DisplayMessageCtrlrVariableName {
+    Available,
+    DisplayMessages,
+    Enabled,
+    PersonalMessageSize,
+    SupportedFormats,
+    SupportedPriorities,
+}
+
+/// Standardized variable names of the `ISO15118Ctrlr` component
+/// (ISO 15118 plug-and-charge). Ports `ISO15118CtrlrVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ISO15118CtrlrVariableName {
+    Active,
+    Enabled,
+    CentralContractValidationAllowed,
+    Complete,
+    ContractValidationOffline,
+    SeccId,
+    SelftestActive,
+    /// Wire value `"SelftestActive(Set)"` — the settable selftest flag.
+    #[serde(rename = "SelftestActive(Set)")]
+    SelftestActiveSet,
+    MaxScheduleEntries,
+    RequestedEnergyTransferMode,
+    RequestMeteringReceipt,
+    CountryName,
+    OrganizationName,
+    PnCEnabled,
+    Problem,
+    Tripped,
+    V2GCertificateInstallationEnabled,
+    ContractCertificateInstallationEnabled,
+}
+
+/// Standardized variable names of the `LocalAuthListCtrlr` component
+/// (local authorization list). Ports `LocalAuthListCtrlrVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LocalAuthListCtrlrVariableName {
+    Available,
+    BytesPerMessage,
+    Enabled,
+    Entries,
+    ItemsPerMessage,
+    Storage,
+    DisablePostAuthorize,
+}
+
 /// Standardized names of the *logical* (controller) components of the OCPP
 /// 2.0.1 device model.
 ///

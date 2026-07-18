@@ -70,11 +70,19 @@
 //!   `StandardizedVariableName` (#359 slice 1) — the OCPP 2.0.1 Part 2
 //!   Appendix-3 device-model name catalogs, backing the open
 //!   `ComponentType.name` / `VariableType.name` fields.
-//! - the per-controller `*CtrlrVariableName` / `*CtrlrInstanceName` catalogs,
-//!   controllers A–L (#359 slice 2a) and M–T (#359 slice 2b) — the
-//!   Appendix-3 standardized variable/instance names of each controller
-//!   component, backing the same open `VariableType.name` /
-//!   `ComponentType.instance` fields.
+//! - the device-model controller variable-/instance-name catalogs of Part 2
+//!   Appendix 3 (#359), backing the open `ComponentType.name` /
+//!   `VariableType.name` / `ComponentType.instance` device-model fields.
+//!   Slice 2a, controllers A–L (#361):
+//!   `AlignedDataCtrlrVariableName`, `AuthCacheCtrlrVariableName`,
+//!   `AuthCtrlrVariableName`, `CHAdeMOCtrlrVariableName`,
+//!   `ClockCtrlrVariableName`, `CustomizationCtrlrVariableName`,
+//!   `DeviceDataCtrlrVariableName`, `DeviceDataCtrlrInstanceName`,
+//!   `DisplayMessageCtrlrVariableName`, `ISO15118CtrlrVariableName`,
+//!   `LocalAuthListCtrlrVariableName`.
+//! - slice 2b, controllers M–T (#362) — the Appendix-3 standardized
+//!   variable/instance names of each controller component M–T, backing the
+//!   same open `VariableType.name` / `ComponentType.instance` fields.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -114,6 +122,12 @@ use ocpp_types::v201::{
     TriggerMessageStatusEnumType, TriggerReasonEnumType, TxCtrlrVariableName,
     TxStartStopPointEnumType, UnlockStatusEnumType, UnpublishFirmwareStatusEnumType,
     UpdateEnumType, UpdateFirmwareStatusEnumType, UploadLogStatusEnumType, VPNEnumType,
+};
+use ocpp_types::v201::{
+    AlignedDataCtrlrVariableName, AuthCacheCtrlrVariableName, AuthCtrlrVariableName,
+    CHAdeMOCtrlrVariableName, ClockCtrlrVariableName, CustomizationCtrlrVariableName,
+    DeviceDataCtrlrInstanceName, DeviceDataCtrlrVariableName, DisplayMessageCtrlrVariableName,
+    ISO15118CtrlrVariableName, LocalAuthListCtrlrVariableName,
 };
 
 /// Assert that `wire` deserializes into `T` and re-serializes back to the
@@ -1331,6 +1345,178 @@ fn test_security_event_type() {
         "InvalidTLSCipherSuite",
         "MaintenanceLoginAccepted",
         "MaintenanceLoginFailed",
+    ]);
+}
+
+// ---------------------------------------------------------------------------
+// Device-model controller variable-/instance-name catalogs (#359, Appendix 3)
+//
+// Open recommendation vocabularies backing the device model's open
+// `ComponentType.name` / `VariableType.name` string fields — pinned as catalogs
+// (`pin_all` only, no `reject`, since an unlisted name is a valid open-string
+// value). Slice 2, controllers A–L. Each list is verbatim from the reference's
+// `*CtrlrVariableName` / `*CtrlrInstanceName` `StrEnum`s in
+// `ocpp/v201/enums.py`. Drift risk is the acronym / parenthesized spellings:
+// `CHAdeMOProtocolNumber`, `SelftestActive(Set)`, `SeccId`, `PnCEnabled`,
+// `V2GCertificateInstallationEnabled`.
+// ---------------------------------------------------------------------------
+
+/// Ports `AlignedDataCtrlrVariableName` (8 members).
+#[test]
+fn test_aligned_data_ctrlr_variable_name() {
+    pin_all::<AlignedDataCtrlrVariableName>(&[
+        "Available",
+        "Enabled",
+        "Interval",
+        "Measurands",
+        "SendDuringIdle",
+        "SignReadings",
+        "TxEndedInterval",
+        "TxEndedMeasurands",
+    ]);
+}
+
+/// Ports `AuthCacheCtrlrVariableName` (6 members).
+#[test]
+fn test_auth_cache_ctrlr_variable_name() {
+    pin_all::<AuthCacheCtrlrVariableName>(&[
+        "Available",
+        "Enabled",
+        "LifeTime",
+        "Policy",
+        "Storage",
+        "DisablePostAuthorize",
+    ]);
+}
+
+/// Ports `AuthCtrlrVariableName` (8 members).
+#[test]
+fn test_auth_ctrlr_variable_name() {
+    pin_all::<AuthCtrlrVariableName>(&[
+        "AdditionalInfoItemsPerMessage",
+        "AuthorizeRemoteStart",
+        "Enabled",
+        "LocalAuthorizeOffline",
+        "LocalPreAuthorize",
+        "MasterPassGroupId",
+        "OfflineTxForUnknownIdEnabled",
+        "DisableRemoteAuthorization",
+    ]);
+}
+
+/// Ports `CHAdeMOCtrlrVariableName` (13 members). Pins the acronym
+/// `CHAdeMOProtocolNumber` and the parenthesized `SelftestActive(Set)`, which
+/// carries a `#[serde(rename)]` on the Rust side.
+#[test]
+fn test_chademo_ctrlr_variable_name() {
+    pin_all::<CHAdeMOCtrlrVariableName>(&[
+        "Enabled",
+        "Active",
+        "Complete",
+        "Tripped",
+        "Problem",
+        "SelftestActive",
+        "SelftestActive(Set)",
+        "CHAdeMOProtocolNumber",
+        "VehicleStatus",
+        "DynamicControl",
+        "HighCurrentControl",
+        "HighVoltageControl",
+        "AutoManufacturerCode",
+    ]);
+}
+
+/// Ports `ClockCtrlrVariableName` (8 members).
+#[test]
+fn test_clock_ctrlr_variable_name() {
+    pin_all::<ClockCtrlrVariableName>(&[
+        "DateTime",
+        "NextTimeOffsetTransitionDateTime",
+        "NtpServerUri",
+        "NtpSource",
+        "TimeAdjustmentReportingThreshold",
+        "TimeOffset",
+        "TimeSource",
+        "TimeZone",
+    ]);
+}
+
+/// Ports `CustomizationCtrlrVariableName` (1 member).
+#[test]
+fn test_customization_ctrlr_variable_name() {
+    pin_all::<CustomizationCtrlrVariableName>(&["CustomImplementationEnabled"]);
+}
+
+/// Ports `DeviceDataCtrlrVariableName` (5 members).
+#[test]
+fn test_device_data_ctrlr_variable_name() {
+    pin_all::<DeviceDataCtrlrVariableName>(&[
+        "BytesPerMessage",
+        "ConfigurationValueSize",
+        "ItemsPerMessage",
+        "ReportingValueSize",
+        "ValueSize",
+    ]);
+}
+
+/// Ports `DeviceDataCtrlrInstanceName` (3 members).
+#[test]
+fn test_device_data_ctrlr_instance_name() {
+    pin_all::<DeviceDataCtrlrInstanceName>(&["GetReport", "GetVariables", "SetVariables"]);
+}
+
+/// Ports `DisplayMessageCtrlrVariableName` (6 members).
+#[test]
+fn test_display_message_ctrlr_variable_name() {
+    pin_all::<DisplayMessageCtrlrVariableName>(&[
+        "Available",
+        "DisplayMessages",
+        "Enabled",
+        "PersonalMessageSize",
+        "SupportedFormats",
+        "SupportedPriorities",
+    ]);
+}
+
+/// Ports `ISO15118CtrlrVariableName` (18 members). Pins the acronym /
+/// compound spellings `SeccId`, `PnCEnabled`,
+/// `V2GCertificateInstallationEnabled`, and the parenthesized
+/// `SelftestActive(Set)` (`#[serde(rename)]` on the Rust side).
+#[test]
+fn test_iso15118_ctrlr_variable_name() {
+    pin_all::<ISO15118CtrlrVariableName>(&[
+        "Active",
+        "Enabled",
+        "CentralContractValidationAllowed",
+        "Complete",
+        "ContractValidationOffline",
+        "SeccId",
+        "SelftestActive",
+        "SelftestActive(Set)",
+        "MaxScheduleEntries",
+        "RequestedEnergyTransferMode",
+        "RequestMeteringReceipt",
+        "CountryName",
+        "OrganizationName",
+        "PnCEnabled",
+        "Problem",
+        "Tripped",
+        "V2GCertificateInstallationEnabled",
+        "ContractCertificateInstallationEnabled",
+    ]);
+}
+
+/// Ports `LocalAuthListCtrlrVariableName` (7 members).
+#[test]
+fn test_local_auth_list_ctrlr_variable_name() {
+    pin_all::<LocalAuthListCtrlrVariableName>(&[
+        "Available",
+        "BytesPerMessage",
+        "Enabled",
+        "Entries",
+        "ItemsPerMessage",
+        "Storage",
+        "DisablePostAuthorize",
     ]);
 }
 
