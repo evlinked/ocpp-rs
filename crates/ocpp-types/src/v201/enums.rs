@@ -1900,3 +1900,214 @@ pub enum StandardizedVariableName {
     VersionNumber,
     VoltageImbalance,
 }
+
+/// Standardized variable names of the `MonitoringCtrlr` controller component.
+///
+/// Ports `MonitoringCtrlrVariableName` (`ocpp/v201/enums.py`), sourced from OCPP
+/// 2.0.1 Part 2 Appendix 3 v1.3 (`appendices_CSV_v1.3.zip`).
+///
+/// # An open vocabulary, not a schema constraint
+///
+/// Same open-string semantics as [`ControllerComponentName`] /
+/// [`StandardizedVariableName`]: this catalog backs the *open*
+/// [`VariableType::name`](crate::v201::VariableType) field (schema `string`,
+/// `maxLength: 50`, **not** an `enum`), which stays a [`String`]. The enum lets
+/// callers name the standardized `MonitoringCtrlr` variables without typos.
+///
+/// Every wire value is already a valid Rust PascalCase identifier, so variants
+/// are named verbatim and need no `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MonitoringCtrlrVariableName {
+    Available,
+    BytesPerMessage,
+    Enabled,
+    ItemsPerMessage,
+    OfflineQueuingSeverity,
+    MonitoringBase,
+    MonitoringLevel,
+    ActiveMonitoringBase,
+    ActiveMonitoringLevel,
+}
+
+/// Standardized instance names of the `MonitoringCtrlr` controller component.
+///
+/// Ports `MonitoringCtrlrInstanceName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary backing the *open*
+/// [`ComponentType::instance`](crate::v201::ComponentType) field — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MonitoringCtrlrInstanceName {
+    ClearVariableMonitoring,
+    SetVariableMonitoring,
+}
+
+/// Standardized variable names of the `OCPPCommCtrlr` controller component.
+///
+/// Ports `OCPPCommCtrlrVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary backing the *open*
+/// [`VariableType::name`](crate::v201::VariableType) field — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+///
+/// Every wire value is already a valid Rust PascalCase identifier (including the
+/// acronym spellings `UnlockOnEVSideDisconnect`, `WebSocketPingInterval`), so
+/// variants are named verbatim and need no `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OCPPCommCtrlrVariableName {
+    ActiveNetworkProfile,
+    FileTransferProtocols,
+    HeartbeatInterval,
+    MessageTimeout,
+    MessageAttemptInterval,
+    MessageAttempts,
+    MinimumStatusDuration,
+    NetworkConfigurationPriority,
+    NetworkProfileConnectionAttempts,
+    OfflineThreshold,
+    PublicKeyWithSignedMeterValue,
+    QueueAllMessages,
+    ResetRetries,
+    RetryBackOffRandomRange,
+    RetryBackOffRepeatTimes,
+    RetryBackOffWaitMinimum,
+    UnlockOnEVSideDisconnect,
+    WebSocketPingInterval,
+    FieldLength,
+}
+
+/// Standardized instance names of the `OCPPCommCtrlr` controller component.
+///
+/// Ports `OCPPCommCtrlrInstanceName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OCPPCommCtrlrInstanceName {
+    Default,
+    TransactionEvent,
+}
+
+/// Standardized variable names of the `ReservationCtrlr` controller component.
+///
+/// Ports `ReservationCtrlrVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ReservationCtrlrVariableName {
+    Available,
+    Enabled,
+    NonEvseSpecific,
+}
+
+/// Standardized variable names of the `SampledDataCtrlr` controller component.
+///
+/// Ports `SampledDataCtrlrVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SampledDataCtrlrVariableName {
+    Available,
+    Enabled,
+    SignReadings,
+    TxEndedInterval,
+    TxEndedMeasurands,
+    TxStartedMeasurands,
+    TxUpdatedInterval,
+    TxUpdatedMeasurands,
+    RegisterValuesWithoutPhases,
+}
+
+/// Standardized variable names of the `SecurityCtrlr` controller component.
+///
+/// Ports `SecurityCtrlrVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SecurityCtrlrVariableName {
+    AdditionalRootCertificateCheck,
+    BasicAuthPassword,
+    CertificateEntries,
+    CertSigningRepeatTimes,
+    CertSigningWaitMinimum,
+    Identity,
+    MaxCertificateChainSize,
+    OrganizationName,
+    SecurityProfile,
+}
+
+/// Standardized variable names of the `SmartChargingCtrlr` controller component.
+///
+/// Ports `SmartChargingCtrlrVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1
+/// Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+///
+/// Every wire value is already a valid Rust PascalCase identifier (including the
+/// acronym spelling `ACPhaseSwitchingSupported` and the digit-bearing
+/// `Phases3to1`), so variants are named verbatim and need no `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SmartChargingCtrlrVariableName {
+    ACPhaseSwitchingSupported,
+    Available,
+    Enabled,
+    Entries,
+    ExternalControlSignalsEnabled,
+    LimitChangeSignificance,
+    NotifyChargingLimitWithSchedules,
+    PeriodsPerSchedule,
+    Phases3to1,
+    ProfileStackLevel,
+    RateUnit,
+}
+
+/// Standardized instance names of the `SmartChargingCtrlr` controller component.
+///
+/// Ports `SmartChargingCtrlrInstanceName` (`ocpp/v201/enums.py`), OCPP 2.0.1
+/// Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SmartChargingCtrlrInstanceName {
+    ChargingProfiles,
+}
+
+/// Standardized variable names of the `TariffCostCtrlr` controller component.
+///
+/// Ports `TariffCostCtrlrVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TariffCostCtrlrVariableName {
+    Available,
+    Currency,
+    Enabled,
+    TariffFallbackMessage,
+    TotalCostFallbackMessage,
+}
+
+/// Standardized instance names of the `TariffCostCtrlr` controller component.
+///
+/// Ports `TariffCostCtrlrInstanceName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TariffCostCtrlrInstanceName {
+    Tariff,
+    Cost,
+}
+
+/// Standardized variable names of the `TxCtrlr` controller component.
+///
+/// Ports `TxCtrlrVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+///
+/// Every wire value is already a valid Rust PascalCase identifier (including the
+/// acronym spellings `EVConnectionTimeOut`, `StopTxOnEVSideDisconnect`), so
+/// variants are named verbatim and need no `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TxCtrlrVariableName {
+    EVConnectionTimeOut,
+    MaxEnergyOnInvalidId,
+    StopTxOnEVSideDisconnect,
+    StopTxOnInvalidId,
+    TxBeforeAcceptedEnabled,
+    TxStartPoint,
+    TxStopPoint,
+}
