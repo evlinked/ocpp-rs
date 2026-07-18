@@ -72,13 +72,17 @@
 //!   `ComponentType.name` / `VariableType.name` fields.
 //! - the device-model controller variable-/instance-name catalogs of Part 2
 //!   Appendix 3 (#359), backing the open `ComponentType.name` /
-//!   `VariableType.name` device-model fields. Slice 2, controllers A–L:
+//!   `VariableType.name` / `ComponentType.instance` device-model fields.
+//!   Slice 2a, controllers A–L (#361):
 //!   `AlignedDataCtrlrVariableName`, `AuthCacheCtrlrVariableName`,
 //!   `AuthCtrlrVariableName`, `CHAdeMOCtrlrVariableName`,
 //!   `ClockCtrlrVariableName`, `CustomizationCtrlrVariableName`,
 //!   `DeviceDataCtrlrVariableName`, `DeviceDataCtrlrInstanceName`,
 //!   `DisplayMessageCtrlrVariableName`, `ISO15118CtrlrVariableName`,
 //!   `LocalAuthListCtrlrVariableName`.
+//! - slice 2b, controllers M–T (#362) — the Appendix-3 standardized
+//!   variable/instance names of each controller component M–T, backing the
+//!   same open `VariableType.name` / `ComponentType.instance` fields.
 
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -104,17 +108,20 @@ use ocpp_types::v201::{
     Iso15118EVCertificateStatusEnumType, LocationEnumType, LogEnumType, LogStatusEnumType,
     MeasurandEnumType, MessageFormatEnumType, MessagePriorityEnumType, MessageStateEnumType,
     MessageTriggerEnumType, MonitorBaseEnumType, MonitorEnumType, MonitoringCriterionEnumType,
-    MutabilityEnumType, NotifyEVChargingNeedsStatusEnumType, OCPPInterfaceEnumType,
-    OCPPTransportEnumType, OCPPVersionEnumType, OperationalStatusEnumType, PhaseEnumType,
-    PhysicalComponentName, PublishFirmwareStatusEnumType, ReadingContextEnumType, ReasonEnumType,
-    RecurrencyKindEnumType, RegistrationStatusEnumType, ReportBaseEnumType,
-    RequestStartStopStatusEnumType, ReservationUpdateStatusEnumType, ReserveNowStatusEnumType,
-    ResetEnumType, ResetStatusEnumType, SecurityEventType, SendLocalListStatusEnumType,
+    MonitoringCtrlrInstanceName, MonitoringCtrlrVariableName, MutabilityEnumType,
+    NotifyEVChargingNeedsStatusEnumType, OCPPCommCtrlrInstanceName, OCPPCommCtrlrVariableName,
+    OCPPInterfaceEnumType, OCPPTransportEnumType, OCPPVersionEnumType, OperationalStatusEnumType,
+    PhaseEnumType, PhysicalComponentName, PublishFirmwareStatusEnumType, ReadingContextEnumType,
+    ReasonEnumType, RecurrencyKindEnumType, RegistrationStatusEnumType, ReportBaseEnumType,
+    RequestStartStopStatusEnumType, ReservationCtrlrVariableName, ReservationUpdateStatusEnumType,
+    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, SampledDataCtrlrVariableName,
+    SecurityCtrlrVariableName, SecurityEventType, SendLocalListStatusEnumType,
     SetMonitoringStatusEnumType, SetNetworkProfileStatusEnumType, SetVariableStatusEnumType,
-    StandardizedVariableName, TransactionEventEnumType, TriggerMessageStatusEnumType,
-    TriggerReasonEnumType, TxStartStopPointEnumType, UnlockStatusEnumType,
-    UnpublishFirmwareStatusEnumType, UpdateEnumType, UpdateFirmwareStatusEnumType,
-    UploadLogStatusEnumType, VPNEnumType,
+    SmartChargingCtrlrInstanceName, SmartChargingCtrlrVariableName, StandardizedVariableName,
+    TariffCostCtrlrInstanceName, TariffCostCtrlrVariableName, TransactionEventEnumType,
+    TriggerMessageStatusEnumType, TriggerReasonEnumType, TxCtrlrVariableName,
+    TxStartStopPointEnumType, UnlockStatusEnumType, UnpublishFirmwareStatusEnumType,
+    UpdateEnumType, UpdateFirmwareStatusEnumType, UploadLogStatusEnumType, VPNEnumType,
 };
 use ocpp_types::v201::{
     AlignedDataCtrlrVariableName, AuthCacheCtrlrVariableName, AuthCtrlrVariableName,
@@ -1716,5 +1723,180 @@ fn test_standardized_variable_name() {
         "VersionDate",
         "VersionNumber",
         "VoltageImbalance",
+    ]);
+}
+
+// ---------------------------------------------------------------------------
+// #359 slice 2b — per-controller variable-/instance-name catalogs, M–T.
+//
+// Open recommendation vocabularies (Part 2 Appendix 3 v1.3) backing the *open*
+// `VariableType.name` / `ComponentType.instance` fields — pinned as catalogs
+// (`pin_all` only, no `reject`, since an unlisted name is a valid open-string
+// value). Verified byte-for-byte against the `*Ctrlr*Name` `StrEnum`s in
+// `ocpp/v201/enums.py`. 12 classes, 79 members.
+// ---------------------------------------------------------------------------
+
+/// `MonitoringCtrlrVariableName` — the 9 standardized `MonitoringCtrlr`
+/// variable names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_monitoring_ctrlr_variable_name() {
+    pin_all::<MonitoringCtrlrVariableName>(&[
+        "Available",
+        "BytesPerMessage",
+        "Enabled",
+        "ItemsPerMessage",
+        "OfflineQueuingSeverity",
+        "MonitoringBase",
+        "MonitoringLevel",
+        "ActiveMonitoringBase",
+        "ActiveMonitoringLevel",
+    ]);
+}
+
+/// `MonitoringCtrlrInstanceName` — the 2 standardized `MonitoringCtrlr`
+/// instance names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_monitoring_ctrlr_instance_name() {
+    pin_all::<MonitoringCtrlrInstanceName>(&["ClearVariableMonitoring", "SetVariableMonitoring"]);
+}
+
+/// `OCPPCommCtrlrVariableName` — the 19 standardized `OCPPCommCtrlr` variable
+/// names (open recommendation vocabulary, no [`reject`]). Drift risks are the
+/// acronym spellings `UnlockOnEVSideDisconnect`, `WebSocketPingInterval`.
+#[test]
+fn test_ocpp_comm_ctrlr_variable_name() {
+    pin_all::<OCPPCommCtrlrVariableName>(&[
+        "ActiveNetworkProfile",
+        "FileTransferProtocols",
+        "HeartbeatInterval",
+        "MessageTimeout",
+        "MessageAttemptInterval",
+        "MessageAttempts",
+        "MinimumStatusDuration",
+        "NetworkConfigurationPriority",
+        "NetworkProfileConnectionAttempts",
+        "OfflineThreshold",
+        "PublicKeyWithSignedMeterValue",
+        "QueueAllMessages",
+        "ResetRetries",
+        "RetryBackOffRandomRange",
+        "RetryBackOffRepeatTimes",
+        "RetryBackOffWaitMinimum",
+        "UnlockOnEVSideDisconnect",
+        "WebSocketPingInterval",
+        "FieldLength",
+    ]);
+}
+
+/// `OCPPCommCtrlrInstanceName` — the 2 standardized `OCPPCommCtrlr` instance
+/// names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_ocpp_comm_ctrlr_instance_name() {
+    pin_all::<OCPPCommCtrlrInstanceName>(&["Default", "TransactionEvent"]);
+}
+
+/// `ReservationCtrlrVariableName` — the 3 standardized `ReservationCtrlr`
+/// variable names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_reservation_ctrlr_variable_name() {
+    pin_all::<ReservationCtrlrVariableName>(&["Available", "Enabled", "NonEvseSpecific"]);
+}
+
+/// `SampledDataCtrlrVariableName` — the 9 standardized `SampledDataCtrlr`
+/// variable names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_sampled_data_ctrlr_variable_name() {
+    pin_all::<SampledDataCtrlrVariableName>(&[
+        "Available",
+        "Enabled",
+        "SignReadings",
+        "TxEndedInterval",
+        "TxEndedMeasurands",
+        "TxStartedMeasurands",
+        "TxUpdatedInterval",
+        "TxUpdatedMeasurands",
+        "RegisterValuesWithoutPhases",
+    ]);
+}
+
+/// `SecurityCtrlrVariableName` — the 9 standardized `SecurityCtrlr` variable
+/// names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_security_ctrlr_variable_name() {
+    pin_all::<SecurityCtrlrVariableName>(&[
+        "AdditionalRootCertificateCheck",
+        "BasicAuthPassword",
+        "CertificateEntries",
+        "CertSigningRepeatTimes",
+        "CertSigningWaitMinimum",
+        "Identity",
+        "MaxCertificateChainSize",
+        "OrganizationName",
+        "SecurityProfile",
+    ]);
+}
+
+/// `SmartChargingCtrlrVariableName` — the 11 standardized `SmartChargingCtrlr`
+/// variable names (open recommendation vocabulary, no [`reject`]). Drift risks
+/// are the acronym `ACPhaseSwitchingSupported` and the digit-bearing
+/// `Phases3to1`.
+#[test]
+fn test_smart_charging_ctrlr_variable_name() {
+    pin_all::<SmartChargingCtrlrVariableName>(&[
+        "ACPhaseSwitchingSupported",
+        "Available",
+        "Enabled",
+        "Entries",
+        "ExternalControlSignalsEnabled",
+        "LimitChangeSignificance",
+        "NotifyChargingLimitWithSchedules",
+        "PeriodsPerSchedule",
+        "Phases3to1",
+        "ProfileStackLevel",
+        "RateUnit",
+    ]);
+}
+
+/// `SmartChargingCtrlrInstanceName` — the single standardized
+/// `SmartChargingCtrlr` instance name (open recommendation vocabulary, no
+/// [`reject`]).
+#[test]
+fn test_smart_charging_ctrlr_instance_name() {
+    pin_all::<SmartChargingCtrlrInstanceName>(&["ChargingProfiles"]);
+}
+
+/// `TariffCostCtrlrVariableName` — the 5 standardized `TariffCostCtrlr`
+/// variable names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_tariff_cost_ctrlr_variable_name() {
+    pin_all::<TariffCostCtrlrVariableName>(&[
+        "Available",
+        "Currency",
+        "Enabled",
+        "TariffFallbackMessage",
+        "TotalCostFallbackMessage",
+    ]);
+}
+
+/// `TariffCostCtrlrInstanceName` — the 2 standardized `TariffCostCtrlr`
+/// instance names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_tariff_cost_ctrlr_instance_name() {
+    pin_all::<TariffCostCtrlrInstanceName>(&["Tariff", "Cost"]);
+}
+
+/// `TxCtrlrVariableName` — the 7 standardized `TxCtrlr` variable names (open
+/// recommendation vocabulary, no [`reject`]). Drift risks are the acronym
+/// spellings `EVConnectionTimeOut`, `StopTxOnEVSideDisconnect`.
+#[test]
+fn test_tx_ctrlr_variable_name() {
+    pin_all::<TxCtrlrVariableName>(&[
+        "EVConnectionTimeOut",
+        "MaxEnergyOnInvalidId",
+        "StopTxOnEVSideDisconnect",
+        "StopTxOnInvalidId",
+        "TxBeforeAcceptedEnabled",
+        "TxStartPoint",
+        "TxStopPoint",
     ]);
 }
