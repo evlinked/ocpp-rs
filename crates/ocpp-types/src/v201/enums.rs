@@ -1869,3 +1869,238 @@ pub enum LocalAuthListCtrlrVariableName {
     Storage,
     DisablePostAuthorize,
 }
+
+/// Standardized names of the *logical* (controller) components of the OCPP
+/// 2.0.1 device model.
+///
+/// Ports `ControllerComponentName` (`ocpp/v201/enums.py`), sourced from OCPP
+/// 2.0.1 Part 2 Appendix 3.1 v1.3 (`appendices_CSV_v1.3.zip`,
+/// `dm_components_vars.csv` / `components.csv`).
+///
+/// # An open vocabulary, not a schema constraint
+///
+/// Like [`SecurityEventType`] and the 1.6J
+/// [`ConfigurationKey`](crate::v16j::ConfigurationKey), this is an
+/// **available-but-not-forced** catalog of the spec-standardized names. The
+/// device model's [`ComponentType::name`](crate::v201::ComponentType) field is
+/// an *open* string on the wire — the OCPP 2.0.1 FINAL schema types it as
+/// `string` (`maxLength: 50`), **not** an `enum` — so a station may legitimately
+/// report a vendor-specific component. Accordingly `ComponentType.name` stays a
+/// [`String`]; this enum exists so callers can name the standardized components
+/// without stringly-typed typos, not to narrow the field.
+///
+/// Every wire value is already a valid Rust PascalCase identifier (including the
+/// acronym spellings `CHAdeMOCtrlr`, `ISO15118Ctrlr`, `OCPPCommCtrlr`), so
+/// variants are named verbatim and need no `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ControllerComponentName {
+    AlignedDataCtrlr,
+    AuthCacheCtrlr,
+    AuthCtrlr,
+    CHAdeMOCtrlr,
+    ClockCtrlr,
+    CustomizationCtrlr,
+    DeviceDataCtrlr,
+    DisplayMessageCtrlr,
+    ISO15118Ctrlr,
+    LocalAuthListCtrlr,
+    MonitoringCtrlr,
+    OCPPCommCtrlr,
+    ReservationCtrlr,
+    SampledDataCtrlr,
+    SecurityCtrlr,
+    SmartChargingCtrlr,
+    TariffCostCtrlr,
+    TxCtrlr,
+}
+
+/// Standardized names of the *physical* components of the OCPP 2.0.1 device
+/// model.
+///
+/// Ports `PhysicalComponentName` (`ocpp/v201/enums.py`), sourced from OCPP
+/// 2.0.1 Part 2 Appendix 3.2 v1.3 (`appendices_CSV_v1.3.zip`,
+/// `dm_components_vars.csv`).
+///
+/// # An open vocabulary, not a schema constraint
+///
+/// Same open-string semantics as [`ControllerComponentName`]: this catalog
+/// backs the *open* [`ComponentType::name`](crate::v201::ComponentType) field
+/// (schema `string`, not `enum`), which stays a [`String`]. The enum lets
+/// callers name the standardized physical components without typos.
+///
+/// Every wire value is already a valid Rust PascalCase identifier (including the
+/// acronym spellings `AcDcConverter`, `CPPWMController`, `ELVSupply`, `EVSE`,
+/// `RCD`, `RCDRecloser`, `UIInput`), so variants are named verbatim and need no
+/// `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PhysicalComponentName {
+    AccessBarrier,
+    AcDcConverter,
+    AcPhaseSelector,
+    Actuator,
+    AirCoolingSystem,
+    AreaVentilation,
+    BayOccupancySensor,
+    BeaconLighting,
+    CableBreakawaySensor,
+    CaseAccessSensor,
+    ChargingStation,
+    ChargingStatusIndicator,
+    ConnectedEV,
+    Connector,
+    ConnectorHolsterRelease,
+    ConnectorHolsterSensor,
+    ConnectorPlugRetentionLock,
+    ConnectorProtectionRelease,
+    Controller,
+    ControlMetering,
+    CPPWMController,
+    DataLink,
+    Display,
+    DistributionPanel,
+    ElectricalFeed,
+    ELVSupply,
+    EmergencyStopSensor,
+    EnvironmentalLighting,
+    EVRetentionLock,
+    EVSE,
+    ExternalTemperatureSensor,
+    FiscalMetering,
+    FloodSensor,
+    GroundIsolationProtection,
+    Heater,
+    HumiditySensor,
+    LightSensor,
+    LiquidCoolingSystem,
+    LocalAvailabilitySensor,
+    LocalController,
+    LocalEnergyStorage,
+    OverCurrentProtection,
+    OverCurrentProtectionRecloser,
+    PowerContactor,
+    RCD,
+    RCDRecloser,
+    RealTimeClock,
+    ShockSensor,
+    SpacesCountSignage,
+    Switch,
+    TemperatureSensor,
+    TiltSensor,
+    TokenReader,
+    UIInput,
+    UpstreamProtectionTrigger,
+    VehicleIdSensor,
+}
+
+/// Standardized variable names whose owning component is non-specific in the
+/// OCPP 2.0.1 device model.
+///
+/// Ports `StandardizedVariableName` (`ocpp/v201/enums.py`), derived from the
+/// union of `dm_components_vars.csv` (Generic) and `variables.csv` in
+/// `appendices_CSV_v1.3.zip` (OCPP 2.0.1 Part 2 Appendix 3 v1.3).
+///
+/// # An open vocabulary, not a schema constraint
+///
+/// Same open-string semantics as [`ControllerComponentName`]: this catalog
+/// backs the *open* [`VariableType::name`](crate::v201::VariableType) field
+/// (schema `string`, not `enum`), which stays a [`String`]. The enum lets
+/// callers name the standardized variables without typos.
+///
+/// Every wire value is already a valid Rust PascalCase identifier (including the
+/// acronym spellings `ACCurrent`, `ACVoltage`, `DCCurrent`, `DCVoltage`,
+/// `ICCID`, `IMSI`, `ISO15118EvseId`, `SeccId`), so variants are named verbatim
+/// and need no `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StandardizedVariableName {
+    ACCurrent,
+    Active,
+    ACVoltage,
+    AllowReset,
+    Angle,
+    Attempts,
+    AvailabilityState,
+    Available,
+    Certificate,
+    ChargeProtocol,
+    ChargingCompleteBulk,
+    ChargingCompleteFull,
+    ChargingTime,
+    Color,
+    Complete,
+    ConnectedTime,
+    ConnectorType,
+    Count,
+    Currency,
+    CurrentImbalance,
+    DataText,
+    DateTime,
+    DCCurrent,
+    DCVoltage,
+    DepartureTime,
+    ECVariant,
+    Enabled,
+    Energy,
+    EnergyCapacity,
+    EnergyExport,
+    EnergyExportRegister,
+    EnergyImport,
+    EnergyImportRegister,
+    Entries,
+    EvseId,
+    Fallback,
+    FanSpeed,
+    FirmwareVersion,
+    Force,
+    Formats,
+    Frequency,
+    FuseRating,
+    Height,
+    Humidity,
+    Hysteresis,
+    ICCID,
+    Impedance,
+    IMSI,
+    Interval,
+    ISO15118EvseId,
+    Length,
+    Light,
+    Manufacturer,
+    Message,
+    MinimumStatusDuration,
+    Mode,
+    Model,
+    NetworkAddress,
+    Operated,
+    OperatingTimes,
+    Overload,
+    Percent,
+    PhaseRotation,
+    PostChargingTime,
+    Power,
+    Problem,
+    Protecting,
+    RemainingTimeBulk,
+    RemainingTimeFull,
+    SeccId,
+    SerialNumber,
+    SignalStrength,
+    State,
+    StateOfCharge,
+    StateOfChargeBulk,
+    Storage,
+    SupplyPhases,
+    Suspending,
+    Suspension,
+    Temperature,
+    Time,
+    TimeOffset,
+    Timeout,
+    Token,
+    TokenType,
+    Tries,
+    Tripped,
+    VehicleId,
+    VersionDate,
+    VersionNumber,
+    VoltageImbalance,
+}
