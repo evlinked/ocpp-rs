@@ -124,8 +124,12 @@ use ocpp_types::v201::{
     UpdateEnumType, UpdateFirmwareStatusEnumType, UploadLogStatusEnumType, VPNEnumType,
 };
 use ocpp_types::v201::{
-    AlignedDataCtrlrVariableName, AuthCacheCtrlrVariableName, AuthCtrlrVariableName,
-    CHAdeMOCtrlrVariableName, ClockCtrlrVariableName, CustomizationCtrlrVariableName,
+    AcDcConverterVariableName, AcPhaseSelectorVariableName, AccessBarrierVariableName,
+    ActuatorVariableName, AirCoolingSystemVariableName, AlignedDataCtrlrVariableName,
+    AreaVentilationVariableName, AuthCacheCtrlrVariableName, AuthCtrlrVariableName,
+    BayOccupancySensorVariableName, BeaconLightingVariableName, CHAdeMOCtrlrVariableName,
+    CableBreakawaySensorVariableName, CaseAccessSensorVariableName, ChargingStationVariableName,
+    ChargingStatusIndicatorVariableName, ClockCtrlrVariableName, CustomizationCtrlrVariableName,
     DeviceDataCtrlrInstanceName, DeviceDataCtrlrVariableName, DisplayMessageCtrlrVariableName,
     ISO15118CtrlrVariableName, LocalAuthListCtrlrVariableName,
 };
@@ -1724,6 +1728,143 @@ fn test_standardized_variable_name() {
         "VersionNumber",
         "VoltageImbalance",
     ]);
+}
+
+// ---------------------------------------------------------------------------
+// Device-model physical-component variable-name catalogs (#359 slice 3a)
+//
+// The per-physical-component `*VariableName` sets `AccessBarrier` …
+// `ChargingStatusIndicator` from OCPP 2.0.1 Part 2 Appendix 3, ported from
+// `ocpp/v201/enums.py`. Open recommendation vocabularies (no [`reject`]): the
+// `ComponentType.name` / `VariableType.name` wire fields stay `String`. Each
+// test pins every reference wire string byte-for-byte; the drift risks are the
+// acronym spellings (`DCCurrent`, `ACCurrent`, `ECVariant`) and the
+// parenthesized `"…(Set)"` / `"…(MaxLimit)"` renames.
+// ---------------------------------------------------------------------------
+
+/// Ports `AccessBarrierVariableName` (3 members).
+#[test]
+fn test_access_barrier_variable_name() {
+    pin_all::<AccessBarrierVariableName>(&["Enabled", "Active", "Problem"]);
+}
+
+/// Ports `AcDcConverterVariableName` (9 members). Pins the `DCCurrent` /
+/// `DCVoltage` acronym spellings.
+#[test]
+fn test_ac_dc_converter_variable_name() {
+    pin_all::<AcDcConverterVariableName>(&[
+        "DCCurrent",
+        "DCVoltage",
+        "Enabled",
+        "FanSpeed",
+        "Overload",
+        "Power",
+        "Problem",
+        "Temperature",
+        "Tripped",
+    ]);
+}
+
+/// Ports `AcPhaseSelectorVariableName` (4 members).
+#[test]
+fn test_ac_phase_selector_variable_name() {
+    pin_all::<AcPhaseSelectorVariableName>(&["Active", "Enabled", "PhaseRotation", "Problem"]);
+}
+
+/// Ports `ActuatorVariableName` (4 members).
+#[test]
+fn test_actuator_variable_name() {
+    pin_all::<ActuatorVariableName>(&["Active", "Enabled", "Problem", "State"]);
+}
+
+/// Ports `AirCoolingSystemVariableName` (4 members).
+#[test]
+fn test_air_cooling_system_variable_name() {
+    pin_all::<AirCoolingSystemVariableName>(&["Active", "Enabled", "Problem", "FanSpeed"]);
+}
+
+/// Ports `AreaVentilationVariableName` (4 members).
+#[test]
+fn test_area_ventilation_variable_name() {
+    pin_all::<AreaVentilationVariableName>(&["Active", "Enabled", "Problem", "FanSpeed"]);
+}
+
+/// Ports `BayOccupancySensorVariableName` (3 members).
+#[test]
+fn test_bay_occupancy_sensor_variable_name() {
+    pin_all::<BayOccupancySensorVariableName>(&["Active", "Enabled", "Percent"]);
+}
+
+/// Ports `BeaconLightingVariableName` (8 members). Pins the settable
+/// `"Enabled(Set)"` / `"Percent(Set)"` renames.
+#[test]
+fn test_beacon_lighting_variable_name() {
+    pin_all::<BeaconLightingVariableName>(&[
+        "Active",
+        "Color",
+        "Enabled",
+        "Enabled(Set)",
+        "Percent",
+        "Percent(Set)",
+        "Power",
+        "Problem",
+    ]);
+}
+
+/// Ports `CableBreakawaySensorVariableName` (3 members).
+#[test]
+fn test_cable_breakaway_sensor_variable_name() {
+    pin_all::<CableBreakawaySensorVariableName>(&["Active", "Enabled", "Tripped"]);
+}
+
+/// Ports `CaseAccessSensorVariableName` (5 members). Pins the settable
+/// `"Enabled(Set)"` rename.
+#[test]
+fn test_case_access_sensor_variable_name() {
+    pin_all::<CaseAccessSensorVariableName>(&[
+        "Active",
+        "Enabled",
+        "Enabled(Set)",
+        "Problem",
+        "Tripped",
+    ]);
+}
+
+/// Ports `ChargingStationVariableName` (23 members). Pins the `ACCurrent` /
+/// `ACVoltage` / `ECVariant` acronym spellings and the `"…(MaxLimit)"` renames.
+#[test]
+fn test_charging_station_variable_name() {
+    pin_all::<ChargingStationVariableName>(&[
+        "ACCurrent",
+        "ACVoltage",
+        "ACVoltage(MaxLimit)",
+        "AllowNewSessionsPendingFirmwareUpdate",
+        "Available",
+        "AvailabilityState",
+        "ChargeProtocol",
+        "CurrentImbalance",
+        "ECVariant",
+        "Enabled",
+        "Model",
+        "OperatingTimes",
+        "Overload",
+        "PhaseRotation",
+        "Power",
+        "Power(MaxLimit)",
+        "Problem",
+        "SerialNumber",
+        "SupplyPhases",
+        "SupplyPhases(MaxLimit)",
+        "Tripped",
+        "VendorName",
+        "VoltageImbalance",
+    ]);
+}
+
+/// Ports `ChargingStatusIndicatorVariableName` (2 members).
+#[test]
+fn test_charging_status_indicator_variable_name() {
+    pin_all::<ChargingStatusIndicatorVariableName>(&["Active", "Color"]);
 }
 
 // ---------------------------------------------------------------------------

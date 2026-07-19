@@ -2105,6 +2105,214 @@ pub enum StandardizedVariableName {
     VoltageImbalance,
 }
 
+// ===========================================================================
+// Device-model physical-component variable-name catalogs (Appendix 3)
+// ===========================================================================
+//
+// The enums below are the per-*physical-component* variable-name sets from OCPP
+// 2.0.1 Part 2 Appendix 3 (the standardized device model). They port the
+// `*VariableName` `StrEnum`s of `ocpp/v201/enums.py` and are the
+// physical-component half of the device-model name catalogs tracked by #359
+// (slice 3), following the controller half (slices 1/2, landed in #360/#361).
+//
+// Same open-vocabulary semantics documented for the controller catalogs above:
+// the device model puts these names in the *open* `ComponentType.name` /
+// `VariableType.name` wire fields, which the OCPP 2.0.1 FINAL schema types as
+// `string` (`maxLength: 50`), **not** `enum`. A station may expose
+// vendor-specific components/variables outside these sets, so the message /
+// datatype `name` fields stay [`String`]; these enums are typo-proof catalogs
+// of the standardized spellings and narrow no field.
+//
+// Most wire values are valid Rust PascalCase identifiers named verbatim
+// (including the acronym spellings `DCCurrent`, `ACCurrent`, `ECVariant`).
+// The settable-marker `"…(Set)"` names and the `"…(MaxLimit)"` names are not
+// valid identifiers and so carry an explicit `#[serde(rename)]`.
+//
+// This is **slice 3a**: `AccessBarrier` … `ChargingStatusIndicator` (12
+// classes, 72 members). Slices 3b–3d cover the remaining physical-component
+// sets; the final sub-slice closes #359.
+
+/// Standardized variable names of the `AccessBarrier` physical component.
+/// Ports `AccessBarrierVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AccessBarrierVariableName {
+    Enabled,
+    Active,
+    Problem,
+}
+
+/// Standardized variable names of the `AcDcConverter` physical component.
+/// Ports `AcDcConverterVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AcDcConverterVariableName {
+    DCCurrent,
+    DCVoltage,
+    Enabled,
+    FanSpeed,
+    Overload,
+    Power,
+    Problem,
+    Temperature,
+    Tripped,
+}
+
+/// Standardized variable names of the `AcPhaseSelector` physical component.
+/// Ports `AcPhaseSelectorVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AcPhaseSelectorVariableName {
+    Active,
+    Enabled,
+    PhaseRotation,
+    Problem,
+}
+
+/// Standardized variable names of the `Actuator` physical component.
+/// Ports `ActuatorVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ActuatorVariableName {
+    Active,
+    Enabled,
+    Problem,
+    State,
+}
+
+/// Standardized variable names of the `AirCoolingSystem` physical component.
+/// Ports `AirCoolingSystemVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AirCoolingSystemVariableName {
+    Active,
+    Enabled,
+    Problem,
+    FanSpeed,
+}
+
+/// Standardized variable names of the `AreaVentilation` physical component.
+/// Ports `AreaVentilationVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AreaVentilationVariableName {
+    Active,
+    Enabled,
+    Problem,
+    FanSpeed,
+}
+
+/// Standardized variable names of the `BayOccupancySensor` physical component.
+/// Ports `BayOccupancySensorVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BayOccupancySensorVariableName {
+    Active,
+    Enabled,
+    Percent,
+}
+
+/// Standardized variable names of the `BeaconLighting` physical component.
+/// Ports `BeaconLightingVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BeaconLightingVariableName {
+    Active,
+    Color,
+    Enabled,
+    /// Wire value `"Enabled(Set)"` — the settable enabled flag.
+    #[serde(rename = "Enabled(Set)")]
+    EnabledSet,
+    Percent,
+    /// Wire value `"Percent(Set)"` — the settable percent target.
+    #[serde(rename = "Percent(Set)")]
+    PercentSet,
+    Power,
+    Problem,
+}
+
+/// Standardized variable names of the `CableBreakawaySensor` physical
+/// component. Ports `CableBreakawaySensorVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CableBreakawaySensorVariableName {
+    Active,
+    Enabled,
+    Tripped,
+}
+
+/// Standardized variable names of the `CaseAccessSensor` physical component.
+/// Ports `CaseAccessSensorVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CaseAccessSensorVariableName {
+    Active,
+    Enabled,
+    /// Wire value `"Enabled(Set)"` — the settable enabled flag.
+    #[serde(rename = "Enabled(Set)")]
+    EnabledSet,
+    Problem,
+    Tripped,
+}
+
+/// Standardized variable names of the `ChargingStation` physical component.
+/// Ports `ChargingStationVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ChargingStationVariableName {
+    ACCurrent,
+    ACVoltage,
+    /// Wire value `"ACVoltage(MaxLimit)"` — the AC-voltage max-limit variable.
+    #[serde(rename = "ACVoltage(MaxLimit)")]
+    ACVoltageMaxLimit,
+    AllowNewSessionsPendingFirmwareUpdate,
+    Available,
+    AvailabilityState,
+    ChargeProtocol,
+    CurrentImbalance,
+    ECVariant,
+    Enabled,
+    Model,
+    OperatingTimes,
+    Overload,
+    PhaseRotation,
+    Power,
+    /// Wire value `"Power(MaxLimit)"` — the power max-limit variable.
+    #[serde(rename = "Power(MaxLimit)")]
+    PowerMaxLimit,
+    Problem,
+    SerialNumber,
+    SupplyPhases,
+    /// Wire value `"SupplyPhases(MaxLimit)"` — the supply-phases max-limit
+    /// variable.
+    #[serde(rename = "SupplyPhases(MaxLimit)")]
+    SupplyPhasesMaxLimit,
+    Tripped,
+    VendorName,
+    VoltageImbalance,
+}
+
+/// Standardized variable names of the `ChargingStatusIndicator` physical
+/// component. Ports `ChargingStatusIndicatorVariableName`.
+///
+/// Open recommendation vocabulary — see the module section above.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ChargingStatusIndicatorVariableName {
+    Active,
+    Color,
+}
+
 /// Standardized variable names of the `MonitoringCtrlr` controller component.
 ///
 /// Ports `MonitoringCtrlrVariableName` (`ocpp/v201/enums.py`), sourced from OCPP
