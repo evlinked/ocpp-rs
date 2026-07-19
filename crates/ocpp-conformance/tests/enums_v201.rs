@@ -140,6 +140,14 @@ use ocpp_types::v201::{
     ConnectorPlugRetentionLockVariableName, ConnectorProtectionReleaseVariableName,
     ConnectorVariableName, ControlMeteringVariableName, ControllerVariableName,
 };
+// Device-model physical-component variable-name catalogs (Appendix 3) — slice
+// 3d part 1 (`ExternalTemperatureSensor` → `LocalEnergyStorage`).
+use ocpp_types::v201::{
+    ExternalTemperatureSensorVariableName, FiscalMeteringVariableName, FloodSensorVariableName,
+    GroundIsolationProtectionVariableName, HeaterVariableName, HumiditySensorVariableName,
+    LightSensorVariableName, LiquidCoolingSystemVariableName, LocalAvailabilitySensorVariableName,
+    LocalControllerVariableName, LocalEnergyStorageVariableName,
+};
 
 /// Assert that `wire` deserializes into `T` and re-serializes back to the
 /// identical string — the reference's `Enum.member == "Wire"` assertion,
@@ -2223,4 +2231,134 @@ fn test_cppwm_controller_variable_name() {
         "SelftestActive(Set)",
         "State",
     ]);
+}
+
+// -- Slice 3d part 1: `ExternalTemperatureSensor` → `LocalEnergyStorage` -------
+
+/// `ExternalTemperatureSensorVariableName` — the 3 standardized
+/// `ExternalTemperatureSensor` variable names (open recommendation vocabulary,
+/// no [`reject`]).
+#[test]
+fn test_external_temperature_sensor_variable_name() {
+    pin_all::<ExternalTemperatureSensorVariableName>(&["Active", "Problem", "Temperature"]);
+}
+
+/// `FiscalMeteringVariableName` — the 15 standardized `FiscalMetering` variable
+/// names (open recommendation vocabulary, no [`reject`]). Drift risks are the
+/// `ECVariant` acronym and the bracketed `Manufacturer[CT]` / `Model[Meter]` /
+/// `OptionsSet[MeterValueAlignedData]` / `SerialNumber[…]` spellings.
+#[test]
+fn test_fiscal_metering_variable_name() {
+    pin_all::<FiscalMeteringVariableName>(&[
+        "Problem",
+        "Certificate",
+        "ECVariant",
+        "EnergyExport",
+        "EnergyExportRegister",
+        "EnergyImport",
+        "EnergyImportRegister",
+        "Manufacturer[CT]",
+        "Manufacturer[Meter]",
+        "Model[CT]",
+        "Model[Meter]",
+        "OptionsSet[MeterValueAlignedData]",
+        "OptionsSet[TxnStoppedAlignedData]",
+        "SerialNumber[CT]",
+        "SerialNumber[Meter]",
+    ]);
+}
+
+/// `FloodSensorVariableName` — the 5 standardized `FloodSensor` variable names
+/// (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_flood_sensor_variable_name() {
+    pin_all::<FloodSensorVariableName>(&["Active", "Enabled", "Height", "Percent", "Tripped"]);
+}
+
+/// `GroundIsolationProtectionVariableName` — the 5 standardized
+/// `GroundIsolationProtection` variable names (open recommendation vocabulary,
+/// no [`reject`]).
+#[test]
+fn test_ground_isolation_protection_variable_name() {
+    pin_all::<GroundIsolationProtectionVariableName>(&[
+        "Active",
+        "Complete",
+        "Enabled",
+        "Impedance",
+        "Problem",
+    ]);
+}
+
+/// `HeaterVariableName` — the 9 standardized `Heater` variable names (open
+/// recommendation vocabulary, no [`reject`]). Drift risks are the parenthesized
+/// `Power(MaxLimit)` / `Power(MaxSet)` / `Temperature(MinSet)` /
+/// `Temperature(MaxSet)` spellings.
+#[test]
+fn test_heater_variable_name() {
+    pin_all::<HeaterVariableName>(&[
+        "Active",
+        "Enabled",
+        "Problem",
+        "Tripped",
+        "Power",
+        "Power(MaxLimit)",
+        "Power(MaxSet)",
+        "Temperature(MinSet)",
+        "Temperature(MaxSet)",
+    ]);
+}
+
+/// `HumiditySensorVariableName` — the 3 standardized `HumiditySensor` variable
+/// names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_humidity_sensor_variable_name() {
+    pin_all::<HumiditySensorVariableName>(&["Enabled", "Humidity", "Problem"]);
+}
+
+/// `LightSensorVariableName` — the 3 standardized `LightSensor` variable names
+/// (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_light_sensor_variable_name() {
+    pin_all::<LightSensorVariableName>(&["Enabled", "Light", "Problem"]);
+}
+
+/// `LiquidCoolingSystemVariableName` — the 4 standardized `LiquidCoolingSystem`
+/// variable names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_liquid_cooling_system_variable_name() {
+    pin_all::<LiquidCoolingSystemVariableName>(&["Active", "Enabled", "Problem", "Temperature"]);
+}
+
+/// `LocalAvailabilitySensorVariableName` — the 3 standardized
+/// `LocalAvailabilitySensor` variable names (open recommendation vocabulary, no
+/// [`reject`]).
+#[test]
+fn test_local_availability_sensor_variable_name() {
+    pin_all::<LocalAvailabilitySensorVariableName>(&["Active", "Enabled", "Problem"]);
+}
+
+/// `LocalControllerVariableName` — the 10 standardized `LocalController`
+/// variable names (open recommendation vocabulary, no [`reject`]). Drift risk
+/// is the `ECVariant` acronym.
+#[test]
+fn test_local_controller_variable_name() {
+    pin_all::<LocalControllerVariableName>(&[
+        "ChargingStation",
+        "DistributionPanel",
+        "ECVariant",
+        "Enabled",
+        "Identity",
+        "Manufacturer",
+        "Model",
+        "Problem",
+        "SerialNumber",
+        "Tripped",
+    ]);
+}
+
+/// `LocalEnergyStorageVariableName` — the 2 standardized `LocalEnergyStorage`
+/// variable names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_local_energy_storage_variable_name() {
+    pin_all::<LocalEnergyStorageVariableName>(&["EnergyCapacity", "Identity"]);
 }
