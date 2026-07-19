@@ -2963,3 +2963,187 @@ pub enum EVSEVariableName {
     Tripped,
     VoltageImbalance,
 }
+
+// ===========================================================================
+// Standardized StatusInfo reason codes (Appendix 5) and units of measure
+// ===========================================================================
+//
+// The two enums below are the last two non-`*VariableName` recommendation
+// vocabularies of `ocpp/v201/enums.py`. Like [`SecurityEventType`] and the
+// device-model name catalogs above, they name *open* string fields, not JSON
+// `enum`s:
+//
+// - `StatusInfoReasonType` catalogs the standardized `StatusInfo.reasonCode`
+//   values. The OCPP 2.0.1 FINAL schema types that field as `string`
+//   (`maxLength: 20`), so a station may legitimately return a vendor-specific
+//   code; [`StatusInfoType::reason_code`](crate::v201::StatusInfoType::reason_code)
+//   stays a [`String`].
+// - `StandardizedUnitsOfMeasureType` catalogs the allowable `unit` values of a
+//   sampled value / variable characteristic. The reference types that field as
+//   `Union[StandardizedUnitsOfMeasureType, str]` and the FINAL schema as a
+//   bounded `string`, so
+//   [`UnitOfMeasureType::unit`](crate::v201::UnitOfMeasureType::unit) stays an
+//   `Option<`[`String`]`>`.
+//
+// These enums exist so callers can name the standardized values without
+// stringly-typed typos — they do not narrow any field. Members and wire strings
+// are verbatim from the reference; variants whose spec spelling is not an
+// idiomatic UpperCamelCase Rust identifier carry an explicit `#[serde(rename)]`.
+
+/// Standardized `StatusInfo.reasonCode` values.
+///
+/// Ports `StatusInfoReasonType` (`ocpp/v201/enums.py`) — the reason codes of
+/// OCPP 2.0.1 Part 2, Appendix 5, v1.3.
+///
+/// Open recommendation vocabulary — see the module section above. Every wire
+/// value is already a valid UpperCamelCase Rust identifier (the acronym-cased
+/// `CSNotAccepted`, `InvalidCSR`, `InvalidURL`, `InvalidMessageSeq`,
+/// `UnknownEvse` included), so variants are named verbatim and need no
+/// `#[serde(rename)]` — matching the [`SecurityEventType`] precedent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StatusInfoReasonType {
+    CSNotAccepted,
+    DuplicateProfile,
+    DuplicateRequestId,
+    FixedCable,
+    FwUpdateInProgress,
+    InternalError,
+    InvalidCertificate,
+    InvalidCSR,
+    InvalidIdToken,
+    InvalidMessageSeq,
+    InvalidProfile,
+    InvalidSchedule,
+    InvalidStackLevel,
+    InvalidURL,
+    InvalidValue,
+    MissingDeviceModelInfo,
+    MissingParam,
+    NoCable,
+    NoError,
+    NotEnabled,
+    NotFound,
+    OutOfMemory,
+    OutOfStorage,
+    ReadOnly,
+    TooLargeElement,
+    TooManyElements,
+    TxInProgress,
+    TxNotFound,
+    TxStarted,
+    UnknownConnectorId,
+    UnknownConnectorType,
+    UnknownEvse,
+    UnknownTxId,
+    Unspecified,
+    UnsupportedParam,
+    UnsupportedRateUnit,
+    UnsupportedRequest,
+    ValueOutOfRange,
+    ValuePositiveOnly,
+    ValueTooHigh,
+    ValueTooLow,
+    ValueZeroNotAllowed,
+    WriteOnly,
+}
+
+/// Allowable `unit` values of a sampled value / variable characteristic.
+///
+/// Ports `StandardizedUnitsOfMeasureType` (`ocpp/v201/enums.py`). The default
+/// unit on the wire is `"Wh"`.
+///
+/// Open recommendation vocabulary — see the module section above. Most wire
+/// spellings are lower- or mixed-case unit symbols that are not idiomatic
+/// UpperCamelCase Rust identifiers, so those variants carry an explicit
+/// `#[serde(rename)]`; the plain symbols that already are valid identifiers
+/// (`B`, `Deg`, `Hz`, `N`, `Ohm`, `Percent`, `Wh`, `W`, `A`, `V`, `Celsius`,
+/// `Fahrenheit`, `K`) are named verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum StandardizedUnitsOfMeasureType {
+    /// Wire value `"ASU"` — arbitrary strength unit (signal strength).
+    #[serde(rename = "ASU")]
+    Asu,
+    /// Wire value `"B"` — bytes.
+    B,
+    /// Wire value `"dB"` — decibels.
+    #[serde(rename = "dB")]
+    Db,
+    /// Wire value `"dBm"` — decibel-milliwatts.
+    #[serde(rename = "dBm")]
+    Dbm,
+    /// Wire value `"Deg"` — degrees (angle).
+    Deg,
+    /// Wire value `"Hz"` — hertz.
+    Hz,
+    /// Wire value `"lx"` — lux.
+    #[serde(rename = "lx")]
+    Lx,
+    /// Wire value `"m"` — metres.
+    #[serde(rename = "m")]
+    M,
+    /// Wire value `"ms2"` — metres per second squared (acceleration).
+    #[serde(rename = "ms2")]
+    Ms2,
+    /// Wire value `"N"` — newtons.
+    N,
+    /// Wire value `"Ohm"` — ohms.
+    Ohm,
+    /// Wire value `"kPa"` — kilopascals.
+    #[serde(rename = "kPa")]
+    Kpa,
+    /// Wire value `"Percent"` — percent.
+    Percent,
+    /// Wire value `"RH"` — relative humidity (percent).
+    #[serde(rename = "RH")]
+    Rh,
+    /// Wire value `"RPM"` — revolutions per minute.
+    #[serde(rename = "RPM")]
+    Rpm,
+    /// Wire value `"s"` — seconds.
+    #[serde(rename = "s")]
+    S,
+    /// Wire value `"VA"` — volt-amperes (apparent power).
+    #[serde(rename = "VA")]
+    Va,
+    /// Wire value `"kVA"` — kilovolt-amperes.
+    #[serde(rename = "kVA")]
+    Kva,
+    /// Wire value `"VAh"` — volt-ampere-hours.
+    #[serde(rename = "VAh")]
+    Vah,
+    /// Wire value `"kVAh"` — kilovolt-ampere-hours.
+    #[serde(rename = "kVAh")]
+    Kvah,
+    /// Wire value `"var"` — volt-amperes reactive.
+    #[serde(rename = "var")]
+    Var,
+    /// Wire value `"kvar"` — kilovolt-amperes reactive.
+    #[serde(rename = "kvar")]
+    Kvar,
+    /// Wire value `"varh"` — volt-ampere-reactive-hours.
+    #[serde(rename = "varh")]
+    Varh,
+    /// Wire value `"kvarh"` — kilovolt-ampere-reactive-hours.
+    #[serde(rename = "kvarh")]
+    Kvarh,
+    /// Wire value `"Wh"` — watt-hours (the default unit).
+    Wh,
+    /// Wire value `"kWh"` — kilowatt-hours.
+    #[serde(rename = "kWh")]
+    Kwh,
+    /// Wire value `"W"` — watts.
+    W,
+    /// Wire value `"kW"` — kilowatts.
+    #[serde(rename = "kW")]
+    Kw,
+    /// Wire value `"A"` — amperes.
+    A,
+    /// Wire value `"V"` — volts.
+    V,
+    /// Wire value `"Celsius"` — degrees Celsius.
+    Celsius,
+    /// Wire value `"Fahrenheit"` — degrees Fahrenheit.
+    Fahrenheit,
+    /// Wire value `"K"` — kelvin.
+    K,
+}
