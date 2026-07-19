@@ -140,6 +140,12 @@ use ocpp_types::v201::{
     ConnectorPlugRetentionLockVariableName, ConnectorProtectionReleaseVariableName,
     ConnectorVariableName, ControlMeteringVariableName, ControllerVariableName,
 };
+// Device-model physical-component variable-name catalogs (Appendix 3) — slice 3c.
+use ocpp_types::v201::{
+    DataLinkVariableName, DisplayVariableName, DistributionPanelVariableName,
+    ELVSupplyVariableName, EVRetentionLockVariableName, EVSEVariableName,
+    ElectricalFeedVariableName, EmergencyStopSensorVariableName, EnvironmentalLightingVariableName,
+};
 
 /// Assert that `wire` deserializes into `T` and re-serializes back to the
 /// identical string — the reference's `Enum.member == "Wire"` assertion,
@@ -2222,5 +2228,129 @@ fn test_cppwm_controller_variable_name() {
         "SelftestActive",
         "SelftestActive(Set)",
         "State",
+    ]);
+}
+
+// Device-model physical-component variable-name catalogs (#363 slice 3c):
+// DataLink → EVSE. Faithful `pin_all` ports of the reference `*VariableName`
+// StrEnums; wire strings verified byte-for-byte against `ocpp/v201/enums.py`.
+
+#[test]
+fn test_data_link_variable_name() {
+    pin_all::<DataLinkVariableName>(&[
+        "Active",
+        "Complete",
+        "Enabled",
+        "Fallback",
+        "ICCID",
+        "IMSI",
+        "NetworkAddress",
+        "Problem",
+        "SignalStrength",
+    ]);
+}
+
+#[test]
+fn test_display_variable_name() {
+    pin_all::<DisplayVariableName>(&[
+        "Color",
+        "Count[HeightInChars]",
+        "Count[WidthInChars]",
+        "DataText[Visible]",
+        "Enabled",
+        "Problem",
+        "State",
+    ]);
+}
+
+#[test]
+fn test_distribution_panel_variable_name() {
+    pin_all::<DistributionPanelVariableName>(&[
+        "ChargingStation",
+        "DistributionPanel",
+        "Fuse",
+        "InstanceName",
+    ]);
+}
+
+#[test]
+fn test_electrical_feed_variable_name() {
+    pin_all::<ElectricalFeedVariableName>(&[
+        "ACVoltage",
+        "Active",
+        "DCVoltage",
+        "Enabled",
+        "Energy",
+        "PhaseRotation",
+        "Power",
+        "PowerType",
+        "Problem",
+        "SupplyPhases",
+    ]);
+}
+
+#[test]
+fn test_elv_supply_variable_name() {
+    pin_all::<ELVSupplyVariableName>(&[
+        "EnergyImportRegister",
+        "Fallback",
+        "Fallback(MaxLimit)",
+        "Power",
+        "Power(MaxLimit)",
+        "StateOfCharge",
+        "Time",
+    ]);
+}
+
+#[test]
+fn test_emergency_stop_sensor_variable_name() {
+    pin_all::<EmergencyStopSensorVariableName>(&["Enabled", "Active", "Tripped"]);
+}
+
+#[test]
+fn test_environmental_lighting_variable_name() {
+    pin_all::<EnvironmentalLightingVariableName>(&[
+        "Active",
+        "Color",
+        "Enabled",
+        "Enabled(Set)",
+        "Percent",
+        "Percent(Set)",
+        "Power",
+        "Problem",
+    ]);
+}
+
+#[test]
+fn test_ev_retention_lock_variable_name() {
+    pin_all::<EVRetentionLockVariableName>(&["Active", "Complete", "Enabled", "Problem"]);
+}
+
+#[test]
+fn test_evse_variable_name() {
+    pin_all::<EVSEVariableName>(&[
+        "ACCurrent",
+        "ACVoltage",
+        "Available",
+        "AvailabilityState",
+        "AllowReset",
+        "ChargeProtocol",
+        "ChargingTime",
+        "Count[ChargingProfiles](MaxLimit)",
+        "Count[ChargingProfiles]",
+        "CurrentImbalance",
+        "DCCurrent",
+        "DCVoltage",
+        "Enabled",
+        "EvseId",
+        "ISO15118EvseId",
+        "Overload",
+        "PhaseRotation",
+        "PostChargingTime",
+        "Power",
+        "Problem",
+        "SupplyPhases",
+        "Tripped",
+        "VoltageImbalance",
     ]);
 }
