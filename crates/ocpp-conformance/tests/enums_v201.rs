@@ -133,6 +133,13 @@ use ocpp_types::v201::{
     DeviceDataCtrlrInstanceName, DeviceDataCtrlrVariableName, DisplayMessageCtrlrVariableName,
     ISO15118CtrlrVariableName, LocalAuthListCtrlrVariableName,
 };
+// Device-model physical-component variable-name catalogs (Appendix 3) — slice 3b.
+use ocpp_types::v201::{
+    CPPWMControllerVariableName, ChargingStateVariableName, ConnectedEVVariableName,
+    ConnectorHolsterReleaseVariableName, ConnectorHolsterSensorVariableName,
+    ConnectorPlugRetentionLockVariableName, ConnectorProtectionReleaseVariableName,
+    ConnectorVariableName, ControlMeteringVariableName, ControllerVariableName,
+};
 
 /// Assert that `wire` deserializes into `T` and re-serializes back to the
 /// identical string — the reference's `Enum.member == "Wire"` assertion,
@@ -2039,5 +2046,181 @@ fn test_tx_ctrlr_variable_name() {
         "TxBeforeAcceptedEnabled",
         "TxStartPoint",
         "TxStopPoint",
+    ]);
+}
+
+// --- Device-model physical-component variable-name catalogs (Appendix 3) — 3b ---
+// Open recommendation vocabularies, no `reject` — an unlisted name is a valid
+// open-string value. Wire strings verified byte-for-byte against
+// `ocpp/v201/enums.py` (`ConnectedEV` … `CPPWMController`, 98 members).
+
+/// `ConnectedEVVariableName` — the 35 standardized `ConnectedEV` variable names
+/// (open recommendation vocabulary, no [`reject`]). Drift risks are the dotted
+/// measurement spellings (`ACCurrent.minSet`, `DCVoltage.target`, `Power.maxSet`,
+/// `StateOfCharge.actual`, …) and the `ProtocolSupportedByEV` acronym.
+#[test]
+fn test_connected_ev_variable_name() {
+    pin_all::<ConnectedEVVariableName>(&[
+        "Available",
+        "VehicleId",
+        "ProtocolAgreed",
+        "ProtocolSupportedByEV",
+        "ACCurrent.minSet",
+        "ACCurrent.maxSet",
+        "ACVoltage.maxSet",
+        "DCCurrent.minSet",
+        "DCCurrent.maxSet",
+        "DCCurrent.target",
+        "DCVoltage.minSet",
+        "DCVoltage.maxSet",
+        "DCVoltage.target",
+        "Power.maxSet",
+        "EnergyCapacity",
+        "EnergyImport.target",
+        "DepartureTime",
+        "RemainingTimeBulk",
+        "RemainingTimeFull.maxSet",
+        "RemainingTimeFull.actual",
+        "StateOfChargeBulk",
+        "StateOfCharge.maxSet",
+        "StateOfCharge.actual",
+        "ChargingCompleteBulk",
+        "ChargingCompleteFull",
+        "BatteryOvervoltage",
+        "BatteryUndervoltage",
+        "ChargingCurrentDeviation",
+        "BatteryTemperature",
+        "VoltageDeviation",
+        "ChargingSystemError",
+        "VehicleShiftPosition",
+        "VehicleChargingEnabled",
+        "ChargingSystemIncompatibility",
+        "ChargerConnectorLockFault",
+    ]);
+}
+
+/// `ChargingStateVariableName` — the 10 standardized `ChargingState` variable
+/// names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_charging_state_variable_name() {
+    pin_all::<ChargingStateVariableName>(&[
+        "BatteryOvervoltage",
+        "BatteryUndervoltage",
+        "ChargingCurrentDeviation",
+        "BatteryTemperature",
+        "VoltageDeviation",
+        "ChargingSystemError",
+        "VehicleShiftPosition",
+        "VehicleChargingEnabled",
+        "ChargingSystemIncompatibility",
+        "ChargerConnectorLockFault",
+    ]);
+}
+
+/// `ConnectorVariableName` — the 10 standardized `Connector` variable names
+/// (open recommendation vocabulary, no [`reject`]). Drift risk is the
+/// parenthesized `SupplyPhases(MaxLimit)`.
+#[test]
+fn test_connector_variable_name() {
+    pin_all::<ConnectorVariableName>(&[
+        "AvailabilityState",
+        "Available",
+        "ChargeProtocol",
+        "ConnectorType",
+        "Enabled",
+        "PhaseRotation",
+        "Problem",
+        "SupplyPhases",
+        "SupplyPhases(MaxLimit)",
+        "Tripped",
+    ]);
+}
+
+/// `ConnectorHolsterReleaseVariableName` — the 4 standardized
+/// `ConnectorHolsterRelease` variable names (open recommendation vocabulary, no
+/// [`reject`]).
+#[test]
+fn test_connector_holster_release_variable_name() {
+    pin_all::<ConnectorHolsterReleaseVariableName>(&["Enabled", "Active", "Problem", "State"]);
+}
+
+/// `ConnectorHolsterSensorVariableName` — the 3 standardized
+/// `ConnectorHolsterSensor` variable names (open recommendation vocabulary, no
+/// [`reject`]).
+#[test]
+fn test_connector_holster_sensor_variable_name() {
+    pin_all::<ConnectorHolsterSensorVariableName>(&["Enabled", "Active", "Problem"]);
+}
+
+/// `ConnectorPlugRetentionLockVariableName` — the 7 standardized
+/// `ConnectorPlugRetentionLock` variable names (open recommendation vocabulary,
+/// no [`reject`]). Drift risks are the parenthesized `Tries(SetLimit)` /
+/// `Tries(MaxLimit)`.
+#[test]
+fn test_connector_plug_retention_lock_variable_name() {
+    pin_all::<ConnectorPlugRetentionLockVariableName>(&[
+        "Enabled",
+        "Active",
+        "Problem",
+        "Tripped",
+        "Tries",
+        "Tries(SetLimit)",
+        "Tries(MaxLimit)",
+    ]);
+}
+
+/// `ConnectorProtectionReleaseVariableName` — the 4 standardized
+/// `ConnectorProtectionRelease` variable names (open recommendation vocabulary,
+/// no [`reject`]).
+#[test]
+fn test_connector_protection_release_variable_name() {
+    pin_all::<ConnectorProtectionReleaseVariableName>(&["Enabled", "Active", "Problem", "Tripped"]);
+}
+
+/// `ControllerVariableName` — the 13 standardized `Controller` variable names
+/// (open recommendation vocabulary, no [`reject`]). Drift risks are the
+/// bracketed `Interval[Heartbeat]`, the parenthesized `SelftestActive(Set)`,
+/// and the `ECVariant` acronym.
+#[test]
+fn test_controller_variable_name() {
+    pin_all::<ControllerVariableName>(&[
+        "Active",
+        "ECVariant",
+        "FirmwareVersion",
+        "Interval[Heartbeat]",
+        "Manufacturer",
+        "MaxMsgElements",
+        "Model",
+        "Problem",
+        "SelftestActive",
+        "SelftestActive(Set)",
+        "SerialNumber",
+        "VersionDate",
+        "VersionNumber",
+    ]);
+}
+
+/// `ControlMeteringVariableName` — the 4 standardized `ControlMetering`
+/// variable names (open recommendation vocabulary, no [`reject`]). Drift risks
+/// are the `ACCurrent` / `DCCurrent` / `DCVoltage` acronyms.
+#[test]
+fn test_control_metering_variable_name() {
+    pin_all::<ControlMeteringVariableName>(&["Power", "ACCurrent", "DCCurrent", "DCVoltage"]);
+}
+
+/// `CPPWMControllerVariableName` — the 8 standardized `CPPWMController` variable
+/// names (open recommendation vocabulary, no [`reject`]). Drift risks are the
+/// `DCVoltage` acronym and the parenthesized `SelftestActive(Set)`.
+#[test]
+fn test_cppwm_controller_variable_name() {
+    pin_all::<CPPWMControllerVariableName>(&[
+        "Active",
+        "DCVoltage",
+        "Enabled",
+        "Percentage",
+        "Problem",
+        "SelftestActive",
+        "SelftestActive(Set)",
+        "State",
     ]);
 }

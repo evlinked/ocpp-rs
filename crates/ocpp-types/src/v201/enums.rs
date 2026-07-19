@@ -2523,3 +2523,251 @@ pub enum TxCtrlrVariableName {
     TxStartPoint,
     TxStopPoint,
 }
+
+// ---------------------------------------------------------------------------
+// Device-model physical-component variable-name catalogs (Appendix 3) — 3b
+//
+// The per-physical-component `*VariableName` StrEnums `ConnectedEV` →
+// `CPPWMController` (slice 3b of #359 / #363; slice 3a is `AccessBarrier` →
+// `ChargingStatusIndicator`). Same open-recommendation-vocabulary semantics as
+// the controller catalogs: the device model addresses these via the *open*
+// `ComponentType.name` / `VariableType.name` fields, which the OCPP 2.0.1 FINAL
+// schema types as `string` (`maxLength: 50`), **not** `enum`. Message/datatype
+// `name` fields stay `String` — these enums are typo-proof catalogs of the
+// standardized spellings, not wire-narrowing constraints.
+// ---------------------------------------------------------------------------
+
+/// Standardized variable names of the `ConnectedEV` physical component.
+///
+/// Ports `ConnectedEVVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+///
+/// The dotted measurement spellings (`"ACCurrent.minSet"`, `"DCVoltage.target"`,
+/// `"Power.maxSet"`, `"StateOfCharge.actual"`, …) are not valid Rust
+/// identifiers and carry an explicit `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ConnectedEVVariableName {
+    Available,
+    VehicleId,
+    ProtocolAgreed,
+    ProtocolSupportedByEV,
+    #[serde(rename = "ACCurrent.minSet")]
+    ACCurrentMinSet,
+    #[serde(rename = "ACCurrent.maxSet")]
+    ACCurrentMaxSet,
+    #[serde(rename = "ACVoltage.maxSet")]
+    ACVoltageMaxSet,
+    #[serde(rename = "DCCurrent.minSet")]
+    DCCurrentMinSet,
+    #[serde(rename = "DCCurrent.maxSet")]
+    DCCurrentMaxSet,
+    #[serde(rename = "DCCurrent.target")]
+    DCCurrentTarget,
+    #[serde(rename = "DCVoltage.minSet")]
+    DCVoltageMinSet,
+    #[serde(rename = "DCVoltage.maxSet")]
+    DCVoltageMaxSet,
+    #[serde(rename = "DCVoltage.target")]
+    DCVoltageTarget,
+    #[serde(rename = "Power.maxSet")]
+    PowerMaxSet,
+    EnergyCapacity,
+    #[serde(rename = "EnergyImport.target")]
+    EnergyImportTarget,
+    DepartureTime,
+    RemainingTimeBulk,
+    #[serde(rename = "RemainingTimeFull.maxSet")]
+    RemainingTimeFullMaxSet,
+    #[serde(rename = "RemainingTimeFull.actual")]
+    RemainingTimeFullActual,
+    StateOfChargeBulk,
+    #[serde(rename = "StateOfCharge.maxSet")]
+    StateOfChargeMaxSet,
+    #[serde(rename = "StateOfCharge.actual")]
+    StateOfChargeActual,
+    ChargingCompleteBulk,
+    ChargingCompleteFull,
+    BatteryOvervoltage,
+    BatteryUndervoltage,
+    ChargingCurrentDeviation,
+    BatteryTemperature,
+    VoltageDeviation,
+    ChargingSystemError,
+    VehicleShiftPosition,
+    VehicleChargingEnabled,
+    ChargingSystemIncompatibility,
+    ChargerConnectorLockFault,
+}
+
+/// Standardized variable names of the `ChargingState` physical component.
+///
+/// Ports `ChargingStateVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale. (The status
+/// half of [`ConnectedEVVariableName`]; distinct from the `ChargingState`
+/// *message* enum [`ChargingStateEnumType`].)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ChargingStateVariableName {
+    BatteryOvervoltage,
+    BatteryUndervoltage,
+    ChargingCurrentDeviation,
+    BatteryTemperature,
+    VoltageDeviation,
+    ChargingSystemError,
+    VehicleShiftPosition,
+    VehicleChargingEnabled,
+    ChargingSystemIncompatibility,
+    ChargerConnectorLockFault,
+}
+
+/// Standardized variable names of the `Connector` physical component.
+///
+/// Ports `ConnectorVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ConnectorVariableName {
+    AvailabilityState,
+    Available,
+    ChargeProtocol,
+    ConnectorType,
+    Enabled,
+    PhaseRotation,
+    Problem,
+    SupplyPhases,
+    /// Wire value `"SupplyPhases(MaxLimit)"` — the settable phase-count limit.
+    #[serde(rename = "SupplyPhases(MaxLimit)")]
+    SupplyPhasesMaxLimit,
+    Tripped,
+}
+
+/// Standardized variable names of the `ConnectorHolsterRelease` physical
+/// component.
+///
+/// Ports `ConnectorHolsterReleaseVariableName` (`ocpp/v201/enums.py`), OCPP
+/// 2.0.1 Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ConnectorHolsterReleaseVariableName {
+    Enabled,
+    Active,
+    Problem,
+    State,
+}
+
+/// Standardized variable names of the `ConnectorHolsterSensor` physical
+/// component.
+///
+/// Ports `ConnectorHolsterSensorVariableName` (`ocpp/v201/enums.py`), OCPP
+/// 2.0.1 Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ConnectorHolsterSensorVariableName {
+    Enabled,
+    Active,
+    Problem,
+}
+
+/// Standardized variable names of the `ConnectorPlugRetentionLock` physical
+/// component.
+///
+/// Ports `ConnectorPlugRetentionLockVariableName` (`ocpp/v201/enums.py`), OCPP
+/// 2.0.1 Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+///
+/// The parenthesized `Tries(SetLimit)` / `Tries(MaxLimit)` spellings are not
+/// valid Rust identifiers and carry an explicit `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ConnectorPlugRetentionLockVariableName {
+    Enabled,
+    Active,
+    Problem,
+    Tripped,
+    Tries,
+    /// Wire value `"Tries(SetLimit)"` — the settable retry limit.
+    #[serde(rename = "Tries(SetLimit)")]
+    TriesSetLimit,
+    /// Wire value `"Tries(MaxLimit)"` — the maximum retry limit.
+    #[serde(rename = "Tries(MaxLimit)")]
+    TriesMaxLimit,
+}
+
+/// Standardized variable names of the `ConnectorProtectionRelease` physical
+/// component.
+///
+/// Ports `ConnectorProtectionReleaseVariableName` (`ocpp/v201/enums.py`), OCPP
+/// 2.0.1 Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ConnectorProtectionReleaseVariableName {
+    Enabled,
+    Active,
+    Problem,
+    Tripped,
+}
+
+/// Standardized variable names of the `Controller` physical component.
+///
+/// Ports `ControllerVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+///
+/// The bracketed `Interval[Heartbeat]` and parenthesized `SelftestActive(Set)`
+/// spellings are not valid Rust identifiers and carry an explicit
+/// `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ControllerVariableName {
+    Active,
+    ECVariant,
+    FirmwareVersion,
+    /// Wire value `"Interval[Heartbeat]"` — the heartbeat reporting interval.
+    #[serde(rename = "Interval[Heartbeat]")]
+    IntervalHeartbeat,
+    Manufacturer,
+    MaxMsgElements,
+    Model,
+    Problem,
+    SelftestActive,
+    /// Wire value `"SelftestActive(Set)"` — the settable selftest flag.
+    #[serde(rename = "SelftestActive(Set)")]
+    SelftestActiveSet,
+    SerialNumber,
+    VersionDate,
+    VersionNumber,
+}
+
+/// Standardized variable names of the `ControlMetering` physical component.
+///
+/// Ports `ControlMeteringVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ControlMeteringVariableName {
+    Power,
+    ACCurrent,
+    DCCurrent,
+    DCVoltage,
+}
+
+/// Standardized variable names of the `CPPWMController` physical component.
+///
+/// Ports `CPPWMControllerVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+///
+/// The parenthesized `SelftestActive(Set)` spelling is not a valid Rust
+/// identifier and carries an explicit `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CPPWMControllerVariableName {
+    Active,
+    DCVoltage,
+    Enabled,
+    Percentage,
+    Problem,
+    SelftestActive,
+    /// Wire value `"SelftestActive(Set)"` — the settable selftest flag.
+    #[serde(rename = "SelftestActive(Set)")]
+    SelftestActiveSet,
+    State,
+}
