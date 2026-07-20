@@ -156,6 +156,17 @@ use ocpp_types::v201::{
     LocalControllerVariableName, LocalEnergyStorageVariableName,
 };
 
+// Device-model physical-component variable-name catalogs (Appendix 3) — slice
+// 3d part 2 (`OverCurrentProtection` → `VehicleIdSensor`).
+use ocpp_types::v201::{
+    OverCurrentProtectionRecloserVariableName, OverCurrentProtectionVariableName,
+    PowerContactorVariableName, RCDRecloserVariableName, RCDVariableName,
+    RealTimeClockVariableName, ShockSensorVariableName, SpacesCountSignageVariableName,
+    SwitchVariableName, TemperatureSensorVariableName, TiltSensorVariableName,
+    TokenReaderVariableName, UIInputVariableName, UpstreamProtectionTriggerVariableName,
+    VehicleIdSensorVariableName,
+};
+
 /// Assert that `wire` deserializes into `T` and re-serializes back to the
 /// identical string — the reference's `Enum.member == "Wire"` assertion,
 /// expressed as a byte-for-byte serde round-trip.
@@ -2492,4 +2503,153 @@ fn test_local_controller_variable_name() {
 #[test]
 fn test_local_energy_storage_variable_name() {
     pin_all::<LocalEnergyStorageVariableName>(&["EnergyCapacity", "Identity"]);
+}
+
+/// `OverCurrentProtectionVariableName` — the 3 standardized
+/// `OverCurrentProtection` variable names (open recommendation vocabulary, no
+/// [`reject`]). Drift risk is the `ACCurrent` acronym.
+#[test]
+fn test_over_current_protection_variable_name() {
+    pin_all::<OverCurrentProtectionVariableName>(&["ACCurrent", "Active", "Operated"]);
+}
+
+/// `OverCurrentProtectionRecloserVariableName` — the 9 standardized
+/// `OverCurrentProtectionRecloser` variable names (open recommendation
+/// vocabulary, no [`reject`]). Drift risk is the parenthesized `Active(Set)` /
+/// `Tries(SetLimit)` / `Tries(MaxLimit)` renames.
+#[test]
+fn test_over_current_protection_recloser_variable_name() {
+    pin_all::<OverCurrentProtectionRecloserVariableName>(&[
+        "Active",
+        "Active(Set)",
+        "Enabled",
+        "Complete",
+        "Problem",
+        "Mode",
+        "Tries",
+        "Tries(SetLimit)",
+        "Tries(MaxLimit)",
+    ]);
+}
+
+/// `PowerContactorVariableName` — the 3 standardized `PowerContactor` variable
+/// names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_power_contactor_variable_name() {
+    pin_all::<PowerContactorVariableName>(&["Active", "Problem", "Tripped"]);
+}
+
+/// `RCDVariableName` — the 2 standardized `RCD` variable names (open
+/// recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_rcd_variable_name() {
+    pin_all::<RCDVariableName>(&["Operated", "Tripped"]);
+}
+
+/// `RCDRecloserVariableName` — the 8 standardized `RCDRecloser` variable names
+/// (open recommendation vocabulary, no [`reject`]). Drift risk is the
+/// parenthesized `Active(Set)` / `Tries(MaxLimit)` / `Tries(SetLimit)` renames.
+#[test]
+fn test_rcd_recloser_variable_name() {
+    pin_all::<RCDRecloserVariableName>(&[
+        "Active",
+        "Active(Set)",
+        "Complete",
+        "Enabled",
+        "Problem",
+        "Tries",
+        "Tries(MaxLimit)",
+        "Tries(SetLimit)",
+    ]);
+}
+
+/// `RealTimeClockVariableName` — the 5 standardized `RealTimeClock` variable
+/// names (open recommendation vocabulary, no [`reject`]). Drift risk is the
+/// `DCVoltage` acronym and the parenthesized `Fallback(MaxLimit)` rename.
+#[test]
+fn test_real_time_clock_variable_name() {
+    pin_all::<RealTimeClockVariableName>(&[
+        "Active",
+        "DCVoltage",
+        "Fallback",
+        "Fallback(MaxLimit)",
+        "Problem",
+    ]);
+}
+
+/// `ShockSensorVariableName` — the 3 standardized `ShockSensor` variable names
+/// (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_shock_sensor_variable_name() {
+    pin_all::<ShockSensorVariableName>(&["Active", "Enabled", "Force"]);
+}
+
+/// `SpacesCountSignageVariableName` — the 3 standardized `SpacesCountSignage`
+/// variable names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_spaces_count_signage_variable_name() {
+    pin_all::<SpacesCountSignageVariableName>(&["Active", "Count", "Enabled"]);
+}
+
+/// `SwitchVariableName` — the 3 standardized `Switch` variable names (open
+/// recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_switch_variable_name() {
+    pin_all::<SwitchVariableName>(&["Active", "Enabled", "State"]);
+}
+
+/// `TemperatureSensorVariableName` — the 3 standardized `TemperatureSensor`
+/// variable names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_temperature_sensor_variable_name() {
+    pin_all::<TemperatureSensorVariableName>(&["Active", "Problem", "Temperature"]);
+}
+
+/// `TiltSensorVariableName` — the 3 standardized `TiltSensor` variable names
+/// (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_tilt_sensor_variable_name() {
+    pin_all::<TiltSensorVariableName>(&["Active", "Enabled", "Angle"]);
+}
+
+/// `TokenReaderVariableName` — the 6 standardized `TokenReader` variable names
+/// (open recommendation vocabulary, no [`reject`]). Drift risk is the
+/// parenthesized `Enabled(Set)` rename.
+#[test]
+fn test_token_reader_variable_name() {
+    pin_all::<TokenReaderVariableName>(&[
+        "Enabled",
+        "Enabled(Set)",
+        "Operated",
+        "Problem",
+        "Token",
+        "TokenType",
+    ]);
+}
+
+/// `UIInputVariableName` — the 3 standardized `UIInput` variable names (open
+/// recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_ui_input_variable_name() {
+    pin_all::<UIInputVariableName>(&["Active", "Enabled", "Operated"]);
+}
+
+/// `UpstreamProtectionTriggerVariableName` — the 4 standardized
+/// `UpstreamProtectionTrigger` variable names (open recommendation vocabulary,
+/// no [`reject`]). Drift risk is the parenthesized `Active(Set)` rename.
+#[test]
+fn test_upstream_protection_trigger_variable_name() {
+    pin_all::<UpstreamProtectionTriggerVariableName>(&[
+        "Active(Set)",
+        "Enabled",
+        "Problem",
+        "Tripped",
+    ]);
+}
+
+/// `VehicleIdSensorVariableName` — the 2 standardized `VehicleIdSensor`
+/// variable names (open recommendation vocabulary, no [`reject`]).
+#[test]
+fn test_vehicle_id_sensor_variable_name() {
+    pin_all::<VehicleIdSensorVariableName>(&["Active", "Enabled"]);
 }

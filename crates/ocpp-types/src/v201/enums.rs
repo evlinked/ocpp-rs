@@ -3160,3 +3160,231 @@ pub enum LocalEnergyStorageVariableName {
     EnergyCapacity,
     Identity,
 }
+
+/// Standardized variable names of the `OverCurrentProtection` physical
+/// component.
+///
+/// Ports `OverCurrentProtectionVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1
+/// Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale. `ACCurrent`
+/// keeps its `AC` acronym casing verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OverCurrentProtectionVariableName {
+    ACCurrent,
+    Active,
+    Operated,
+}
+
+/// Standardized variable names of the `OverCurrentProtectionRecloser` physical
+/// component.
+///
+/// Ports `OverCurrentProtectionRecloserVariableName` (`ocpp/v201/enums.py`),
+/// OCPP 2.0.1 Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale. The
+/// parenthesized `Active(Set)` / `Tries(SetLimit)` / `Tries(MaxLimit)`
+/// spellings are not valid Rust identifiers and carry an explicit
+/// `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum OverCurrentProtectionRecloserVariableName {
+    Active,
+    /// Wire value `"Active(Set)"` — the settable active marker.
+    #[serde(rename = "Active(Set)")]
+    ActiveSet,
+    Enabled,
+    Complete,
+    Problem,
+    Mode,
+    Tries,
+    /// Wire value `"Tries(SetLimit)"` — the settable retry limit.
+    #[serde(rename = "Tries(SetLimit)")]
+    TriesSetLimit,
+    /// Wire value `"Tries(MaxLimit)"` — the maximum retry limit.
+    #[serde(rename = "Tries(MaxLimit)")]
+    TriesMaxLimit,
+}
+
+/// Standardized variable names of the `PowerContactor` physical component.
+///
+/// Ports `PowerContactorVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PowerContactorVariableName {
+    Active,
+    Problem,
+    Tripped,
+}
+
+/// Standardized variable names of the `RCD` (residual-current device) physical
+/// component.
+///
+/// Ports `RCDVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2 Appendix 3
+/// v1.3. Open recommendation vocabulary — see [`MonitoringCtrlrVariableName`]
+/// for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RCDVariableName {
+    Operated,
+    Tripped,
+}
+
+/// Standardized variable names of the `RCDRecloser` physical component.
+///
+/// Ports `RCDRecloserVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale. The
+/// parenthesized `Active(Set)` / `Tries(MaxLimit)` / `Tries(SetLimit)`
+/// spellings carry an explicit `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RCDRecloserVariableName {
+    Active,
+    /// Wire value `"Active(Set)"` — the settable active marker.
+    #[serde(rename = "Active(Set)")]
+    ActiveSet,
+    Complete,
+    Enabled,
+    Problem,
+    Tries,
+    /// Wire value `"Tries(MaxLimit)"` — the maximum retry limit.
+    #[serde(rename = "Tries(MaxLimit)")]
+    TriesMaxLimit,
+    /// Wire value `"Tries(SetLimit)"` — the settable retry limit.
+    #[serde(rename = "Tries(SetLimit)")]
+    TriesSetLimit,
+}
+
+/// Standardized variable names of the `RealTimeClock` physical component.
+///
+/// Ports `RealTimeClockVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale. `DCVoltage`
+/// keeps its `DC` acronym casing verbatim; the parenthesized
+/// `Fallback(MaxLimit)` carries an explicit `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RealTimeClockVariableName {
+    Active,
+    DCVoltage,
+    Fallback,
+    /// Wire value `"Fallback(MaxLimit)"` — the fallback max-limit variable.
+    #[serde(rename = "Fallback(MaxLimit)")]
+    FallbackMaxLimit,
+    Problem,
+}
+
+/// Standardized variable names of the `ShockSensor` physical component.
+///
+/// Ports `ShockSensorVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ShockSensorVariableName {
+    Active,
+    Enabled,
+    Force,
+}
+
+/// Standardized variable names of the `SpacesCountSignage` physical component.
+///
+/// Ports `SpacesCountSignageVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1
+/// Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SpacesCountSignageVariableName {
+    Active,
+    Count,
+    Enabled,
+}
+
+/// Standardized variable names of the `Switch` physical component.
+///
+/// Ports `SwitchVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SwitchVariableName {
+    Active,
+    Enabled,
+    State,
+}
+
+/// Standardized variable names of the `TemperatureSensor` physical component.
+///
+/// Ports `TemperatureSensorVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1
+/// Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TemperatureSensorVariableName {
+    Active,
+    Problem,
+    Temperature,
+}
+
+/// Standardized variable names of the `TiltSensor` physical component.
+///
+/// Ports `TiltSensorVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TiltSensorVariableName {
+    Active,
+    Enabled,
+    Angle,
+}
+
+/// Standardized variable names of the `TokenReader` physical component.
+///
+/// Ports `TokenReaderVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale. The
+/// parenthesized `Enabled(Set)` spelling carries an explicit
+/// `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TokenReaderVariableName {
+    Enabled,
+    /// Wire value `"Enabled(Set)"` — the settable enabled marker.
+    #[serde(rename = "Enabled(Set)")]
+    EnabledSet,
+    Operated,
+    Problem,
+    Token,
+    TokenType,
+}
+
+/// Standardized variable names of the `UIInput` physical component.
+///
+/// Ports `UIInputVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UIInputVariableName {
+    Active,
+    Enabled,
+    Operated,
+}
+
+/// Standardized variable names of the `UpstreamProtectionTrigger` physical
+/// component.
+///
+/// Ports `UpstreamProtectionTriggerVariableName` (`ocpp/v201/enums.py`), OCPP
+/// 2.0.1 Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale. The
+/// parenthesized `Active(Set)` spelling carries an explicit `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum UpstreamProtectionTriggerVariableName {
+    /// Wire value `"Active(Set)"` — the settable active marker.
+    #[serde(rename = "Active(Set)")]
+    ActiveSet,
+    Enabled,
+    Problem,
+    Tripped,
+}
+
+/// Standardized variable names of the `VehicleIdSensor` physical component.
+///
+/// Ports `VehicleIdSensorVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part
+/// 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VehicleIdSensorVariableName {
+    Active,
+    Enabled,
+}
