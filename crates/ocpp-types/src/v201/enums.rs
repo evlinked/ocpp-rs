@@ -2772,6 +2772,198 @@ pub enum CPPWMControllerVariableName {
     State,
 }
 
+/// Standardized variable names of the `DataLink` physical component.
+///
+/// Ports `DataLinkVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DataLinkVariableName {
+    Active,
+    Complete,
+    Enabled,
+    Fallback,
+    ICCID,
+    IMSI,
+    NetworkAddress,
+    Problem,
+    SignalStrength,
+}
+
+/// Standardized variable names of the `Display` physical component.
+///
+/// Ports `DisplayVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+///
+/// The bracketed `Count[HeightInChars]` / `Count[WidthInChars]` /
+/// `DataText[Visible]` spellings are not valid Rust identifiers and carry
+/// explicit `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DisplayVariableName {
+    Color,
+    /// Wire value `"Count[HeightInChars]"` — display height in characters.
+    #[serde(rename = "Count[HeightInChars]")]
+    CountHeightInChars,
+    /// Wire value `"Count[WidthInChars]"` — display width in characters.
+    #[serde(rename = "Count[WidthInChars]")]
+    CountWidthInChars,
+    /// Wire value `"DataText[Visible]"` — whether the data text is visible.
+    #[serde(rename = "DataText[Visible]")]
+    DataTextVisible,
+    Enabled,
+    Problem,
+    State,
+}
+
+/// Standardized variable names of the `DistributionPanel` physical component.
+///
+/// Ports `DistributionPanelVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1
+/// Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DistributionPanelVariableName {
+    ChargingStation,
+    DistributionPanel,
+    Fuse,
+    InstanceName,
+}
+
+/// Standardized variable names of the `ElectricalFeed` physical component.
+///
+/// Ports `ElectricalFeedVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ElectricalFeedVariableName {
+    ACVoltage,
+    Active,
+    DCVoltage,
+    Enabled,
+    Energy,
+    PhaseRotation,
+    Power,
+    PowerType,
+    Problem,
+    SupplyPhases,
+}
+
+/// Standardized variable names of the `ELVSupply` (extra-low-voltage supply)
+/// physical component.
+///
+/// Ports `ELVSupplyVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+///
+/// The parenthesized `Fallback(MaxLimit)` / `Power(MaxLimit)` spellings are not
+/// valid Rust identifiers and carry explicit `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ELVSupplyVariableName {
+    EnergyImportRegister,
+    Fallback,
+    /// Wire value `"Fallback(MaxLimit)"` — the settable fallback max limit.
+    #[serde(rename = "Fallback(MaxLimit)")]
+    FallbackMaxLimit,
+    Power,
+    /// Wire value `"Power(MaxLimit)"` — the settable power max limit.
+    #[serde(rename = "Power(MaxLimit)")]
+    PowerMaxLimit,
+    StateOfCharge,
+    Time,
+}
+
+/// Standardized variable names of the `EmergencyStopSensor` physical component.
+///
+/// Ports `EmergencyStopSensorVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1
+/// Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EmergencyStopSensorVariableName {
+    Enabled,
+    Active,
+    Tripped,
+}
+
+/// Standardized variable names of the `EnvironmentalLighting` physical
+/// component.
+///
+/// Ports `EnvironmentalLightingVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1
+/// Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+///
+/// The parenthesized `Enabled(Set)` / `Percent(Set)` spellings are not valid
+/// Rust identifiers and carry explicit `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EnvironmentalLightingVariableName {
+    Active,
+    Color,
+    Enabled,
+    /// Wire value `"Enabled(Set)"` — the settable enabled flag.
+    #[serde(rename = "Enabled(Set)")]
+    EnabledSet,
+    Percent,
+    /// Wire value `"Percent(Set)"` — the settable brightness percentage.
+    #[serde(rename = "Percent(Set)")]
+    PercentSet,
+    Power,
+    Problem,
+}
+
+/// Standardized variable names of the `EVRetentionLock` physical component.
+///
+/// Ports `EVRetentionLockVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EVRetentionLockVariableName {
+    Active,
+    Complete,
+    Enabled,
+    Problem,
+}
+
+/// Standardized variable names of the `EVSE` physical component.
+///
+/// Ports `EVSEVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+///
+/// The bracketed `Count[ChargingProfiles]` / `Count[ChargingProfiles](MaxLimit)`
+/// spellings are not valid Rust identifiers and carry explicit
+/// `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EVSEVariableName {
+    ACCurrent,
+    ACVoltage,
+    Available,
+    AvailabilityState,
+    AllowReset,
+    ChargeProtocol,
+    ChargingTime,
+    /// Wire value `"Count[ChargingProfiles](MaxLimit)"` — the max number of
+    /// charging profiles the EVSE accepts.
+    #[serde(rename = "Count[ChargingProfiles](MaxLimit)")]
+    CountChargingProfilesMaxLimit,
+    /// Wire value `"Count[ChargingProfiles]"` — the current number of installed
+    /// charging profiles.
+    #[serde(rename = "Count[ChargingProfiles]")]
+    CountChargingProfiles,
+    CurrentImbalance,
+    DCCurrent,
+    DCVoltage,
+    Enabled,
+    EvseId,
+    ISO15118EvseId,
+    Overload,
+    PhaseRotation,
+    PostChargingTime,
+    Power,
+    Problem,
+    SupplyPhases,
+    Tripped,
+    VoltageImbalance,
+}
+
 /// Standardized variable names of the `ExternalTemperatureSensor` physical
 /// component.
 ///
