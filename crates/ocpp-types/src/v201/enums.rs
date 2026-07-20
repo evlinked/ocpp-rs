@@ -2963,3 +2963,200 @@ pub enum EVSEVariableName {
     Tripped,
     VoltageImbalance,
 }
+
+/// Standardized variable names of the `ExternalTemperatureSensor` physical
+/// component.
+///
+/// Ports `ExternalTemperatureSensorVariableName` (`ocpp/v201/enums.py`), OCPP
+/// 2.0.1 Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ExternalTemperatureSensorVariableName {
+    Active,
+    Problem,
+    Temperature,
+}
+
+/// Standardized variable names of the `FiscalMetering` physical component.
+///
+/// Ports `FiscalMeteringVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+///
+/// The bracketed `Manufacturer[CT]`, `Model[Meter]`,
+/// `OptionsSet[MeterValueAlignedData]`, `SerialNumber[CT]`, … spellings are not
+/// valid Rust identifiers and carry an explicit `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FiscalMeteringVariableName {
+    Problem,
+    Certificate,
+    ECVariant,
+    EnergyExport,
+    EnergyExportRegister,
+    EnergyImport,
+    EnergyImportRegister,
+    /// Wire value `"Manufacturer[CT]"` — the current-transformer manufacturer.
+    #[serde(rename = "Manufacturer[CT]")]
+    ManufacturerCT,
+    /// Wire value `"Manufacturer[Meter]"` — the meter manufacturer.
+    #[serde(rename = "Manufacturer[Meter]")]
+    ManufacturerMeter,
+    /// Wire value `"Model[CT]"` — the current-transformer model.
+    #[serde(rename = "Model[CT]")]
+    ModelCT,
+    /// Wire value `"Model[Meter]"` — the meter model.
+    #[serde(rename = "Model[Meter]")]
+    ModelMeter,
+    /// Wire value `"OptionsSet[MeterValueAlignedData]"` — the aligned-data
+    /// measurand option set.
+    #[serde(rename = "OptionsSet[MeterValueAlignedData]")]
+    OptionsSetMeterValueAlignedData,
+    /// Wire value `"OptionsSet[TxnStoppedAlignedData]"` — the transaction-stop
+    /// aligned-data measurand option set.
+    #[serde(rename = "OptionsSet[TxnStoppedAlignedData]")]
+    OptionsSetTxnStoppedAlignedData,
+    /// Wire value `"SerialNumber[CT]"` — the current-transformer serial number.
+    #[serde(rename = "SerialNumber[CT]")]
+    SerialNumberCT,
+    /// Wire value `"SerialNumber[Meter]"` — the meter serial number.
+    #[serde(rename = "SerialNumber[Meter]")]
+    SerialNumberMeter,
+}
+
+/// Standardized variable names of the `FloodSensor` physical component.
+///
+/// Ports `FloodSensorVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FloodSensorVariableName {
+    Active,
+    Enabled,
+    Height,
+    Percent,
+    Tripped,
+}
+
+/// Standardized variable names of the `GroundIsolationProtection` physical
+/// component.
+///
+/// Ports `GroundIsolationProtectionVariableName` (`ocpp/v201/enums.py`), OCPP
+/// 2.0.1 Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GroundIsolationProtectionVariableName {
+    Active,
+    Complete,
+    Enabled,
+    Impedance,
+    Problem,
+}
+
+/// Standardized variable names of the `Heater` physical component.
+///
+/// Ports `HeaterVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+///
+/// The parenthesized `Power(MaxLimit)`, `Temperature(MinSet)`, … spellings are
+/// not valid Rust identifiers and carry an explicit `#[serde(rename)]`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HeaterVariableName {
+    Active,
+    Enabled,
+    Problem,
+    Tripped,
+    Power,
+    /// Wire value `"Power(MaxLimit)"` — the power max-limit variable.
+    #[serde(rename = "Power(MaxLimit)")]
+    PowerMaxLimit,
+    /// Wire value `"Power(MaxSet)"` — the settable power max.
+    #[serde(rename = "Power(MaxSet)")]
+    PowerMaxSet,
+    /// Wire value `"Temperature(MinSet)"` — the settable minimum temperature.
+    #[serde(rename = "Temperature(MinSet)")]
+    TemperatureMinSet,
+    /// Wire value `"Temperature(MaxSet)"` — the settable maximum temperature.
+    #[serde(rename = "Temperature(MaxSet)")]
+    TemperatureMaxSet,
+}
+
+/// Standardized variable names of the `HumiditySensor` physical component.
+///
+/// Ports `HumiditySensorVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum HumiditySensorVariableName {
+    Enabled,
+    Humidity,
+    Problem,
+}
+
+/// Standardized variable names of the `LightSensor` physical component.
+///
+/// Ports `LightSensorVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LightSensorVariableName {
+    Enabled,
+    Light,
+    Problem,
+}
+
+/// Standardized variable names of the `LiquidCoolingSystem` physical component.
+///
+/// Ports `LiquidCoolingSystemVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1
+/// Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LiquidCoolingSystemVariableName {
+    Active,
+    Enabled,
+    Problem,
+    Temperature,
+}
+
+/// Standardized variable names of the `LocalAvailabilitySensor` physical
+/// component.
+///
+/// Ports `LocalAvailabilitySensorVariableName` (`ocpp/v201/enums.py`), OCPP
+/// 2.0.1 Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LocalAvailabilitySensorVariableName {
+    Active,
+    Enabled,
+    Problem,
+}
+
+/// Standardized variable names of the `LocalController` physical component.
+///
+/// Ports `LocalControllerVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1 Part 2
+/// Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LocalControllerVariableName {
+    ChargingStation,
+    DistributionPanel,
+    ECVariant,
+    Enabled,
+    Identity,
+    Manufacturer,
+    Model,
+    Problem,
+    SerialNumber,
+    Tripped,
+}
+
+/// Standardized variable names of the `LocalEnergyStorage` physical component.
+///
+/// Ports `LocalEnergyStorageVariableName` (`ocpp/v201/enums.py`), OCPP 2.0.1
+/// Part 2 Appendix 3 v1.3. Open recommendation vocabulary — see
+/// [`MonitoringCtrlrVariableName`] for the open-string rationale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum LocalEnergyStorageVariableName {
+    EnergyCapacity,
+    Identity,
+}
