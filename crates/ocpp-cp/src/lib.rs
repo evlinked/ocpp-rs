@@ -364,9 +364,11 @@ enum RemoteCommand {
 /// `MeterValues`, `DiagnosticsStatusNotification` (the CP tracks a
 /// diagnostics-upload status from `GetDiagnostics`), and
 /// `FirmwareStatusNotification` (the CP tracks a firmware-update status from
-/// `UpdateFirmware`) are wired — every OCPP 1.6J `MessageTrigger` variant. The
-/// explicit match means any future variant defaults to `NotImplemented` until
-/// it grows a state machine.
+/// `UpdateFirmware`) are wired. The two `ExtendedTriggerMessage`-only triggers
+/// (`LogStatusNotification`, `SignChargePointCertificate`) are recognized but
+/// unimplemented by the simulator, so they report `NotImplemented`. The
+/// `matches!` gate means any future variant likewise defaults to
+/// `NotImplemented` until it grows a state machine.
 fn trigger_message_supported(message: &MessageTrigger) -> bool {
     matches!(
         message,
@@ -2666,6 +2668,15 @@ impl ChargePoint {
                 // has run). Closes the deferred half of Issue #65.
                 let status = *self.firmware_status.read().await;
                 self.send_firmware_status_notification(status).await;
+            }
+            other @ (MessageTrigger::LogStatusNotification
+            | MessageTrigger::SignChargePointCertificate) => {
+                // ExtendedTriggerMessage-only Security-extension triggers. The
+                // simulator has no LogStatusNotification / SignCertificate state
+                // machine, so `trigger_message_supported` reports them
+                // unsupported and they never reach here in normal flow; this arm
+                // keeps the match exhaustive and aligned with the gate.
+                warn!("TriggerMessage({other:?}): not implemented by the simulator");
             }
         }
     }
