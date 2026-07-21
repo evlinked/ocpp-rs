@@ -210,11 +210,13 @@ fn test_diagnostics_status() {
 
 #[test]
 fn test_firmware_status() {
-    // The reference pins these seven core 1.6 statuses. Rust's `FirmwareStatus`
-    // additionally models the Security-extension errata variants
-    // (`SignatureError`, `CertificateExpired`, …); a superset is allowed —
-    // this suite only asserts the reference members are present and correct.
+    // Pinned to the reference `FirmwareStatus` (ocpp/v16/enums.py) and the
+    // bundled `SignedFirmwareStatusNotification.json` `FirmwareStatusEnumType`
+    // (14 members). One enum serves both the core `FirmwareStatusNotification`
+    // (the first seven, common statuses) and the Security-extension
+    // `SignedFirmwareStatusNotification` (all 14).
     pin_all::<FirmwareStatus>(&[
+        // Common to FirmwareStatusNotification + SignedFirmwareStatusNotification
         "Downloaded",
         "DownloadFailed",
         "Downloading",
@@ -222,6 +224,14 @@ fn test_firmware_status() {
         "InstallationFailed",
         "Installing",
         "Installed",
+        // SignedFirmwareStatusNotification-only (Security extension)
+        "DownloadScheduled",
+        "DownloadPaused",
+        "InstallRebooting",
+        "InstallScheduled",
+        "InstallVerificationFailed",
+        "InvalidSignature",
+        "SignatureVerified",
     ]);
 }
 
@@ -265,6 +275,9 @@ fn test_measurand() {
 
 #[test]
 fn test_message_trigger() {
+    // TriggerMessage triggers plus the two ExtendedTriggerMessage-only triggers
+    // (`LogStatusNotification`, `SignChargePointCertificate`) from the reference
+    // `MessageTrigger` and `ExtendedTriggerMessage.json` `MessageTriggerEnumType`.
     pin_all::<MessageTrigger>(&[
         "BootNotification",
         "DiagnosticsStatusNotification",
@@ -272,6 +285,8 @@ fn test_message_trigger() {
         "Heartbeat",
         "MeterValues",
         "StatusNotification",
+        "LogStatusNotification",
+        "SignChargePointCertificate",
     ]);
 }
 

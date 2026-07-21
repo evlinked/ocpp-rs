@@ -1952,11 +1952,11 @@ mod tests {
     #[test]
     fn test_signed_firmware_status_notification() {
         let req = SignedFirmwareStatusNotificationRequest {
-            status: FirmwareStatus::SignatureError,
+            status: FirmwareStatus::SignatureVerified,
             request_id: 99,
         };
         let json = serde_json::to_string(&req).unwrap();
-        assert!(json.contains("SignatureError"));
+        assert!(json.contains("SignatureVerified"));
         assert!(json.contains("requestId"));
         let d: SignedFirmwareStatusNotificationRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, d);

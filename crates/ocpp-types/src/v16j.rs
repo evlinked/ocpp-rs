@@ -118,10 +118,20 @@ pub enum DiagnosticsStatus {
     Uploading,
 }
 
-/// Firmware status enumeration (core + security extension variants)
+/// Firmware status reported in `FirmwareStatusNotification.req` and
+/// `SignedFirmwareStatusNotification.req`.
+///
+/// The member set is pinned to the mobilityhouse/ocpp reference
+/// [`FirmwareStatus`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v16/enums.py)
+/// and the bundled `SignedFirmwareStatusNotification.json`
+/// `FirmwareStatusEnumType` schema — 14 members. As in the reference, a single
+/// enum serves both messages: the core `FirmwareStatusNotification` uses the
+/// first seven (common) statuses; the remaining seven are the OCPP 1.6
+/// Security-extension additions, valid only in `SignedFirmwareStatusNotification`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum FirmwareStatus {
+    // --- Common: FirmwareStatusNotification.req + SignedFirmwareStatusNotification.req ---
     /// Firmware downloaded
     Downloaded,
     /// Download failed
@@ -136,21 +146,21 @@ pub enum FirmwareStatus {
     Installing,
     /// Firmware installed
     Installed,
-    // --- Security Extension variants (OCPP 1.6J Security Annex) ---
-    /// Signature verification failed
-    SignatureError,
-    /// Signing certificate has expired
-    CertificateExpired,
-    /// Signing certificate has been revoked
-    CertificateRevoked,
+    // --- Security extension: SignedFirmwareStatusNotification.req only ---
+    /// Download scheduled
+    DownloadScheduled,
+    /// Download paused
+    DownloadPaused,
+    /// Rebooting to install the firmware
+    InstallRebooting,
+    /// Installation scheduled
+    InstallScheduled,
     /// Installed firmware failed verification
     InstallVerificationFailed,
-    /// Signature is invalid
+    /// Firmware signature is invalid
     InvalidSignature,
-    /// Certificate not yet valid
-    NotYetValid,
-    /// Signature was revoked
-    RevokedSignatureError,
+    /// Firmware signature successfully verified
+    SignatureVerified,
 }
 
 /// Remote start/stop status
@@ -565,6 +575,11 @@ pub enum MessageTrigger {
     MeterValues,
     /// StatusNotification
     StatusNotification,
+    // --- ExtendedTriggerMessage.req only (OCPP 1.6 Security extension) ---
+    /// LogStatusNotification — request the station to send a `LogStatusNotification`
+    LogStatusNotification,
+    /// SignChargePointCertificate — request the station to send a `SignCertificate`
+    SignChargePointCertificate,
 }
 
 /// Trigger message status
@@ -1023,27 +1038,48 @@ mod tests {
     }
 
     #[test]
-    fn test_firmware_status_security_variants() {
+    fn test_firmware_status_all_variants() {
+        // Pinned to the reference `enums.py` / `SignedFirmwareStatusNotification.json`
+        // `FirmwareStatusEnumType` (14 members).
         let cases = [
-            (FirmwareStatus::SignatureError, "\"SignatureError\""),
-            (FirmwareStatus::CertificateExpired, "\"CertificateExpired\""),
-            (FirmwareStatus::CertificateRevoked, "\"CertificateRevoked\""),
+            (FirmwareStatus::Downloaded, "\"Downloaded\""),
+            (FirmwareStatus::DownloadFailed, "\"DownloadFailed\""),
+            (FirmwareStatus::Downloading, "\"Downloading\""),
+            (FirmwareStatus::Idle, "\"Idle\""),
+            (FirmwareStatus::InstallationFailed, "\"InstallationFailed\""),
+            (FirmwareStatus::Installing, "\"Installing\""),
+            (FirmwareStatus::Installed, "\"Installed\""),
+            (FirmwareStatus::DownloadScheduled, "\"DownloadScheduled\""),
+            (FirmwareStatus::DownloadPaused, "\"DownloadPaused\""),
+            (FirmwareStatus::InstallRebooting, "\"InstallRebooting\""),
+            (FirmwareStatus::InstallScheduled, "\"InstallScheduled\""),
             (
                 FirmwareStatus::InstallVerificationFailed,
                 "\"InstallVerificationFailed\"",
             ),
             (FirmwareStatus::InvalidSignature, "\"InvalidSignature\""),
-            (FirmwareStatus::NotYetValid, "\"NotYetValid\""),
-            (
-                FirmwareStatus::RevokedSignatureError,
-                "\"RevokedSignatureError\"",
-            ),
+            (FirmwareStatus::SignatureVerified, "\"SignatureVerified\""),
         ];
         for (status, expected) in &cases {
             let json = serde_json::to_string(status).unwrap();
             assert_eq!(&json, expected);
             let deserialized: FirmwareStatus = serde_json::from_str(&json).unwrap();
             assert_eq!(status, &deserialized);
+        }
+        // Regression guard: the previously-invented, wire-invalid variants must
+        // no longer deserialize — they are absent from both the reference
+        // `enums.py` and the bundled FINAL schema.
+        for bad in [
+            "\"SignatureError\"",
+            "\"CertificateExpired\"",
+            "\"CertificateRevoked\"",
+            "\"NotYetValid\"",
+            "\"RevokedSignatureError\"",
+        ] {
+            assert!(
+                serde_json::from_str::<FirmwareStatus>(bad).is_err(),
+                "wire-invalid FirmwareStatus {bad} must be rejected"
+            );
         }
     }
 
