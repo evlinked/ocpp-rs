@@ -19,13 +19,15 @@
 //!
 //! ## Divergence from the reference dataclass — pinned, not dropped
 //!
-//! Two reference *dataclass* members are intentionally **absent** from the Rust
-//! enums because they are absent from the OCPP 2.0.1 **FINAL JSON Schemas** that
-//! `SchemaValidator::v201()` enforces — modelling them would let serde accept a
-//! value the message layer then rejects:
+//! Several reference *dataclass* members are intentionally **absent** from the
+//! Rust enums because they are absent from the OCPP 2.0.1 **FINAL JSON Schemas**
+//! that `SchemaValidator::v201()` enforces — modelling them would let serde
+//! accept a value the message layer then rejects:
 //!
-//! - `ConnectorEnumType::cChaoJi` / `cGBT` — not in `ReserveNowRequest.json`'s
-//!   22-member `ConnectorEnumType` enum (verified against the bundled schema).
+//! - `ConnectorEnumType::cChaoJi` / `cGBT` / `OppCharge` — not in
+//!   `ReserveNowRequest.json`'s 22-member `ConnectorEnumType` enum (verified
+//!   against the bundled schema). `OppCharge` is a proprietary combined-DC
+//!   connector added to the mobilityhouse dataclass after the FINAL schema.
 //! - `DataEnumType::passwordString` — not in the FINAL 8-member `DataEnumType`.
 //!
 //! Rather than silently drop the reference's assertions for these, the suite
@@ -221,8 +223,8 @@ fn type_name<T>() -> &'static str {
 /// Ports `test_connector_type`. Pins the 22 members of the FINAL-schema
 /// `ConnectorEnumType` (`ReserveNowRequest.json`), including every prefixed /
 /// hyphenated acronym case: `cCCS1`, `s309-1P-16A`, `sCEE-7-7`, `wInductive`,
-/// `Other1PhMax16A`. The reference's `cChaoJi` / `cGBT` are pinned as
-/// *rejected* — see [`reject`] and the module docs.
+/// `Other1PhMax16A`. The reference's `cChaoJi` / `cGBT` / `OppCharge` are pinned
+/// as *rejected* — see [`reject`] and the module docs.
 #[test]
 fn test_connector_type() {
     pin_all::<ConnectorEnumType>(&[
@@ -253,6 +255,9 @@ fn test_connector_type() {
     // Reference dataclass members absent from the FINAL 2.0.1 schema.
     reject::<ConnectorEnumType>("cChaoJi");
     reject::<ConnectorEnumType>("cGBT");
+    // `OppCharge` — proprietary combined-DC connector added to the mobilityhouse
+    // dataclass after the FINAL schema; not in `ReserveNowRequest.json`.
+    reject::<ConnectorEnumType>("OppCharge");
 }
 
 /// Ports `test_data_type`. Pins the 8 members of the FINAL-schema
