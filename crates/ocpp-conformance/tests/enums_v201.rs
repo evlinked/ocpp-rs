@@ -146,6 +146,7 @@ use ocpp_types::v201::{
     ELVSupplyVariableName, EVRetentionLockVariableName, EVSEVariableName,
     ElectricalFeedVariableName, EmergencyStopSensorVariableName, EnvironmentalLightingVariableName,
 };
+use ocpp_types::v201::{StandardizedUnitsOfMeasureType, StatusInfoReasonType};
 
 // Device-model physical-component variable-name catalogs (Appendix 3) — slice
 // 3d part 1 (`ExternalTemperatureSensor` → `LocalEnergyStorage`).
@@ -2652,4 +2653,101 @@ fn test_upstream_protection_trigger_variable_name() {
 #[test]
 fn test_vehicle_id_sensor_variable_name() {
     pin_all::<VehicleIdSensorVariableName>(&["Active", "Enabled"]);
+}
+
+/// Ports the `StatusInfoReasonType` members (`ocpp/v201/enums.py`, Appendix 5
+/// v1.3). Pins all 43 standardized `StatusInfo.reasonCode` values, including
+/// the acronym-cased `CSNotAccepted`, `InvalidCSR`, `InvalidURL`,
+/// `InvalidMessageSeq`, `UnknownEvse` — a wrong rename would silently break
+/// interop with a spec-conformant CSMS reading `reasonCode`.
+#[test]
+fn test_status_info_reason_type() {
+    pin_all::<StatusInfoReasonType>(&[
+        "CSNotAccepted",
+        "DuplicateProfile",
+        "DuplicateRequestId",
+        "FixedCable",
+        "FwUpdateInProgress",
+        "InternalError",
+        "InvalidCertificate",
+        "InvalidCSR",
+        "InvalidIdToken",
+        "InvalidMessageSeq",
+        "InvalidProfile",
+        "InvalidSchedule",
+        "InvalidStackLevel",
+        "InvalidURL",
+        "InvalidValue",
+        "MissingDeviceModelInfo",
+        "MissingParam",
+        "NoCable",
+        "NoError",
+        "NotEnabled",
+        "NotFound",
+        "OutOfMemory",
+        "OutOfStorage",
+        "ReadOnly",
+        "TooLargeElement",
+        "TooManyElements",
+        "TxInProgress",
+        "TxNotFound",
+        "TxStarted",
+        "UnknownConnectorId",
+        "UnknownConnectorType",
+        "UnknownEvse",
+        "UnknownTxId",
+        "Unspecified",
+        "UnsupportedParam",
+        "UnsupportedRateUnit",
+        "UnsupportedRequest",
+        "ValueOutOfRange",
+        "ValuePositiveOnly",
+        "ValueTooHigh",
+        "ValueTooLow",
+        "ValueZeroNotAllowed",
+        "WriteOnly",
+    ]);
+}
+
+/// Ports the `StandardizedUnitsOfMeasureType` members (`ocpp/v201/enums.py`).
+/// Pins all 33 allowable `unit` symbols, dominated by lower-/mixed-case
+/// spellings (`dB`, `dBm`, `lx`, `m`, `ms2`, `kPa`, `kVA`, `kWh`, `var`,
+/// `kvarh`, …) whose `#[serde(rename)]` a typo would silently break.
+#[test]
+fn test_standardized_units_of_measure_type() {
+    pin_all::<StandardizedUnitsOfMeasureType>(&[
+        "ASU",
+        "B",
+        "dB",
+        "dBm",
+        "Deg",
+        "Hz",
+        "lx",
+        "m",
+        "ms2",
+        "N",
+        "Ohm",
+        "kPa",
+        "Percent",
+        "RH",
+        "RPM",
+        "s",
+        "VA",
+        "kVA",
+        "VAh",
+        "kVAh",
+        "var",
+        "kvar",
+        "varh",
+        "kvarh",
+        "Wh",
+        "kWh",
+        "W",
+        "kW",
+        "A",
+        "V",
+        "Celsius",
+        "Fahrenheit",
+        "K",
+    ]);
 }
