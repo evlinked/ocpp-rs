@@ -2460,6 +2460,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn central_system_server_validates_callresult_from_fake_cp() {
+        // End-to-end acceptance for the batteries-included `central_system_server`
+        // helper (#386): a server built via the helper carries a 1.6J validator
+        // on its `call()` path, so a fake CP's schema-invalid CALLRESULT (a valid
+        // `status` plus an extra property the schema forbids under
+        // `additionalProperties: false`) is rejected as `SchemaViolation` over a
+        // real socket — serde alone would silently accept it. This is the helper
+        // analog of `server_call_validates_callresult_rejects_additional_property`,
+        // built through `central_system_server` rather than a hand-attached
+        // validator. The validator-less counterpart is
+        // `server_call_without_validator_accepts_unvalidated_callresult`.
+        let (mut server, _rx) = crate::central_system::central_system_server(
+            TransportConfig::default(),
+            Arc::new(EchoHandler),
+        );
+        server.start("127.0.0.1:0").await.expect("server start");
+        let addr = server.local_addr().unwrap();
+        let mut cp = connect_cp(&server, addr, "CP_HELPER").await;
+
+        let responder = tokio::spawn(async move {
+            let (_action, unique_id) = read_call(&mut cp).await;
+            cp.send(WsMsg::Text(call_result_frame(
+                &unique_id,
+                serde_json::json!({ "status": "Accepted", "extra": true }),
+            )))
+            .await
+            .unwrap();
+            cp
+        });
+
+        let err = server
+            .call("CP_HELPER", remote_start("TAG"))
+            .await
+            .expect_err("helper-built server must reject schema-invalid CALLRESULT");
+        assert!(
+            matches!(err, OcppError::SchemaViolation { .. }),
+            "expected SchemaViolation from helper-wired validator, got {err:?}"
+        );
+
+        responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn server_concurrent_calls_to_multiple_cps_correct() {
         let (server, addr) = start_server(Arc::new(EchoHandler)).await;
 

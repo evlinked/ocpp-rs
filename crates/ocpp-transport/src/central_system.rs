@@ -27,6 +27,10 @@ use ocpp_messages::v16j::{
     RegistrationStatus, StatusNotificationRequest, StatusNotificationResponse,
 };
 use ocpp_messages::{ActionDispatcher, SchemaValidator};
+use tokio::sync::mpsc;
+
+use crate::server::OcppServer;
+use crate::{MessageHandler, TransportConfig, TransportEvent};
 
 /// Configuration for the default Central System handler set.
 ///
@@ -109,6 +113,70 @@ pub fn register_default_handlers(dispatcher: &mut ActionDispatcher, config: Cent
 
     dispatcher
         .on(|_req: StatusNotificationRequest| async move { Ok(StatusNotificationResponse {}) });
+}
+
+/// Batteries-included CSMS server constructor for **OCPP 1.6J**.
+///
+/// Builds an [`OcppServer`] from `config` and `handler` and attaches an OCPP
+/// 1.6J [`SchemaValidator`] to its CSMS-initiated
+/// [`call`](OcppServer::call) path, so the recommended CSMS setup validates
+/// **both directions of an outbound command out of the box**: the outbound CALL
+/// before it goes on the wire, and the inbound CALLRESULT before it is
+/// deserialized (a charge point's response is an untrusted trust boundary). This
+/// matches the CP side's validate-by-default posture
+/// (`ChargePointConfig::validate_payloads` defaults to `true`) and the
+/// reference's side-agnostic
+/// [`charge_point.py::call`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py),
+/// whose `skip_schema_validation` defaults to `False`.
+///
+/// The `handler` argument controls the *inbound* dispatch path independently:
+/// wrap a [`central_system_dispatcher`] (which attaches the same 1.6J validator
+/// to inbound CALLs) in a [`DispatchHandler`](crate::DispatchHandler) to get a
+/// CSMS that validates every direction:
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use ocpp_transport::{central_system_dispatcher, central_system_server, DispatchHandler, TransportConfig};
+///
+/// let dispatcher = central_system_dispatcher();
+/// let handler = Arc::new(DispatchHandler::new(Arc::new(dispatcher)));
+/// let (mut server, _events) = central_system_server(TransportConfig::default(), handler);
+/// server.start("0.0.0.0:9000").await?;
+/// ```
+///
+/// **Opt-out** (the `skip_schema_validation=True` analog): to build a CSMS whose
+/// `call()` path performs no validation, construct the server directly with
+/// [`OcppServer::new`], which defaults to no validator.
+pub fn central_system_server(
+    config: TransportConfig,
+    handler: Arc<dyn MessageHandler>,
+) -> (OcppServer, mpsc::UnboundedReceiver<TransportEvent>) {
+    build_validated_server(config, handler, SchemaValidator::v16j())
+}
+
+/// Like [`central_system_server`] but attaches an **OCPP 2.0.1**
+/// [`SchemaValidator`] to the [`call`](OcppServer::call) path, for a CSMS that
+/// speaks 2.0.1. Pair with
+/// [`central_system_dispatcher_v201`](crate::central_system_dispatcher_v201) on
+/// the inbound side.
+pub fn central_system_server_v201(
+    config: TransportConfig,
+    handler: Arc<dyn MessageHandler>,
+) -> (OcppServer, mpsc::UnboundedReceiver<TransportEvent>) {
+    build_validated_server(config, handler, SchemaValidator::v201())
+}
+
+/// Shared construction for the version-specific batteries-included server
+/// helpers: build the [`OcppServer`] and attach `validator` to its `call()`
+/// path. The 1.6J and 2.0.1 entry points differ only in which bundled validator
+/// they pass, so the wiring lives here once.
+fn build_validated_server(
+    config: TransportConfig,
+    handler: Arc<dyn MessageHandler>,
+    validator: SchemaValidator,
+) -> (OcppServer, mpsc::UnboundedReceiver<TransportEvent>) {
+    let (server, events) = OcppServer::new(config, handler);
+    (server.with_validator(Arc::new(validator)), events)
 }
 
 #[cfg(test)]
@@ -243,5 +311,102 @@ mod tests {
         assert!(!d.has_handler("Authorize"));
         assert!(!d.has_handler("StartTransaction"));
         assert_eq!(d.handler_count(), 3);
+    }
+
+    // ── central_system_server: outbound `call()` validator wiring ────────────
+    //
+    // These assertions exploit `OcppServer::call`'s documented ordering — the
+    // outbound CALL is schema-validated *before* the connection check — so the
+    // validator's presence is observable without ever starting the server or
+    // connecting a CP: a schema-invalid request fails with `SchemaViolation`
+    // (validator attached), whereas the same request on a validator-less server
+    // reaches the connection check and fails with `CpNotConnected`. The
+    // end-to-end inbound-CALLRESULT rejection over a real socket is covered by
+    // `server::tests::central_system_server_validates_callresult_from_fake_cp`.
+
+    use ocpp_messages::v16j::RemoteStartTransactionRequest;
+    use ocpp_types::OcppError;
+
+    /// A `RemoteStartTransaction` request with the given `idTag`. A 21-char tag
+    /// is serde-valid but violates the `CiString20` `maxLength` in the schema.
+    fn remote_start(id_tag: &str) -> RemoteStartTransactionRequest {
+        RemoteStartTransactionRequest {
+            connector_id: None,
+            id_tag: id_tag.to_string(),
+            charging_profile: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn central_system_server_wires_outbound_validator() {
+        // A server built via the helper rejects a schema-invalid outbound CALL
+        // (21-char idTag over CiString20's maxLength) as `SchemaViolation`
+        // *before* the connection check — proving the 1.6J validator is wired
+        // to the `call()` path.
+        let (server, _events) =
+            central_system_server(TransportConfig::default(), Arc::new(NoopHandler));
+        let err = server
+            .call("NEVER_CONNECTED", remote_start(&"x".repeat(21)))
+            .await
+            .expect_err("overlong idTag must be rejected before send");
+        assert!(
+            matches!(err, OcppError::SchemaViolation { .. }),
+            "expected SchemaViolation (validator wired), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn opt_out_server_has_no_outbound_validator() {
+        // The `skip_schema_validation=True` analog: a server built with plain
+        // `OcppServer::new` performs no `call()`-path validation, so the same
+        // overlong-idTag request sails past validation and fails only at the
+        // connection check (`CpNotConnected`). This pins the opt-out as reachable
+        // and behaviorally distinct from the helper.
+        let (server, _events) = OcppServer::new(TransportConfig::default(), Arc::new(NoopHandler));
+        let err = server
+            .call("NEVER_CONNECTED", remote_start(&"x".repeat(21)))
+            .await
+            .expect_err("no validator ⇒ reaches connection check");
+        assert!(
+            matches!(err, OcppError::CpNotConnected { .. }),
+            "expected CpNotConnected (no validator), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn central_system_server_v201_selects_v201_validator() {
+        // The v201 helper attaches a *2.0.1* validator, whose schema set does not
+        // include the 1.6J-only `RemoteStartTransaction` (renamed
+        // `RequestStartTransaction` in 2.0.1). An outbound CALL for an action the
+        // attached validator doesn't know surfaces as `NotSupported` — proving
+        // the helper wired the v201 validator specifically, not the 1.6J one
+        // (under which this same, otherwise-valid request would pass validation
+        // and fail later with `CpNotConnected`).
+        let (server, _events) =
+            central_system_server_v201(TransportConfig::default(), Arc::new(NoopHandler));
+        let err = server
+            .call("NEVER_CONNECTED", remote_start("TAG"))
+            .await
+            .expect_err("RemoteStartTransaction is unknown to the v201 validator");
+        assert!(
+            matches!(err, OcppError::NotSupported { .. }),
+            "expected NotSupported from the v201 validator, got {err:?}"
+        );
+    }
+
+    /// A no-op [`MessageHandler`] — these tests drive the CSMS→CP `call()` path,
+    /// which never routes through the inbound handler.
+    struct NoopHandler;
+
+    #[async_trait::async_trait]
+    impl MessageHandler for NoopHandler {
+        async fn handle_message(
+            &self,
+            _message: ocpp_messages::Message,
+        ) -> ocpp_types::OcppResult<Option<ocpp_messages::Message>> {
+            Ok(None)
+        }
+
+        async fn handle_event(&self, _event: TransportEvent) {}
     }
 }
