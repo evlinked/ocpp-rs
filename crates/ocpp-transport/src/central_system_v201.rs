@@ -129,7 +129,7 @@ pub fn central_system_handler_v201_with(config: CentralSystemConfigV201) -> Disp
 /// Wires the inbound-validated lifecycle dispatcher
 /// [`central_system_dispatcher_v201_with`], the [`DispatchHandler`] adapter, and
 /// the outbound-validated
-/// [`central_system_server_v201`](crate::central_system_server_v201), so **both
+/// [`central_system_server_v201`], so **both
 /// directions are `SchemaValidator::v201()`-backed out of the box** and the boot
 /// and transaction-acknowledgement lifecycle handlers are pre-registered.
 /// Returns the ready-to-[`start`](OcppServer::start) server and its
