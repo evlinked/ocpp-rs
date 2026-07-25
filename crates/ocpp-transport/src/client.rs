@@ -6,7 +6,7 @@ use crate::{
 };
 use futures_util::{SinkExt, StreamExt};
 use ocpp_messages::Message;
-use ocpp_types::{OcppError, OcppResult};
+use ocpp_types::{recover_inbound_call_error, OcppError, OcppResult};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use std::sync::Arc;
@@ -191,7 +191,31 @@ impl WebSocketClient {
                                             })
                                             .await;
                                     }
-                                    Err(e) => error!("Failed to parse WS text frame: {}", e),
+                                    Err(e) => {
+                                        // A CALLERROR carrying an out-of-spec
+                                        // `error_code` (untrusted peer input) fails
+                                        // the strict whole-frame decode but still
+                                        // carries a `unique_id`. Resolve the
+                                        // correlated pending CALL promptly — an
+                                        // unknown code maps to `ProtocolViolation`,
+                                        // faithful to the reference's
+                                        // `CallError.to_exception` /
+                                        // `UnknownCallErrorCodeError` — instead of
+                                        // dropping the frame and letting `call()`
+                                        // hang to its timeout (#381).
+                                        if let Some((unique_id, err)) =
+                                            recover_inbound_call_error(&text)
+                                        {
+                                            if !pending_calls.reject(&unique_id, err) {
+                                                warn!(
+                                                    "CALLERROR (unrecognized error_code) for unknown unique_id '{}'",
+                                                    unique_id
+                                                );
+                                            }
+                                        } else {
+                                            error!("Failed to parse WS text frame: {}", e);
+                                        }
+                                    }
                                 }
                             }
                             Some(Ok(WsMessage::Ping(data))) => {

@@ -443,6 +443,76 @@ impl RawMessage {
     }
 }
 
+/// Recover an inbound **object-form** CALLERROR frame that the strict [`Message`]
+/// deserialize rejected, so the live transport recv loops can still resolve the
+/// correlated pending CALL promptly instead of silently dropping the frame.
+///
+/// The wire `error_code` is untrusted input from a remote peer: a vendor-specific
+/// code, a forward-compat code from a newer OCPP revision, or a buggy/malicious
+/// peer can all put a value outside the 12-member [`CallErrorCode`] set on the
+/// wire. `Message`'s strict `serde` decode (which routes a `"CALLERROR"` frame
+/// through [`CallErrorMessage`]'s `error_code: CallErrorCode`) fails the *whole
+/// frame* on such a value. Without this fallback the frame lands in the recv
+/// loop's error arm and is dropped, so the outstanding `call()` — keyed by this
+/// `unique_id` — is never rejected and blocks until its call-timeout fires,
+/// surfacing a misleading [`OcppError::Timeout`] instead of a prompt, correlated
+/// error carrying the peer's code + description (issue #381).
+///
+/// This is the faithful analog of the reference's `CallError.to_exception`
+/// ([`ocpp/messages.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/messages.py)):
+/// the frame always *unpacks* (its `unique_id` is preserved so the pending call
+/// is still resolved — never left dangling, matching `_handle_call_error` in
+/// [`ocpp/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py)),
+/// and only the code→error mapping distinguishes known from unknown: a recognized
+/// code yields the typed [`OcppError::CallError`], while an out-of-spec code
+/// yields [`OcppError::ProtocolViolation`] — the Rust analog of the reference's
+/// `UnknownCallErrorCodeError`. The 12-code mapping is **not** duplicated here;
+/// this reuses the #260-hardened [`RawMessage::into_message`] as the single
+/// source of truth by reshaping the parsed object into a [`RawMessage::CallError`].
+///
+/// Returns `None` when `text` is not a CALLERROR object, or carries no string
+/// `unique_id`/`error_code` — i.e. there is nothing to correlate — so the caller
+/// treats it as an undecodable frame exactly as it did before. `error_description`
+/// and `error_details` are best-effort: a peer that omits them still gets its
+/// pending call resolved, with the same defaults [`CallErrorMessage::new`] applies.
+pub fn recover_inbound_call_error(text: &str) -> Option<(String, OcppError)> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    if value.get("0").and_then(|t| t.as_str()) != Some("CALLERROR") {
+        return None;
+    }
+    let unique_id = value.get("1").and_then(|v| v.as_str())?.to_string();
+    let error_code = value.get("2").and_then(|v| v.as_str())?.to_string();
+    let error_description = value
+        .get("3")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let error_details = value
+        .get("4")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+
+    // Route through the shared tolerant decoder: a known code decodes to
+    // `Message::CallError` (→ typed `OcppError::CallError`), an unknown code
+    // returns `Err(OcppError::ProtocolViolation { "Unknown error code: …" })`.
+    let err = match RawMessage::CallError(
+        4,
+        unique_id.clone(),
+        error_code,
+        error_description,
+        error_details,
+    )
+    .into_message()
+    {
+        Ok(Message::CallError(frame)) => OcppError::from(&frame),
+        // `RawMessage::CallError` only ever decodes to `Message::CallError`; any
+        // other outcome means the frame is not correlatable as a CALLERROR.
+        Ok(_) => return None,
+        Err(e) => e,
+    };
+    Some((unique_id, err))
+}
+
 impl From<Message> for RawMessage {
     fn from(message: Message) -> Self {
         match message {
@@ -689,6 +759,126 @@ mod tests {
             }
             other => panic!("expected ProtocolViolation, got {other:?}"),
         }
+    }
+
+    /// Build the **object-form** wire text for a CALLERROR exactly as the live
+    /// transport puts it on the wire (`Message`'s untagged serialize), so the
+    /// recovery helper is exercised against a real frame rather than a
+    /// hand-shaped string.
+    fn object_form_call_error(
+        unique_id: &str,
+        code: &str,
+        desc: &str,
+        details: serde_json::Value,
+    ) -> String {
+        serde_json::to_string(&json!({
+            "0": "CALLERROR",
+            "1": unique_id,
+            "2": code,
+            "3": desc,
+            "4": details,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn recover_unknown_error_code_preserves_unique_id_as_protocol_violation() {
+        // The primary #381 regression: a peer sends a CALLERROR with an
+        // out-of-spec code (`418`). Strict `Message` decode rejects the whole
+        // frame, but recovery must still surface the `unique_id` (so the pending
+        // call can be rejected) and map the unknown code to `ProtocolViolation`.
+        let text = object_form_call_error("call-teapot", "418", "I'm a teapot", json!({}));
+        let (unique_id, err) =
+            recover_inbound_call_error(&text).expect("an unknown-code CALLERROR must be recovered");
+        assert_eq!(unique_id, "call-teapot", "the correlation key must survive");
+        match err {
+            OcppError::ProtocolViolation { message } => {
+                assert!(message.contains("418"), "got: {message}");
+            }
+            other => panic!("expected ProtocolViolation for an unknown code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recover_known_error_code_yields_typed_call_error() {
+        // Regression: a recognized code must still surface as the typed
+        // `OcppError::CallError` with code + description + details intact — the
+        // recovery path must not flatten known codes into `ProtocolViolation`.
+        let text = object_form_call_error(
+            "call-known",
+            "InternalError",
+            "central system unavailable",
+            json!({"retryAfter": 30}),
+        );
+        let (unique_id, err) =
+            recover_inbound_call_error(&text).expect("a known-code CALLERROR must be recovered");
+        assert_eq!(unique_id, "call-known");
+        assert_eq!(
+            err,
+            OcppError::CallError {
+                code: CallErrorCode::InternalError,
+                description: "central system unavailable".to_string(),
+                details: json!({"retryAfter": 30}),
+            }
+        );
+    }
+
+    #[test]
+    fn recover_ignores_non_call_error_frames() {
+        // CALL and CALLRESULT frames are handled by the normal decode path; the
+        // recovery helper must decline them (returning `None`) so its caller only
+        // ever uses it as a CALLERROR-specific fallback.
+        let call =
+            serde_json::to_string(&CallMessage::new("Heartbeat".to_string(), json!({})).unwrap())
+                .unwrap();
+        assert!(recover_inbound_call_error(&call).is_none());
+
+        let call_result =
+            serde_json::to_string(&CallResultMessage::new("id-1".to_string(), json!({})).unwrap())
+                .unwrap();
+        assert!(recover_inbound_call_error(&call_result).is_none());
+
+        // Not JSON at all → None (no panic).
+        assert!(recover_inbound_call_error("not json").is_none());
+    }
+
+    #[test]
+    fn recover_declines_call_error_without_correlatable_ids() {
+        // A CALLERROR missing its `unique_id` (or `error_code`) cannot be
+        // correlated to a pending call, so recovery declines it rather than
+        // fabricating a key.
+        let no_uid = serde_json::to_string(&json!({
+            "0": "CALLERROR", "2": "418", "3": "d", "4": {}
+        }))
+        .unwrap();
+        assert!(recover_inbound_call_error(&no_uid).is_none());
+
+        let no_code = serde_json::to_string(&json!({
+            "0": "CALLERROR", "1": "uid", "3": "d", "4": {}
+        }))
+        .unwrap();
+        assert!(recover_inbound_call_error(&no_code).is_none());
+    }
+
+    #[test]
+    fn recover_defaults_missing_description_and_details() {
+        // Description/details are best-effort: a peer that omits them still gets
+        // its pending call resolved, with the empty-object detail default.
+        let text = serde_json::to_string(&json!({
+            "0": "CALLERROR", "1": "uid-min", "2": "GenericError"
+        }))
+        .unwrap();
+        let (unique_id, err) =
+            recover_inbound_call_error(&text).expect("a minimal CALLERROR must still recover");
+        assert_eq!(unique_id, "uid-min");
+        assert_eq!(
+            err,
+            OcppError::CallError {
+                code: CallErrorCode::GenericError,
+                description: String::new(),
+                details: json!({}),
+            }
+        );
     }
 
     #[test]

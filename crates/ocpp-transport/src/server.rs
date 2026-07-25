@@ -34,7 +34,9 @@ use ocpp_types::v16j::{
     ConfigurationStatus, MessageTrigger, RemoteStartStopStatus, ReservationStatus, ResetStatus,
     ResetType, TriggerMessageStatus, UnlockStatus, UpdateStatus, UpdateType,
 };
-use ocpp_types::{CallErrorCode, DateTime, OcppError, OcppResult, SchemaKeyword, Utc};
+use ocpp_types::{
+    recover_inbound_call_error, CallErrorCode, DateTime, OcppError, OcppResult, SchemaKeyword, Utc,
+};
 use std::{net::SocketAddr, sync::Arc};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{error, info, warn};
@@ -1182,8 +1184,25 @@ async fn handle_cp_socket(
                         }
                     }
                     None => {
-                        // Cannot correlate without a parseable frame — log and continue.
-                        warn!("Malformed OCPP frame from '{}'", charge_point_id);
+                        // A CALLERROR whose `error_code` is outside the spec set
+                        // fails `classify_frame`'s strict decode (`.ok()` → None).
+                        // It still carries a `unique_id`, so resolve the correlated
+                        // in-flight CSMS-initiated CALL promptly — an unknown code
+                        // maps to `ProtocolViolation`, faithful to the reference's
+                        // `CallError.to_exception` / `UnknownCallErrorCodeError` —
+                        // instead of dropping the frame and letting
+                        // `OcppServer::call` hang to its timeout (#381).
+                        if let Some((unique_id, err)) = recover_inbound_call_error(&text) {
+                            if !pending.reject(&unique_id, err) {
+                                warn!(
+                                    "CALLERROR (unrecognized error_code) from '{}' for unknown unique_id '{}'",
+                                    charge_point_id, unique_id
+                                );
+                            }
+                        } else {
+                            // Cannot correlate without a parseable frame — log and continue.
+                            warn!("Malformed OCPP frame from '{}'", charge_point_id);
+                        }
                     }
                 }
             }
