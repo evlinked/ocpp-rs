@@ -360,6 +360,73 @@ async fn after_hook_does_not_fire_without_a_matching_on_handler() {
     );
 }
 
+/// **Port of `@after(action, inject_response=True)`** — the reference's
+/// `test_response_injected_to_after_handler` (`tests/test_charge_point.py`).
+/// When an `@after` hook opts into the response via `after_with_response`, it
+/// receives the exact response the `@on` handler returned (and that was sent
+/// back to the counterparty), mirroring `_handle_call()` injecting
+/// `call_response = response_payload`. The reference asserts the hook sees
+/// `current_time` / `interval` / `status`; the strongly-typed Rust hook asserts
+/// the same three fields on a `BootNotificationResponse`.
+#[tokio::test]
+async fn after_with_response_injects_the_on_handlers_response() {
+    // A fixed response (the reference uses a hard-coded `2024-11-01T00:00:00Z`)
+    // so the hook can assert an exact `current_time`.
+    let current_time = chrono::DateTime::parse_from_rfc3339("2024-11-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let fixed = BootNotificationResponse {
+        current_time,
+        interval: 300,
+        status: RegistrationStatus::Accepted,
+    };
+
+    // Capture the injected response so assertions run on the main test thread
+    // (a panic inside the spawned hook would not fail the test on its own).
+    let seen = Arc::new(std::sync::Mutex::new(None::<BootNotificationResponse>));
+    let s = seen.clone();
+    let notify = Arc::new(Notify::new());
+    let n = notify.clone();
+
+    let mut d = ActionDispatcher::new();
+    d.on(move |_req: BootNotificationRequest| {
+        let fixed = fixed.clone();
+        async move { Ok(fixed) }
+    });
+    d.after_with_response(
+        move |_req: BootNotificationRequest, resp: BootNotificationResponse| {
+            let s = s.clone();
+            let n = n.clone();
+            async move {
+                *s.lock().unwrap() = Some(resp);
+                n.notify_one();
+            }
+        },
+    );
+
+    let call = CallMessage::new(
+        "BootNotification".to_string(),
+        json!({ "chargePointVendor": "vendor", "chargePointModel": "model" }),
+    )
+    .unwrap();
+    d.dispatch(&call).await.unwrap();
+
+    // Ensure the after handler actually ran (the reference asserts a call count
+    // of 1 so its inner assertions are not silently skipped).
+    tokio::time::timeout(Duration::from_secs(5), notify.notified())
+        .await
+        .expect("the after_with_response hook must fire after a successful dispatch");
+
+    let got = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the hook must have run");
+    assert_eq!(got.current_time, current_time, "injected current_time");
+    assert_eq!(got.interval, 300, "injected interval");
+    assert_eq!(got.status, RegistrationStatus::Accepted, "injected status");
+}
+
 // ─── skip_schema_validation — per-route flag (Issue #275) ───────────────────
 
 /// An over-length `BootNotification` CALL: `chargePointVendor` exceeds the

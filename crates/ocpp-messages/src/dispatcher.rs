@@ -30,11 +30,18 @@ type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 /// route type and lets `dispatch()` supply the id unconditionally.
 type HandlerFn = Box<dyn Fn(Value, String) -> BoxFuture<OcppResult<Value>> + Send + Sync>;
 
-/// Type-erased after-hook: `(payload Value, triggering CALL's unique_id)` in,
-/// fire-and-forget (`()`). As with [`HandlerFn`], the `unique_id` is consumed by
-/// id-aware hooks ([`ActionDispatcher::after_with_id`]) and ignored by the plain
-/// [`ActionDispatcher::after`] erasure.
-type AfterFn = Box<dyn Fn(Value, String) -> BoxFuture<()> + Send + Sync>;
+/// Type-erased after-hook: `(request payload Value, `@on` handler's response
+/// Value, triggering CALL's unique_id)` in, fire-and-forget (`()`).
+///
+/// As with [`HandlerFn`], each erasure consumes only the arguments its builder
+/// opted into and ignores the rest: the plain [`ActionDispatcher::after`] uses
+/// just the request, [`ActionDispatcher::after_with_id`] adds the `unique_id`,
+/// and [`ActionDispatcher::after_with_response`] adds the handler's `response`
+/// (the port of the reference's `@after(action, inject_response=True)` /
+/// `call_response`). Threading all three through one signature (rather than
+/// storing several hook variants) keeps a single `after_hooks` map; `dispatch()`
+/// always supplies every argument.
+type AfterFn = Box<dyn Fn(Value, Value, String) -> BoxFuture<()> + Send + Sync>;
 
 /// A registered `@on` route: the handler plus its per-route options.
 ///
@@ -239,7 +246,7 @@ impl ActionDispatcher {
         Fut: Future<Output = ()> + Send + 'static,
         F: Fn(Req) -> Fut + Send + Sync + Clone + 'static,
     {
-        let erased: AfterFn = Box::new(move |raw: Value, _unique_id: String| {
+        let erased: AfterFn = Box::new(move |raw: Value, _response: Value, _unique_id: String| {
             let h = hook.clone();
             Box::pin(async move {
                 if let Ok(req) = serde_json::from_value::<Req>(raw) {
@@ -268,11 +275,61 @@ impl ActionDispatcher {
         Fut: Future<Output = ()> + Send + 'static,
         F: Fn(Req, String) -> Fut + Send + Sync + Clone + 'static,
     {
-        let erased: AfterFn = Box::new(move |raw: Value, unique_id: String| {
+        let erased: AfterFn = Box::new(move |raw: Value, _response: Value, unique_id: String| {
             let h = hook.clone();
             Box::pin(async move {
                 if let Ok(req) = serde_json::from_value::<Req>(raw) {
                     h(req, unique_id).await;
+                }
+            })
+        });
+        self.after_hooks.insert(Req::ACTION_NAME, erased);
+    }
+
+    /// Register a fire-and-forget `@after` hook for `Req::ACTION_NAME` that
+    /// additionally receives the **`@on` handler's response** as a second
+    /// argument — the port of the reference's
+    /// `@after(action, inject_response=True)` and its injected `call_response`
+    /// keyword (`ocpp/routing.py::after` + `_handle_call()` in
+    /// [`ocpp/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py),
+    /// which sets `snake_case_payload["call_response"] = response_payload` when
+    /// the hook was decorated with `inject_response=True`).
+    ///
+    /// The hook closure receives `(Req, Req::Response)`: the deserialised request
+    /// and the strongly-typed response the `@on` handler returned (and that was
+    /// sent back to the counterparty). This is the supported way to run a
+    /// post-response side effect keyed on *what was actually answered* — e.g.
+    /// recording the CSMS-assigned `interval`/`status` from a `BootNotification`
+    /// response, or the `idTagInfo` returned to an `Authorize`.
+    ///
+    /// As with the reference, the response is the **validated** one: `dispatch()`
+    /// spawns this hook only after the `@on` handler succeeds *and* the outgoing
+    /// CALLRESULT passes response validation (a failed `validate_call_result`
+    /// short-circuits before the spawn), so an invalid response never reaches
+    /// this hook. Like [`after`](Self::after) / [`after_with_id`](Self::after_with_id),
+    /// it is spawned via [`tokio::spawn`], does not block the CALLRESULT path,
+    /// and is silently skipped if either payload fails to deserialise. The plain
+    /// [`after`](Self::after) / [`after_with_id`](Self::after_with_id) builders are
+    /// unaffected — their hooks never see the response.
+    pub fn after_with_response<Req, Fut, F>(&mut self, hook: F)
+    where
+        Req: OcppAction + 'static,
+        Req::Response: 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+        F: Fn(Req, Req::Response) -> Fut + Send + Sync + Clone + 'static,
+    {
+        let erased: AfterFn = Box::new(move |raw: Value, response: Value, _unique_id: String| {
+            let h = hook.clone();
+            Box::pin(async move {
+                // Both the request and the response must deserialise for the hook
+                // to run — mirroring the plain `after`, which is skipped when the
+                // request fails to deserialise. `response` is the already-
+                // validated CALLRESULT payload threaded in by `dispatch()`.
+                if let (Ok(req), Ok(resp)) = (
+                    serde_json::from_value::<Req>(raw),
+                    serde_json::from_value::<Req::Response>(response),
+                ) {
+                    h(req, resp).await;
                 }
             })
         });
@@ -350,8 +407,14 @@ impl ActionDispatcher {
             }
         }
 
+        // Thread the request payload, the *validated* response, and the
+        // `unique_id` into the after-hook. Each erasure consumes only the
+        // arguments its builder opted into (`after` → request; `after_with_id` →
+        // request + id; `after_with_response` → request + response), ports the
+        // reference's conditional `call_response`/`call_unique_id` injection in
+        // `_handle_call()`. `response` is cloned because it is also returned below.
         if let Some(after) = self.after_hooks.get(action) {
-            tokio::spawn(after(payload, unique_id));
+            tokio::spawn(after(payload, response.clone(), unique_id));
         }
 
         Ok(response)
@@ -1206,5 +1269,109 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), notify.notified())
             .await
             .expect("a plain @after hook must still fire when the id is threaded");
+    }
+
+    // --- response-aware after hooks: after_with_response (Issue #388) ---
+    //
+    // Python ref: `@after(action, inject_response=True)` in ocpp/routing.py, and
+    // `_handle_call()` in ocpp/charge_point.py setting
+    // `snake_case_payload["call_response"] = response_payload` before invoking the
+    // after-hook. `after_with_response` receives the `@on` handler's (validated)
+    // response as a strongly-typed second argument; plain `after` never does.
+
+    #[tokio::test]
+    async fn after_with_response_receives_the_handler_response() {
+        let seen = Arc::new(std::sync::Mutex::new(None::<PingResponse>));
+        let s = seen.clone();
+        let notify = Arc::new(Notify::new());
+        let n = notify.clone();
+
+        let mut d = ActionDispatcher::new();
+        // The `@on` handler echoes the nonce back in its response.
+        d.on(|req: PingRequest| async move { Ok(PingResponse { echoed: req.nonce }) });
+        d.after_with_response(move |_req: PingRequest, resp: PingResponse| {
+            let s = s.clone();
+            let n = n.clone();
+            async move {
+                *s.lock().unwrap() = Some(resp);
+                n.notify_one();
+            }
+        });
+
+        d.dispatch(&ping_call(7)).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("the after_with_response hook must fire after a successful dispatch");
+        assert_eq!(
+            seen.lock().unwrap().as_ref().map(|r| r.echoed),
+            Some(7),
+            "after_with_response must see the exact response the @on handler returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_with_response_not_run_on_response_validation_failure() {
+        // Same guard as `dispatch_rejects_a_schema_invalid_response`: with a
+        // validator attached and a handler returning an out-of-enum `status`, the
+        // outgoing CALLRESULT fails validation and short-circuits *before* the
+        // after-hook spawn — so a response-aware hook must not run, matching the
+        // reference which raises before reaching its after block.
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+
+        let mut d = validating_dispatcher();
+        d.on(|_req: RawBootRequest| async move { Ok(raw_boot_response("Yolo")) });
+        d.after_with_response(move |_req: RawBootRequest, _resp: RawBootResponse| {
+            let r = r.clone();
+            async move {
+                r.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let err = d.dispatch(&valid_boot_call()).await.unwrap_err();
+        assert!(
+            matches!(err, OcppError::SchemaViolation { .. }),
+            "the out-of-enum response must fail validation, got {err:?}"
+        );
+
+        // Give any (erroneously) spawned hook a chance to run before asserting.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "after_with_response must not run when response validation fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_with_response_sees_a_validated_response() {
+        // The passing counterpart: a schema-valid response is threaded into the
+        // hook. Uses the raw response type so the hook observes the exact
+        // (validated) `status` the handler produced.
+        let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+        let s = seen.clone();
+        let notify = Arc::new(Notify::new());
+        let n = notify.clone();
+
+        let mut d = validating_dispatcher();
+        d.on(|_req: RawBootRequest| async move { Ok(raw_boot_response("Accepted")) });
+        d.after_with_response(move |_req: RawBootRequest, resp: RawBootResponse| {
+            let s = s.clone();
+            let n = n.clone();
+            async move {
+                *s.lock().unwrap() = Some(resp.status);
+                n.notify_one();
+            }
+        });
+
+        d.dispatch(&valid_boot_call()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("the after_with_response hook must fire on a valid response");
+        assert_eq!(
+            seen.lock().unwrap().as_deref(),
+            Some("Accepted"),
+            "the hook must see the validated response status"
+        );
     }
 }
