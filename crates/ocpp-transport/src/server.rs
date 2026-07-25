@@ -27,7 +27,7 @@ use ocpp_messages::v16j::{
     StartTransactionResponse, StatusNotificationRequest, StopTransactionRequest,
     TriggerMessageRequest, UnlockConnectorRequest, UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
-use ocpp_messages::{CallMessage, Message, MessageType, OcppAction};
+use ocpp_messages::{CallMessage, Message, MessageType, OcppAction, SchemaValidator};
 use ocpp_types::v16j::{
     AuthorizationData, CancelReservationStatus, ChargingProfile, ChargingProfilePurposeType,
     ChargingProfileStatus, ChargingRateUnitType, ClearCacheStatus, ClearChargingProfileStatus,
@@ -85,6 +85,13 @@ pub struct OcppServer {
     message_handler: Arc<dyn MessageHandler>,
     serve_handle: Option<JoinHandle<()>>,
     local_addr: Option<SocketAddr>,
+    /// Optional schema validator for the CSMS-initiated [`call`](Self::call)
+    /// path. When `Some`, `call()` validates the outbound CALL before sending
+    /// and the inbound CALLRESULT before deserializing, mirroring the CP-side
+    /// [`ChargePoint::call`](../../ocpp_cp/struct.ChargePoint.html) and the
+    /// reference's side-agnostic `charge_point.py::call`. `None` (the default)
+    /// is the analog of the reference's `skip_schema_validation=True`.
+    validator: Option<Arc<SchemaValidator>>,
 }
 
 impl OcppServer {
@@ -105,8 +112,31 @@ impl OcppServer {
             message_handler,
             serve_handle: None,
             local_addr: None,
+            validator: None,
         };
         (server, event_rx)
+    }
+
+    /// Attach a [`SchemaValidator`] to the CSMS-initiated [`call`](Self::call)
+    /// path, so outbound CALLs and inbound CALLRESULTs are schema-validated —
+    /// the CSMS-side analog of the CP's `config.validate_payloads` and of the
+    /// reference's `skip_schema_validation=False`.
+    ///
+    /// Opt-in (rather than a hard-wired `v16j()` default) because
+    /// [`call`](Self::call) is version-generic: the caller supplies the
+    /// validator matching the OCPP version they speak — e.g.
+    /// `SchemaValidator::v16j()` for 1.6J or `SchemaValidator::v201()` for
+    /// 2.0.1. An unknown action for the attached validator surfaces as
+    /// [`OcppError::NotSupported`] (same as the CP side).
+    ///
+    /// ```ignore
+    /// let (server, events) = OcppServer::new(config, handler);
+    /// let server = server.with_validator(Arc::new(SchemaValidator::v16j()));
+    /// ```
+    #[must_use]
+    pub fn with_validator(mut self, validator: Arc<SchemaValidator>) -> Self {
+        self.validator = Some(validator);
+        self
     }
 
     /// Bind to `bind_addr` and start accepting WebSocket connections.
@@ -208,14 +238,19 @@ impl OcppServer {
     /// It is used to dispatch CS→CP actions such as `RemoteStartTransaction`,
     /// `Reset`, or `ChangeAvailability`.
     ///
+    /// 0. Serialize + (if a validator is attached via [`with_validator`](Self::with_validator))
+    ///    schema-validate the outbound CALL, before the connection check
     /// 1. Resolve the per-CP routing handle by `cp_id`
     /// 2. Register the `unique_id` in the CP's `PendingCallMap` *before* sending
     ///    (race-free, identical to the CP-side `call()`)
     /// 3. Write the CALL frame to the CP's WebSocket sink
     /// 4. Await the response, bounded by `config.call_timeout`
-    /// 5. Deserialize the CALLRESULT payload into `Req::Response`
+    /// 5. (if a validator is attached) schema-validate the CALLRESULT, then
+    ///    deserialize the payload into `Req::Response`
     ///
     /// # Errors
+    /// - [`OcppError::SchemaViolation`] if a validator is attached and the
+    ///   outbound CALL or inbound CALLRESULT violates its schema
     /// - [`OcppError::CpNotConnected`] if `cp_id` has no live session (checked
     ///   before registering, and again if the sink channel has closed mid-flight)
     /// - [`OcppError::CallError`] if the CP replies with a CALLERROR frame
@@ -230,6 +265,24 @@ impl OcppServer {
         cp_id: &str,
         request: Req,
     ) -> OcppResult<Req::Response> {
+        // 0. Serialize the typed request up front and validate the OUTGOING CALL
+        //    against its `{action}` schema *before* the connection check or any
+        //    network I/O, mirroring the CP-side `ChargePoint::call` and the
+        //    reference's `call()` in charge_point.py (which runs
+        //    `validate_payload(call)` prior to `_send`). A strongly-typed
+        //    request can still be schema-invalid (e.g. a `String` field
+        //    exceeding its `maxLength`); the reference rejects it locally rather
+        //    than putting a malformed CALL on the wire. Gated by an attached
+        //    validator, whose absence is the analog of the reference's
+        //    `skip_schema_validation=True`. Ordering it before the connection
+        //    check means a schema-invalid request surfaces as `SchemaViolation`
+        //    regardless of link state, matching the reference's
+        //    validate-before-`_send` ordering.
+        let payload = serde_json::to_value(&request).map_err(OcppError::from)?;
+        if let Some(validator) = &self.validator {
+            validator.validate_call(Req::ACTION_NAME, &payload)?;
+        }
+
         // 1. Resolve the routing handle. Clone it out so we don't hold a DashMap
         //    guard across the await points below (which could deadlock writers).
         let handle = self
@@ -246,12 +299,13 @@ impl OcppServer {
         //    arrives before the receiver is in the map.
         let rx = handle.pending.register(unique_id.clone());
 
-        // 3. Build and send the CALL frame.
+        // 3. Build and send the CALL frame, reusing the payload serialized (and
+        //    validated) in step 0.
         let call_msg = CallMessage {
             message_type: MessageType::Call,
             unique_id: unique_id.clone(),
             action: Req::ACTION_NAME.to_string(),
-            payload: serde_json::to_value(&request).map_err(OcppError::from)?,
+            payload,
         };
         let text = serde_json::to_string(&Message::Call(call_msg)).map_err(OcppError::from)?;
         if handle.outbound.send(WsMessage::Text(text)).is_err() {
@@ -289,8 +343,22 @@ impl OcppServer {
             }
         };
 
-        // 5. Propagate any CALLERROR, then deserialize the success payload.
+        // 5. Propagate any CALLERROR, then validate + deserialize the success
+        //    payload.
         let payload = raw?;
+
+        // Validate the CALLRESULT against the `{action}Response` schema before
+        // deserializing, mirroring `_handle_call_result()` in charge_point.py
+        // and the CP-side `ChargePoint::call`. A CP's response is a trust
+        // boundary: a frame that violates the schema but still deserializes into
+        // `Req::Response` — an over-`maxLength` string, or an extra property
+        // under the schema's `additionalProperties: false` (serde ignores
+        // unknown fields) — is rejected explicitly rather than silently
+        // accepted.
+        if let Some(validator) = &self.validator {
+            validator.validate_call_result(Req::ACTION_NAME, &payload)?;
+        }
+
         serde_json::from_value::<Req::Response>(payload).map_err(OcppError::from)
     }
 
@@ -2243,6 +2311,130 @@ mod tests {
             matches!(err, OcppError::CallError { ref code, .. } if *code == CallErrorCode::InternalError),
             "expected CallError(InternalError), got {err:?}"
         );
+
+        responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    /// Like [`start_server`] but attaches an OCPP 1.6J [`SchemaValidator`] to
+    /// the CSMS-initiated `call()` path, so outbound CALLs and inbound
+    /// CALLRESULTs are schema-validated.
+    async fn start_server_validated(handler: Arc<dyn MessageHandler>) -> (OcppServer, SocketAddr) {
+        let (server, _rx) = OcppServer::new(TransportConfig::default(), handler);
+        let mut server = server.with_validator(Arc::new(SchemaValidator::v16j()));
+        server.start("127.0.0.1:0").await.expect("server start");
+        let addr = server.local_addr().unwrap();
+        (server, addr)
+    }
+
+    #[tokio::test]
+    async fn server_call_validates_outbound_rejects_overlong_idtag() {
+        // A 21-char idTag exceeds RemoteStartTransaction's CiString20 maxLength:
+        // serde builds it fine, but the schema rejects it. With a validator
+        // attached, `call()` must reject it as a SchemaViolation *before* the
+        // connection check — so even a call to an unconnected CP fails with
+        // SchemaViolation, not CpNotConnected — matching the reference's
+        // validate-before-`_send` ordering (`charge_point.py::call`).
+        let (mut server, _addr) = start_server_validated(Arc::new(EchoHandler)).await;
+        let err = server
+            .call("NEVER_CONNECTED", remote_start(&"x".repeat(21)))
+            .await
+            .expect_err("overlong idTag must be rejected before send");
+        assert!(
+            matches!(err, OcppError::SchemaViolation { .. }),
+            "expected SchemaViolation (not CpNotConnected), got {err:?}"
+        );
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_call_validates_callresult_rejects_additional_property() {
+        // Primary trust-boundary regression: the CP replies with a valid
+        // `status` plus an extra property the schema forbids
+        // (`additionalProperties: false`). serde ignores unknown fields and
+        // would accept this; the validator must reject it as a SchemaViolation,
+        // mirroring `_handle_call_result` / `validate_payload(response)`.
+        let (mut server, addr) = start_server_validated(Arc::new(EchoHandler)).await;
+        let mut cp = connect_cp(&server, addr, "CP_VAL").await;
+
+        let responder = tokio::spawn(async move {
+            let (_action, unique_id) = read_call(&mut cp).await;
+            cp.send(WsMsg::Text(call_result_frame(
+                &unique_id,
+                serde_json::json!({ "status": "Accepted", "extra": true }),
+            )))
+            .await
+            .unwrap();
+            cp
+        });
+
+        let err = server
+            .call("CP_VAL", remote_start("TAG"))
+            .await
+            .expect_err("schema-invalid CALLRESULT must be rejected");
+        assert!(
+            matches!(err, OcppError::SchemaViolation { .. }),
+            "expected SchemaViolation for additionalProperties violation, got {err:?}"
+        );
+
+        responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_call_without_validator_accepts_unvalidated_callresult() {
+        // Regression pinning the opt-in gate: a default server (no validator)
+        // accepts the SAME additionalProperties-violating CALLRESULT, because
+        // serde ignores the unknown `extra` field. Attaching a validator is
+        // what adds the check; the default preserves prior behavior (the
+        // reference's `skip_schema_validation=True`).
+        let (mut server, addr) = start_server(Arc::new(EchoHandler)).await;
+        let mut cp = connect_cp(&server, addr, "CP_NOVAL").await;
+
+        let responder = tokio::spawn(async move {
+            let (_action, unique_id) = read_call(&mut cp).await;
+            cp.send(WsMsg::Text(call_result_frame(
+                &unique_id,
+                serde_json::json!({ "status": "Accepted", "extra": true }),
+            )))
+            .await
+            .unwrap();
+            cp
+        });
+
+        let resp = server
+            .call("CP_NOVAL", remote_start("TAG"))
+            .await
+            .expect("no validator ⇒ CALLRESULT accepted");
+        assert_eq!(resp.status, RemoteStartStopStatus::Accepted);
+
+        responder.await.unwrap();
+        server.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_call_with_validator_accepts_valid_callresult() {
+        // Happy path: with a validator attached, a conformant CALLRESULT still
+        // round-trips to Ok — the validator doesn't break valid traffic.
+        let (mut server, addr) = start_server_validated(Arc::new(EchoHandler)).await;
+        let mut cp = connect_cp(&server, addr, "CP_OK").await;
+
+        let responder = tokio::spawn(async move {
+            let (_action, unique_id) = read_call(&mut cp).await;
+            cp.send(WsMsg::Text(call_result_frame(
+                &unique_id,
+                serde_json::json!({ "status": "Accepted" }),
+            )))
+            .await
+            .unwrap();
+            cp
+        });
+
+        let resp = server
+            .call("CP_OK", remote_start("TAG"))
+            .await
+            .expect("valid CALLRESULT passes validation");
+        assert_eq!(resp.status, RemoteStartStopStatus::Accepted);
 
         responder.await.unwrap();
         server.stop().await.unwrap();
