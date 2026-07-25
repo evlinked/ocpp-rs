@@ -427,6 +427,75 @@ async fn after_with_response_injects_the_on_handlers_response() {
     assert_eq!(got.status, RegistrationStatus::Accepted, "injected status");
 }
 
+/// **Port of an `@after` hook declaring `call_unique_id` *and*
+/// `inject_response=True`** — the reference's `_handle_call()` injects the two
+/// independently and simultaneously (`snake_case_payload["call_unique_id"]` and
+/// `snake_case_payload["call_response"]`), so a single hook can receive both.
+/// `after_with_id_and_response` is the Rust analog: the hook sees the triggering
+/// CALL's exact `unique_id` alongside the `@on` handler's response.
+#[tokio::test]
+async fn after_with_id_and_response_injects_both_id_and_response() {
+    let current_time = chrono::DateTime::parse_from_rfc3339("2024-11-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let fixed = BootNotificationResponse {
+        current_time,
+        interval: 300,
+        status: RegistrationStatus::Accepted,
+    };
+
+    let seen_resp = Arc::new(std::sync::Mutex::new(None::<BootNotificationResponse>));
+    let seen_id = Arc::new(std::sync::Mutex::new(None::<String>));
+    let sr = seen_resp.clone();
+    let si = seen_id.clone();
+    let notify = Arc::new(Notify::new());
+    let n = notify.clone();
+
+    let mut d = ActionDispatcher::new();
+    d.on(move |_req: BootNotificationRequest| {
+        let fixed = fixed.clone();
+        async move { Ok(fixed) }
+    });
+    d.after_with_id_and_response(
+        move |_req: BootNotificationRequest, resp: BootNotificationResponse, unique_id: String| {
+            let sr = sr.clone();
+            let si = si.clone();
+            let n = n.clone();
+            async move {
+                *sr.lock().unwrap() = Some(resp);
+                *si.lock().unwrap() = Some(unique_id);
+                n.notify_one();
+            }
+        },
+    );
+
+    let call = CallMessage::with_id(
+        "boot-abc-123".to_string(),
+        "BootNotification".to_string(),
+        json!({ "chargePointVendor": "vendor", "chargePointModel": "model" }),
+    )
+    .unwrap();
+    d.dispatch(&call).await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(5), notify.notified())
+        .await
+        .expect("the after_with_id_and_response hook must fire after a successful dispatch");
+
+    let got = seen_resp
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the hook must have run");
+    assert_eq!(got.current_time, current_time, "injected current_time");
+    assert_eq!(got.interval, 300, "injected interval");
+    assert_eq!(got.status, RegistrationStatus::Accepted, "injected status");
+    assert_eq!(
+        seen_id.lock().unwrap().as_deref(),
+        Some("boot-abc-123"),
+        "the hook must also see the triggering CALL's exact unique_id"
+    );
+}
+
 // ─── skip_schema_validation — per-route flag (Issue #275) ───────────────────
 
 /// An over-length `BootNotification` CALL: `chargePointVendor` exceeds the
