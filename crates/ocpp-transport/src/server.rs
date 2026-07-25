@@ -1167,7 +1167,9 @@ pub(crate) fn build_call_error(unique_id: &str, error: &OcppError) -> Message {
             // the bare action name and the cause is unambiguous.
             OcppError::NotImplemented { feature } => (
                 CallErrorCode::NotImplemented,
-                "Request Action is recognized but not supported by the receiver".to_string(),
+                CallErrorCode::NotImplemented
+                    .default_description()
+                    .to_string(),
                 Some(serde_json::json!({
                     "cause": format!("No handler for {feature} registered."),
                 })),
@@ -1180,7 +1182,9 @@ pub(crate) fn build_call_error(unique_id: &str, error: &OcppError) -> Message {
             // cause here (see issue #311). The canonical description matches.
             OcppError::NotSupported { feature } => (
                 CallErrorCode::NotSupported,
-                "Requested Action is not known by receiver".to_string(),
+                CallErrorCode::NotSupported
+                    .default_description()
+                    .to_string(),
                 Some(serde_json::json!({
                     "cause": format!("{feature} not supported by receiver."),
                 })),

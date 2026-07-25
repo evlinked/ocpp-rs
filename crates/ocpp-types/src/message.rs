@@ -318,6 +318,26 @@ impl CallErrorMessage {
             error_details: error_details.unwrap_or(serde_json::Value::Object(Default::default())),
         }
     }
+
+    /// Create a CallError message whose description defaults to the code's
+    /// spec-canonical [`default_description`](CallErrorCode::default_description),
+    /// mirroring the reference's `OCPPError(description=None)` fallback in
+    /// [`ocpp/exceptions.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/exceptions.py)
+    /// (`OCPPError.__init__` sets `description = default_description` when none is
+    /// given — pinned by `tests/test_exceptions.py::test_exception_without_error_details`).
+    ///
+    /// Use this when emitting a CALLERROR carries no case-specific description and
+    /// the canonical text is the correct wire value; pass an explicit description
+    /// via [`CallErrorMessage::new`] otherwise. Details default to an empty object
+    /// exactly as `new` (and the reference's `details or {}`) do.
+    pub fn from_code(
+        unique_id: String,
+        error_code: CallErrorCode,
+        error_details: Option<serde_json::Value>,
+    ) -> Self {
+        let description = error_code.default_description().to_string();
+        CallErrorMessage::new(unique_id, error_code, description, error_details)
+    }
 }
 
 /// Human-readable CALLERROR frame, adapting the reference's

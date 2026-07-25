@@ -323,6 +323,65 @@ impl CallErrorCode {
             CallErrorCode::GenericError => "GenericError",
         }
     }
+
+    /// The spec-canonical **default description** for this error code, ported
+    /// verbatim from the reference's per-subclass `default_description`
+    /// ([`ocpp/exceptions.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/exceptions.py)).
+    ///
+    /// The reference fills `OCPPError.description` from this string whenever an
+    /// error is raised without an explicit description (`OCPPError.__init__`,
+    /// pinned by `tests/test_exceptions.py::test_exception_without_error_details`).
+    /// This method is the single source of truth for those strings; the CALLERROR
+    /// builder (`crates/ocpp-transport/src/server.rs::build_call_error`) and
+    /// [`crate::message::CallErrorMessage::from_code`] both source their fallback
+    /// text here rather than duplicating literals.
+    ///
+    /// The strings are reproduced **exactly**, including the reference's own
+    /// quirks a faithful port must preserve:
+    /// - [`NotImplemented`](CallErrorCode::NotImplemented) reads *"Request Action"*
+    ///   (not *"Requested"*) — a typo in the reference, kept for byte-fidelity.
+    /// - The two `Format`/`Formation` spellings and the two
+    ///   `Occur[r]enceConstraintViolation` spellings each share one description,
+    ///   matching the reference (which pairs the strict-1.6J and corrected forms).
+    /// - [`TypeConstraintViolation`](CallErrorCode::TypeConstraintViolation)
+    ///   embeds the reference's curly quotes (`“somestring”`), not ASCII quotes.
+    pub fn default_description(&self) -> &'static str {
+        match self {
+            CallErrorCode::NotImplemented => {
+                "Request Action is recognized but not supported by the receiver"
+            }
+            CallErrorCode::NotSupported => "Requested Action is not known by receiver",
+            CallErrorCode::InternalError => {
+                "An internal error occurred and the receiver was not able to process the \
+                 requested Action successfully"
+            }
+            CallErrorCode::ProtocolError => "Payload for Action is incomplete",
+            CallErrorCode::SecurityError => {
+                "During the processing of Action a security issue occurred preventing receiver \
+                 from completing the Action successfully"
+            }
+            // The reference's `FormatViolationError` and `FormationViolationError`
+            // carry the same `default_description` (implicit string concatenation
+            // in `ocpp/exceptions.py` collapses to this exact text for both).
+            CallErrorCode::FormatViolation | CallErrorCode::FormationViolation => {
+                "Payload for Action is syntactically incorrect or structure for Action"
+            }
+            CallErrorCode::PropertyConstraintViolation => {
+                "Payload is syntactically correct but at least one field contains an invalid value"
+            }
+            // Both `Occurence`/`Occurrence` spellings share one description.
+            CallErrorCode::OccurenceConstraintViolation
+            | CallErrorCode::OccurrenceConstraintViolation => {
+                "Payload for Action is syntactically correct but at least one of the fields \
+                 violates occurence constraints"
+            }
+            CallErrorCode::TypeConstraintViolation => {
+                "Payload for Action is syntactically correct but at least one of the fields \
+                 violates data type constraints (e.g. \u{201c}somestring\u{201d}: 12)"
+            }
+            CallErrorCode::GenericError => "Any other error not all other OCPP defined errors",
+        }
+    }
 }
 
 /// Result type alias for OCPP operations
