@@ -39,8 +39,10 @@ use ocpp_messages::v201::{
 };
 use ocpp_messages::{ActionDispatcher, SchemaValidator};
 use ocpp_types::v201::RegistrationStatusEnumType;
+use tokio::sync::mpsc;
 
-use crate::DispatchHandler;
+use crate::server::OcppServer;
+use crate::{central_system_server_v201, DispatchHandler, TransportConfig, TransportEvent};
 
 /// Configuration for the default 2.0.1 Central System handler set.
 ///
@@ -119,6 +121,49 @@ pub fn central_system_handler_v201() -> DispatchHandler {
 /// [`CentralSystemConfigV201`].
 pub fn central_system_handler_v201_with(config: CentralSystemConfigV201) -> DispatchHandler {
     DispatchHandler::new(Arc::new(central_system_dispatcher_v201_with(config)))
+}
+
+/// Fully-assembled, batteries-included default **2.0.1** CSMS in one call — the
+/// 2.0.1 twin of [`central_system_service`](crate::central_system_service).
+///
+/// Wires the inbound-validated lifecycle dispatcher
+/// [`central_system_dispatcher_v201_with`], the [`DispatchHandler`] adapter, and
+/// the outbound-validated
+/// [`central_system_server_v201`](crate::central_system_server_v201), so **both
+/// directions are `SchemaValidator::v201()`-backed out of the box** and the boot
+/// and transaction-acknowledgement lifecycle handlers are pre-registered.
+/// Returns the ready-to-[`start`](OcppServer::start) server and its
+/// [`TransportEvent`] receiver.
+///
+/// `customize` runs against the fully-defaulted [`ActionDispatcher`] *before* it
+/// is shared into the handler — register extra `@on`/`@after` handlers or
+/// override a default without dropping the defaults or either validator, exactly
+/// as in the 1.6J [`central_system_service`](crate::central_system_service).
+/// Pass `|_| {}` for the pure-defaults CSMS:
+///
+/// ```ignore
+/// use ocpp_transport::{central_system_service_v201, CentralSystemConfigV201, TransportConfig};
+///
+/// let (mut server, _events) = central_system_service_v201(
+///     CentralSystemConfigV201::default(),
+///     TransportConfig::default(),
+///     |_| {},
+/// );
+/// server.start("0.0.0.0:9000").await?;
+/// ```
+///
+/// A convenience layer over the three primitives, which stay public and
+/// unchanged; [`central_system_handler_v201`] remains available for callers who
+/// only want the ready-made inbound [`DispatchHandler`].
+pub fn central_system_service_v201(
+    cs_config: CentralSystemConfigV201,
+    transport_config: TransportConfig,
+    customize: impl FnOnce(&mut ActionDispatcher),
+) -> (OcppServer, mpsc::UnboundedReceiver<TransportEvent>) {
+    let mut dispatcher = central_system_dispatcher_v201_with(cs_config);
+    customize(&mut dispatcher);
+    let handler = Arc::new(DispatchHandler::new(Arc::new(dispatcher)));
+    central_system_server_v201(transport_config, handler)
 }
 
 /// Install the default 2.0.1 lifecycle handlers onto an existing
@@ -330,6 +375,39 @@ mod tests {
         assert!(!d.has_handler("Authorize"));
         assert!(!d.has_handler("SetVariables"));
         assert_eq!(d.handler_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn central_system_service_v201_wires_outbound_validator() {
+        // The one-call v201 builder attaches a *2.0.1* validator to the `call()`
+        // path. `RemoteStartTransaction` is a 1.6J-only action (renamed
+        // `RequestStartTransaction` in 2.0.1), so an outbound CALL for it is
+        // unknown to the v201 validator and surfaces as `NotSupported` *before*
+        // the connection check — proving the v201 builder wired the v201
+        // validator (under 1.6J this otherwise-valid request would pass and reach
+        // `CpNotConnected`). The inbound leg is pinned over a real socket in
+        // `tests/central_system_service_e2e.rs`.
+        use ocpp_messages::v16j::RemoteStartTransactionRequest;
+        use ocpp_types::OcppError;
+
+        let (server, _events) = central_system_service_v201(
+            CentralSystemConfigV201::default(),
+            TransportConfig::default(),
+            |_| {},
+        );
+        let req = RemoteStartTransactionRequest {
+            connector_id: None,
+            id_tag: "TAG".to_string(),
+            charging_profile: None,
+        };
+        let err = server
+            .call("NEVER_CONNECTED", req)
+            .await
+            .expect_err("RemoteStartTransaction is unknown to the v201 validator");
+        assert!(
+            matches!(err, OcppError::NotSupported { .. }),
+            "expected NotSupported from the v201 validator, got {err:?}"
+        );
     }
 
     #[tokio::test]

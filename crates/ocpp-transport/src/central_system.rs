@@ -30,7 +30,7 @@ use ocpp_messages::{ActionDispatcher, SchemaValidator};
 use tokio::sync::mpsc;
 
 use crate::server::OcppServer;
-use crate::{MessageHandler, TransportConfig, TransportEvent};
+use crate::{DispatchHandler, MessageHandler, TransportConfig, TransportEvent};
 
 /// Configuration for the default Central System handler set.
 ///
@@ -177,6 +177,61 @@ fn build_validated_server(
 ) -> (OcppServer, mpsc::UnboundedReceiver<TransportEvent>) {
     let (server, events) = OcppServer::new(config, handler);
     (server.with_validator(Arc::new(validator)), events)
+}
+
+/// Fully-assembled, batteries-included default **1.6J** CSMS in one call.
+///
+/// Wires the three primitives the recommended CSMS is built from — the
+/// inbound-validated boot-trio [`central_system_dispatcher_with`], the
+/// [`DispatchHandler`] adapter, and the outbound-validated
+/// [`central_system_server`] — so **both directions are schema-validated out of
+/// the box** (inbound CALLs by the dispatcher's validator, outbound CALLs and
+/// inbound CALLRESULTs by the server's `call()`-path validator) and the
+/// boot-time trio is pre-registered. Returns the ready-to-[`start`](OcppServer::start)
+/// server and its [`TransportEvent`] receiver — the last wiring step callers
+/// otherwise get subtly wrong (forgetting the adapter, or pairing the server
+/// with a non-validating dispatcher).
+///
+/// `customize` runs against the fully-defaulted [`ActionDispatcher`] *before* it
+/// is shared into the handler, so callers can register additional `@on`/`@after`
+/// handlers — or override a default — without dropping the defaults or either
+/// validator (later registrations win, per [`ActionDispatcher::on`]). Pass
+/// `|_| {}` for the pure-defaults CSMS:
+///
+/// ```ignore
+/// use ocpp_transport::{central_system_service, CentralSystemConfig, TransportConfig};
+/// use ocpp_messages::v16j::{AuthorizeRequest, AuthorizeResponse};
+///
+/// // Pure defaults — the whole default CSMS in one call:
+/// let (mut server, _events) =
+///     central_system_service(CentralSystemConfig::default(), TransportConfig::default(), |_| {});
+///
+/// // …or register an extra handler before start(), defaults intact:
+/// let (mut server, _events) = central_system_service(
+///     CentralSystemConfig::default(),
+///     TransportConfig::default(),
+///     |d| {
+///         d.on(|_req: AuthorizeRequest| async move { Ok(/* AuthorizeResponse { .. } */) });
+///     },
+/// );
+/// server.start("0.0.0.0:9000").await?;
+/// ```
+///
+/// This is a convenience layer over the three primitives, which stay public and
+/// unchanged — construct them by hand for finer control (e.g. a different
+/// inbound vs outbound validator, or the `skip_schema_validation` opt-out via
+/// plain [`OcppServer::new`]). See
+/// [`central_system_service_v201`](crate::central_system_service_v201) for the
+/// 2.0.1 twin.
+pub fn central_system_service(
+    cs_config: CentralSystemConfig,
+    transport_config: TransportConfig,
+    customize: impl FnOnce(&mut ActionDispatcher),
+) -> (OcppServer, mpsc::UnboundedReceiver<TransportEvent>) {
+    let mut dispatcher = central_system_dispatcher_with(cs_config);
+    customize(&mut dispatcher);
+    let handler = Arc::new(DispatchHandler::new(Arc::new(dispatcher)));
+    central_system_server(transport_config, handler)
 }
 
 #[cfg(test)]
@@ -370,6 +425,57 @@ mod tests {
         assert!(
             matches!(err, OcppError::CpNotConnected { .. }),
             "expected CpNotConnected (no validator), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn central_system_service_wires_outbound_validator() {
+        // The one-call `central_system_service` builder attaches the 1.6J
+        // validator to the `call()` path: a schema-invalid outbound CALL
+        // (21-char idTag over CiString20's maxLength) is rejected as
+        // `SchemaViolation` *before* the connection check — proving the outbound
+        // direction is validated through the one-call builder, without a socket.
+        // The inbound leg and the CALLRESULT-rejection leg are pinned over a real
+        // socket in `tests/central_system_service_e2e.rs`.
+        let (server, _events) = central_system_service(
+            CentralSystemConfig::default(),
+            TransportConfig::default(),
+            |_| {},
+        );
+        let err = server
+            .call("NEVER_CONNECTED", remote_start(&"x".repeat(21)))
+            .await
+            .expect_err("overlong idTag must be rejected before send");
+        assert!(
+            matches!(err, OcppError::SchemaViolation { .. }),
+            "expected SchemaViolation (outbound validator wired), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn central_system_service_customizer_runs_before_wrapping() {
+        // The customizer is invoked exactly once against the fully-defaulted
+        // dispatcher before it is shared into the handler. Observing the extra
+        // handler's *effect* needs a socket (see the e2e suite); here we pin the
+        // cheaper invariant that the hook fires, so a caller's registrations are
+        // never silently dropped.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_in = Arc::clone(&calls);
+        let (_server, _events) = central_system_service(
+            CentralSystemConfig::default(),
+            TransportConfig::default(),
+            move |d| {
+                calls_in.fetch_add(1, Ordering::SeqCst);
+                // Registering here must not drop the defaults installed above.
+                assert!(d.has_handler("BootNotification"));
+                assert!(d.has_validator());
+            },
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "customizer runs exactly once"
         );
     }
 
