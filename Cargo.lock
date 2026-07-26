@@ -1079,6 +1079,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "futures-util",
  "ocpp-cp",
  "ocpp-messages",
  "ocpp-transport",
@@ -1087,6 +1088,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-tungstenite 0.20.1",
  "tracing",
 ]
 
