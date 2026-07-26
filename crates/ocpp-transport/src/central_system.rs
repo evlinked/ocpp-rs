@@ -131,7 +131,7 @@ pub fn register_default_handlers(dispatcher: &mut ActionDispatcher, config: Cent
 ///
 /// The `handler` argument controls the *inbound* dispatch path independently:
 /// wrap a [`central_system_dispatcher`] (which attaches the same 1.6J validator
-/// to inbound CALLs) in a [`DispatchHandler`](crate::DispatchHandler) to get a
+/// to inbound CALLs) in a [`DispatchHandler`] to get a
 /// CSMS that validates every direction:
 ///
 /// ```ignore
