@@ -36,9 +36,11 @@ type HandlerFn = Box<dyn Fn(Value, String) -> BoxFuture<OcppResult<Value>> + Sen
 /// As with [`HandlerFn`], each erasure consumes only the arguments its builder
 /// opted into and ignores the rest: the plain [`ActionDispatcher::after`] uses
 /// just the request, [`ActionDispatcher::after_with_id`] adds the `unique_id`,
-/// and [`ActionDispatcher::after_with_response`] adds the handler's `response`
+/// [`ActionDispatcher::after_with_response`] adds the handler's `response`
 /// (the port of the reference's `@after(action, inject_response=True)` /
-/// `call_response`). Threading all three through one signature (rather than
+/// `call_response`), and [`ActionDispatcher::after_with_id_and_response`] takes
+/// both — the hook that declares `call_unique_id` *and* `inject_response=True`.
+/// Threading all three through one signature (rather than
 /// storing several hook variants) keeps a single `after_hooks` map; `dispatch()`
 /// always supplies every argument.
 type AfterFn = Box<dyn Fn(Value, Value, String) -> BoxFuture<()> + Send + Sync>;
@@ -330,6 +332,67 @@ impl ActionDispatcher {
                     serde_json::from_value::<Req::Response>(response),
                 ) {
                     h(req, resp).await;
+                }
+            })
+        });
+        self.after_hooks.insert(Req::ACTION_NAME, erased);
+    }
+
+    /// Register a fire-and-forget `@after` hook for `Req::ACTION_NAME` that
+    /// receives **both** the triggering CALL's `unique_id` **and** the `@on`
+    /// handler's response — the port of an `@after` hook that declares
+    /// `call_unique_id` *and* is decorated `inject_response=True`.
+    ///
+    /// The reference's `_handle_call()`
+    /// ([`ocpp/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py))
+    /// injects the two **independently and simultaneously**:
+    ///
+    /// ```python
+    /// if call_unique_id_required:
+    ///     snake_case_payload["call_unique_id"] = msg.unique_id
+    /// if getattr(handler, "_inject_response", False):
+    ///     snake_case_payload["call_response"] = response_payload
+    /// response = handler(**snake_case_payload)
+    /// ```
+    ///
+    /// so a single hook can see both. This is the fourth and most complete of
+    /// the `@after` builders — the combination of
+    /// [`after_with_id`](Self::after_with_id) and
+    /// [`after_with_response`](Self::after_with_response) — and the home for a
+    /// post-response side effect that must correlate back to the originating
+    /// CALL *and* key on what was answered (e.g. "record that CALL `<id>`
+    /// received an `Authorize` response of `Blocked`" for an audit trail).
+    ///
+    /// The hook closure receives `(Req, Req::Response, String)`: the deserialised
+    /// request, the strongly-typed (validated) response the `@on` handler
+    /// returned, and the triggering `unique_id`. As with
+    /// [`after_with_response`](Self::after_with_response), the response is the
+    /// **validated** one — `dispatch()` spawns this hook only after the handler
+    /// succeeds *and* the outgoing CALLRESULT passes response validation — and
+    /// the hook is silently skipped if either payload fails to deserialise. Like
+    /// the other three builders it is spawned via [`tokio::spawn`] and does not
+    /// block the CALLRESULT path. The existing
+    /// [`after`](Self::after) / [`after_with_id`](Self::after_with_id) /
+    /// [`after_with_response`](Self::after_with_response) builders are unaffected.
+    pub fn after_with_id_and_response<Req, Fut, F>(&mut self, hook: F)
+    where
+        Req: OcppAction + 'static,
+        Req::Response: 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+        F: Fn(Req, Req::Response, String) -> Fut + Send + Sync + Clone + 'static,
+    {
+        let erased: AfterFn = Box::new(move |raw: Value, response: Value, unique_id: String| {
+            let h = hook.clone();
+            Box::pin(async move {
+                // Both the request and the response must deserialise for the hook
+                // to run — matching `after_with_response`. `response` is the
+                // already-validated CALLRESULT payload and `unique_id` the
+                // triggering CALL's id, both threaded in by `dispatch()`.
+                if let (Ok(req), Ok(resp)) = (
+                    serde_json::from_value::<Req>(raw),
+                    serde_json::from_value::<Req::Response>(response),
+                ) {
+                    h(req, resp, unique_id).await;
                 }
             })
         });
@@ -1372,6 +1435,88 @@ mod tests {
             seen.lock().unwrap().as_deref(),
             Some("Accepted"),
             "the hook must see the validated response status"
+        );
+    }
+
+    // --- id- AND response-aware after hooks: after_with_id_and_response (Issue #391) ---
+    //
+    // Python ref: `_handle_call()` in ocpp/charge_point.py injects
+    // `call_unique_id` and `call_response` *independently and simultaneously*, so
+    // a single `@after` hook decorated `inject_response=True` and declaring a
+    // `call_unique_id` parameter receives both. `after_with_id_and_response` is
+    // the Rust analog — the combination of `after_with_id` + `after_with_response`.
+
+    #[tokio::test]
+    async fn after_with_id_and_response_receives_both_id_and_response() {
+        let seen_id = Arc::new(std::sync::Mutex::new(None::<String>));
+        let seen_resp = Arc::new(std::sync::Mutex::new(None::<PingResponse>));
+        let si = seen_id.clone();
+        let sr = seen_resp.clone();
+        let notify = Arc::new(Notify::new());
+        let n = notify.clone();
+
+        let mut d = ActionDispatcher::new();
+        d.on(|req: PingRequest| async move { Ok(PingResponse { echoed: req.nonce }) });
+        d.after_with_id_and_response(
+            move |_req: PingRequest, resp: PingResponse, unique_id: String| {
+                let si = si.clone();
+                let sr = sr.clone();
+                let n = n.clone();
+                async move {
+                    *si.lock().unwrap() = Some(unique_id);
+                    *sr.lock().unwrap() = Some(resp);
+                    n.notify_one();
+                }
+            },
+        );
+
+        d.dispatch(&ping_call_with_id("call-77", 42)).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("the after_with_id_and_response hook must fire after a successful dispatch");
+        assert_eq!(
+            seen_id.lock().unwrap().as_deref(),
+            Some("call-77"),
+            "after_with_id_and_response must see the triggering CALL's exact unique_id"
+        );
+        assert_eq!(
+            seen_resp.lock().unwrap().as_ref().map(|r| r.echoed),
+            Some(42),
+            "after_with_id_and_response must see the exact response the @on handler returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_with_id_and_response_not_run_on_response_validation_failure() {
+        // Same short-circuit guard as `after_with_response`: with a validator
+        // attached and a handler returning an out-of-enum `status`, the outgoing
+        // CALLRESULT fails validation before the after-hook spawn, so a hook that
+        // opted into both id and response must not run.
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+
+        let mut d = validating_dispatcher();
+        d.on(|_req: RawBootRequest| async move { Ok(raw_boot_response("Yolo")) });
+        d.after_with_id_and_response(
+            move |_req: RawBootRequest, _resp: RawBootResponse, _unique_id: String| {
+                let r = r.clone();
+                async move {
+                    r.store(true, Ordering::SeqCst);
+                }
+            },
+        );
+
+        let err = d.dispatch(&valid_boot_call()).await.unwrap_err();
+        assert!(
+            matches!(err, OcppError::SchemaViolation { .. }),
+            "the out-of-enum response must fail validation, got {err:?}"
+        );
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "after_with_id_and_response must not run when response validation fails"
         );
     }
 }
