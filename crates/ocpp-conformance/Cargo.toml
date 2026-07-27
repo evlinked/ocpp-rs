@@ -30,4 +30,10 @@ chrono = { workspace = true }
 # Test-only: implement a scripted `MessageHandler` that swallows one action to
 # drive `ChargePoint::call()`'s timeout path end-to-end (charge_point_call_e2e).
 async-trait = "0.1"
+# Test-only: hand-craft a raw WebSocket peer that puts an out-of-spec CALLERROR
+# `error_code` on the wire (the stock `OcppServer` can only emit the 12 spec
+# codes), driving the real client.rs / server.rs recv loops end-to-end
+# (wire_level_call_error, Issue #383).
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
 
