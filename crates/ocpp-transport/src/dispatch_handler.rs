@@ -67,13 +67,19 @@ impl MessageHandler for DispatchHandler {
         match message {
             Message::Call(call) => {
                 let unique_id = call.unique_id.clone();
+                // Thread the routing dispatcher's negotiated OCPP version into the
+                // CALLERROR builder so an unrouted-action `NotSupported` cause
+                // embeds it byte-exactly (`… not supported by OCPP1.6.`), matching
+                // the reference's `_raise_key_error` (issue #404). `None` for a
+                // version-generic dispatcher keeps the version-agnostic fallback.
+                let ocpp_version = self.dispatcher.ocpp_version();
                 let response = match self.dispatcher.dispatch(&call).await {
                     Ok(payload) => Message::call_result(unique_id.clone(), payload)
                         // Serialising a handler's own response should never fail;
                         // if it somehow does, surface a CALLERROR rather than
                         // silently dropping the frame.
-                        .unwrap_or_else(|e| build_call_error(&unique_id, &e)),
-                    Err(e) => build_call_error(&unique_id, &e),
+                        .unwrap_or_else(|e| build_call_error(&unique_id, &e, ocpp_version)),
+                    Err(e) => build_call_error(&unique_id, &e, ocpp_version),
                 };
                 Ok(Some(response))
             }

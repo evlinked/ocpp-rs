@@ -1146,7 +1146,14 @@ async fn handle_cp_socket(
                                 .ok(),
                             Ok(None) => None,
                             Err(e) => {
-                                let callerror = build_call_error(&unique_id, &e);
+                                // A bespoke `MessageHandler` returned `Err`
+                                // directly (the routing `DispatchHandler` converts
+                                // its own dispatch errors to a CALLERROR frame
+                                // internally, so it never reaches this arm). There
+                                // is no routing dispatcher — hence no version
+                                // context — on this path, so `None` keeps the
+                                // version-agnostic `NotSupported` cause.
+                                let callerror = build_call_error(&unique_id, &e, None);
                                 serde_json::to_string(&callerror)
                                     .map_err(|e| error!("Failed to serialize CALLERROR: {}", e))
                                     .ok()
@@ -1237,7 +1244,20 @@ async fn handle_cp_socket(
 /// receive loop. Unrouted-action errors (`NotImplemented`/`NotSupported`) carry
 /// the reference's spec-canonical description and a `{"cause": …}` detail; every
 /// other variant keeps its `Display` text and empty details.
-pub(crate) fn build_call_error(unique_id: &str, error: &OcppError) -> Message {
+///
+/// `ocpp_version` is the negotiated version label (`"1.6"` / `"2.0.1"`) of the
+/// routing dispatcher, threaded from
+/// [`ActionDispatcher::ocpp_version`](ocpp_messages::ActionDispatcher::ocpp_version)
+/// so the `NotSupported` cause can embed it byte-exactly as the reference does
+/// (`_raise_key_error`: `f"{action} not supported by OCPP{version}."`). `None`
+/// when there is no version context (a version-generic dispatcher, or the inline
+/// server receive loop's bespoke-handler path), in which case the cause falls
+/// back to a version-agnostic phrasing.
+pub(crate) fn build_call_error(
+    unique_id: &str,
+    error: &OcppError,
+    ocpp_version: Option<&str>,
+) -> Message {
     // Port of `_raise_key_error` + `create_call_error` from
     // `ocpp/charge_point.py`: the two unrouted-action errors carry the
     // spec-canonical `default_description` (from `ocpp/exceptions.py`) and a
@@ -1262,18 +1282,26 @@ pub(crate) fn build_call_error(unique_id: &str, error: &OcppError) -> Message {
                 })),
             ),
             // An action the negotiated version does not define — the
-            // `NotSupportedError` branch of `_raise_key_error`. The reference
-            // cause embeds the OCPP version (`… not supported by OCPP2.0.1.`),
-            // which isn't threaded to this layer, and the same variant is also
-            // raised for a missing bundled schema; so we emit a version-agnostic
-            // cause here (see issue #311). The canonical description matches.
+            // `NotSupportedError` branch of `_raise_key_error`, which raises
+            // `details={"cause": f"{action} not supported by OCPP{version}."}`.
+            // The version now arrives via `ocpp_version` (threaded from the
+            // routing dispatcher's `SchemaValidator`, issue #404), so the cause is
+            // byte-exact with the reference — e.g. `InvalidAction not supported by
+            // OCPP1.6.` A version-generic dispatcher (no validator) reports `None`
+            // here, keeping the earlier version-agnostic `… not supported by
+            // receiver.` phrasing; the same variant is also raised for a
+            // missing bundled schema, for which the OCPP-version cause is equally
+            // accurate. The canonical description matches either way.
             OcppError::NotSupported { feature } => (
                 CallErrorCode::NotSupported,
                 CallErrorCode::NotSupported
                     .default_description()
                     .to_string(),
                 Some(serde_json::json!({
-                    "cause": format!("{feature} not supported by receiver."),
+                    "cause": match ocpp_version {
+                        Some(version) => format!("{feature} not supported by OCPP{version}."),
+                        None => format!("{feature} not supported by receiver."),
+                    },
                 })),
             ),
             // A JSON-Schema validation failure. The code is the keyword-granular

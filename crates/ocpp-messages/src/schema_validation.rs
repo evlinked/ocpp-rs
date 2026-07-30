@@ -843,6 +843,11 @@ static SCHEMA_TEXTS_V201: &[(&str, &str)] = &[
 pub struct SchemaValidator {
     /// action-name → parsed JSON Schema value
     schemas: HashMap<String, Value>,
+    /// OCPP version label (`"1.6"` / `"2.0.1"`) this validator's bundled schema
+    /// set targets. Supplies the version context the reference threads into
+    /// `_raise_key_error` for the unrouted-action `NotSupported` cause
+    /// (`f"{action} not supported by OCPP{version}."`).
+    ocpp_version: &'static str,
 }
 
 impl SchemaValidator {
@@ -859,7 +864,10 @@ impl SchemaValidator {
                 serde_json::from_str(text).expect("bundled OCPP 1.6J schema is valid JSON");
             schemas.insert((*name).to_string(), value);
         }
-        Self { schemas }
+        Self {
+            schemas,
+            ocpp_version: "1.6",
+        }
     }
 
     /// Build a validator pre-loaded with the bundled OCPP 2.0.1 schemas.
@@ -876,7 +884,22 @@ impl SchemaValidator {
                 serde_json::from_str(text).expect("bundled OCPP 2.0.1 schema is valid JSON");
             schemas.insert((*name).to_string(), value);
         }
-        Self { schemas }
+        Self {
+            schemas,
+            ocpp_version: "2.0.1",
+        }
+    }
+
+    /// The OCPP version label (`"1.6"` / `"2.0.1"`) this validator's bundled
+    /// schema set targets.
+    ///
+    /// This is the version context the reference threads into `_raise_key_error`
+    /// ([`ocpp/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/charge_point.py))
+    /// to build the unrouted-action `NotSupported` cause
+    /// (`f"{action} not supported by OCPP{version}."`); the CALLERROR builder
+    /// reads it via [`ActionDispatcher::ocpp_version`](crate::ActionDispatcher::ocpp_version).
+    pub fn ocpp_version(&self) -> &'static str {
+        self.ocpp_version
     }
 
     /// Validate a CALL payload against the schema for `action`.

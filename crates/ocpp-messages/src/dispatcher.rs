@@ -123,6 +123,21 @@ impl ActionDispatcher {
         self.validator.is_some()
     }
 
+    /// The OCPP version label of the attached [`SchemaValidator`] (`"1.6"` /
+    /// `"2.0.1"`), or `None` when the dispatcher is version-generic (no validator
+    /// attached).
+    ///
+    /// This is the version context the reference threads into `_raise_key_error`
+    /// for the unrouted-action `NotSupported` cause
+    /// (`f"{action} not supported by OCPP{version}."`). With no validator there
+    /// is no version to report, so the CALLERROR builder falls back to a
+    /// version-agnostic cause — mirroring the same conservative choice
+    /// `unrouted_action_error` makes when it cannot tell a known action from an
+    /// unknown one.
+    pub fn ocpp_version(&self) -> Option<&'static str> {
+        self.validator.as_ref().map(|v| v.ocpp_version())
+    }
+
     /// Register a typed `@on` handler for `Req::ACTION_NAME`.
     ///
     /// Replaces any previously registered handler for the same action.
