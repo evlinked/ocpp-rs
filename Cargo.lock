@@ -1084,6 +1084,7 @@ dependencies = [
  "ocpp-messages",
  "ocpp-transport",
  "ocpp-types",
+ "proptest",
  "serde",
  "serde_json",
  "thiserror",
