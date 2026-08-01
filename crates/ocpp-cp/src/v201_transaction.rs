@@ -4,7 +4,7 @@
 //! 2.0.1 message that replaces the 1.6J `StartTransaction` / `MeterValues` /
 //! `StopTransaction` triad. A transaction is reported as a sequence of events:
 //! one `Started`, zero or more `Updated`, and one `Ended`
-//! ([`TransactionEventEnumType`](ocpp_types::v201::TransactionEventEnumType)).
+//! ([`TransactionEventEnumType`]).
 //!
 //! Following the same cadence #419 used for the boot handshake (slice 1 landed a
 //! pure, schema-validated builder; slice 2 wired it into the live loop), this
