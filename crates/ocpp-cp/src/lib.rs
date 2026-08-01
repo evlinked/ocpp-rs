@@ -18,6 +18,7 @@ pub mod message_handler;
 pub mod meter_sampler;
 pub mod state_machine;
 pub mod transaction;
+pub mod v201_transaction;
 
 use anyhow::Result;
 use auth_cache::AuthCache;
@@ -2717,7 +2718,7 @@ impl ChargePoint {
         for txn_id in active_txns {
             // meter_stop is unknown for a reset-triggered stop; report 0 like the
             // Python reference's example, which does not meter a forced stop.
-            if let Err(e) = self.stop_transaction(txn_id, 0, reason.clone()).await {
+            if let Err(e) = self.stop_transaction(txn_id, 0, reason).await {
                 warn!("reset: failed to stop transaction {txn_id}: {e}");
             }
         }

@@ -293,7 +293,7 @@ pub enum AuthorizationStatus {
 }
 
 /// Reason for stopping a transaction
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum Reason {
     /// Emergency stop button was used
