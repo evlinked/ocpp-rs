@@ -2754,7 +2754,7 @@ impl ChargePoint {
     /// `Charging`, and start periodic metering.
     ///
     /// The version-specific "open the transaction" CALL is delegated to
-    /// [`open_transaction`](Self::open_transaction): `V16J` sends
+    /// the private `open_transaction` helper: `V16J` sends
     /// `StartTransaction` (CSMS assigns the id); `V201` sends
     /// `TransactionEvent(Started)` (the station mints the id). Everything after —
     /// reservation consumption, the connector state transition, the
@@ -2923,8 +2923,8 @@ impl ChargePoint {
     /// Returns `OcppError::NotFound` if `transaction_id` does not correspond
     /// to a transaction started via [`ChargePoint::start_transaction`].
     ///
-    /// The "transaction closed" CALL is version-specific (see
-    /// [`close_transaction`](Self::close_transaction)): `V16J` sends
+    /// The "transaction closed" CALL is version-specific (see the private
+    /// `close_transaction` helper): `V16J` sends
     /// `StopTransaction`; `V201` emits `TransactionEvent(Ended)`. The connector
     /// state transition and its (version-aware) `StatusNotification`s are shared.
     ///
