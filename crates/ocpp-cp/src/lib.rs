@@ -69,10 +69,13 @@ use ocpp_types::{
 // (slice 2). Aliased to avoid clashing with the unqualified 1.6J names imported
 // above (`StatusNotificationRequest`, `RegistrationStatus`).
 use ocpp_messages::v201::StatusNotificationRequest as V201StatusNotificationRequest;
-use ocpp_types::v201::{ConnectorStatusEnumType, RegistrationStatusEnumType};
+use ocpp_types::v201::{
+    AuthorizationStatusEnumType, ConnectorStatusEnumType, RegistrationStatusEnumType,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -186,6 +189,14 @@ fn charge_point_status_to_v201(status: ChargePointStatus) -> ConnectorStatusEnum
         ChargePointStatus::Faulted => ConnectorStatusEnumType::Faulted,
         ChargePointStatus::Unavailable => ConnectorStatusEnumType::Unavailable,
     }
+}
+
+/// The current time as an RFC 3339 / ISO 8601 string, the wire form the 2.0.1
+/// `TransactionEvent` (and `StatusNotification`) timestamps use. Centralized so
+/// every 2.0.1 event stamps its `timestamp` the same way the schema's
+/// `date-time` format expects.
+fn v201_now() -> String {
+    chrono::Utc::now().to_rfc3339()
 }
 
 /// Version-normalized view of a `BootNotification` response, so
@@ -643,6 +654,33 @@ fn ocpp_error_to_callerror_code(e: &OcppError) -> (CallErrorCode, String) {
 // ChargePoint
 // ---------------------------------------------------------------------------
 
+/// Per-transaction state a `V201` charge point carries across the three
+/// `TransactionEvent`s of one charging session (slice 3b, Issue #423).
+///
+/// The 1.6J transactional loop is stateless between `StartTransaction` and
+/// `StopTransaction` — the integer `transactionId` and the connector are all it
+/// needs, and both live in [`ChargePoint::active_transactions`]. The unified
+/// 2.0.1 `TransactionEvent` message needs two extra things that must stay
+/// constant across `Started` / `Updated` / `Ended`:
+///
+/// * the authorizing `idToken` — echoed on the `Ended` event so a CSMS that
+///   authorizes stops can match it, but not available from the 1.6J
+///   `StopTransaction` inputs (which carry no `idTag`), so it is captured at
+///   start; and
+/// * a monotonic `seqNo` — shared between the periodic meter sampler (which
+///   emits `Updated` events off a background task) and `stop_transaction`
+///   (which emits the final `Ended`), so an `Arc<AtomicI32>` hands out
+///   strictly increasing values with no coordination beyond the atomic.
+#[derive(Debug, Clone)]
+struct V201Session {
+    /// The `idTag` that authorized the session (its 2.0.1 `idToken.idToken`).
+    id_tag: String,
+    /// Next `seqNo` to hand out. `Started` used `0`; the sampler and the
+    /// `Ended` event each `fetch_add(1)` to claim the next value, so `seqNo`
+    /// is strictly increasing across the whole transaction.
+    next_seq_no: Arc<AtomicI32>,
+}
+
 /// Main charge point implementation
 ///
 /// `ChargePoint` is cheap to [`Clone`]: every field is either an [`Arc`] over
@@ -679,7 +717,25 @@ pub struct ChargePoint {
     /// Heartbeat task handle
     heartbeat_handle: Arc<RwLock<Option<tokio::task::JoinHandle<()>>>>,
     /// Maps CSMS-assigned transaction ID → connector ID for stop_transaction lookup.
+    ///
+    /// In 2.0.1 the *station* chooses the `transactionId` (the
+    /// `TransactionEventResponse` carries none), so a `V201` CP mints the id
+    /// from [`next_v201_transaction_id`](Self::next_v201_transaction_id) rather
+    /// than reading it off the CSMS reply; the map is keyed the same either way.
     active_transactions: Arc<RwLock<HashMap<i32, ConnectorId>>>,
+    /// Monotonic allocator for station-chosen 2.0.1 `transactionId`s (slice 3b,
+    /// Issue #423). Unused on the 1.6J path (there the CSMS assigns the id). A
+    /// `V201` `start_transaction` `fetch_add(1)`s to mint the next id and renders
+    /// it as its decimal string for the wire (`SessionRef::transaction_id`). A CP
+    /// is a single protocol version for its whole life, so these never collide
+    /// with any CSMS-assigned 1.6J id.
+    next_v201_transaction_id: Arc<AtomicI32>,
+    /// Per-transaction 2.0.1 session state, keyed by the same station-chosen
+    /// `transactionId` as [`active_transactions`](Self::active_transactions).
+    /// Populated only on the `V201` path: inserted by `start_transaction`
+    /// alongside the `active_transactions` entry and removed by
+    /// `stop_transaction` in lockstep. See [`V201Session`].
+    v201_sessions: Arc<RwLock<HashMap<i32, V201Session>>>,
     /// Maps an active reservation ID → the connector it holds (OCPP 1.6J §5.14).
     /// Populated by the default `ReserveNow` handler, consulted/cleared by
     /// `CancelReservation`, and emptied for a connector when a transaction
@@ -699,9 +755,12 @@ pub struct ChargePoint {
     /// the dispatcher's incoming-CALL validation and `call()`'s CALLRESULT
     /// validation. `None` when validation is disabled.
     validator: Option<Arc<SchemaValidator>>,
-    /// Per-transaction periodic `MeterValues` sampler tasks, keyed by the
-    /// CSMS-assigned transaction ID. Each active transaction has its own task
-    /// (connectors charge concurrently); cancelled on `stop_transaction`/`stop`.
+    /// Per-transaction periodic metering sampler tasks, keyed by the transaction
+    /// ID. Each active transaction has its own task (connectors charge
+    /// concurrently); cancelled on `stop_transaction`/`stop`. The task emits the
+    /// 1.6J `MeterValues` frame or the 2.0.1 `TransactionEvent(Updated)`
+    /// depending on `config.protocol_version`, but the handle map is
+    /// version-agnostic.
     meter_sampler_handles: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
     /// Authorization ID-tag cache (Issue #23). Shared with the default
     /// `ClearCache` handler so a CSMS `ClearCache` command empties it. Backs the
@@ -856,6 +915,8 @@ impl ChargePoint {
             is_connected: Arc::new(RwLock::new(false)),
             heartbeat_handle: Arc::new(RwLock::new(None)),
             active_transactions,
+            next_v201_transaction_id: Arc::new(AtomicI32::new(1)),
+            v201_sessions: Arc::new(RwLock::new(HashMap::new())),
             reservations,
             expiry_timers,
             validator,
@@ -2207,7 +2268,45 @@ impl ChargePoint {
         *self.heartbeat_handle.write().await = Some(handle);
     }
 
-    /// Start the periodic `MeterValues` sampler for an active transaction.
+    /// Start the periodic metering sampler for an active transaction, in the
+    /// wire shape the negotiated protocol version uses.
+    ///
+    /// `V16J` emits the 1.6J `MeterValues` frame; `V201` emits
+    /// `TransactionEvent(Updated)` (slice 3b). Both spawn a fire-and-forget
+    /// background task and register its handle the same way, so
+    /// [`stop_meter_sampler`](Self::stop_meter_sampler) cancels either uniformly.
+    async fn start_meter_sampler(&self, connector_id: ConnectorId, transaction_id: i32) {
+        match self.config.protocol_version {
+            OcppVersion::V16J => {
+                self.start_v16j_meter_sampler(connector_id, transaction_id)
+                    .await
+            }
+            OcppVersion::V201 => {
+                self.start_v201_meter_sampler(connector_id, transaction_id)
+                    .await
+            }
+        }
+    }
+
+    /// Register a freshly spawned meter-sampler task under `transaction_id`,
+    /// aborting any stale task previously registered for that id so a sampler can
+    /// never outlive its transaction (defensive against a reused id).
+    async fn register_meter_sampler(
+        &self,
+        transaction_id: i32,
+        handle: tokio::task::JoinHandle<()>,
+    ) {
+        if let Some(previous) = self
+            .meter_sampler_handles
+            .write()
+            .await
+            .insert(transaction_id, handle)
+        {
+            previous.abort();
+        }
+    }
+
+    /// Start the periodic 1.6J `MeterValues` sampler for an active transaction.
     ///
     /// Ports the periodic background-task pattern from the Python reference
     /// (`ocpp/charge_point.py`), which spawns meter sampling alongside the
@@ -2218,7 +2317,7 @@ impl ChargePoint {
     /// Frames are sent fire-and-forget via `send_message` (like the heartbeat):
     /// a periodic emitter must not block on the empty `MeterValuesResponse`, and
     /// a send failure is logged without aborting the transaction.
-    async fn start_meter_sampler(&self, connector_id: ConnectorId, transaction_id: i32) {
+    async fn start_v16j_meter_sampler(&self, connector_id: ConnectorId, transaction_id: i32) {
         let interval = Duration::from_secs(self.config.meter_values_interval.max(1));
         let measurands = self.config.meter_value_measurands.clone();
         let client = self.client.clone();
@@ -2292,16 +2391,95 @@ impl ChargePoint {
             }
         });
 
-        // Replace any existing sampler for this id, aborting the stale task so
-        // it can't outlive its transaction (defensive against a reused id).
-        if let Some(previous) = self
-            .meter_sampler_handles
-            .write()
-            .await
-            .insert(transaction_id, handle)
-        {
-            previous.abort();
-        }
+        self.register_meter_sampler(transaction_id, handle).await;
+    }
+
+    /// Start the periodic 2.0.1 `TransactionEvent(Updated)` sampler for an active
+    /// transaction (slice 3b, Issue #423).
+    ///
+    /// The 2.0.1 twin of [`start_v16j_meter_sampler`](Self::start_v16j_meter_sampler):
+    /// instead of a 1.6J `MeterValues` frame, each tick emits a
+    /// `TransactionEvent(Updated)` (`triggerReason = MeterValuePeriodic`) via the
+    /// slice-3a builder, carrying a `Sample.Periodic` reading. The `Started`
+    /// event already carried the `Transaction.Begin` reading, so — unlike the
+    /// 1.6J sampler — this one emits *only* periodic samples and needs no
+    /// begin-snapshot bootstrap.
+    ///
+    /// `seqNo` is drawn from the transaction's shared counter
+    /// ([`V201Session::next_seq_no`]), so the values the sampler emits and the
+    /// one `stop_transaction` puts on the `Ended` event form a single strictly
+    /// increasing sequence. If the session has already been torn down (a stop
+    /// racing the tick), the tick is skipped rather than inventing a `seqNo`.
+    async fn start_v201_meter_sampler(&self, connector_id: ConnectorId, transaction_id: i32) {
+        let interval = Duration::from_secs(self.config.meter_values_interval.max(1));
+        let client = self.client.clone();
+        let is_connected = self.is_connected.clone();
+        let connectors = self.connectors.clone();
+        let sessions = self.v201_sessions.clone();
+        let evse_id = connector_id.value() as i32;
+        let txid_str = transaction_id.to_string();
+
+        let handle = tokio::spawn(async move {
+            let mut timer = tokio::time::interval(interval);
+            loop {
+                timer.tick().await;
+
+                if !*is_connected.read().await {
+                    continue;
+                }
+
+                // Claim the next seqNo for this transaction. A missing session
+                // means the transaction is being stopped; drop the tick.
+                let seq_no = match sessions.read().await.get(&transaction_id) {
+                    Some(session) => session.next_seq_no.fetch_add(1, Ordering::SeqCst),
+                    None => continue,
+                };
+
+                // Read the connector's latest meter value, releasing the lock
+                // before building/sending so we never hold it across the send.
+                let reading = {
+                    let connectors = connectors.read().await;
+                    match connectors.get(&connector_id) {
+                        Some(connector) => connector.last_meter_reading().await,
+                        None => continue,
+                    }
+                };
+
+                let session = v201_transaction::SessionRef {
+                    transaction_id: &txid_str,
+                    evse_id,
+                    connector_id: 1,
+                };
+                let request = v201_transaction::transaction_event_updated(
+                    &session,
+                    seq_no,
+                    reading.energy_wh,
+                    &reading.timestamp.to_rfc3339(),
+                );
+
+                let message = match ocpp_messages::CallMessage::new(
+                    ocpp_messages::v201::TransactionEventRequest::ACTION_NAME.to_string(),
+                    request,
+                ) {
+                    Ok(call) => Message::Call(call),
+                    Err(e) => {
+                        error!("Failed to create TransactionEvent(Updated) message: {}", e);
+                        continue;
+                    }
+                };
+
+                if let Some(client) = client.read().await.as_ref() {
+                    if let Err(e) = client.send_message(message).await {
+                        warn!(
+                            "Failed to send TransactionEvent(Updated) for transaction {}: {}",
+                            transaction_id, e
+                        );
+                    }
+                }
+            }
+        });
+
+        self.register_meter_sampler(transaction_id, handle).await;
     }
 
     /// Stop and remove the periodic `MeterValues` sampler for a transaction.
@@ -2476,15 +2654,119 @@ impl ChargePoint {
         }
     }
 
-    /// Send a `StartTransaction` CALL to the CSMS, record the CSMS-assigned
-    /// transaction ID, and transition the connector to `Charging`.
+    /// The version-specific half of [`start_transaction`](Self::start_transaction):
+    /// send the protocol's "transaction opened" CALL and return the
+    /// `transactionId` the rest of the flow keys its bookkeeping on.
     ///
-    /// Returns the CSMS-assigned `transactionId` on success, or
-    /// `OcppError::Authorization` if the CSMS rejects the id tag
-    /// (`idTagInfo.status != Accepted`).
+    /// * `V16J` sends `StartTransaction` and returns the CSMS-assigned integer
+    ///   id, erroring if the CSMS rejects the id tag.
+    /// * `V201` mints a station-chosen id (2.0.1 makes the *station* choose it —
+    ///   the `TransactionEventResponse` carries none), sends
+    ///   `TransactionEvent(Started)` (slice-3a builder), records the
+    ///   [`V201Session`] the sampler and the `Ended` event share, and errors if
+    ///   the CSMS returns a non-`Accepted` `idTokenInfo`. An empty ack (no
+    ///   `idTokenInfo`) is an implicit accept, matching the default 2.0.1 CSMS.
+    ///
+    /// The `V201` id is minted (and the session recorded) only after the CSMS
+    /// accepts, so a rejected start leaves no dangling session state and does not
+    /// burn a usable id sequence position for the wire.
+    async fn open_transaction(
+        &self,
+        connector_id: ConnectorId,
+        id_tag: &str,
+        meter_start: i32,
+    ) -> OcppResult<i32> {
+        match self.config.protocol_version {
+            OcppVersion::V16J => {
+                let response = self
+                    .call(StartTransactionRequest {
+                        connector_id: connector_id.value(),
+                        id_tag: id_tag.to_string(),
+                        meter_start,
+                        timestamp: chrono::Utc::now(),
+                        reservation_id: None,
+                    })
+                    .await?;
+
+                if response.id_tag_info.status != AuthorizationStatus::Accepted {
+                    return Err(OcppError::Authorization {
+                        reason: format!(
+                            "StartTransaction rejected: idTagInfo.status = {:?}",
+                            response.id_tag_info.status
+                        ),
+                    });
+                }
+                Ok(response.transaction_id)
+            }
+            OcppVersion::V201 => {
+                // The station chooses the 2.0.1 transactionId; render the minted
+                // integer as its decimal string for the wire (SessionRef).
+                let transaction_id = self.next_v201_transaction_id.fetch_add(1, Ordering::SeqCst);
+                let txid_str = transaction_id.to_string();
+                let session = v201_transaction::SessionRef {
+                    transaction_id: &txid_str,
+                    // The CP inherits 1.6J's flat connector model, so each
+                    // connector maps to a single-connector EVSE — the same
+                    // `evseId = connector_id, connectorId = 1` convention the
+                    // 2.0.1 StatusNotification path uses.
+                    evse_id: connector_id.value() as i32,
+                    connector_id: 1,
+                };
+
+                let response = self
+                    .call(v201_transaction::transaction_event_started(
+                        &session,
+                        id_tag,
+                        meter_start as f64,
+                        &v201_now(),
+                    ))
+                    .await?;
+
+                // Honor an explicit authorization decision when the CSMS returns
+                // one; an empty ack (no idTokenInfo) is an implicit accept.
+                if let Some(info) = response.id_token_info {
+                    if info.status != AuthorizationStatusEnumType::Accepted {
+                        return Err(OcppError::Authorization {
+                            reason: format!(
+                                "TransactionEvent(Started) rejected: idTokenInfo.status = {:?}",
+                                info.status
+                            ),
+                        });
+                    }
+                }
+
+                // Record the session before the sampler starts so both share the
+                // seqNo counter (Started took 0; the sampler and Ended hand out
+                // 1, 2, …) and the authorizing idTag for the Ended event.
+                self.v201_sessions.write().await.insert(
+                    transaction_id,
+                    V201Session {
+                        id_tag: id_tag.to_string(),
+                        next_seq_no: Arc::new(AtomicI32::new(1)),
+                    },
+                );
+                Ok(transaction_id)
+            }
+        }
+    }
+
+    /// Open a charging transaction on `connector_id`, transition it to
+    /// `Charging`, and start periodic metering.
+    ///
+    /// The version-specific "open the transaction" CALL is delegated to
+    /// [`open_transaction`](Self::open_transaction): `V16J` sends
+    /// `StartTransaction` (CSMS assigns the id); `V201` sends
+    /// `TransactionEvent(Started)` (the station mints the id). Everything after —
+    /// reservation consumption, the connector state transition, the
+    /// (version-aware) `StatusNotification`s, and the meter sampler — is shared.
+    ///
+    /// Returns the `transactionId` on success, or `OcppError::Authorization` if
+    /// the CSMS rejects the id tag.
     ///
     /// Ports `send_start_transaction()` from
-    /// [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py).
+    /// [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py)
+    /// and, on the `V201` path, the `TransactionEvent(Started)` flow from
+    /// [`ocpp/v201/call.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
     pub async fn start_transaction(
         &self,
         connector_id: ConnectorId,
@@ -2499,28 +2781,11 @@ impl ChargePoint {
         )
         .await?;
 
-        let response = self
-            .call(StartTransactionRequest {
-                connector_id: connector_id.value(),
-                id_tag: id_tag.to_string(),
-                meter_start,
-                timestamp: chrono::Utc::now(),
-                reservation_id: None,
-            })
+        let transaction_id = self
+            .open_transaction(connector_id, id_tag, meter_start)
             .await?;
 
-        if response.id_tag_info.status != AuthorizationStatus::Accepted {
-            return Err(OcppError::Authorization {
-                reason: format!(
-                    "StartTransaction rejected: idTagInfo.status = {:?}",
-                    response.id_tag_info.status
-                ),
-            });
-        }
-
-        let transaction_id = response.transaction_id;
-
-        // Map CSMS transaction ID → connector ID for stop_transaction lookup
+        // Map transaction ID → connector ID for stop_transaction lookup
         self.active_transactions
             .write()
             .await
@@ -2583,14 +2848,90 @@ impl ChargePoint {
         Ok(transaction_id)
     }
 
+    /// The version-specific half of [`stop_transaction`](Self::stop_transaction):
+    /// send the protocol's "transaction closed" CALL.
+    ///
+    /// * `V16J` sends `StopTransaction`.
+    /// * `V201` emits `TransactionEvent(Ended)` (slice-3a builder) with the final
+    ///   meter reading and the `stoppedReason` / `triggerReason` mapped from
+    ///   `reason`. It aborts the periodic sampler *first*, so the `Ended`'s
+    ///   `seqNo` is the last value drawn from the transaction's shared counter and
+    ///   no in-flight `Updated` can claim a number after it, then removes the
+    ///   session record. A missing session (a stop racing an already-torn-down
+    ///   transaction) is logged and the `Ended` event skipped rather than
+    ///   panicking — the stop path must never panic.
+    async fn close_transaction(
+        &self,
+        connector_id: ConnectorId,
+        transaction_id: i32,
+        meter_stop: i32,
+        reason: Reason,
+    ) -> OcppResult<()> {
+        match self.config.protocol_version {
+            OcppVersion::V16J => {
+                self.call(StopTransactionRequest {
+                    id_tag: None,
+                    meter_stop,
+                    timestamp: chrono::Utc::now(),
+                    transaction_id,
+                    reason: Some(reason),
+                    transaction_data: None,
+                })
+                .await?;
+            }
+            OcppVersion::V201 => {
+                // Silence the periodic sampler before drawing the final seqNo, so
+                // no in-flight Updated can claim a number after the Ended event.
+                self.stop_meter_sampler(transaction_id).await;
+
+                let session = self.v201_sessions.write().await.remove(&transaction_id);
+                let session = match session {
+                    Some(session) => session,
+                    None => {
+                        warn!(
+                            transaction_id,
+                            "V201 stop_transaction: no session state; \
+                             skipping TransactionEvent(Ended)"
+                        );
+                        return Ok(());
+                    }
+                };
+
+                let seq_no = session.next_seq_no.fetch_add(1, Ordering::SeqCst);
+                let txid_str = transaction_id.to_string();
+                let event = v201_transaction::transaction_event_ended(
+                    &v201_transaction::SessionRef {
+                        transaction_id: &txid_str,
+                        evse_id: connector_id.value() as i32,
+                        connector_id: 1,
+                    },
+                    seq_no,
+                    &session.id_tag,
+                    meter_stop as f64,
+                    reason,
+                    &v201_now(),
+                );
+                self.call(event).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Send a `StopTransaction` CALL to the CSMS and transition the connector
     /// back to `Available`.
     ///
     /// Returns `OcppError::NotFound` if `transaction_id` does not correspond
     /// to a transaction started via [`ChargePoint::start_transaction`].
     ///
+    /// The "transaction closed" CALL is version-specific (see
+    /// [`close_transaction`](Self::close_transaction)): `V16J` sends
+    /// `StopTransaction`; `V201` emits `TransactionEvent(Ended)`. The connector
+    /// state transition and its (version-aware) `StatusNotification`s are shared.
+    ///
     /// Ports `send_stop_transaction()` from
-    /// [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py).
+    /// [`examples/v16/charge_point.py`](https://github.com/mobilityhouse/ocpp/blob/master/examples/v16/charge_point.py)
+    /// and, on the `V201` path, the `TransactionEvent(Ended)` flow from
+    /// [`ocpp/v201/call.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
     pub async fn stop_transaction(
         &self,
         transaction_id: i32,
@@ -2607,15 +2948,8 @@ impl ChargePoint {
                 resource: format!("active transaction with ID {}", transaction_id),
             })?;
 
-        self.call(StopTransactionRequest {
-            id_tag: None,
-            meter_stop,
-            timestamp: chrono::Utc::now(),
-            transaction_id,
-            reason: Some(reason),
-            transaction_data: None,
-        })
-        .await?;
+        self.close_transaction(connector_id, transaction_id, meter_stop, reason)
+            .await?;
 
         // Transaction is wrapping up (Charging -> Finishing).
         self.send_status_notification(
