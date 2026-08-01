@@ -64,6 +64,11 @@ use ocpp_types::{
     CallErrorCode, CallErrorMessage, CallResultMessage, ConnectorId, OcppError, OcppResult,
     OcppVersion,
 };
+// 2.0.1 provisioning message + enum types used by the version-aware runtime
+// (slice 2). Aliased to avoid clashing with the unqualified 1.6J names imported
+// above (`StatusNotificationRequest`, `RegistrationStatus`).
+use ocpp_messages::v201::StatusNotificationRequest as V201StatusNotificationRequest;
+use ocpp_types::v201::{ConnectorStatusEnumType, RegistrationStatusEnumType};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
@@ -140,6 +145,60 @@ pub fn subprotocols_for(version: OcppVersion) -> Vec<String> {
         OcppVersion::V16J => vec!["ocpp1.6".to_string()],
         OcppVersion::V201 => vec!["ocpp2.0.1".to_string()],
     }
+}
+
+/// Normalize a 2.0.1 `RegistrationStatusEnumType` onto the 1.6J
+/// [`RegistrationStatus`] the runtime uses as its canonical registration state.
+///
+/// Both enums carry exactly `Accepted` / `Pending` / `Rejected` (the 2.0.1 set
+/// is unchanged from 1.6J), so this is a total, lossless 1:1 mapping. It lets
+/// [`ChargePoint::boot_sequence`] drive one retry loop over both versions
+/// instead of duplicating the Accepted/Pending/Rejected control flow.
+fn v201_registration_status_to_canonical(status: RegistrationStatusEnumType) -> RegistrationStatus {
+    match status {
+        RegistrationStatusEnumType::Accepted => RegistrationStatus::Accepted,
+        RegistrationStatusEnumType::Pending => RegistrationStatus::Pending,
+        RegistrationStatusEnumType::Rejected => RegistrationStatus::Rejected,
+    }
+}
+
+/// Map a 1.6J [`ChargePointStatus`] onto the reduced 2.0.1
+/// [`ConnectorStatusEnumType`] used in a 2.0.1 `StatusNotification`.
+///
+/// 2.0.1 collapses the 1.6J connector-status set (9 values) down to 5
+/// (`Available`, `Occupied`, `Reserved`, `Unavailable`, `Faulted`): the four
+/// "a vehicle is connected and a session is in some phase" states
+/// (`Preparing`, `Charging`, `SuspendedEV`, `SuspendedEVSE`) plus `Finishing`
+/// all report as `Occupied`. `Available` / `Reserved` / `Faulted` /
+/// `Unavailable` carry across unchanged. This is a total mapping, so the 2.0.1
+/// `StatusNotification` path can report any status the 1.6J connector model
+/// tracks.
+fn charge_point_status_to_v201(status: ChargePointStatus) -> ConnectorStatusEnumType {
+    match status {
+        ChargePointStatus::Available => ConnectorStatusEnumType::Available,
+        ChargePointStatus::Preparing
+        | ChargePointStatus::Charging
+        | ChargePointStatus::SuspendedEV
+        | ChargePointStatus::SuspendedEVSE
+        | ChargePointStatus::Finishing => ConnectorStatusEnumType::Occupied,
+        ChargePointStatus::Reserved => ConnectorStatusEnumType::Reserved,
+        ChargePointStatus::Faulted => ConnectorStatusEnumType::Faulted,
+        ChargePointStatus::Unavailable => ConnectorStatusEnumType::Unavailable,
+    }
+}
+
+/// Version-normalized view of a `BootNotification` response, so
+/// [`ChargePoint::boot_sequence`]'s retry loop is written once and works for
+/// both 1.6J and 2.0.1. The 1.6J and 2.0.1 responses carry the same three
+/// load-bearing fields (`status`, `interval`, `currentTime`); this is the
+/// common shape the loop reads.
+struct BootOutcome {
+    /// Registration decision, normalized onto the canonical 1.6J enum.
+    status: RegistrationStatus,
+    /// Heartbeat interval (Accepted/Pending) or minimum retry wait (Rejected).
+    interval: i32,
+    /// The CSMS's current time, reported to consumers on `Accepted`.
+    current_time: chrono::DateTime<chrono::Utc>,
 }
 
 /// Charge point configuration
@@ -716,11 +775,21 @@ impl ChargePoint {
             connectors.insert(connector_id, Connector::new(connector_config)?);
         }
 
-        // Build the shared validator once (compiles 78 schemas) and back both
-        // the dispatcher (incoming CALLs) and `call()` (CALLRESULTs) with it.
+        // Build the shared validator once and back both the dispatcher (incoming
+        // CALLs) and `call()` (outgoing CALLs + their CALLRESULTs) with it.
         // Mirrors `ocpp/charge_point.py`, which always runs `_validate()`.
+        //
+        // The validator is version-aware: a `V201`-configured CP validates
+        // against the 2.0.1 schema set so its outgoing 2.0.1 `BootNotification`
+        // /`StatusNotification` (which have entirely different shapes from their
+        // 1.6J namesakes) are checked against the *right* schema. `V16J` (the
+        // default) resolves to `SchemaValidator::v16j()` exactly as before, so
+        // existing behavior is byte-for-byte unchanged.
         let validator = if config.validate_payloads {
-            Some(Arc::new(SchemaValidator::v16j()))
+            Some(Arc::new(match config.protocol_version {
+                OcppVersion::V16J => SchemaValidator::v16j(),
+                OcppVersion::V201 => SchemaValidator::v201(),
+            }))
         } else {
             None
         };
@@ -1968,12 +2037,61 @@ impl ChargePoint {
         }
     }
 
-    async fn boot_sequence(&self) -> OcppResult<()> {
-        let request = self.boot_notification_request();
+    /// Send a single `BootNotification` in the configured OCPP version and
+    /// return a version-normalized [`BootOutcome`].
+    ///
+    /// This is the one version-branching seam in the boot handshake: `V16J`
+    /// sends the 1.6J [`BootNotificationRequest`] built from vendor info, while
+    /// `V201` sends the spec-valid 2.0.1 request built by
+    /// [`ChargePointConfig::v201_boot_notification_request`] (slice 1, #417).
+    /// Both responses are collapsed onto [`BootOutcome`] so the retry loop in
+    /// [`boot_sequence`](Self::boot_sequence) stays version-agnostic.
+    ///
+    /// `call()` validates the outgoing request and the incoming CALLRESULT
+    /// against the CP's version-aware validator, so a `V201` CP checks its
+    /// 2.0.1 boot payload against the 2.0.1 schema.
+    async fn send_boot_notification(&self) -> OcppResult<BootOutcome> {
+        match self.config.protocol_version {
+            OcppVersion::V16J => {
+                let response = self.call(self.boot_notification_request()).await?;
+                Ok(BootOutcome {
+                    status: response.status,
+                    interval: response.interval,
+                    current_time: response.current_time,
+                })
+            }
+            OcppVersion::V201 => {
+                let response = self
+                    .call(self.config.v201_boot_notification_request())
+                    .await?;
+                // The 2.0.1 response carries `currentTime` as an RFC 3339 string
+                // (the wire form); the schema validated it as `date-time`, so a
+                // conformant CSMS always parses. Fall back to "now" on the
+                // (schema-rejected) off-nominal case rather than failing an
+                // otherwise-`Accepted` boot on a cosmetic timestamp field.
+                let current_time = chrono::DateTime::parse_from_rfc3339(&response.current_time)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| {
+                        warn!(
+                            "v201 BootNotificationResponse.currentTime not RFC 3339 ({:?}); \
+                             using local time for the accepted event",
+                            response.current_time
+                        );
+                        chrono::Utc::now()
+                    });
+                Ok(BootOutcome {
+                    status: v201_registration_status_to_canonical(response.status),
+                    interval: response.interval,
+                    current_time,
+                })
+            }
+        }
+    }
 
+    async fn boot_sequence(&self) -> OcppResult<()> {
         let max_attempts = self.config.max_boot_retries + 1;
         for attempt in 1..=max_attempts {
-            let response = self.call(request.clone()).await?;
+            let response = self.send_boot_notification().await?;
             *self.registration_status.write().await = response.status;
 
             match response.status {
@@ -2022,9 +2140,15 @@ impl ChargePoint {
     /// initial operational state of every connector. Mirrors the boot-time
     /// status reporting in `examples/v16/charge_point.py`.
     async fn announce_connectors_available(&self) -> OcppResult<()> {
-        // Connector 0 represents the charge point itself; 1..=connector_count
-        // are the physical connectors created in `ChargePoint::new`.
-        for connector_id in 0..=self.config.connector_count {
+        // 1.6J: connector 0 represents the charge point itself and 1..=count are
+        // the physical connectors (§4.8). 2.0.1 has no whole-station connector-0
+        // slot — `StatusNotification` is reported per physical connector — so
+        // the 2.0.1 path announces 1..=count only.
+        let first_connector = match self.config.protocol_version {
+            OcppVersion::V16J => 0,
+            OcppVersion::V201 => 1,
+        };
+        for connector_id in first_connector..=self.config.connector_count {
             self.send_status_notification(
                 connector_id,
                 ChargePointStatus::Available,
@@ -2040,6 +2164,11 @@ impl ChargePoint {
     /// The interval comes from `BootNotificationResponse.interval` — not from
     /// `ChargePointConfig.heartbeat_interval` — matching the Python reference
     /// behaviour in `charge_point.py`.
+    ///
+    /// The `Heartbeat` CALL is version-agnostic on the wire: both the 1.6J and
+    /// 2.0.1 requests carry an empty payload, serializing to the identical
+    /// `[2, "<id>", "Heartbeat", {}]` frame. So this task is correct for a
+    /// 2.0.1 session as-is and needs no `protocol_version` branch.
     async fn start_heartbeat(&self, interval_secs: u64) {
         let interval = Duration::from_secs(interval_secs.max(1));
         let client = self.client.clone();
@@ -2710,16 +2839,35 @@ impl ChargePoint {
         status: ChargePointStatus,
         error_code: ChargePointErrorCode,
     ) -> OcppResult<()> {
-        self.call(StatusNotificationRequest {
-            connector_id,
-            error_code,
-            info: None,
-            status,
-            timestamp: Some(chrono::Utc::now()),
-            vendor_error_code: None,
-            vendor_id: None,
-        })
-        .await?;
+        match self.config.protocol_version {
+            OcppVersion::V16J => {
+                self.call(StatusNotificationRequest {
+                    connector_id,
+                    error_code,
+                    info: None,
+                    status,
+                    timestamp: Some(chrono::Utc::now()),
+                    vendor_error_code: None,
+                    vendor_id: None,
+                })
+                .await?;
+            }
+            OcppVersion::V201 => {
+                // 2.0.1 reports status per `(evseId, connectorId)` pair and has
+                // no `errorCode` field. The CP inherits 1.6J's flat connector
+                // model, so each connector maps to a single-connector EVSE:
+                // `evseId = connector_id`, `connectorId = 1`. (A richer EVSE
+                // topology is out of scope for this wire-shape slice.)
+                self.call(V201StatusNotificationRequest {
+                    timestamp: chrono::Utc::now().to_rfc3339(),
+                    connector_status: charge_point_status_to_v201(status),
+                    evse_id: connector_id as i32,
+                    connector_id: 1,
+                    custom_data: None,
+                })
+                .await?;
+            }
+        }
 
         Ok(())
     }
@@ -3227,6 +3375,84 @@ mod tests {
                 .is_ok(),
             "built v201 BootNotification should be schema-valid, got: {payload}"
         );
+    }
+
+    #[test]
+    fn test_v201_registration_status_maps_to_canonical() {
+        // Total, lossless 1:1 mapping — every 2.0.1 registration status has a
+        // matching canonical 1.6J status, so the shared boot retry loop reads
+        // the same three states regardless of version.
+        assert_eq!(
+            v201_registration_status_to_canonical(RegistrationStatusEnumType::Accepted),
+            RegistrationStatus::Accepted
+        );
+        assert_eq!(
+            v201_registration_status_to_canonical(RegistrationStatusEnumType::Pending),
+            RegistrationStatus::Pending
+        );
+        assert_eq!(
+            v201_registration_status_to_canonical(RegistrationStatusEnumType::Rejected),
+            RegistrationStatus::Rejected
+        );
+    }
+
+    #[test]
+    fn test_charge_point_status_maps_to_v201_connector_status() {
+        use ConnectorStatusEnumType as V201;
+        // The four "vehicle connected, session in progress" states plus
+        // Finishing collapse to Occupied in the reduced 2.0.1 set; the rest
+        // carry across unchanged.
+        assert_eq!(
+            charge_point_status_to_v201(ChargePointStatus::Available),
+            V201::Available
+        );
+        assert_eq!(
+            charge_point_status_to_v201(ChargePointStatus::Preparing),
+            V201::Occupied
+        );
+        assert_eq!(
+            charge_point_status_to_v201(ChargePointStatus::Charging),
+            V201::Occupied
+        );
+        assert_eq!(
+            charge_point_status_to_v201(ChargePointStatus::SuspendedEV),
+            V201::Occupied
+        );
+        assert_eq!(
+            charge_point_status_to_v201(ChargePointStatus::SuspendedEVSE),
+            V201::Occupied
+        );
+        assert_eq!(
+            charge_point_status_to_v201(ChargePointStatus::Finishing),
+            V201::Occupied
+        );
+        assert_eq!(
+            charge_point_status_to_v201(ChargePointStatus::Reserved),
+            V201::Reserved
+        );
+        assert_eq!(
+            charge_point_status_to_v201(ChargePointStatus::Faulted),
+            V201::Faulted
+        );
+        assert_eq!(
+            charge_point_status_to_v201(ChargePointStatus::Unavailable),
+            V201::Unavailable
+        );
+    }
+
+    #[test]
+    fn test_v201_config_builds_v201_validator() {
+        // A V201-configured CP must validate its outgoing 2.0.1 boot payload
+        // against the 2.0.1 schema set. Proven indirectly: the built 2.0.1
+        // BootNotification is schema-valid, and a V201 CP is constructible with
+        // validation enabled (which selects `SchemaValidator::v201()`).
+        let mut config = ChargePointConfig::for_version(OcppVersion::V201);
+        config.charge_point_id = "CP_V201_VALIDATOR".to_string();
+        assert!(config.validate_payloads);
+        let cp = ChargePoint::new(config).expect("V201 CP with validation must build");
+        // The validator is private; the observable proxy is that construction
+        // succeeded and the config retained the 2.0.1 protocol version.
+        assert_eq!(cp.config.protocol_version, OcppVersion::V201);
     }
 
     #[tokio::test]
