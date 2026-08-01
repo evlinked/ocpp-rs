@@ -36,8 +36,10 @@ async-trait = "0.1"
 # (wire_level_call_error, Issue #383).
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
-# Test-only: property-based fuzz sweep over arbitrary wire input, asserting the
-# decode path never panics and only surfaces sanctioned protocol errors
-# (decode_fuzz_robustness, Issue #406 — ports test_messages.py::test_unpack_and_pack).
+# Test-only: property-based fuzz sweeps over arbitrary wire input, asserting the
+# decode paths never panic and only surface sanctioned protocol errors — the
+# array-form decode boundary (decode_fuzz_robustness, Issue #406) and the
+# object-form CALLERROR recovery boundary (recover_call_error_fuzz, Issue #409),
+# both porting test_messages.py::test_unpack_and_pack / CallError.to_exception.
 proptest = { workspace = true }
 
