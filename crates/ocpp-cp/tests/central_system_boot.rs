@@ -22,7 +22,8 @@ use ocpp_cp::{ChargePoint, ChargePointConfig};
 use ocpp_messages::v16j::RegistrationStatus;
 use ocpp_messages::v201::{
     BootNotificationRequest as V201BootNotificationRequest,
-    BootNotificationResponse as V201BootNotificationResponse,
+    BootNotificationResponse as V201BootNotificationResponse, TransactionEventRequest,
+    TransactionEventResponse,
 };
 use ocpp_messages::ActionDispatcher;
 use ocpp_transport::server::OcppServer;
@@ -30,8 +31,12 @@ use ocpp_transport::{
     central_system_dispatcher, central_system_dispatcher_with, central_system_service_v201,
     CentralSystemConfig, CentralSystemConfigV201, DispatchHandler, TransportConfig,
 };
-use ocpp_types::v201::{BootReasonEnumType, RegistrationStatusEnumType};
-use ocpp_types::OcppVersion;
+use ocpp_types::common::Reason;
+use ocpp_types::v201::{
+    BootReasonEnumType, ReasonEnumType, RegistrationStatusEnumType, TransactionEventEnumType,
+    TriggerReasonEnumType,
+};
+use ocpp_types::{ConnectorId, OcppVersion};
 
 /// Start an in-process CSMS whose dispatcher is built from `dispatcher` and
 /// return it alongside the bound address (random free port).
@@ -241,6 +246,165 @@ async fn v201_boot_notification_carries_spec_shape_over_the_wire() {
     assert_eq!(
         boot.charging_station.firmware_version.as_deref(),
         Some("1.0.0")
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// ---------------------------------------------------------------------------
+// OCPP 2.0.1 charging session (Issue #423, slice 3b): a `for_version(V201)` CP
+// runs a full start -> periodic -> stop session against a
+// `SchemaValidator::v201()`-backed CSMS that captures every `TransactionEvent`.
+// The unified 2.0.1 `TransactionEvent` message replaces the 1.6J
+// `StartTransaction` / `MeterValues` / `StopTransaction` triad, so a green run
+// proves the live transactional loop speaks 2.0.1 end to end: the three events
+// arrive in order, `seqNo` is strictly increasing from 0, and the
+// station-chosen `transactionId` is stable across all of them.
+// ---------------------------------------------------------------------------
+
+/// Shared, ordered log of every `TransactionEvent` the CSMS received.
+type TxnLog = Arc<Mutex<Vec<TransactionEventRequest>>>;
+
+/// Start an in-process 2.0.1 CSMS that records every `TransactionEvent` it
+/// receives (replacing the default empty-ack handler with a recording one that
+/// still returns the empty `{}` ack), on top of the default 2.0.1 lifecycle
+/// responders. Returns the server, its address, and the shared log.
+async fn start_v201_csms_recording_txns() -> (OcppServer, SocketAddr, TxnLog) {
+    let log: TxnLog = Arc::new(Mutex::new(Vec::new()));
+    let log_for_handler = log.clone();
+    let (server, addr) = start_v201_csms(move |dispatcher| {
+        let log = log_for_handler;
+        dispatcher.on(move |req: TransactionEventRequest| {
+            let log = log.clone();
+            async move {
+                log.lock().expect("txn log mutex not poisoned").push(req);
+                // Empty ack, exactly like the default 2.0.1 CSMS handler — no
+                // cost / authorization policy, so `idTokenInfo` is absent and the
+                // CP treats the start as an implicit accept.
+                Ok(TransactionEventResponse::default())
+            }
+        });
+    })
+    .await;
+    (server, addr, log)
+}
+
+/// Poll `log` until it contains at least one event of `event_type`, or panic
+/// after ~5s. Used to wait for the background meter sampler to emit its first
+/// `Updated` before stopping the transaction, without a fixed sleep.
+async fn wait_for_event(log: &TxnLog, event_type: TransactionEventEnumType) {
+    for _ in 0..250 {
+        {
+            let events = log.lock().expect("txn log mutex not poisoned");
+            if events.iter().any(|e| e.event_type == event_type) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for a {event_type:?} TransactionEvent");
+}
+
+#[tokio::test]
+async fn v201_charging_session_emits_transaction_events_in_order() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    // A 1s meter interval so the periodic `Updated` sampler ticks promptly; the
+    // test waits on the recorded log rather than sleeping a fixed duration.
+    let config = ChargePointConfig {
+        meter_values_interval: 1,
+        ..v201_cp_config(addr, "CP201_TXN")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // Start a transaction on connector 1 -> emits TransactionEvent(Started).
+    let connector = ConnectorId::new(1).unwrap();
+    let txn_id = cp
+        .start_transaction(connector, "RFID-CAFE", 1000)
+        .await
+        .expect("v201 start_transaction");
+    // The station mints the first transactionId as 1 (rendered "1" on the wire).
+    assert_eq!(txn_id, 1, "V201 station mints the transaction id");
+
+    // Wait for the background sampler to emit at least one periodic `Updated`.
+    wait_for_event(&log, TransactionEventEnumType::Updated).await;
+
+    // Stop the transaction (EV unplugged) -> emits TransactionEvent(Ended).
+    cp.stop_transaction(txn_id, 2000, Reason::EVDisconnected)
+        .await
+        .expect("v201 stop_transaction");
+
+    let events = log.lock().expect("txn log mutex not poisoned").clone();
+
+    // At minimum: Started, >=1 Updated, Ended.
+    assert!(
+        events.len() >= 3,
+        "expected at least Started + Updated + Ended, got {} events",
+        events.len()
+    );
+
+    let first = &events[0];
+    let last = &events[events.len() - 1];
+    assert_eq!(
+        first.event_type,
+        TransactionEventEnumType::Started,
+        "first event must be Started"
+    );
+    assert_eq!(
+        last.event_type,
+        TransactionEventEnumType::Ended,
+        "last event must be Ended"
+    );
+    // Everything between the first and last is an Updated.
+    for mid in &events[1..events.len() - 1] {
+        assert_eq!(
+            mid.event_type,
+            TransactionEventEnumType::Updated,
+            "mid-session events must be Updated"
+        );
+    }
+
+    // seqNo strictly increasing, starting at 0 on Started.
+    assert_eq!(first.seq_no, 0, "Started carries seqNo 0");
+    for pair in events.windows(2) {
+        assert!(
+            pair[1].seq_no > pair[0].seq_no,
+            "seqNo must strictly increase: {} then {}",
+            pair[0].seq_no,
+            pair[1].seq_no
+        );
+    }
+
+    // transactionId is stable across every event of the session.
+    for e in &events {
+        assert_eq!(
+            e.transaction_info.transaction_id, "1",
+            "transactionId must be stable across all events"
+        );
+        // Each event reports the same EVSE the 1.6J connector maps onto.
+        let evse = e.evse.as_ref().expect("every event carries evse");
+        assert_eq!(evse.id, 1, "connector 1 maps to evse 1");
+        assert_eq!(evse.connector_id, Some(1));
+    }
+
+    // The Started event authorizes with the presented idToken; the Ended event
+    // carries the mapped stop reason and trigger for an EV unplug.
+    let started_token = first
+        .id_token
+        .as_ref()
+        .expect("Started carries the authorizing idToken");
+    assert_eq!(started_token.id_token, "RFID-CAFE");
+    assert_eq!(
+        last.trigger_reason,
+        TriggerReasonEnumType::EVDeparted,
+        "EV unplug maps to an EVDeparted trigger"
+    );
+    assert_eq!(
+        last.transaction_info.stopped_reason,
+        Some(ReasonEnumType::EVDisconnected),
+        "EV unplug maps to an EVDisconnected stopped-reason"
     );
 
     cp.disconnect().await.expect("disconnect");
