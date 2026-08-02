@@ -18,6 +18,7 @@ pub mod message_handler;
 pub mod meter_sampler;
 pub mod state_machine;
 pub mod transaction;
+pub mod v201_command;
 pub mod v201_transaction;
 
 use anyhow::Result;
