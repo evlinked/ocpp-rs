@@ -21,6 +21,7 @@
 //! accepts but defers the reset until it is idle).
 
 use ocpp_types::common::Reason;
+use ocpp_types::v16j::ResetType;
 use ocpp_types::v201::{ResetEnumType, ResetStatusEnumType, StatusInfoType};
 
 use ocpp_messages::v201::ResetResponse;
@@ -77,6 +78,29 @@ pub fn v201_reset_reason(kind: ResetEnumType) -> Reason {
     match kind {
         ResetEnumType::Immediate => Reason::HardReset,
         ResetEnumType::OnIdle => Reason::SoftReset,
+    }
+}
+
+/// Map a 2.0.1 reset [`kind`](ResetEnumType) onto the 1.6J [`ResetType`] the CP's
+/// runtime `perform_reset` side-effect is driven by, selecting the reboot
+/// *behavior*:
+///
+/// - `Immediate → Hard` — reset the station at once (tear the session down and
+///   reconnect), the 1.6J "hard" reboot.
+/// - `OnIdle → Soft` — a graceful, in-place restart, the 1.6J "soft" reboot.
+///
+/// This is the wiring layer's companion to [`v201_reset_reason`]: `perform_reset`
+/// derives the transaction stop [`Reason`] from the `ResetType` it is given
+/// (`Hard → HardReset`, `Soft → SoftReset`), and this mapping is chosen so that
+/// derived reason is **identical** to `v201_reset_reason(kind)` — an invariant
+/// pinned by [`reset_type_reason_matches_reset_reason`](self). Keeping the pure
+/// mapping here (rather than inline in the dispatcher) leaves it unit-testable
+/// without a runtime. Total over the two `ResetEnumType` variants.
+#[must_use]
+pub fn v201_reset_reset_type(kind: ResetEnumType) -> ResetType {
+    match kind {
+        ResetEnumType::Immediate => ResetType::Hard,
+        ResetEnumType::OnIdle => ResetType::Soft,
     }
 }
 
@@ -139,6 +163,43 @@ mod tests {
             Reason::HardReset
         );
         assert_eq!(v201_reset_reason(ResetEnumType::OnIdle), Reason::SoftReset);
+    }
+
+    #[test]
+    fn reset_type_mapping_is_total() {
+        assert_eq!(
+            v201_reset_reset_type(ResetEnumType::Immediate),
+            ResetType::Hard
+        );
+        assert_eq!(
+            v201_reset_reset_type(ResetEnumType::OnIdle),
+            ResetType::Soft
+        );
+    }
+
+    /// Consistency invariant between the two mappings the wiring layer relies on:
+    /// the runtime drives the side-effect via [`v201_reset_reset_type`] and
+    /// `perform_reset` then derives the transaction stop `Reason` from that
+    /// `ResetType` (`Hard → HardReset`, `Soft → SoftReset`). That derived reason
+    /// must equal [`v201_reset_reason`] for the same kind, so a reset that ends a
+    /// live transaction records exactly the reason the pure logic prescribes.
+    #[test]
+    fn reset_type_reason_matches_reset_reason() {
+        // Mirrors `perform_reset`'s ResetType → Reason derivation.
+        fn perform_reset_reason(rt: ResetType) -> Reason {
+            match rt {
+                ResetType::Soft => Reason::SoftReset,
+                ResetType::Hard => Reason::HardReset,
+            }
+        }
+        for kind in [ResetEnumType::Immediate, ResetEnumType::OnIdle] {
+            assert_eq!(
+                perform_reset_reason(v201_reset_reset_type(kind)),
+                v201_reset_reason(kind),
+                "the reason perform_reset derives from the mapped ResetType must \
+                 match v201_reset_reason for {kind:?}"
+            );
+        }
     }
 
     #[test]

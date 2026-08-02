@@ -69,9 +69,12 @@ use ocpp_types::{
 // 2.0.1 provisioning message + enum types used by the version-aware runtime
 // (slice 2). Aliased to avoid clashing with the unqualified 1.6J names imported
 // above (`StatusNotificationRequest`, `RegistrationStatus`).
-use ocpp_messages::v201::StatusNotificationRequest as V201StatusNotificationRequest;
+use ocpp_messages::v201::{
+    ResetRequest as V201ResetRequest, StatusNotificationRequest as V201StatusNotificationRequest,
+};
 use ocpp_types::v201::{
     AuthorizationStatusEnumType, ConnectorStatusEnumType, RegistrationStatusEnumType,
+    ResetStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -887,6 +890,7 @@ impl ChargePoint {
             Arc::new(RwLock::new(store))
         };
         let mut dispatcher = Self::build_default_dispatcher(
+            config.protocol_version,
             config_store.clone(),
             auth_cache.clone(),
             command_sender,
@@ -945,6 +949,7 @@ impl ChargePoint {
     // design smell, so the lint is intentionally allowed here.
     #[allow(clippy::too_many_arguments)]
     fn build_default_dispatcher(
+        protocol_version: OcppVersion,
         config_store: Arc<RwLock<ConfigurationStore>>,
         auth_cache: Arc<AuthCache>,
         command_sender: mpsc::UnboundedSender<RemoteCommand>,
@@ -1118,28 +1123,85 @@ impl ChargePoint {
             });
         }
 
-        // Reset — acknowledge, then carry out the reset as a real side effect
-        // (OCPP 1.6J §5.13). The work is queued on the command channel and run
-        // by the consumer task spawned in `connect()`, so the CALLRESULT is
-        // flushed before any outbound CALL (graceful StopTransaction, re-boot)
-        // and the receive loop never re-enters itself. Returning `Accepted`
-        // commits only to *attempting* the reset; if the consumer has gone away
-        // (the CP is shutting down) the command cannot be honored, so we report
-        // `Rejected` rather than silently dropping it.
-        {
-            let command_sender = command_sender.clone();
-            d.on(move |req: ResetRequest| {
+        // Reset — acknowledge, then carry out the reset as a real side effect.
+        // Both OCPP versions name the action `"Reset"`, so exactly one handler is
+        // registered per `protocol_version`; the negotiated subprotocol and the
+        // version-aware inbound validator keep the wire on a single dialect, so
+        // the other version's request shape never reaches this dispatcher.
+        match protocol_version {
+            // OCPP 1.6J §5.13. The work is queued on the command channel and run
+            // by the consumer task spawned in `connect()`, so the CALLRESULT is
+            // flushed before any outbound CALL (graceful StopTransaction, re-boot)
+            // and the receive loop never re-enters itself. Returning `Accepted`
+            // commits only to *attempting* the reset; if the consumer has gone
+            // away (the CP is shutting down) the command cannot be honored, so we
+            // report `Rejected` rather than silently dropping it.
+            OcppVersion::V16J => {
                 let command_sender = command_sender.clone();
-                async move {
-                    let status = match command_sender.send(RemoteCommand::Reset {
-                        reset_type: req.reset_type,
-                    }) {
-                        Ok(()) => ResetStatus::Accepted,
-                        Err(_) => ResetStatus::Rejected,
-                    };
-                    Ok(ResetResponse { status })
-                }
-            });
+                d.on(move |req: ResetRequest| {
+                    let command_sender = command_sender.clone();
+                    async move {
+                        let status = match command_sender.send(RemoteCommand::Reset {
+                            reset_type: req.reset_type,
+                        }) {
+                            Ok(()) => ResetStatus::Accepted,
+                            Err(_) => ResetStatus::Rejected,
+                        };
+                        Ok(ResetResponse { status })
+                    }
+                });
+            }
+            // OCPP 2.0.1 (Part 2, `Reset`). Ports `ocpp.v201.call.Reset`: the 1.6J
+            // Hard/Soft distinction becomes a `ResetEnumType` (`Immediate`/
+            // `OnIdle`) and the response gains a `Scheduled` status (accept but
+            // defer) plus optional `statusInfo`. The pure decision + response
+            // construction live in `v201_command` (slice 4a, #427); this is the
+            // runtime wiring (slice 4b, #428). Same off-CALL-path side-effect
+            // discipline as the 1.6J handler.
+            OcppVersion::V201 => {
+                let command_sender = command_sender.clone();
+                let active_transactions = active_transactions.clone();
+                d.on(move |req: V201ResetRequest| {
+                    let command_sender = command_sender.clone();
+                    let active_transactions = active_transactions.clone();
+                    async move {
+                        // Whether a transaction is running is the only extra input
+                        // to the `Accepted` vs `Scheduled` decision for an `OnIdle`
+                        // reset. The simulator's flat single-connector-EVSE
+                        // topology (established by the slice-2 StatusNotification
+                        // path) makes a whole-station reset behaviorally equivalent
+                        // to a per-`evseId` one, so the request's optional `evseId`
+                        // scope is accepted but does not narrow this check;
+                        // per-EVSE-scoped resets are a documented follow-up.
+                        let transaction_in_progress = !active_transactions.read().await.is_empty();
+                        let mut status =
+                            v201_command::v201_reset_status(req.kind, transaction_in_progress);
+
+                        // Only an accepted, immediately-actionable reset drives the
+                        // side-effect now: `Accepted` covers `Immediate` (always)
+                        // and `OnIdle` while idle. If the consumer has gone away we
+                        // cannot honor it, so downgrade to `Rejected` — the same
+                        // capability outcome the 1.6J handler reports on a failed
+                        // channel send. A `Scheduled` reset (an `OnIdle` request
+                        // received while charging) is accepted-but-deferred: the
+                        // correct status is returned and no side-effect is queued,
+                        // so this never interrupts a live charging session.
+                        // Carrying the deferred reset out once the station next
+                        // goes idle is a separate slice (4c).
+                        if status == ResetStatusEnumType::Accepted {
+                            let reset_type = v201_command::v201_reset_reset_type(req.kind);
+                            if command_sender
+                                .send(RemoteCommand::Reset { reset_type })
+                                .is_err()
+                            {
+                                status = ResetStatusEnumType::Rejected;
+                            }
+                        }
+
+                        Ok(v201_command::v201_reset_response(status, None))
+                    }
+                });
+            }
         }
 
         // TriggerMessage — acknowledge, then send the requested message as a real
