@@ -19,12 +19,28 @@
 //! (`Immediate` / `OnIdle`), the request may target a single `evseId` instead of
 //! the whole station, and the response gains a `Scheduled` status (the station
 //! accepts but defers the reset until it is idle).
+//!
+//! ## `TriggerMessage`
+//!
+//! Ports `ocpp.v201.call.TriggerMessage` / `ocpp.v201.call_result.TriggerMessage`.
+//! The CSMS asks the station to *proactively* send one specific message now
+//! (e.g. a fresh `BootNotification`, `StatusNotification`, `Heartbeat`, or
+//! `TransactionEvent`), optionally scoped to a single `evse`. The station replies
+//! [`Accepted`](TriggerMessageStatusEnumType::Accepted) for a message it can
+//! produce, or [`NotImplemented`](TriggerMessageStatusEnumType::NotImplemented)
+//! for a recognized message it has no way to emit.
+//! [`Rejected`](TriggerMessageStatusEnumType::Rejected), like `Reset`'s, is a
+//! runtime *capability* outcome (the trigger was accepted in policy but the
+//! side-effect could not be enqueued), decided by the slice-5b wiring layer.
 
 use ocpp_types::common::Reason;
 use ocpp_types::v16j::ResetType;
-use ocpp_types::v201::{ResetEnumType, ResetStatusEnumType, StatusInfoType};
+use ocpp_types::v201::{
+    MessageTriggerEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
+    TriggerMessageStatusEnumType,
+};
 
-use ocpp_messages::v201::ResetResponse;
+use ocpp_messages::v201::{ResetResponse, TriggerMessageResponse};
 
 /// Decide the [`ResetStatusEnumType`] a `V201` station reports for an inbound
 /// `Reset.req`, given the requested [`kind`](ResetEnumType) and whether a
@@ -116,6 +132,78 @@ pub fn v201_reset_response(
     status_info: Option<StatusInfoType>,
 ) -> ResetResponse {
     ResetResponse {
+        status,
+        status_info,
+        custom_data: None,
+    }
+}
+
+/// Decide the [`TriggerMessageStatusEnumType`] a `V201` station reports for an
+/// inbound `TriggerMessage.req`, given the [`requested`](MessageTriggerEnumType)
+/// message.
+///
+/// This is the *policy* decision: whether the simulator has any way to produce
+/// the requested message. It maps to
+/// [`Accepted`](TriggerMessageStatusEnumType::Accepted) for the messages this CP
+/// already emits on the live `V201` path —
+/// [`BootNotification`](MessageTriggerEnumType::BootNotification),
+/// [`Heartbeat`](MessageTriggerEnumType::Heartbeat),
+/// [`StatusNotification`](MessageTriggerEnumType::StatusNotification),
+/// [`MeterValues`](MessageTriggerEnumType::MeterValues), and
+/// [`TransactionEvent`](MessageTriggerEnumType::TransactionEvent) — and to
+/// [`NotImplemented`](TriggerMessageStatusEnumType::NotImplemented) for the
+/// firmware-, log-, and certificate-signing triggers the simulator has no
+/// support for.
+///
+/// `MeterValues` is `Accepted` at the policy level because the CP produces meter
+/// readings; in 2.0.1 those ride inside `TransactionEvent`, so the slice-5b
+/// wiring must supply the concrete emit path for a standalone `MeterValues`
+/// trigger (tracked with the 5b follow-up) before it can be honored on the wire.
+///
+/// Total, exhaustive `match` — every [`MessageTriggerEnumType`] variant is
+/// classified explicitly, with no wildcard arm, so a future spec-added trigger
+/// is a compile error here rather than a silent default.
+/// [`Rejected`](TriggerMessageStatusEnumType::Rejected) is a runtime *capability*
+/// outcome (a failed side-effect enqueue in slice 5b), not a policy decision, and
+/// is intentionally not produced by this function — mirroring
+/// [`v201_reset_status`]'s split of policy from capability.
+#[must_use]
+pub fn v201_trigger_message_status(
+    requested: MessageTriggerEnumType,
+) -> TriggerMessageStatusEnumType {
+    use MessageTriggerEnumType::{
+        BootNotification, FirmwareStatusNotification, Heartbeat, LogStatusNotification,
+        MeterValues, PublishFirmwareStatusNotification, SignChargingStationCertificate,
+        SignCombinedCertificate, SignV2GCertificate, StatusNotification, TransactionEvent,
+    };
+    match requested {
+        // Messages this CP already builds and sends on the live V201 path.
+        BootNotification | Heartbeat | StatusNotification | MeterValues | TransactionEvent => {
+            TriggerMessageStatusEnumType::Accepted
+        }
+        // Firmware-, diagnostics-log-, and certificate-signing flows the
+        // simulator does not implement: recognized but not triggerable.
+        LogStatusNotification
+        | FirmwareStatusNotification
+        | SignChargingStationCertificate
+        | SignV2GCertificate
+        | SignCombinedCertificate
+        | PublishFirmwareStatusNotification => TriggerMessageStatusEnumType::NotImplemented,
+    }
+}
+
+/// Build a schema-valid `TriggerMessage.conf` ([`TriggerMessageResponse`]).
+///
+/// Pure constructor mirroring [`v201_reset_response`]: carries the decided
+/// [`status`](TriggerMessageStatusEnumType) plus the optional 2.0.1 `statusInfo`
+/// (a vendor-agnostic `reasonCode` and human-readable detail — useful, for
+/// example, to name the message a `NotImplemented` trigger declined).
+#[must_use]
+pub fn v201_trigger_message_response(
+    status: TriggerMessageStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> TriggerMessageResponse {
+    TriggerMessageResponse {
         status,
         status_info,
         custom_data: None,
@@ -248,6 +336,137 @@ mod tests {
                 assert!(
                     validator.validate_call_result("Reset", &payload).is_ok(),
                     "built {status:?} ResetResponse should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    /// Every `MessageTriggerEnumType` value the simulator can actually produce
+    /// on the live V201 path resolves to `Accepted`.
+    #[test]
+    fn producible_triggers_are_accepted() {
+        for requested in [
+            MessageTriggerEnumType::BootNotification,
+            MessageTriggerEnumType::Heartbeat,
+            MessageTriggerEnumType::StatusNotification,
+            MessageTriggerEnumType::MeterValues,
+            MessageTriggerEnumType::TransactionEvent,
+        ] {
+            assert_eq!(
+                v201_trigger_message_status(requested),
+                TriggerMessageStatusEnumType::Accepted,
+                "{requested:?} should be Accepted"
+            );
+        }
+    }
+
+    /// The firmware-, log-, and certificate-signing triggers the simulator has
+    /// no way to emit resolve to `NotImplemented` (recognized, not triggerable).
+    #[test]
+    fn unsupported_triggers_are_not_implemented() {
+        for requested in [
+            MessageTriggerEnumType::LogStatusNotification,
+            MessageTriggerEnumType::FirmwareStatusNotification,
+            MessageTriggerEnumType::SignChargingStationCertificate,
+            MessageTriggerEnumType::SignV2GCertificate,
+            MessageTriggerEnumType::SignCombinedCertificate,
+            MessageTriggerEnumType::PublishFirmwareStatusNotification,
+        ] {
+            assert_eq!(
+                v201_trigger_message_status(requested),
+                TriggerMessageStatusEnumType::NotImplemented,
+                "{requested:?} should be NotImplemented"
+            );
+        }
+    }
+
+    /// The status decision is total: the `Accepted` and `NotImplemented` groups
+    /// together cover every `MessageTriggerEnumType` variant, and `Rejected`
+    /// (a runtime capability outcome) is never a policy result.
+    #[test]
+    fn trigger_status_decision_is_total_and_never_rejected() {
+        let all = [
+            MessageTriggerEnumType::BootNotification,
+            MessageTriggerEnumType::LogStatusNotification,
+            MessageTriggerEnumType::FirmwareStatusNotification,
+            MessageTriggerEnumType::Heartbeat,
+            MessageTriggerEnumType::MeterValues,
+            MessageTriggerEnumType::SignChargingStationCertificate,
+            MessageTriggerEnumType::SignV2GCertificate,
+            MessageTriggerEnumType::StatusNotification,
+            MessageTriggerEnumType::TransactionEvent,
+            MessageTriggerEnumType::SignCombinedCertificate,
+            MessageTriggerEnumType::PublishFirmwareStatusNotification,
+        ];
+        let mut accepted = 0;
+        let mut not_implemented = 0;
+        for requested in all {
+            match v201_trigger_message_status(requested) {
+                TriggerMessageStatusEnumType::Accepted => accepted += 1,
+                TriggerMessageStatusEnumType::NotImplemented => not_implemented += 1,
+                TriggerMessageStatusEnumType::Rejected => {
+                    panic!("{requested:?} must not map to the runtime-only Rejected status")
+                }
+            }
+        }
+        assert_eq!(accepted, 5, "expected exactly 5 producible triggers");
+        assert_eq!(
+            not_implemented, 6,
+            "expected exactly 6 unsupported triggers"
+        );
+    }
+
+    #[test]
+    fn trigger_response_carries_status_and_optional_status_info() {
+        let bare = v201_trigger_message_response(TriggerMessageStatusEnumType::Accepted, None);
+        assert_eq!(bare.status, TriggerMessageStatusEnumType::Accepted);
+        assert!(bare.status_info.is_none());
+
+        let info = StatusInfoType {
+            reason_code: "NotSupported".to_string(),
+            additional_info: Some("MeterValues trigger not yet wired".to_string()),
+            custom_data: None,
+        };
+        let declined =
+            v201_trigger_message_response(TriggerMessageStatusEnumType::NotImplemented, Some(info));
+        assert_eq!(
+            declined.status,
+            TriggerMessageStatusEnumType::NotImplemented
+        );
+        assert_eq!(
+            declined
+                .status_info
+                .as_ref()
+                .map(|i| i.reason_code.as_str()),
+            Some("NotSupported")
+        );
+    }
+
+    /// Wire fidelity: every built `TriggerMessage.conf` — with and without
+    /// `statusInfo`, across all three status values — satisfies the bundled OCPP
+    /// 2.0.1 `TriggerMessageResponse` JSON Schema, the same guarantee the CP's
+    /// version-aware validator gives on the live path.
+    #[test]
+    fn built_trigger_responses_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        let info = StatusInfoType {
+            reason_code: "NotSupported".to_string(),
+            additional_info: Some("recognized but not triggerable".to_string()),
+            custom_data: None,
+        };
+        for status in [
+            TriggerMessageStatusEnumType::Accepted,
+            TriggerMessageStatusEnumType::Rejected,
+            TriggerMessageStatusEnumType::NotImplemented,
+        ] {
+            for status_info in [None, Some(info.clone())] {
+                let resp = v201_trigger_message_response(status, status_info);
+                let payload = serde_json::to_value(&resp).unwrap();
+                assert!(
+                    validator
+                        .validate_call_result("TriggerMessage", &payload)
+                        .is_ok(),
+                    "built {status:?} TriggerMessageResponse should be schema-valid, got: {payload}"
                 );
             }
         }
