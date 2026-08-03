@@ -46,15 +46,35 @@
 //! idle — directly analogous to the `Reset(OnIdle)` → `Scheduled` decision.
 //! [`Rejected`](ChangeAvailabilityStatusEnumType::Rejected), like the others', is
 //! a runtime *capability* outcome decided by the slice-6b wiring layer.
+//!
+//! ## `RequestStartTransaction`
+//!
+//! Ports `ocpp.v201.call.RequestStartTransaction` /
+//! `ocpp.v201.call_result.RequestStartTransaction` — the 2.0.1 successor to the
+//! 1.6J `RemoteStartTransaction` the CP already answers on the `V16J` path. A
+//! CSMS remotely starts a session for a driver's `idToken`, optionally targeting
+//! a single `evseId`. The station decides whether it can honor the start —
+//! [`Accepted`](RequestStartStopStatusEnumType::Accepted) for a targeted EVSE
+//! that exists and is free to charge,
+//! [`Rejected`](RequestStartStopStatusEnumType::Rejected) for a busy, unknown, or
+//! structurally-invalid EVSE — before actually beginning the transaction,
+//! exactly as the 1.6J handler does. A missing `evseId` defaults to EVSE 1,
+//! matching the 1.6J handler's `connector_id.unwrap_or(1)`. The
+//! `remoteStartId` / `groupIdToken` / `chargingProfile` fields are carried
+//! through by the later wire slice (7b), not decided here.
 
 use ocpp_types::common::Reason;
 use ocpp_types::v16j::ResetType;
 use ocpp_types::v201::{
     ChangeAvailabilityStatusEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
-    ResetEnumType, ResetStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
+    RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
+    TriggerMessageStatusEnumType,
 };
 
-use ocpp_messages::v201::{ChangeAvailabilityResponse, ResetResponse, TriggerMessageResponse};
+use ocpp_messages::v201::{
+    ChangeAvailabilityResponse, RequestStartTransactionResponse, ResetResponse,
+    TriggerMessageResponse,
+};
 
 /// Decide the [`ResetStatusEnumType`] a `V201` station reports for an inbound
 /// `Reset.req`, given the requested [`kind`](ResetEnumType) and whether a
@@ -285,6 +305,83 @@ pub fn v201_change_availability_response(
     ChangeAvailabilityResponse {
         status,
         status_info,
+        custom_data: None,
+    }
+}
+
+/// Decide the [`RequestStartStopStatusEnumType`] a `V201` station reports for an
+/// inbound `RequestStartTransaction.req`, given the requested
+/// [`evse_id`](ocpp_messages::v201::RequestStartTransactionRequest::evse_id)
+/// target and whether that targeted EVSE is currently free to start charging.
+///
+/// Faithful to OCPP 2.0.1 (Part 2, `RequestStartTransaction`) and a direct
+/// port of the 1.6J `RemoteStartTransaction` handler's decision in
+/// [`crate`]'s `ChargePoint`:
+///
+/// - A missing `evseId` defaults to **EVSE 1**, mirroring the 1.6J handler's
+///   `connector_id.unwrap_or(1)`.
+/// - An `evseId` of `0` or negative is not a chargeable EVSE — 2.0.1 EVSE ids
+///   are 1-based (`0` addresses the whole station, never a physical EVSE to
+///   start a session on) — so it is
+///   [`Rejected`](RequestStartStopStatusEnumType::Rejected) structurally,
+///   mirroring the 1.6J handler's `ConnectorId::new(..)` `Err` arm for
+///   connector `0` / out of range.
+/// - Otherwise the targeted EVSE's chargeability decides:
+///   [`Accepted`](RequestStartStopStatusEnumType::Accepted) when it exists and
+///   is free to charge, [`Rejected`](RequestStartStopStatusEnumType::Rejected)
+///   when it is busy or unknown. Both the busy and unknown cases collapse to
+///   `evse_available == false`, exactly as the 1.6J handler folds a
+///   known-but-busy connector and an unknown connector id into one `Rejected`
+///   arm.
+///
+/// This is the *pure* decision, depending only on the request target and the
+/// station's chargeability read — no runtime handles, so it is unit-testable in
+/// isolation. Resolving `evse_id` to a concrete EVSE, reading its live status,
+/// and queuing the local `StartTransaction` off the CALL path is the slice-7b
+/// wiring layer's job. `RequestStartStopStatusEnumType` has exactly `Accepted` /
+/// `Rejected` (no `Scheduled`), so — unlike `Reset` / `ChangeAvailability` —
+/// this is a clean two-way split with no deferred outcome.
+#[must_use]
+pub fn v201_request_start_status(
+    evse_id: Option<i32>,
+    evse_available: bool,
+) -> RequestStartStopStatusEnumType {
+    // Default a missing evseId to EVSE 1 (1.6J `connector_id.unwrap_or(1)`).
+    let target = evse_id.unwrap_or(1);
+    // EVSE 0 / negative is not a chargeable EVSE: reject before consulting
+    // availability, mirroring the 1.6J `ConnectorId::new` Err arm.
+    if target < 1 {
+        return RequestStartStopStatusEnumType::Rejected;
+    }
+    if evse_available {
+        RequestStartStopStatusEnumType::Accepted
+    } else {
+        // Busy or unknown EVSE — both surface as "not free to charge".
+        RequestStartStopStatusEnumType::Rejected
+    }
+}
+
+/// Build a schema-valid `RequestStartTransaction.conf`
+/// ([`RequestStartTransactionResponse`]).
+///
+/// Pure constructor mirroring [`v201_reset_response`]: carries the decided
+/// [`status`](RequestStartStopStatusEnumType) plus the optional 2.0.1
+/// `statusInfo` (a vendor-agnostic `reasonCode` and human-readable detail —
+/// useful, for example, to explain why a remote start was `Rejected`).
+///
+/// `transactionId` is left `None`: it is only set when the transaction had
+/// *already* started (e.g. the cable was plugged in first) and the station is
+/// reporting the id of that already-running transaction — a live-state concern
+/// the slice-7b wiring layer owns, not this pure builder.
+#[must_use]
+pub fn v201_request_start_response(
+    status: RequestStartStopStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> RequestStartTransactionResponse {
+    RequestStartTransactionResponse {
+        status,
+        status_info,
+        transaction_id: None,
         custom_data: None,
     }
 }
@@ -666,6 +763,131 @@ mod tests {
                         .validate_call_result("ChangeAvailability", &payload)
                         .is_ok(),
                     "built {status:?} ChangeAvailabilityResponse should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    /// A targeted EVSE that exists and is free to charge is `Accepted`, whether
+    /// the id is explicit or defaulted — the 2.0.1 twin of the 1.6J handler's
+    /// "free connector → Accepted".
+    #[test]
+    fn request_start_is_accepted_for_a_free_targeted_evse() {
+        assert_eq!(
+            v201_request_start_status(Some(1), true),
+            RequestStartStopStatusEnumType::Accepted
+        );
+        // A missing evseId resolves to EVSE 1, so it behaves identically.
+        assert_eq!(
+            v201_request_start_status(None, true),
+            RequestStartStopStatusEnumType::Accepted
+        );
+    }
+
+    /// A busy or unknown EVSE (`evse_available == false`) is `Rejected` — the
+    /// 1.6J handler folds both the known-but-busy connector and the unknown
+    /// connector id into the same `Rejected` arm.
+    #[test]
+    fn request_start_is_rejected_for_a_busy_or_unknown_evse() {
+        assert_eq!(
+            v201_request_start_status(Some(2), false),
+            RequestStartStopStatusEnumType::Rejected
+        );
+        assert_eq!(
+            v201_request_start_status(None, false),
+            RequestStartStopStatusEnumType::Rejected
+        );
+    }
+
+    /// A structurally-invalid target (`evseId` of 0 or negative) is `Rejected`
+    /// *before* availability is even consulted — 2.0.1 EVSE ids are 1-based, so
+    /// there is no chargeable EVSE there. Mirrors the 1.6J `ConnectorId::new`
+    /// `Err` arm for connector 0 / out of range: even a "would-be-available"
+    /// read cannot rescue it.
+    #[test]
+    fn request_start_is_rejected_for_a_structurally_invalid_evse_id() {
+        for id in [0, -1, i32::MIN] {
+            assert_eq!(
+                v201_request_start_status(Some(id), true),
+                RequestStartStopStatusEnumType::Rejected,
+                "evseId {id} is not a chargeable EVSE and must be Rejected \
+                 regardless of the availability read"
+            );
+        }
+    }
+
+    /// A missing `evseId` resolves to EVSE 1: the `None` decision matches the
+    /// `Some(1)` decision across the availability axis (acceptance criterion),
+    /// while `Some(0)` — a real but invalid target — must *not* be treated like
+    /// the `None` default.
+    #[test]
+    fn missing_evse_id_resolves_to_evse_1() {
+        for available in [false, true] {
+            assert_eq!(
+                v201_request_start_status(None, available),
+                v201_request_start_status(Some(1), available),
+                "a missing evseId (available={available}) must decide exactly as \
+                 an explicit EVSE 1"
+            );
+        }
+        // The default is EVSE 1, not EVSE 0: an explicit 0 is still Rejected.
+        assert_eq!(
+            v201_request_start_status(Some(0), true),
+            RequestStartStopStatusEnumType::Rejected
+        );
+    }
+
+    #[test]
+    fn request_start_response_carries_status_and_optional_status_info() {
+        let bare = v201_request_start_response(RequestStartStopStatusEnumType::Accepted, None);
+        assert_eq!(bare.status, RequestStartStopStatusEnumType::Accepted);
+        assert!(bare.status_info.is_none());
+        // The pure builder never fabricates a transactionId (a live-state concern).
+        assert!(bare.transaction_id.is_none());
+
+        let info = StatusInfoType {
+            reason_code: "EvseBusy".to_string(),
+            additional_info: Some("targeted EVSE is not free to charge".to_string()),
+            custom_data: None,
+        };
+        let rejected =
+            v201_request_start_response(RequestStartStopStatusEnumType::Rejected, Some(info));
+        assert_eq!(rejected.status, RequestStartStopStatusEnumType::Rejected);
+        assert_eq!(
+            rejected
+                .status_info
+                .as_ref()
+                .map(|i| i.reason_code.as_str()),
+            Some("EvseBusy")
+        );
+    }
+
+    /// Wire fidelity: every built `RequestStartTransaction.conf` — with and
+    /// without `statusInfo`, across both status values — satisfies the bundled
+    /// OCPP 2.0.1 `RequestStartTransactionResponse` JSON Schema, the same
+    /// guarantee the CP's version-aware validator gives on the live path.
+    /// `validate_call_result` keys on the base `"RequestStartTransaction"`
+    /// action (it appends `Response` internally).
+    #[test]
+    fn built_request_start_responses_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        let info = StatusInfoType {
+            reason_code: "EvseBusy".to_string(),
+            additional_info: Some("targeted EVSE is not free to charge".to_string()),
+            custom_data: None,
+        };
+        for status in [
+            RequestStartStopStatusEnumType::Accepted,
+            RequestStartStopStatusEnumType::Rejected,
+        ] {
+            for status_info in [None, Some(info.clone())] {
+                let resp = v201_request_start_response(status, status_info);
+                let payload = serde_json::to_value(&resp).unwrap();
+                assert!(
+                    validator
+                        .validate_call_result("RequestStartTransaction", &payload)
+                        .is_ok(),
+                    "built {status:?} RequestStartTransactionResponse should be schema-valid, got: {payload}"
                 );
             }
         }
