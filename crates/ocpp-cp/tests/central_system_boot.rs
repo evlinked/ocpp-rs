@@ -23,9 +23,11 @@ use ocpp_messages::v16j::RegistrationStatus;
 use ocpp_messages::v201::{
     BootNotificationRequest as V201BootNotificationRequest,
     BootNotificationResponse as V201BootNotificationResponse,
+    ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
     MeterValuesRequest as V201MeterValuesRequest, MeterValuesResponse as V201MeterValuesResponse,
-    ResetRequest as V201ResetRequest, TransactionEventRequest, TransactionEventResponse,
-    TriggerMessageRequest as V201TriggerMessageRequest,
+    ResetRequest as V201ResetRequest, StatusNotificationRequest as V201StatusNotificationRequest,
+    StatusNotificationResponse as V201StatusNotificationResponse, TransactionEventRequest,
+    TransactionEventResponse, TriggerMessageRequest as V201TriggerMessageRequest,
 };
 use ocpp_messages::ActionDispatcher;
 use ocpp_transport::server::OcppServer;
@@ -35,7 +37,8 @@ use ocpp_transport::{
 };
 use ocpp_types::common::Reason;
 use ocpp_types::v201::{
-    BootReasonEnumType, EvseType, MessageTriggerEnumType, ReadingContextEnumType, ReasonEnumType,
+    BootReasonEnumType, ChangeAvailabilityStatusEnumType, ConnectorStatusEnumType, EvseType,
+    MessageTriggerEnumType, OperationalStatusEnumType, ReadingContextEnumType, ReasonEnumType,
     RegistrationStatusEnumType, ResetEnumType, ResetStatusEnumType, TransactionEventEnumType,
     TriggerMessageStatusEnumType, TriggerReasonEnumType,
 };
@@ -963,6 +966,282 @@ async fn v201_trigger_unsupported_message_is_not_implemented_and_emits_nothing()
         1,
         "the NotImplemented trigger emitted no BootNotification"
     );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// ---------------------------------------------------------------------------
+// OCPP 2.0.1 ChangeAvailability (Issue #436, slice 6b): a CSMS takes a
+// `for_version(V201)` CP (or a single EVSE) Operative / Inoperative over a real
+// socket, exercising the version-aware inbound dispatcher wired to the slice-6a
+// decision logic (`crates/ocpp-cp/src/v201_command.rs`, #435). A green run
+// proves an inbound 2.0.1 `ChangeAvailability.req` routes to the v201 handler,
+// returns a schema-valid `ChangeAvailability.conf`, and actually applies the
+// availability transition — immediately when idle, or deferred to the moment the
+// in-flight transaction ends when scheduled.
+// ---------------------------------------------------------------------------
+
+/// Shared, ordered log of every 2.0.1 `StatusNotification` the CSMS received.
+type StatusLog = Arc<Mutex<Vec<V201StatusNotificationRequest>>>;
+
+/// Start an in-process 2.0.1 CSMS that records every `StatusNotification` it
+/// receives (on top of the default 2.0.1 lifecycle responders, whose default
+/// `TransactionEvent` empty-ack still runs so a charging session works). Returns
+/// the server, its address, and the shared log — enough to observe an
+/// availability change reflected as a `StatusNotification`.
+async fn start_v201_csms_recording_status() -> (OcppServer, SocketAddr, StatusLog) {
+    let log: StatusLog = Arc::new(Mutex::new(Vec::new()));
+    let log_for_handler = log.clone();
+    let (server, addr) = start_v201_csms(move |dispatcher| {
+        let log = log_for_handler;
+        dispatcher.on(move |req: V201StatusNotificationRequest| {
+            let log = log.clone();
+            async move {
+                log.lock().expect("status log mutex not poisoned").push(req);
+                Ok(V201StatusNotificationResponse::default())
+            }
+        });
+    })
+    .await;
+    (server, addr, log)
+}
+
+/// Count `StatusNotification`s recorded for `evse_id` reporting `status`.
+fn status_count(log: &StatusLog, evse_id: i32, status: ConnectorStatusEnumType) -> usize {
+    log.lock()
+        .expect("status log mutex not poisoned")
+        .iter()
+        .filter(|s| s.evse_id == evse_id && s.connector_status == status)
+        .count()
+}
+
+/// Poll `log` until it holds at least `target` `StatusNotification`s for
+/// `evse_id` reporting `status`, or panic after ~5s. Used to wait for an applied
+/// availability change without a fixed sleep.
+async fn wait_for_status_count(
+    log: &StatusLog,
+    evse_id: i32,
+    status: ConnectorStatusEnumType,
+    target: usize,
+) {
+    for _ in 0..250 {
+        if status_count(log, evse_id, status) >= target {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "timed out waiting for {target} StatusNotification({status:?}) on evse {evse_id} \
+         (last saw {})",
+        status_count(log, evse_id, status)
+    );
+}
+
+#[tokio::test]
+async fn v201_change_availability_inoperative_then_operative_round_trips_over_the_wire() {
+    let (mut server, addr, status_log) = start_v201_csms_recording_status().await;
+
+    let cp =
+        ChargePoint::new(v201_cp_config(addr, "CP201_AVAIL_RT")).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+    // Boot announces every connector Available; wait for EVSE 1's so we don't
+    // race the announce with the change below.
+    wait_for_status_count(&status_log, 1, ConnectorStatusEnumType::Available, 1).await;
+
+    // CSMS -> CP: take EVSE 1 Inoperative while idle. The slice-6a decision
+    // returns Accepted, and the wiring applies the change off the CALL path.
+    let resp = server
+        .call::<V201ChangeAvailabilityRequest>(
+            "CP201_AVAIL_RT",
+            V201ChangeAvailabilityRequest {
+                operational_status: OperationalStatusEnumType::Inoperative,
+                evse: Some(EvseType {
+                    id: 1,
+                    connector_id: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS ChangeAvailability call round-trips");
+    assert_eq!(
+        resp.status,
+        ChangeAvailabilityStatusEnumType::Accepted,
+        "an availability change on an idle EVSE is Accepted"
+    );
+
+    // The accepted change flips EVSE 1 to Unavailable and emits the reflecting
+    // StatusNotification after the CALLRESULT — proof the side effect fired off
+    // the CALL path.
+    wait_for_status_count(&status_log, 1, ConnectorStatusEnumType::Unavailable, 1).await;
+
+    // CSMS -> CP: bring EVSE 1 back Operative. Idle -> Accepted, and the change
+    // restores Available (a *second* Available for EVSE 1, distinct from the boot
+    // announce).
+    let resp = server
+        .call::<V201ChangeAvailabilityRequest>(
+            "CP201_AVAIL_RT",
+            V201ChangeAvailabilityRequest {
+                operational_status: OperationalStatusEnumType::Operative,
+                evse: Some(EvseType {
+                    id: 1,
+                    connector_id: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS ChangeAvailability call round-trips");
+    assert_eq!(resp.status, ChangeAvailabilityStatusEnumType::Accepted);
+    wait_for_status_count(&status_log, 1, ConnectorStatusEnumType::Available, 2).await;
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_change_availability_mid_transaction_is_scheduled_and_applied_on_stop() {
+    let (mut server, addr, status_log) = start_v201_csms_recording_status().await;
+
+    // A long meter interval so the periodic sampler does not tick during the test
+    // (its TransactionEvents are irrelevant to the status log either way).
+    let config = ChargePointConfig {
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_AVAIL_SCHED")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+    wait_for_status_count(&status_log, 1, ConnectorStatusEnumType::Available, 1).await;
+
+    // Start a transaction on connector 1 (EVSE 1) so the station is busy.
+    let connector = ConnectorId::new(1).unwrap();
+    let txn_id = cp
+        .start_transaction(connector, "RFID-CAFE", 0)
+        .await
+        .expect("v201 start_transaction");
+
+    // CSMS -> CP: take EVSE 1 Inoperative mid-transaction. The slice-6a decision
+    // returns Scheduled (accept but defer): the paying session must not be cut off.
+    let resp = server
+        .call::<V201ChangeAvailabilityRequest>(
+            "CP201_AVAIL_SCHED",
+            V201ChangeAvailabilityRequest {
+                operational_status: OperationalStatusEnumType::Inoperative,
+                evse: Some(EvseType {
+                    id: 1,
+                    connector_id: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS ChangeAvailability call round-trips");
+    assert_eq!(
+        resp.status,
+        ChangeAvailabilityStatusEnumType::Scheduled,
+        "an availability change mid-transaction is deferred, not applied"
+    );
+
+    // While charging, nothing arms an apply — no code path can emit Unavailable
+    // for EVSE 1 until the transaction ends, so this is deterministic, not a race.
+    assert_eq!(
+        status_count(&status_log, 1, ConnectorStatusEnumType::Unavailable),
+        0,
+        "the live session must not be taken Unavailable while charging"
+    );
+
+    // End the transaction. The connector returns to Available (stop path), then
+    // the deferred change is carried out and flips it Unavailable.
+    cp.stop_transaction(txn_id, 0, Reason::EVDisconnected)
+        .await
+        .expect("v201 stop_transaction");
+    wait_for_status_count(&status_log, 1, ConnectorStatusEnumType::Unavailable, 1).await;
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_change_availability_for_an_unknown_evse_is_rejected() {
+    let (mut server, addr, status_log) = start_v201_csms_recording_status().await;
+
+    let cp =
+        ChargePoint::new(v201_cp_config(addr, "CP201_AVAIL_REJ")).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+    wait_for_status_count(&status_log, 1, ConnectorStatusEnumType::Available, 1).await;
+
+    // CSMS -> CP: target an EVSE that does not exist on this CP (the default
+    // config has 2 connectors, so EVSE 99 is out of range). The station cannot
+    // apply the change, so it answers Rejected — the capability outcome the
+    // slice-6a policy never produces on its own — and emits nothing.
+    let resp = server
+        .call::<V201ChangeAvailabilityRequest>(
+            "CP201_AVAIL_REJ",
+            V201ChangeAvailabilityRequest {
+                operational_status: OperationalStatusEnumType::Inoperative,
+                evse: Some(EvseType {
+                    id: 99,
+                    connector_id: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS ChangeAvailability call round-trips");
+    assert_eq!(
+        resp.status,
+        ChangeAvailabilityStatusEnumType::Rejected,
+        "an unknown / out-of-range EVSE target is Rejected"
+    );
+    // No connector ever reports Unavailable for a rejected change.
+    assert_eq!(
+        status_count(&status_log, 99, ConnectorStatusEnumType::Unavailable),
+        0
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_change_availability_whole_station_takes_every_connector_inoperative() {
+    let (mut server, addr, status_log) = start_v201_csms_recording_status().await;
+
+    // The default v201 config exposes 2 connectors (EVSE 1 and EVSE 2), so an
+    // `evse`-less whole-station change must apply to both.
+    let cp =
+        ChargePoint::new(v201_cp_config(addr, "CP201_AVAIL_ALL")).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+    wait_for_status_count(&status_log, 1, ConnectorStatusEnumType::Available, 1).await;
+    wait_for_status_count(&status_log, 2, ConnectorStatusEnumType::Available, 1).await;
+
+    // CSMS -> CP: whole-station Inoperative (no `evse`). Idle -> Accepted, and the
+    // wiring fans the change out to every connector.
+    let resp = server
+        .call::<V201ChangeAvailabilityRequest>(
+            "CP201_AVAIL_ALL",
+            V201ChangeAvailabilityRequest {
+                operational_status: OperationalStatusEnumType::Inoperative,
+                evse: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS ChangeAvailability call round-trips");
+    assert_eq!(
+        resp.status,
+        ChangeAvailabilityStatusEnumType::Accepted,
+        "a whole-station change on an idle station is Accepted"
+    );
+
+    // Both connectors flip to Unavailable after the CALLRESULT.
+    wait_for_status_count(&status_log, 1, ConnectorStatusEnumType::Unavailable, 1).await;
+    wait_for_status_count(&status_log, 2, ConnectorStatusEnumType::Unavailable, 1).await;
 
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");

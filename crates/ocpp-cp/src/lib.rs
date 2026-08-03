@@ -70,13 +70,15 @@ use ocpp_types::{
 // (slice 2). Aliased to avoid clashing with the unqualified 1.6J names imported
 // above (`StatusNotificationRequest`, `RegistrationStatus`).
 use ocpp_messages::v201::{
+    ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
     MeterValuesRequest as V201MeterValuesRequest, ResetRequest as V201ResetRequest,
     StatusNotificationRequest as V201StatusNotificationRequest,
     TriggerMessageRequest as V201TriggerMessageRequest,
 };
 use ocpp_types::v201::{
-    AuthorizationStatusEnumType, ConnectorStatusEnumType, MessageTriggerEnumType,
-    RegistrationStatusEnumType, ResetStatusEnumType, TriggerMessageStatusEnumType,
+    AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType, ConnectorStatusEnumType,
+    MessageTriggerEnumType, OperationalStatusEnumType, RegistrationStatusEnumType,
+    ResetStatusEnumType, TriggerMessageStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -194,6 +196,23 @@ fn charge_point_status_to_v201(status: ChargePointStatus) -> ConnectorStatusEnum
         ChargePointStatus::Reserved => ConnectorStatusEnumType::Reserved,
         ChargePointStatus::Faulted => ConnectorStatusEnumType::Faulted,
         ChargePointStatus::Unavailable => ConnectorStatusEnumType::Unavailable,
+    }
+}
+
+/// Map a 2.0.1 [`OperationalStatusEnumType`] onto the connector
+/// [`ChargePointStatus`] the simulator applies when it carries out a
+/// `ChangeAvailability` (slice 6b): `Operative → Available`, `Inoperative →
+/// Unavailable`. The simulator has no separate operative-state field — the
+/// connector's own status *is* its operative state, and an inoperative connector
+/// reports `Unavailable` — so this is the single point that turns a 2.0.1
+/// availability target into the state the CP sets and announces.
+///
+/// Total over both `OperationalStatusEnumType` variants, so a future spec-added
+/// operational status is a compile error here rather than a silent default.
+fn operational_status_to_cp_status(target: OperationalStatusEnumType) -> ChargePointStatus {
+    match target {
+        OperationalStatusEnumType::Operative => ChargePointStatus::Available,
+        OperationalStatusEnumType::Inoperative => ChargePointStatus::Unavailable,
     }
 }
 
@@ -537,6 +556,35 @@ enum RemoteCommand {
         connector_id: ConnectorId,
         transaction_id: i32,
     },
+    /// Apply a 2.0.1 `ChangeAvailability` transition to a single connector as a
+    /// real side effect (OCPP 2.0.1 Part 2, `ChangeAvailability`, slice 6b). Flips
+    /// the connector's operative state (`Operative → Available`, `Inoperative →
+    /// Unavailable`) and emits the reflecting `StatusNotification`. Enqueued off
+    /// the inbound-CALL path — by the `Accepted` handler now, or by
+    /// [`stop_transaction`](ChargePoint::stop_transaction) when a `Scheduled`
+    /// change is carried out once the station goes idle — so the CALLRESULT is
+    /// flushed before the outbound `StatusNotification` and the receive loop never
+    /// re-enters itself. One command is enqueued per targeted connector (a
+    /// whole-station change targets every connector).
+    V201ApplyAvailability {
+        connector_id: ConnectorId,
+        target: OperationalStatusEnumType,
+    },
+}
+
+/// A 2.0.1 `ChangeAvailability` accepted-but-deferred while a transaction was in
+/// progress (slice 6b, Issue #436). Recorded by the V201 `ChangeAvailability`
+/// handler when it answers [`Scheduled`](ChangeAvailabilityStatusEnumType::Scheduled)
+/// and carried out by [`stop_transaction`](ChargePoint::stop_transaction) once
+/// the station next goes idle — the availability twin of the deferred
+/// `Reset(OnIdle)` slot [`pending_v201_reset`](ChargePoint::pending_v201_reset).
+#[derive(Debug, Clone, Copy)]
+struct PendingAvailability {
+    /// Targeted EVSE id; `None` targets the whole Charging Station (every
+    /// connector).
+    evse_id: Option<i32>,
+    /// The availability the station will apply once idle.
+    target: OperationalStatusEnumType,
 }
 
 /// Whether this charge point can proactively produce `message` on a
@@ -757,6 +805,17 @@ pub struct ChargePoint {
     /// reset supersedes a pending deferred one instead of double-firing. `None`
     /// on the 1.6J path and whenever no deferred reset is armed.
     pending_v201_reset: Arc<RwLock<Option<ResetType>>>,
+    /// Deferred 2.0.1 `ChangeAvailability` awaiting the station going idle (slice
+    /// 6b, Issue #436). The V201 `ChangeAvailability` handler records the target
+    /// (and its optional `evse` scope) here when it answers `Scheduled` (an
+    /// availability change received mid-transaction); [`stop_transaction`](Self::stop_transaction)
+    /// takes and applies it exactly once when [`active_transactions`](Self::active_transactions)
+    /// drains empty, so the change lands the moment the last session ends — never
+    /// cutting off a paying driver. Drained in the same `active_transactions`-guarded
+    /// block as [`pending_v201_reset`](Self::pending_v201_reset), preserving the
+    /// `active_transactions → pending_*` lock order. `None` on the 1.6J path and
+    /// whenever no deferred change is armed.
+    pending_v201_availability: Arc<RwLock<Option<PendingAvailability>>>,
     /// Per-transaction 2.0.1 session state, keyed by the same station-chosen
     /// `transactionId` as [`active_transactions`](Self::active_transactions).
     /// Populated only on the `V201` path: inserted by `start_transaction`
@@ -906,6 +965,13 @@ impl ChargePoint {
         // idle. Shared into the dispatcher (writer) and kept on the CP (reader).
         let pending_v201_reset: Arc<RwLock<Option<ResetType>>> = Arc::new(RwLock::new(None));
 
+        // Slice 6b (#436): the V201 `ChangeAvailability` handler records a deferred
+        // availability change here; `stop_transaction` drains it when the station
+        // goes idle. Shared into the dispatcher (writer) and kept on the CP (reader),
+        // exactly like `pending_v201_reset`.
+        let pending_v201_availability: Arc<RwLock<Option<PendingAvailability>>> =
+            Arc::new(RwLock::new(None));
+
         // Wrap the shared state the default handlers need *before* building the
         // dispatcher: RemoteStart/RemoteStop consult live connector status and
         // the active-transaction map to answer Accepted/Rejected faithfully.
@@ -939,6 +1005,7 @@ impl ChargePoint {
             data_transfer.clone(),
             local_list.clone(),
             pending_v201_reset.clone(),
+            pending_v201_availability.clone(),
         );
         if let Some(v) = &validator {
             dispatcher = dispatcher.with_validator(v.clone());
@@ -958,6 +1025,7 @@ impl ChargePoint {
             heartbeat_handle: Arc::new(RwLock::new(None)),
             active_transactions,
             pending_v201_reset,
+            pending_v201_availability,
             command_sender,
             next_v201_transaction_id: Arc::new(AtomicI32::new(1)),
             v201_sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -1001,15 +1069,145 @@ impl ChargePoint {
         data_transfer: Arc<DataTransferRegistry>,
         local_list: Arc<LocalAuthList>,
         pending_v201_reset: Arc<RwLock<Option<ResetType>>>,
+        pending_v201_availability: Arc<RwLock<Option<PendingAvailability>>>,
     ) -> ActionDispatcher {
         let mut d = ActionDispatcher::new();
 
-        // ChangeAvailability — always accept (Issue #21 will add real state tracking)
-        d.on(|_req: ChangeAvailabilityRequest| async move {
-            Ok(ChangeAvailabilityResponse {
-                status: AvailabilityStatus::Accepted,
-            })
-        });
+        // ChangeAvailability — take the Charging Station (or a single EVSE)
+        // Operative / Inoperative. Both OCPP versions name the action
+        // `"ChangeAvailability"`, so exactly one handler is registered per
+        // `protocol_version` (the same discipline as the Reset / TriggerMessage
+        // splits below); the negotiated subprotocol and the version-aware inbound
+        // validator keep the wire on a single dialect, so the other version's
+        // request shape never reaches this dispatcher.
+        match protocol_version {
+            // OCPP 1.6J §5.4. Unchanged: always accept (Issue #21 tracks real
+            // availability-state tracking on the 1.6J path).
+            OcppVersion::V16J => {
+                d.on(|_req: ChangeAvailabilityRequest| async move {
+                    Ok(ChangeAvailabilityResponse {
+                        status: AvailabilityStatus::Accepted,
+                    })
+                });
+            }
+            // OCPP 2.0.1 (Part 2, `ChangeAvailability`). Ports
+            // `ocpp.v201.call.ChangeAvailability`: the request carries an
+            // `OperationalStatusEnumType` and, when `evse` is omitted, targets the
+            // whole Charging Station. The pure Accepted/Scheduled policy lives in
+            // `v201_command` (slice 6a, #435); this is the runtime wiring (slice
+            // 6b, #436). Same off-CALL-path side-effect discipline and
+            // capability-`Rejected` outcome as the Reset / TriggerMessage handlers.
+            OcppVersion::V201 => {
+                let command_sender = command_sender.clone();
+                let active_transactions = active_transactions.clone();
+                let connectors = connectors.clone();
+                let pending_v201_availability = pending_v201_availability.clone();
+                d.on(move |req: V201ChangeAvailabilityRequest| {
+                    let command_sender = command_sender.clone();
+                    let active_transactions = active_transactions.clone();
+                    let connectors = connectors.clone();
+                    let pending_v201_availability = pending_v201_availability.clone();
+                    async move {
+                        let target = req.operational_status;
+                        let evse_id = req.evse.as_ref().map(|e| e.id);
+
+                        // Resolve the targeted connectors. `evse` present → that
+                        // single connector, but only if it is a real connector on
+                        // this CP (an unknown / out-of-range EVSE — including a 0 or
+                        // negative id — resolves to no target and is `Rejected`
+                        // below). `evse` absent → the whole station (every
+                        // connector). The simulator's flat topology maps EVSE id to
+                        // the same-valued connector (the slice-2 StatusNotification
+                        // convention).
+                        let targets: Vec<ConnectorId> = match evse_id {
+                            Some(id) => {
+                                let cid = u32::try_from(id)
+                                    .ok()
+                                    .and_then(|v| ConnectorId::new(v).ok());
+                                match cid {
+                                    Some(cid) if connectors.read().await.contains_key(&cid) => {
+                                        vec![cid]
+                                    }
+                                    _ => Vec::new(),
+                                }
+                            }
+                            None => {
+                                let mut ids: Vec<ConnectorId> =
+                                    connectors.read().await.keys().copied().collect();
+                                ids.sort_by_key(ConnectorId::value);
+                                ids
+                            }
+                        };
+
+                        // Unknown / out-of-range EVSE target → the station cannot
+                        // apply the change: `Rejected` (a capability outcome, which
+                        // the slice-6a policy never produces on its own).
+                        if targets.is_empty() {
+                            return Ok(v201_command::v201_change_availability_response(
+                                ChangeAvailabilityStatusEnumType::Rejected,
+                                None,
+                            ));
+                        }
+
+                        // A transaction "in progress on the targeted scope" gates
+                        // Accepted vs Scheduled: whole-station when `evse` is
+                        // omitted, else only the targeted connector.
+                        let transaction_in_progress = {
+                            let active = active_transactions.read().await;
+                            match evse_id {
+                                None => !active.is_empty(),
+                                Some(_) => active.values().any(|c| targets.contains(c)),
+                            }
+                        };
+
+                        let mut status = v201_command::v201_change_availability_status(
+                            target,
+                            transaction_in_progress,
+                        );
+
+                        match status {
+                            // Idle: apply now — one apply command per targeted
+                            // connector, off the CALL path. If the consumer has gone
+                            // away (CP shutting down) we cannot honor it, so
+                            // downgrade to `Rejected` rather than accept-and-drop —
+                            // the same capability outcome the Reset handler reports
+                            // on a failed channel send.
+                            ChangeAvailabilityStatusEnumType::Accepted => {
+                                for cid in &targets {
+                                    if command_sender
+                                        .send(RemoteCommand::V201ApplyAvailability {
+                                            connector_id: *cid,
+                                            target,
+                                        })
+                                        .is_err()
+                                    {
+                                        status = ChangeAvailabilityStatusEnumType::Rejected;
+                                        break;
+                                    }
+                                }
+                            }
+                            // Busy: accept but defer. Arm the pending change (last
+                            // write wins, like the deferred reset); no side effect is
+                            // queued now, so the live session is never interrupted.
+                            // `stop_transaction` applies it once the station next
+                            // goes idle (slice 6b tail).
+                            ChangeAvailabilityStatusEnumType::Scheduled => {
+                                *pending_v201_availability.write().await =
+                                    Some(PendingAvailability { evse_id, target });
+                            }
+                            // Never produced by the slice-6a policy function; a
+                            // capability `Rejected` is only reached via the failed
+                            // enqueue / unknown-EVSE paths above.
+                            ChangeAvailabilityStatusEnumType::Rejected => {}
+                        }
+
+                        Ok(v201_command::v201_change_availability_response(
+                            status, None,
+                        ))
+                    }
+                });
+            }
+        }
 
         // ChangeConfiguration — write to ConfigurationStore
         {
@@ -2014,6 +2212,12 @@ impl ChargePoint {
                         } => {
                             cp.send_v201_triggered_message(requested_message, evse_id)
                                 .await;
+                        }
+                        RemoteCommand::V201ApplyAvailability {
+                            connector_id,
+                            target,
+                        } => {
+                            cp.apply_v201_availability(connector_id, target).await;
                         }
                         RemoteCommand::GetDiagnostics => {
                             cp.run_diagnostics_upload().await;
@@ -3178,14 +3382,61 @@ impl ChargePoint {
         // order is `active_transactions` → `pending_v201_reset`, matching the V201
         // `Reset` handler (which reads `active_transactions` before it arms the
         // slot); no path nests these the other way, so this cannot deadlock.
-        let armed_reset = {
+        //
+        // Slice 6b (#436) drains a deferred `ChangeAvailability` at the same idle
+        // boundary and under the same held `active_transactions` guard, so a
+        // scheduled availability change lands the moment the last session ends
+        // (never mid-charge) — the availability twin of the deferred reset. Both
+        // slots are taken under the one guard; lock order stays
+        // `active_transactions → pending_v201_reset → pending_v201_availability`,
+        // and no path nests these the other way, so this cannot deadlock.
+        let (armed_reset, armed_availability) = {
             let active = self.active_transactions.read().await;
             if active.is_empty() {
-                self.pending_v201_reset.write().await.take()
+                (
+                    self.pending_v201_reset.write().await.take(),
+                    self.pending_v201_availability.write().await.take(),
+                )
             } else {
-                None
+                (None, None)
             }
         };
+
+        // Apply a deferred availability change before a deferred reset: if both are
+        // armed the reset supersedes, but announcing the availability first keeps
+        // the CSMS's view consistent right up to the reboot. Resolve the targeted
+        // connectors (single EVSE, or the whole station) and enqueue one apply per
+        // connector onto the command channel, so the work stays on the single
+        // consumer task, off this path.
+        if let Some(pending) = armed_availability {
+            let targets: Vec<ConnectorId> = match pending.evse_id {
+                Some(id) => u32::try_from(id)
+                    .ok()
+                    .and_then(|v| ConnectorId::new(v).ok())
+                    .into_iter()
+                    .collect(),
+                None => {
+                    let mut ids: Vec<ConnectorId> =
+                        self.connectors.read().await.keys().copied().collect();
+                    ids.sort_by_key(ConnectorId::value);
+                    ids
+                }
+            };
+            for cid in targets {
+                if self
+                    .command_sender
+                    .send(RemoteCommand::V201ApplyAvailability {
+                        connector_id: cid,
+                        target: pending.target,
+                    })
+                    .is_err()
+                {
+                    warn!("deferred v201 availability: command consumer gone; not applying");
+                    break;
+                }
+            }
+        }
+
         if let Some(reset_type) = armed_reset {
             if self
                 .command_sender
@@ -3413,6 +3664,61 @@ impl ChargePoint {
         }
 
         Ok(())
+    }
+
+    /// Carry out a 2.0.1 `ChangeAvailability` transition on one connector as a
+    /// real simulator side effect (slice 6b, Issue #436): flip the connector's
+    /// operative state — the connector's own [`ChargePointStatus`] *is* its
+    /// operative state, so `Operative → Available` / `Inoperative → Unavailable`
+    /// via [`operational_status_to_cp_status`] — and emit the reflecting
+    /// version-aware `StatusNotification` so the CSMS observes the new
+    /// availability.
+    ///
+    /// Runs only on the command-consumer task (see [`connect`](Self::connect)),
+    /// never inline in the inbound-CALL handler, so the `ChangeAvailability`
+    /// CALLRESULT is flushed before this outbound `StatusNotification` and there is
+    /// no receive-loop re-entrancy. Invoked for an `Accepted` change immediately
+    /// and for a `Scheduled` change from [`stop_transaction`](Self::stop_transaction)
+    /// once the station goes idle. A connector that vanished between the decision
+    /// and here is logged and skipped (no panic); this only ever runs on the
+    /// idle/accepted boundary, so it does not override a live charging state.
+    async fn apply_v201_availability(
+        &self,
+        connector_id: ConnectorId,
+        target: OperationalStatusEnumType,
+    ) {
+        let new_status = operational_status_to_cp_status(target);
+
+        let connector = self.connectors.read().await.get(&connector_id).cloned();
+        let Some(connector) = connector else {
+            warn!(
+                "v201 ChangeAvailability: unknown connector {}; not applying {target:?}",
+                connector_id.value()
+            );
+            return;
+        };
+        if let Err(e) = connector.set_status(new_status).await {
+            warn!(
+                "v201 ChangeAvailability: failed to set connector {} to {new_status:?}: {e}",
+                connector_id.value()
+            );
+            return;
+        }
+
+        if let Err(e) = self
+            .send_status_notification(
+                connector_id.value(),
+                new_status,
+                ChargePointErrorCode::NoError,
+            )
+            .await
+        {
+            warn!(
+                "v201 ChangeAvailability: StatusNotification({new_status:?}) for connector \
+                 {} failed: {e}",
+                connector_id.value()
+            );
+        }
     }
 
     /// Send the message a CSMS asked for via `TriggerMessage` (OCPP 1.6J §4.x).
@@ -4197,6 +4503,30 @@ mod tests {
         assert_eq!(
             charge_point_status_to_v201(ChargePointStatus::Unavailable),
             V201::Unavailable
+        );
+    }
+
+    /// The 2.0.1 availability target maps to the connector state the CP applies
+    /// on a `ChangeAvailability` (slice 6b): `Operative → Available`,
+    /// `Inoperative → Unavailable`. Total over both variants — a `charge_point_status_to_v201`
+    /// round-trip confirms `Inoperative` surfaces as the 2.0.1 `Unavailable`
+    /// connector status the CSMS observes.
+    #[test]
+    fn test_operational_status_maps_to_connector_state() {
+        assert_eq!(
+            operational_status_to_cp_status(OperationalStatusEnumType::Operative),
+            ChargePointStatus::Available
+        );
+        assert_eq!(
+            operational_status_to_cp_status(OperationalStatusEnumType::Inoperative),
+            ChargePointStatus::Unavailable
+        );
+        // An Inoperative connector is what the CSMS sees as 2.0.1 `Unavailable`.
+        assert_eq!(
+            charge_point_status_to_v201(operational_status_to_cp_status(
+                OperationalStatusEnumType::Inoperative
+            )),
+            ConnectorStatusEnumType::Unavailable
         );
     }
 
