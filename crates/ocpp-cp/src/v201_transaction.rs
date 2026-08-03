@@ -272,6 +272,66 @@ pub fn transaction_event_ended(
     }
 }
 
+/// A single-sample `meterValue` array carrying one active-import energy reading
+/// tagged `ReadingContext::Trigger` — the reading a station reports for an
+/// on-demand `TriggerMessage(MeterValues)`.
+///
+/// The 2.0.1 twin of the 1.6J triggered-`MeterValues` reading: same
+/// `Energy.Active.Import.Register` sample as the periodic path, but the reading
+/// `context` records that a `TriggerMessage` prompted it rather than a periodic
+/// sampler. Exposed (unlike the private per-event builders) because a standalone
+/// `MeterValues` CALL is built directly from it, outside the `TransactionEvent`
+/// flow.
+#[must_use]
+pub fn triggered_energy_meter_value(energy_wh: f64, timestamp: &str) -> Vec<MeterValueType> {
+    energy_meter_value(energy_wh, ReadingContextEnumType::Trigger, timestamp)
+}
+
+/// Build a `TransactionEvent(Updated)` for an on-demand
+/// `TriggerMessage(TransactionEvent)` — a mid-transaction sample the CSMS asked
+/// for *now*.
+///
+/// Identical wire shape to [`transaction_event_updated`] (a `Charging` update
+/// carrying the current reading, no `idToken`), except the `triggerReason` is
+/// [`Trigger`](TriggerReasonEnumType::Trigger) — the event was prompted by a
+/// `TriggerMessage`, not the periodic sampler — and the reading `context` is
+/// `Trigger` to match. `seq_no` must still be drawn from the transaction's shared
+/// counter so a triggered event interleaves cleanly with the periodic samples.
+#[must_use]
+pub fn transaction_event_triggered(
+    session: &SessionRef,
+    seq_no: i32,
+    meter_wh: f64,
+    timestamp: &str,
+) -> TransactionEventRequest {
+    TransactionEventRequest {
+        event_type: TransactionEventEnumType::Updated,
+        timestamp: timestamp.to_string(),
+        trigger_reason: TriggerReasonEnumType::Trigger,
+        seq_no,
+        transaction_info: TransactionType {
+            transaction_id: session.transaction_id.to_string(),
+            charging_state: Some(ChargingStateEnumType::Charging),
+            time_spent_charging: None,
+            stopped_reason: None,
+            remote_start_id: None,
+            custom_data: None,
+        },
+        offline: None,
+        number_of_phases_used: None,
+        cable_max_current: None,
+        reservation_id: None,
+        evse: Some(evse_of(session)),
+        meter_value: Some(energy_meter_value(
+            meter_wh,
+            ReadingContextEnumType::Trigger,
+            timestamp,
+        )),
+        id_token: None,
+        custom_data: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -431,6 +491,64 @@ mod tests {
         );
     }
 
+    #[test]
+    fn triggered_event_carries_trigger_reason_and_context() {
+        let s = session();
+        let req = transaction_event_triggered(&s, 7, 1750.0, TS);
+
+        // Same Updated shape as a periodic sample, but flagged as trigger-driven.
+        assert_eq!(req.event_type, TransactionEventEnumType::Updated);
+        assert_eq!(req.trigger_reason, TriggerReasonEnumType::Trigger);
+        assert_eq!(req.seq_no, 7);
+        assert!(req.id_token.is_none());
+        assert_eq!(
+            req.transaction_info.charging_state,
+            Some(ChargingStateEnumType::Charging)
+        );
+        let mv = req
+            .meter_value
+            .as_ref()
+            .expect("triggered event carries meterValue");
+        assert_eq!(mv[0].sampled_value[0].value, 1750.0);
+        assert_eq!(
+            mv[0].sampled_value[0].context,
+            Some(ReadingContextEnumType::Trigger)
+        );
+    }
+
+    #[test]
+    fn triggered_meter_value_is_a_trigger_context_energy_reading() {
+        let mv = triggered_energy_meter_value(1234.0, TS);
+        assert_eq!(mv.len(), 1);
+        let sample = &mv[0].sampled_value[0];
+        assert_eq!(sample.value, 1234.0);
+        assert_eq!(sample.context, Some(ReadingContextEnumType::Trigger));
+        assert_eq!(
+            sample.measurand,
+            Some(MeasurandEnumType::EnergyActiveImportRegister)
+        );
+    }
+
+    /// Wire fidelity: a standalone 2.0.1 `MeterValues` CALL built from a triggered
+    /// reading satisfies the bundled `MeterValues` JSON Schema — the same
+    /// guarantee the CP's version-aware validator gives on the live path.
+    #[test]
+    fn triggered_meter_values_message_is_schema_valid() {
+        use ocpp_messages::v201::MeterValuesRequest;
+        let req = MeterValuesRequest {
+            evse_id: 1,
+            meter_value: triggered_energy_meter_value(1234.0, TS),
+            custom_data: None,
+        };
+        let payload = serde_json::to_value(&req).unwrap();
+        assert!(
+            SchemaValidator::v201()
+                .validate_call("MeterValues", &payload)
+                .is_ok(),
+            "a triggered MeterValues CALL should be schema-valid, got: {payload}"
+        );
+    }
+
     /// Wire fidelity: each built event must satisfy the bundled OCPP 2.0.1
     /// `TransactionEvent` JSON Schema — the same guarantee the CP's version-aware
     /// validator gives on the live path.
@@ -442,6 +560,7 @@ mod tests {
             transaction_event_started(&s, "RFID-CAFE", 1000.0, TS),
             transaction_event_updated(&s, 1, 1500.0, TS),
             transaction_event_ended(&s, 2, "RFID-CAFE", 2000.0, Reason::Remote, TS),
+            transaction_event_triggered(&s, 3, 1750.0, TS),
         ] {
             let payload = serde_json::to_value(&req).unwrap();
             assert!(

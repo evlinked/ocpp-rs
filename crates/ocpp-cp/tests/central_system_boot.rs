@@ -22,8 +22,10 @@ use ocpp_cp::{ChargePoint, ChargePointConfig};
 use ocpp_messages::v16j::RegistrationStatus;
 use ocpp_messages::v201::{
     BootNotificationRequest as V201BootNotificationRequest,
-    BootNotificationResponse as V201BootNotificationResponse, ResetRequest as V201ResetRequest,
-    TransactionEventRequest, TransactionEventResponse,
+    BootNotificationResponse as V201BootNotificationResponse,
+    MeterValuesRequest as V201MeterValuesRequest, MeterValuesResponse as V201MeterValuesResponse,
+    ResetRequest as V201ResetRequest, TransactionEventRequest, TransactionEventResponse,
+    TriggerMessageRequest as V201TriggerMessageRequest,
 };
 use ocpp_messages::ActionDispatcher;
 use ocpp_transport::server::OcppServer;
@@ -33,8 +35,9 @@ use ocpp_transport::{
 };
 use ocpp_types::common::Reason;
 use ocpp_types::v201::{
-    BootReasonEnumType, ReasonEnumType, RegistrationStatusEnumType, ResetEnumType,
-    ResetStatusEnumType, TransactionEventEnumType, TriggerReasonEnumType,
+    BootReasonEnumType, EvseType, MessageTriggerEnumType, ReadingContextEnumType, ReasonEnumType,
+    RegistrationStatusEnumType, ResetEnumType, ResetStatusEnumType, TransactionEventEnumType,
+    TriggerMessageStatusEnumType, TriggerReasonEnumType,
 };
 use ocpp_types::{ConnectorId, OcppVersion};
 
@@ -594,6 +597,254 @@ async fn v201_charging_session_emits_transaction_events_in_order() {
         last.transaction_info.stopped_reason,
         Some(ReasonEnumType::EVDisconnected),
         "EV unplug maps to an EVDisconnected stopped-reason"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// ---------------------------------------------------------------------------
+// OCPP 2.0.1 TriggerMessage (Issue #433, slice 5b): a CSMS sends a
+// `TriggerMessage` CALL against a `for_version(V201)` CP over a real socket,
+// exercising the version-aware inbound dispatcher wired to the slice-5a decision
+// logic (`crates/ocpp-cp/src/v201_command.rs`, #434). A green run proves an
+// inbound 2.0.1 `TriggerMessage.req` routes to the v201 handler, returns a
+// schema-valid `TriggerMessage.conf`, and — for an accepted trigger — actually
+// emits the requested message after the CALLRESULT is flushed.
+// ---------------------------------------------------------------------------
+
+/// Shared, ordered log of every 2.0.1 `MeterValues` the CSMS received.
+type MeterValuesLog = Arc<Mutex<Vec<V201MeterValuesRequest>>>;
+
+/// Start an in-process 2.0.1 CSMS that both counts `BootNotification`s and
+/// records every standalone `MeterValues` it receives (on top of the default
+/// 2.0.1 lifecycle responders). Returns the server, its address, the boot count,
+/// and the meter-values log — enough to observe every message a `TriggerMessage`
+/// side effect can emit.
+async fn start_v201_csms_recording_triggers() -> (OcppServer, SocketAddr, BootCount, MeterValuesLog)
+{
+    let boots: BootCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let meter_values: MeterValuesLog = Arc::new(Mutex::new(Vec::new()));
+    let boots_for_handler = boots.clone();
+    let mv_for_handler = meter_values.clone();
+    let (server, addr) = start_v201_csms(move |dispatcher| {
+        let boots = boots_for_handler;
+        dispatcher.on(move |_req: V201BootNotificationRequest| {
+            let boots = boots.clone();
+            async move {
+                boots.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(V201BootNotificationResponse {
+                    current_time: chrono::Utc::now()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    interval: 300,
+                    status: RegistrationStatusEnumType::Accepted,
+                    status_info: None,
+                    custom_data: None,
+                })
+            }
+        });
+        let meter_values = mv_for_handler;
+        dispatcher.on(move |req: V201MeterValuesRequest| {
+            let meter_values = meter_values.clone();
+            async move {
+                meter_values
+                    .lock()
+                    .expect("meter values log mutex not poisoned")
+                    .push(req);
+                Ok(V201MeterValuesResponse::default())
+            }
+        });
+    })
+    .await;
+    (server, addr, boots, meter_values)
+}
+
+/// Poll `meter_values` until it holds at least `target` entries, or panic after
+/// ~5s. Used to wait for a triggered `MeterValues` without a fixed sleep.
+async fn wait_for_meter_values(meter_values: &MeterValuesLog, target: usize) {
+    for _ in 0..250 {
+        if meter_values
+            .lock()
+            .expect("meter values log mutex not poisoned")
+            .len()
+            >= target
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "timed out waiting for {target} MeterValues (last saw {})",
+        meter_values
+            .lock()
+            .expect("meter values log mutex not poisoned")
+            .len()
+    );
+}
+
+#[tokio::test]
+async fn v201_trigger_boot_notification_is_accepted_and_reboots() {
+    let (mut server, addr, boots) = start_v201_csms_counting_boots().await;
+
+    let cp =
+        ChargePoint::new(v201_cp_config(addr, "CP201_TRIG_BOOT")).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+    // connect() returns only after the first boot handshake completed.
+    assert_eq!(
+        boots.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one BootNotification before the trigger"
+    );
+
+    // CSMS -> CP: TriggerMessage(BootNotification). The pure decision (slice 5a)
+    // returns Accepted, and the wiring enqueues the emission off the CALL path.
+    let resp = server
+        .call::<V201TriggerMessageRequest>(
+            "CP201_TRIG_BOOT",
+            V201TriggerMessageRequest {
+                requested_message: MessageTriggerEnumType::BootNotification,
+                evse: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS TriggerMessage call round-trips");
+    assert_eq!(
+        resp.status,
+        TriggerMessageStatusEnumType::Accepted,
+        "BootNotification is a message the v201 CP emits, so the trigger is Accepted"
+    );
+
+    // The accepted trigger emits a second BootNotification after the CALLRESULT
+    // is flushed — proof the side-effect fired off the CALL path.
+    wait_for_boot_count(&boots, 2).await;
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_trigger_meter_values_is_accepted_and_emits_meter_values() {
+    let (mut server, addr, _boots, meter_values) = start_v201_csms_recording_triggers().await;
+
+    let cp =
+        ChargePoint::new(v201_cp_config(addr, "CP201_TRIG_MV")).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // CSMS -> CP: TriggerMessage(MeterValues) scoped to EVSE 1. 2.0.1 keeps a
+    // standalone MeterValues message, so the CP answers Accepted and emits the
+    // EVSE's current reading in its own CALL — no transaction needed. Scoping to
+    // one EVSE makes the emit count deterministic regardless of connector count.
+    let resp = server
+        .call::<V201TriggerMessageRequest>(
+            "CP201_TRIG_MV",
+            V201TriggerMessageRequest {
+                requested_message: MessageTriggerEnumType::MeterValues,
+                evse: Some(EvseType {
+                    id: 1,
+                    connector_id: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS TriggerMessage call round-trips");
+    assert_eq!(resp.status, TriggerMessageStatusEnumType::Accepted);
+
+    // The EVSE-1-scoped trigger emits exactly one MeterValues after the
+    // CALLRESULT. Waited on, not slept.
+    wait_for_meter_values(&meter_values, 1).await;
+    let recorded = meter_values
+        .lock()
+        .expect("meter values log mutex not poisoned")
+        .clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "EVSE-1-scoped trigger -> one MeterValues"
+    );
+    let mv = &recorded[0];
+    assert_eq!(
+        mv.evse_id, 1,
+        "the reading is reported for the targeted EVSE 1"
+    );
+    let sample = &mv.meter_value[0].sampled_value[0];
+    assert_eq!(
+        sample.context,
+        Some(ReadingContextEnumType::Trigger),
+        "a triggered reading is tagged ReadingContext::Trigger"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_trigger_unsupported_message_is_not_implemented_and_emits_nothing() {
+    let (mut server, addr, boots, meter_values) = start_v201_csms_recording_triggers().await;
+
+    let cp =
+        ChargePoint::new(v201_cp_config(addr, "CP201_TRIG_NIMP")).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+    assert_eq!(boots.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // CSMS -> CP: TriggerMessage(FirmwareStatusNotification). The simulator has no
+    // firmware state machine on the v201 path, so slice 5a classifies it
+    // NotImplemented and the wiring enqueues nothing.
+    let resp = server
+        .call::<V201TriggerMessageRequest>(
+            "CP201_TRIG_NIMP",
+            V201TriggerMessageRequest {
+                requested_message: MessageTriggerEnumType::FirmwareStatusNotification,
+                evse: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS TriggerMessage call round-trips");
+    assert_eq!(
+        resp.status,
+        TriggerMessageStatusEnumType::NotImplemented,
+        "a message the simulator can't produce is NotImplemented"
+    );
+
+    // Absence is hard to assert directly, so drive a *supported* trigger after it
+    // as a deterministic happens-after barrier: once the MeterValues emitted by
+    // the second trigger arrives, the first (NotImplemented) trigger has fully
+    // run and must have emitted nothing — the meter-values log holds exactly the
+    // one MeterValues and no extra BootNotification slipped in. Scope to EVSE 1 so
+    // the barrier emits exactly one MeterValues.
+    let resp = server
+        .call::<V201TriggerMessageRequest>(
+            "CP201_TRIG_NIMP",
+            V201TriggerMessageRequest {
+                requested_message: MessageTriggerEnumType::MeterValues,
+                evse: Some(EvseType {
+                    id: 1,
+                    connector_id: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS TriggerMessage call round-trips");
+    assert_eq!(resp.status, TriggerMessageStatusEnumType::Accepted);
+    wait_for_meter_values(&meter_values, 1).await;
+
+    assert_eq!(
+        meter_values
+            .lock()
+            .expect("meter values log mutex not poisoned")
+            .len(),
+        1,
+        "the NotImplemented trigger emitted no MeterValues; only the supported one did"
+    );
+    assert_eq!(
+        boots.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the NotImplemented trigger emitted no BootNotification"
     );
 
     cp.disconnect().await.expect("disconnect");

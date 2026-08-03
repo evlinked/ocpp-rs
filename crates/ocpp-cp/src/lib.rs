@@ -70,11 +70,13 @@ use ocpp_types::{
 // (slice 2). Aliased to avoid clashing with the unqualified 1.6J names imported
 // above (`StatusNotificationRequest`, `RegistrationStatus`).
 use ocpp_messages::v201::{
-    ResetRequest as V201ResetRequest, StatusNotificationRequest as V201StatusNotificationRequest,
+    MeterValuesRequest as V201MeterValuesRequest, ResetRequest as V201ResetRequest,
+    StatusNotificationRequest as V201StatusNotificationRequest,
+    TriggerMessageRequest as V201TriggerMessageRequest,
 };
 use ocpp_types::v201::{
-    AuthorizationStatusEnumType, ConnectorStatusEnumType, RegistrationStatusEnumType,
-    ResetStatusEnumType,
+    AuthorizationStatusEnumType, ConnectorStatusEnumType, MessageTriggerEnumType,
+    RegistrationStatusEnumType, ResetStatusEnumType, TriggerMessageStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -493,6 +495,17 @@ enum RemoteCommand {
     TriggerMessage {
         requested_message: MessageTrigger,
         connector_id: Option<i32>,
+    },
+    /// Send a CSMS-requested message proactively for an `Accepted` OCPP 2.0.1
+    /// `TriggerMessage` (OCPP 2.0.1 Part 2). The 2.0.1 twin of
+    /// [`TriggerMessage`](RemoteCommand::TriggerMessage): `evse_id` scopes
+    /// EVSE-specific messages (`StatusNotification`, `MeterValues`,
+    /// `TransactionEvent`) and `None` targets the whole Charging Station. Queued
+    /// off the inbound-CALL path for the same reason as the 1.6J variant — the
+    /// triggered outbound CALL must not re-enter the receive loop mid-dispatch.
+    V201TriggerMessage {
+        requested_message: MessageTriggerEnumType,
+        evse_id: Option<i32>,
     },
     /// Run the simulated diagnostics-upload state machine for an `Accepted`
     /// `GetDiagnostics` (OCPP 1.6J §4.x, firmware-management profile). Emits
@@ -1205,32 +1218,77 @@ impl ChargePoint {
         }
 
         // TriggerMessage — acknowledge, then send the requested message as a real
-        // side effect (OCPP 1.6J §4.x). Like Reset, the send is queued on the
-        // command channel and run by the consumer task spawned in `connect()`, so
-        // the CALLRESULT is flushed before the triggered outbound CALL and the
-        // receive loop never re-enters itself. A `requestedMessage` the CP cannot
-        // produce yields `NotImplemented` (no work queued); a supported message
-        // the CP cannot honor right now (consumer gone, CP shutting down) yields
-        // `Rejected` rather than accept-and-drop.
-        {
-            let command_sender = command_sender.clone();
-            d.on(move |req: TriggerMessageRequest| {
+        // side effect. Like Reset, the send is queued on the command channel and
+        // run by the consumer task spawned in `connect()`, so the CALLRESULT is
+        // flushed before the triggered outbound CALL and the receive loop never
+        // re-enters itself. Both OCPP versions name the action `"TriggerMessage"`,
+        // so exactly one handler is registered per `protocol_version` (same
+        // discipline as the Reset split above); the version-aware inbound
+        // validator keeps the wire on a single dialect so the other version's
+        // request shape never reaches this dispatcher.
+        match protocol_version {
+            // OCPP 1.6J §4.x. A `requestedMessage` the CP cannot produce yields
+            // `NotImplemented` (no work queued); a supported message the CP cannot
+            // honor right now (consumer gone, CP shutting down) yields `Rejected`
+            // rather than accept-and-drop.
+            OcppVersion::V16J => {
                 let command_sender = command_sender.clone();
-                async move {
-                    let status = if trigger_message_supported(&req.requested_message) {
-                        match command_sender.send(RemoteCommand::TriggerMessage {
-                            requested_message: req.requested_message,
-                            connector_id: req.connector_id,
-                        }) {
-                            Ok(()) => TriggerMessageStatus::Accepted,
-                            Err(_) => TriggerMessageStatus::Rejected,
+                d.on(move |req: TriggerMessageRequest| {
+                    let command_sender = command_sender.clone();
+                    async move {
+                        let status = if trigger_message_supported(&req.requested_message) {
+                            match command_sender.send(RemoteCommand::TriggerMessage {
+                                requested_message: req.requested_message,
+                                connector_id: req.connector_id,
+                            }) {
+                                Ok(()) => TriggerMessageStatus::Accepted,
+                                Err(_) => TriggerMessageStatus::Rejected,
+                            }
+                        } else {
+                            TriggerMessageStatus::NotImplemented
+                        };
+                        Ok(TriggerMessageResponse { status })
+                    }
+                });
+            }
+            // OCPP 2.0.1 (Part 2, `TriggerMessage`). Ports
+            // `ocpp.v201.call.TriggerMessage`: the `requestedMessage` is a
+            // `MessageTriggerEnumType` and the response gains an optional
+            // `statusInfo`. The pure policy decision (`Accepted` for a message the
+            // simulator emits, `NotImplemented` otherwise) lives in `v201_command`
+            // (slice 5a, #434); this is the runtime wiring (slice 5b, #433). The
+            // request's optional `evse` scope is carried through to the side effect
+            // (station-wide when omitted). Same off-CALL-path discipline and
+            // `Err(_) => Rejected` capability outcome as the 1.6J handler.
+            OcppVersion::V201 => {
+                let command_sender = command_sender.clone();
+                d.on(move |req: V201TriggerMessageRequest| {
+                    let command_sender = command_sender.clone();
+                    async move {
+                        let requested = req.requested_message;
+                        let mut status = v201_command::v201_trigger_message_status(requested);
+                        // Only an accepted trigger queues a side effect; a
+                        // `NotImplemented` message is recognized but has no emit
+                        // path, so nothing is enqueued. A failed enqueue (the
+                        // consumer has gone away, CP shutting down) downgrades to
+                        // `Rejected` — the runtime capability outcome slice 5a
+                        // leaves to the wiring layer — rather than accept-and-drop.
+                        if status == TriggerMessageStatusEnumType::Accepted {
+                            let evse_id = req.evse.map(|evse| evse.id);
+                            if command_sender
+                                .send(RemoteCommand::V201TriggerMessage {
+                                    requested_message: requested,
+                                    evse_id,
+                                })
+                                .is_err()
+                            {
+                                status = TriggerMessageStatusEnumType::Rejected;
+                            }
                         }
-                    } else {
-                        TriggerMessageStatus::NotImplemented
-                    };
-                    Ok(TriggerMessageResponse { status })
-                }
-            });
+                        Ok(v201_command::v201_trigger_message_response(status, None))
+                    }
+                });
+            }
         }
 
         // GetDiagnostics — acknowledge with the file name the CP would upload,
@@ -1914,6 +1972,13 @@ impl ChargePoint {
                             connector_id,
                         } => {
                             cp.send_triggered_message(requested_message, connector_id)
+                                .await;
+                        }
+                        RemoteCommand::V201TriggerMessage {
+                            requested_message,
+                            evse_id,
+                        } => {
+                            cp.send_v201_triggered_message(requested_message, evse_id)
                                 .await;
                         }
                         RemoteCommand::GetDiagnostics => {
@@ -3317,6 +3382,223 @@ impl ChargePoint {
                 // unsupported and they never reach here in normal flow; this arm
                 // keeps the match exhaustive and aligned with the gate.
                 warn!("TriggerMessage({other:?}): not implemented by the simulator");
+            }
+        }
+    }
+
+    /// Send the message a CSMS asked for via an OCPP 2.0.1 `TriggerMessage`
+    /// (`ocpp.v201.call.TriggerMessage`).
+    ///
+    /// The 2.0.1 twin of [`send_triggered_message`](Self::send_triggered_message).
+    /// Runs on the command-consumer task (off the inbound-CALL path), so these
+    /// outbound CALLs never re-enter the receive loop. Only the variants
+    /// [`v201_command::v201_trigger_message_status`] classifies `Accepted` are
+    /// ever queued, but the match here is exhaustive over
+    /// [`MessageTriggerEnumType`], so a new variant fails to compile until it is
+    /// handled — the policy gate and this dispatch cannot silently drift.
+    ///
+    /// `evse_id` scopes the EVSE-specific messages; `None` targets the whole
+    /// Charging Station.
+    async fn send_v201_triggered_message(
+        &self,
+        message: MessageTriggerEnumType,
+        evse_id: Option<i32>,
+    ) {
+        use MessageTriggerEnumType::{
+            BootNotification, FirmwareStatusNotification, Heartbeat, LogStatusNotification,
+            MeterValues, PublishFirmwareStatusNotification, SignChargingStationCertificate,
+            SignCombinedCertificate, SignV2GCertificate, StatusNotification, TransactionEvent,
+        };
+        match message {
+            BootNotification => {
+                if let Err(e) = self
+                    .call(self.config.v201_boot_notification_request())
+                    .await
+                {
+                    warn!("v201 TriggerMessage(BootNotification): send failed: {e}");
+                }
+            }
+            Heartbeat => {
+                // 2.0.1 Heartbeat carries an empty payload, serializing to the
+                // same `{}` frame as 1.6J — the request type is version-agnostic.
+                if let Err(e) = self.call(HeartbeatRequest {}).await {
+                    warn!("v201 TriggerMessage(Heartbeat): send failed: {e}");
+                }
+            }
+            StatusNotification => self.trigger_v201_status_notification(evse_id).await,
+            MeterValues => self.trigger_v201_meter_values(evse_id).await,
+            TransactionEvent => self.trigger_v201_transaction_event(evse_id).await,
+            // Firmware-, diagnostics-log-, and certificate-signing triggers the
+            // simulator does not implement. `v201_trigger_message_status` reports
+            // these `NotImplemented`, so the handler never enqueues them; this arm
+            // keeps the match exhaustive and aligned with that policy.
+            other @ (LogStatusNotification
+            | FirmwareStatusNotification
+            | SignChargingStationCertificate
+            | SignV2GCertificate
+            | SignCombinedCertificate
+            | PublishFirmwareStatusNotification) => {
+                warn!("v201 TriggerMessage({other:?}): not implemented by the simulator");
+            }
+        }
+    }
+
+    /// Emit a 2.0.1 `StatusNotification` for the EVSE(s) a `TriggerMessage`
+    /// targets (`requestedMessage = StatusNotification`).
+    ///
+    /// `Some(id)` reports just that EVSE; `None` reports every EVSE. Unlike 1.6J
+    /// there is no whole-station connector-`0` slot — 2.0.1 reports status per
+    /// `(evseId ≥ 1, connectorId)` — so this iterates `1..=connector_count`
+    /// (matching the boot-time announcement's V201 path). The already
+    /// version-aware [`send_status_notification`](Self::send_status_notification)
+    /// emits the 2.0.1 wire shape.
+    async fn trigger_v201_status_notification(&self, evse_id: Option<i32>) {
+        let count = self.config.connector_count as i32;
+        let ids: Vec<u32> = match evse_id {
+            Some(id) if (1..=count).contains(&id) => vec![id as u32],
+            Some(id) => {
+                warn!("v201 TriggerMessage(StatusNotification): unknown EVSE {id}, ignoring");
+                return;
+            }
+            None => (1..=self.config.connector_count).collect(),
+        };
+
+        for id in ids {
+            let status = self.connector_report_status(id).await;
+            if let Err(e) = self
+                .send_status_notification(id, status, ChargePointErrorCode::NoError)
+                .await
+            {
+                warn!("v201 TriggerMessage(StatusNotification): EVSE {id} send failed: {e}");
+            }
+        }
+    }
+
+    /// Emit a standalone 2.0.1 `MeterValues` CALL for the EVSE(s) a
+    /// `TriggerMessage` targets (`requestedMessage = MeterValues`).
+    ///
+    /// OCPP 2.0.1 keeps a dedicated `MeterValues` message
+    /// (`ocpp.v201.call.MeterValues`) alongside the `TransactionEvent` flow, so a
+    /// triggered `MeterValues` reports the EVSE's *current*
+    /// `Energy.Active.Import.Register` reading (tagged `ReadingContext::Trigger`)
+    /// in its own CALL — not a synthetic `TransactionEvent`. This reads the same
+    /// `last_meter_reading()` the periodic sampler uses and works whether or not a
+    /// transaction is in progress: an idle EVSE still reports its standing meter
+    /// register. `Some(id)` reports just that EVSE; `None` reports every EVSE.
+    async fn trigger_v201_meter_values(&self, evse_id: Option<i32>) {
+        let count = self.config.connector_count as i32;
+        let ids: Vec<u32> = match evse_id {
+            Some(id) if (1..=count).contains(&id) => vec![id as u32],
+            Some(id) => {
+                warn!("v201 TriggerMessage(MeterValues): no meter for EVSE {id}, ignoring");
+                return;
+            }
+            None => (1..=self.config.connector_count).collect(),
+        };
+
+        for id in ids {
+            let connector_id = match ConnectorId::new(id) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            // Read the connector's latest meter value, releasing the lock before
+            // building/sending so it is never held across the send.
+            let reading = {
+                let connectors = self.connectors.read().await;
+                match connectors.get(&connector_id) {
+                    Some(connector) => connector.last_meter_reading().await,
+                    None => continue,
+                }
+            };
+
+            // Flat single-connector-EVSE topology: the connector's value is its
+            // EVSE id, consistent with the V201 StatusNotification / sampler paths.
+            let request = V201MeterValuesRequest {
+                evse_id: id as i32,
+                meter_value: v201_transaction::triggered_energy_meter_value(
+                    reading.energy_wh,
+                    &reading.timestamp.to_rfc3339(),
+                ),
+                custom_data: None,
+            };
+            if let Err(e) = self.call(request).await {
+                warn!("v201 TriggerMessage(MeterValues): EVSE {id} send failed: {e}");
+            }
+        }
+    }
+
+    /// Emit an on-demand 2.0.1 `TransactionEvent(Updated)` for the in-flight
+    /// transaction(s) a `TriggerMessage` targets (`requestedMessage =
+    /// TransactionEvent`).
+    ///
+    /// A 2.0.1 `TransactionEvent` is inherently transaction-scoped, so this
+    /// reports one `Updated` event (`triggerReason = Trigger`) per active
+    /// transaction on the targeted scope, carrying the connector's current
+    /// reading. `seqNo` is drawn from the transaction's shared
+    /// [`V201Session`] counter so a triggered event interleaves cleanly with the
+    /// periodic sampler. `Some(id)` scopes to that EVSE; `None` reports every
+    /// active transaction. With no active transaction on the targeted scope there
+    /// is nothing to report — the trigger was `Accepted` as a capability, but idle
+    /// there is no event to emit.
+    async fn trigger_v201_transaction_event(&self, evse_id: Option<i32>) {
+        // Snapshot the (transaction_id -> connector) pairs to report, scoped to
+        // the targeted EVSE when present (in the flat topology an EVSE id equals
+        // its connector's value). Copied out so no lock is held across a send.
+        let targets: Vec<(i32, ConnectorId)> = {
+            let active = self.active_transactions.read().await;
+            active
+                .iter()
+                .filter(|(_txn, cid)| match evse_id {
+                    Some(id) => cid.value() as i32 == id,
+                    None => true,
+                })
+                .map(|(txn, cid)| (*txn, *cid))
+                .collect()
+        };
+
+        if targets.is_empty() {
+            info!(
+                "v201 TriggerMessage(TransactionEvent): no active transaction on the \
+                 targeted scope, nothing to emit"
+            );
+            return;
+        }
+
+        for (transaction_id, connector_id) in targets {
+            // Claim the next seqNo from the transaction's shared counter. A
+            // missing session means the transaction is being torn down; skip it
+            // rather than inventing a seqNo (same discipline as the sampler).
+            let seq_no = match self.v201_sessions.read().await.get(&transaction_id) {
+                Some(session) => session.next_seq_no.fetch_add(1, Ordering::SeqCst),
+                None => continue,
+            };
+
+            let reading = {
+                let connectors = self.connectors.read().await;
+                match connectors.get(&connector_id) {
+                    Some(connector) => connector.last_meter_reading().await,
+                    None => continue,
+                }
+            };
+
+            let txid_str = transaction_id.to_string();
+            let session = v201_transaction::SessionRef {
+                transaction_id: &txid_str,
+                evse_id: connector_id.value() as i32,
+                connector_id: 1,
+            };
+            let request = v201_transaction::transaction_event_triggered(
+                &session,
+                seq_no,
+                reading.energy_wh,
+                &reading.timestamp.to_rfc3339(),
+            );
+            if let Err(e) = self.call(request).await {
+                warn!(
+                    "v201 TriggerMessage(TransactionEvent): transaction {transaction_id} \
+                     send failed: {e}"
+                );
             }
         }
     }
