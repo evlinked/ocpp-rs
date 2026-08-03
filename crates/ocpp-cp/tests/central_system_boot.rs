@@ -360,10 +360,16 @@ async fn v201_reset_onidle_while_idle_is_accepted_and_reboots() {
     server.stop().await.expect("server stop");
 }
 
+// OCPP 2.0.1 deferred `Reset(OnIdle)` (Issue #431, slice 4c): an `OnIdle` reset
+// received mid-transaction is answered `Scheduled` (slice 4b) and must then be
+// carried out automatically the moment the in-flight transaction ends — the
+// station reboots on idle, never mid-charge. This extends the slice-4b
+// "does not interrupt" scenario with the deferred-reboot tail.
 #[tokio::test]
-async fn v201_reset_onidle_while_charging_is_scheduled_and_does_not_interrupt() {
+async fn v201_reset_onidle_scheduled_then_reboots_once_the_transaction_ends() {
     // A CSMS that records TransactionEvents (so a v201 charging session runs) and
-    // counts boots (so we can assert the deferred reset did NOT reboot yet).
+    // counts boots (so we can observe both that the deferred reset does NOT reboot
+    // while charging, and that it DOES once the transaction ends).
     let boots: BootCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let log: TxnLog = Arc::new(Mutex::new(Vec::new()));
     let boots_for_handler = boots.clone();
@@ -436,9 +442,120 @@ async fn v201_reset_onidle_while_charging_is_scheduled_and_does_not_interrupt() 
         boots_before,
         "a Scheduled reset does not reboot while the transaction is live"
     );
+
+    // End the transaction normally. This is the station's idle transition, and it
+    // is where the armed deferred reset fires: `stop_transaction` re-enqueues the
+    // mapped `Reset` on the command channel once `active_transactions` drains.
     cp.stop_transaction(txn_id, 2000, Reason::EVDisconnected)
         .await
         .expect("the still-live transaction stops normally after a Scheduled reset");
+
+    // The deferred reset now carries out: `OnIdle -> Soft`, so `perform_reset`
+    // re-runs the boot sequence in place and a second BootNotification lands on
+    // the same socket (waited on, no fixed sleep). This proves the `Scheduled`
+    // reset was not merely acknowledged but actually deferred and then executed.
+    wait_for_boot_count(&boots, boots_before + 1).await;
+    assert!(
+        cp.is_connected().await,
+        "the deferred soft reset reboots in place, so the CP stays connected"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// OCPP 2.0.1 deferred reset — negative / exactly-once guards (Issue #431, slice
+// 4c). Two properties the transaction-stop hot path must hold:
+//   1. A plain transaction stop with NO armed deferred reset must not reboot the
+//      station (guard against a false trigger on every stop).
+//   2. The deferred reset, once fired, is single-shot: a *second* transaction on
+//      the same idle-armed station does not re-trigger the already-consumed reset.
+#[tokio::test]
+async fn v201_transaction_stop_without_armed_reset_does_not_reboot() {
+    let boots: BootCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let log: TxnLog = Arc::new(Mutex::new(Vec::new()));
+    let boots_for_handler = boots.clone();
+    let log_for_handler = log.clone();
+    let (mut server, addr) = start_v201_csms(move |dispatcher| {
+        let boots = boots_for_handler;
+        dispatcher.on(move |_req: V201BootNotificationRequest| {
+            let boots = boots.clone();
+            async move {
+                boots.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(V201BootNotificationResponse {
+                    current_time: chrono::Utc::now()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    interval: 300,
+                    status: RegistrationStatusEnumType::Accepted,
+                    status_info: None,
+                    custom_data: None,
+                })
+            }
+        });
+        let log = log_for_handler;
+        dispatcher.on(move |req: TransactionEventRequest| {
+            let log = log.clone();
+            async move {
+                log.lock().expect("txn log mutex not poisoned").push(req);
+                Ok(TransactionEventResponse::default())
+            }
+        });
+    })
+    .await;
+
+    let cp =
+        ChargePoint::new(v201_cp_config(addr, "CP201_NO_RESET")).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+    assert_eq!(
+        boots.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one BootNotification after connect"
+    );
+
+    // A full transaction with NO reset command in between.
+    let connector = ConnectorId::new(1).unwrap();
+    let txn_id = cp
+        .start_transaction(connector, "RFID-CAFE", 1000)
+        .await
+        .expect("v201 start_transaction");
+    wait_for_event(&log, TransactionEventEnumType::Started).await;
+    cp.stop_transaction(txn_id, 2000, Reason::EVDisconnected)
+        .await
+        .expect("v201 stop_transaction");
+    wait_for_event(&log, TransactionEventEnumType::Ended).await;
+
+    // Now drive a real `OnIdle` reset on the (idle) station as a deterministic
+    // happens-after barrier: it is `Accepted` and reboots, taking the count to 2.
+    // Had the plain stop above spuriously armed/fired a reset, that reboot would
+    // have queued *first*, pushing the eventual count past 2 — so asserting the
+    // count settles at exactly 2 catches a false trigger without a bare sleep.
+    let resp = server
+        .call::<V201ResetRequest>(
+            "CP201_NO_RESET",
+            V201ResetRequest {
+                kind: ResetEnumType::OnIdle,
+                evse_id: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS Reset call round-trips");
+    assert_eq!(
+        resp.status,
+        ResetStatusEnumType::Accepted,
+        "an OnIdle reset on the now-idle station is Accepted"
+    );
+    wait_for_boot_count(&boots, 2).await;
+
+    // Give any erroneously-queued extra reboot time to land, then assert exactly
+    // one reboot happened: the plain stop rebooted nothing, and the explicit reset
+    // fired exactly once.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        boots.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "only the explicit OnIdle reset reboots; a plain stop triggers nothing"
+    );
 
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");

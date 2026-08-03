@@ -747,6 +747,16 @@ pub struct ChargePoint {
     /// is a single protocol version for its whole life, so these never collide
     /// with any CSMS-assigned 1.6J id.
     next_v201_transaction_id: Arc<AtomicI32>,
+    /// Deferred 2.0.1 `Reset(OnIdle)` awaiting the station going idle (slice 4c,
+    /// Issue #431). The V201 `Reset` handler records the mapped [`ResetType`] here
+    /// when it answers `Scheduled` (an `OnIdle` reset received mid-transaction);
+    /// [`stop_transaction`](Self::stop_transaction) takes and fires it exactly
+    /// once when [`active_transactions`](Self::active_transactions) drains empty,
+    /// so the station reboots the moment the last session ends — never mid-charge.
+    /// [`perform_reset`](Self::perform_reset) clears it up front, so an immediate
+    /// reset supersedes a pending deferred one instead of double-firing. `None`
+    /// on the 1.6J path and whenever no deferred reset is armed.
+    pending_v201_reset: Arc<RwLock<Option<ResetType>>>,
     /// Per-transaction 2.0.1 session state, keyed by the same station-chosen
     /// `transactionId` as [`active_transactions`](Self::active_transactions).
     /// Populated only on the `V201` path: inserted by `start_transaction`
@@ -783,6 +793,14 @@ pub struct ChargePoint {
     /// `ClearCache` handler so a CSMS `ClearCache` command empties it. Backs the
     /// cache-first behavior of [`ChargePoint::authorize`].
     auth_cache: Arc<AuthCache>,
+    /// Sender half of the [`RemoteCommand`] channel, retained on the
+    /// `ChargePoint` so methods that run *off* the inbound-CALL path (currently
+    /// [`stop_transaction`](Self::stop_transaction), firing a deferred
+    /// `Reset(OnIdle)` — slice 4c) can queue a side effect for the same
+    /// command-consumer task the dispatcher closures feed. Cloned from the sender
+    /// handed to [`build_default_dispatcher`](Self::build_default_dispatcher), so
+    /// every clone points at the one channel drained by the single consumer.
+    command_sender: mpsc::UnboundedSender<RemoteCommand>,
     /// Receiver for [`RemoteCommand`]s queued by inbound CALL handlers (e.g. the
     /// default `Reset` handler). Taken exactly once by the first
     /// [`ChargePoint::connect`] to spawn the single long-lived command-consumer
@@ -883,6 +901,11 @@ impl ChargePoint {
 
         let (command_sender, command_receiver) = mpsc::unbounded_channel();
 
+        // Slice 4c (#431): the V201 `Reset` handler records a deferred
+        // `Reset(OnIdle)` here; `stop_transaction` drains it when the station goes
+        // idle. Shared into the dispatcher (writer) and kept on the CP (reader).
+        let pending_v201_reset: Arc<RwLock<Option<ResetType>>> = Arc::new(RwLock::new(None));
+
         // Wrap the shared state the default handlers need *before* building the
         // dispatcher: RemoteStart/RemoteStop consult live connector status and
         // the active-transaction map to answer Accepted/Rejected faithfully.
@@ -906,7 +929,7 @@ impl ChargePoint {
             config.protocol_version,
             config_store.clone(),
             auth_cache.clone(),
-            command_sender,
+            command_sender.clone(),
             connectors.clone(),
             active_transactions.clone(),
             reservations.clone(),
@@ -915,6 +938,7 @@ impl ChargePoint {
             config.unlock_connector_outcome,
             data_transfer.clone(),
             local_list.clone(),
+            pending_v201_reset.clone(),
         );
         if let Some(v) = &validator {
             dispatcher = dispatcher.with_validator(v.clone());
@@ -933,6 +957,8 @@ impl ChargePoint {
             is_connected: Arc::new(RwLock::new(false)),
             heartbeat_handle: Arc::new(RwLock::new(None)),
             active_transactions,
+            pending_v201_reset,
+            command_sender,
             next_v201_transaction_id: Arc::new(AtomicI32::new(1)),
             v201_sessions: Arc::new(RwLock::new(HashMap::new())),
             reservations,
@@ -974,6 +1000,7 @@ impl ChargePoint {
         unlock_outcome: UnlockConnectorOutcome,
         data_transfer: Arc<DataTransferRegistry>,
         local_list: Arc<LocalAuthList>,
+        pending_v201_reset: Arc<RwLock<Option<ResetType>>>,
     ) -> ActionDispatcher {
         let mut d = ActionDispatcher::new();
 
@@ -1174,9 +1201,11 @@ impl ChargePoint {
             OcppVersion::V201 => {
                 let command_sender = command_sender.clone();
                 let active_transactions = active_transactions.clone();
+                let pending_v201_reset = pending_v201_reset.clone();
                 d.on(move |req: V201ResetRequest| {
                     let command_sender = command_sender.clone();
                     let active_transactions = active_transactions.clone();
+                    let pending_v201_reset = pending_v201_reset.clone();
                     async move {
                         // Whether a transaction is running is the only extra input
                         // to the `Accepted` vs `Scheduled` decision for an `OnIdle`
@@ -1196,11 +1225,13 @@ impl ChargePoint {
                         // cannot honor it, so downgrade to `Rejected` — the same
                         // capability outcome the 1.6J handler reports on a failed
                         // channel send. A `Scheduled` reset (an `OnIdle` request
-                        // received while charging) is accepted-but-deferred: the
-                        // correct status is returned and no side-effect is queued,
-                        // so this never interrupts a live charging session.
-                        // Carrying the deferred reset out once the station next
-                        // goes idle is a separate slice (4c).
+                        // received while charging) is accepted-but-deferred: no
+                        // side-effect is queued now, so the live session is never
+                        // interrupted. Instead (slice 4c, #431) the mapped
+                        // `ResetType` is armed in `pending_v201_reset`, and
+                        // `stop_transaction` carries it out once the station next
+                        // goes idle. A later `Scheduled` overwrites the slot; a
+                        // later `Immediate` reboots now and supersedes it.
                         if status == ResetStatusEnumType::Accepted {
                             let reset_type = v201_command::v201_reset_reset_type(req.kind);
                             if command_sender
@@ -1209,6 +1240,9 @@ impl ChargePoint {
                             {
                                 status = ResetStatusEnumType::Rejected;
                             }
+                        } else if status == ResetStatusEnumType::Scheduled {
+                            let reset_type = v201_command::v201_reset_reset_type(req.kind);
+                            *pending_v201_reset.write().await = Some(reset_type);
                         }
 
                         Ok(v201_command::v201_reset_response(status, None))
@@ -3123,6 +3157,45 @@ impl ChargePoint {
             connector_id.value()
         );
 
+        // Slice 4c (#431): now that the transaction is fully wound down, carry out
+        // a deferred 2.0.1 `Reset(OnIdle)` if one is armed and the station has gone
+        // idle (no other connector still charging). Done at the tail — after the
+        // connector is back to `Available` — so the stop completes cleanly before
+        // the reboot regardless of who called us.
+        //
+        // `take()` fires the armed reset at most once; a plain stop with no armed
+        // reset finds `None` and reboots nothing (guards the hot path against a
+        // false trigger). A reset that is *itself* driving this stop
+        // (`perform_reset` → `stop_transaction`) cleared the slot up front, so it
+        // cannot re-enqueue here and double-reboot. Re-enqueueing onto the same
+        // command channel keeps the reboot on the single consumer task, off this
+        // (and any inbound-CALL) path — never a background poll/wait.
+        //
+        // The emptiness check and the `take` are done under one held
+        // `active_transactions` read guard so a concurrent `start_transaction`
+        // cannot slip a fresh session in between them and have the reboot cut it
+        // off — preserving the "never interrupt a live session" invariant. Lock
+        // order is `active_transactions` → `pending_v201_reset`, matching the V201
+        // `Reset` handler (which reads `active_transactions` before it arms the
+        // slot); no path nests these the other way, so this cannot deadlock.
+        let armed_reset = {
+            let active = self.active_transactions.read().await;
+            if active.is_empty() {
+                self.pending_v201_reset.write().await.take()
+            } else {
+                None
+            }
+        };
+        if let Some(reset_type) = armed_reset {
+            if self
+                .command_sender
+                .send(RemoteCommand::Reset { reset_type })
+                .is_err()
+            {
+                warn!("deferred v201 reset: command consumer gone; not rebooting");
+            }
+        }
+
         Ok(())
     }
 
@@ -3162,6 +3235,13 @@ impl ChargePoint {
         let _ = self
             .event_sender
             .send(ChargePointEvent::ResetRequested { reset_type });
+
+        // Slice 4c (#431): this reset is happening now, so it supersedes any
+        // deferred `Reset(OnIdle)` still armed — disarm it up front. This is also
+        // what makes the deferred-reset fire in `stop_transaction` single-shot:
+        // the `stop_transaction` calls below (ending in-flight sessions for this
+        // reset) then find an empty slot and cannot re-enqueue a second reboot.
+        let _ = self.pending_v201_reset.write().await.take();
 
         // Gracefully end any in-flight transactions with the reset-specific
         // reason. Snapshot the ids first so we don't hold the map lock across
