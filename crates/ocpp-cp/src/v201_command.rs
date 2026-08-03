@@ -32,14 +32,28 @@
 //! [`Rejected`](TriggerMessageStatusEnumType::Rejected), like `Reset`'s, is a
 //! runtime *capability* outcome (the trigger was accepted in policy but the
 //! side-effect could not be enqueued), decided by the slice-5b wiring layer.
+//!
+//! ## `ChangeAvailability`
+//!
+//! Ports `ocpp.v201.call.ChangeAvailability` /
+//! `ocpp.v201.call_result.ChangeAvailability`. The CSMS asks the station (or a
+//! single `evse`, whole-station when `evse` is omitted) to become
+//! [`Operative`](OperationalStatusEnumType::Operative) or
+//! [`Inoperative`](OperationalStatusEnumType::Inoperative). The station replies
+//! [`Accepted`](ChangeAvailabilityStatusEnumType::Accepted) when it can apply the
+//! change now, or [`Scheduled`](ChangeAvailabilityStatusEnumType::Scheduled) when
+//! a transaction is in progress and the change must wait until the connector is
+//! idle — directly analogous to the `Reset(OnIdle)` → `Scheduled` decision.
+//! [`Rejected`](ChangeAvailabilityStatusEnumType::Rejected), like the others', is
+//! a runtime *capability* outcome decided by the slice-6b wiring layer.
 
 use ocpp_types::common::Reason;
 use ocpp_types::v201::{
-    MessageTriggerEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
-    TriggerMessageStatusEnumType,
+    ChangeAvailabilityStatusEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
+    ResetEnumType, ResetStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
 };
 
-use ocpp_messages::v201::{ResetResponse, TriggerMessageResponse};
+use ocpp_messages::v201::{ChangeAvailabilityResponse, ResetResponse, TriggerMessageResponse};
 
 /// Decide the [`ResetStatusEnumType`] a `V201` station reports for an inbound
 /// `Reset.req`, given the requested [`kind`](ResetEnumType) and whether a
@@ -180,6 +194,71 @@ pub fn v201_trigger_message_response(
     status_info: Option<StatusInfoType>,
 ) -> TriggerMessageResponse {
     TriggerMessageResponse {
+        status,
+        status_info,
+        custom_data: None,
+    }
+}
+
+/// Decide the [`ChangeAvailabilityStatusEnumType`] a `V201` station reports for
+/// an inbound `ChangeAvailability.req`, given the requested
+/// [`target`](OperationalStatusEnumType) availability and whether a transaction
+/// is currently in progress on the targeted scope.
+///
+/// Faithful to OCPP 2.0.1 (Part 2, `ChangeAvailability`): the station applies an
+/// availability change only while the affected EVSE/connector is idle. So —
+/// independent of the *direction* of the change (`Operative` or `Inoperative`):
+///
+/// - **Idle** — the change takes effect immediately:
+///   [`Accepted`](ChangeAvailabilityStatusEnumType::Accepted).
+/// - **Transaction in progress** — the station accepts the change but defers it
+///   until the transaction finishes, so a paying driver is never cut off:
+///   [`Scheduled`](ChangeAvailabilityStatusEnumType::Scheduled).
+///
+/// The direction does not change the decision: a busy connector cannot be taken
+/// `Inoperative` mid-charge, and per the spec a change to `Operative` that
+/// coincides with an ongoing transaction is likewise reported `Scheduled` (it is
+/// applied at the same idle boundary) rather than silently taking effect — the
+/// station reports one honest "deferred until idle" status for both.
+///
+/// This is the *policy* decision, depending only on the request and the station's
+/// idle state — the same policy/capability split
+/// [`v201_reset_status`] uses.
+/// [`Rejected`](ChangeAvailabilityStatusEnumType::Rejected) is a runtime
+/// *capability* outcome (the change was accepted in policy but the side-effect
+/// could not be enqueued) decided by the slice-6b wiring layer, not here.
+///
+/// Total, exhaustive `match` — both [`OperationalStatusEnumType`] variants are
+/// classified explicitly, with no wildcard arm, so a future spec-added
+/// operational status is a compile error here rather than a silent default.
+#[must_use]
+pub fn v201_change_availability_status(
+    target: OperationalStatusEnumType,
+    transaction_in_progress: bool,
+) -> ChangeAvailabilityStatusEnumType {
+    match target {
+        OperationalStatusEnumType::Operative | OperationalStatusEnumType::Inoperative => {
+            if transaction_in_progress {
+                ChangeAvailabilityStatusEnumType::Scheduled
+            } else {
+                ChangeAvailabilityStatusEnumType::Accepted
+            }
+        }
+    }
+}
+
+/// Build a schema-valid `ChangeAvailability.conf` ([`ChangeAvailabilityResponse`]).
+///
+/// Pure constructor mirroring [`v201_reset_response`]: carries the decided
+/// [`status`](ChangeAvailabilityStatusEnumType) plus the optional 2.0.1
+/// `statusInfo` (a vendor-agnostic `reasonCode` and human-readable detail —
+/// useful, for example, to explain why an availability change was `Scheduled`).
+#[must_use]
+pub fn v201_change_availability_response(
+    status: ChangeAvailabilityStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> ChangeAvailabilityResponse {
+    ChangeAvailabilityResponse {
         status,
         status_info,
         custom_data: None,
@@ -406,6 +485,126 @@ mod tests {
                         .validate_call_result("TriggerMessage", &payload)
                         .is_ok(),
                     "built {status:?} TriggerMessageResponse should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    /// While the connector is idle, an availability change applies now — in
+    /// either direction (`Operative` / `Inoperative`) — so the station reports
+    /// `Accepted`.
+    #[test]
+    fn change_availability_is_accepted_when_idle() {
+        for target in [
+            OperationalStatusEnumType::Operative,
+            OperationalStatusEnumType::Inoperative,
+        ] {
+            assert_eq!(
+                v201_change_availability_status(target, false),
+                ChangeAvailabilityStatusEnumType::Accepted,
+                "{target:?} while idle should be Accepted"
+            );
+        }
+    }
+
+    /// While a transaction is in progress the change must wait until the
+    /// connector is idle, so the station accepts but defers — `Scheduled` — in
+    /// either direction, never cutting off a paying driver.
+    #[test]
+    fn change_availability_is_scheduled_when_transaction_in_progress() {
+        for target in [
+            OperationalStatusEnumType::Operative,
+            OperationalStatusEnumType::Inoperative,
+        ] {
+            assert_eq!(
+                v201_change_availability_status(target, true),
+                ChangeAvailabilityStatusEnumType::Scheduled,
+                "{target:?} while busy should be Scheduled"
+            );
+        }
+    }
+
+    /// The decision is total over the full `{Operative, Inoperative} × {idle,
+    /// busy}` matrix: every combination classifies to `Accepted` (idle) or
+    /// `Scheduled` (busy), split exactly 2/2, and `Rejected` — a runtime
+    /// capability outcome — is never a policy result.
+    #[test]
+    fn change_availability_decision_is_total_and_never_rejected() {
+        let mut accepted = 0;
+        let mut scheduled = 0;
+        for target in [
+            OperationalStatusEnumType::Operative,
+            OperationalStatusEnumType::Inoperative,
+        ] {
+            for in_progress in [false, true] {
+                match v201_change_availability_status(target, in_progress) {
+                    ChangeAvailabilityStatusEnumType::Accepted => accepted += 1,
+                    ChangeAvailabilityStatusEnumType::Scheduled => scheduled += 1,
+                    ChangeAvailabilityStatusEnumType::Rejected => panic!(
+                        "{target:?} (in_progress={in_progress}) must not map to the \
+                         runtime-only Rejected status"
+                    ),
+                }
+            }
+        }
+        assert_eq!(accepted, 2, "expected exactly 2 idle → Accepted");
+        assert_eq!(scheduled, 2, "expected exactly 2 busy → Scheduled");
+    }
+
+    #[test]
+    fn change_availability_response_carries_status_and_optional_status_info() {
+        let bare =
+            v201_change_availability_response(ChangeAvailabilityStatusEnumType::Accepted, None);
+        assert_eq!(bare.status, ChangeAvailabilityStatusEnumType::Accepted);
+        assert!(bare.status_info.is_none());
+
+        let info = StatusInfoType {
+            reason_code: "Deferred".to_string(),
+            additional_info: Some("availability change deferred until idle".to_string()),
+            custom_data: None,
+        };
+        let scheduled = v201_change_availability_response(
+            ChangeAvailabilityStatusEnumType::Scheduled,
+            Some(info),
+        );
+        assert_eq!(
+            scheduled.status,
+            ChangeAvailabilityStatusEnumType::Scheduled
+        );
+        assert_eq!(
+            scheduled
+                .status_info
+                .as_ref()
+                .map(|i| i.reason_code.as_str()),
+            Some("Deferred")
+        );
+    }
+
+    /// Wire fidelity: every built `ChangeAvailability.conf` — with and without
+    /// `statusInfo`, across all three status values — satisfies the bundled OCPP
+    /// 2.0.1 `ChangeAvailabilityResponse` JSON Schema, the same guarantee the
+    /// CP's version-aware validator gives on the live path.
+    #[test]
+    fn built_change_availability_responses_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        let info = StatusInfoType {
+            reason_code: "Deferred".to_string(),
+            additional_info: Some("availability change deferred until idle".to_string()),
+            custom_data: None,
+        };
+        for status in [
+            ChangeAvailabilityStatusEnumType::Accepted,
+            ChangeAvailabilityStatusEnumType::Rejected,
+            ChangeAvailabilityStatusEnumType::Scheduled,
+        ] {
+            for status_info in [None, Some(info.clone())] {
+                let resp = v201_change_availability_response(status, status_info);
+                let payload = serde_json::to_value(&resp).unwrap();
+                assert!(
+                    validator
+                        .validate_call_result("ChangeAvailability", &payload)
+                        .is_ok(),
+                    "built {status:?} ChangeAvailabilityResponse should be schema-valid, got: {payload}"
                 );
             }
         }
