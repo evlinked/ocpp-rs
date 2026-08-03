@@ -22,8 +22,8 @@ use ocpp_cp::{ChargePoint, ChargePointConfig};
 use ocpp_messages::v16j::RegistrationStatus;
 use ocpp_messages::v201::{
     BootNotificationRequest as V201BootNotificationRequest,
-    BootNotificationResponse as V201BootNotificationResponse, TransactionEventRequest,
-    TransactionEventResponse,
+    BootNotificationResponse as V201BootNotificationResponse, ResetRequest as V201ResetRequest,
+    TransactionEventRequest, TransactionEventResponse,
 };
 use ocpp_messages::ActionDispatcher;
 use ocpp_transport::server::OcppServer;
@@ -33,8 +33,8 @@ use ocpp_transport::{
 };
 use ocpp_types::common::Reason;
 use ocpp_types::v201::{
-    BootReasonEnumType, ReasonEnumType, RegistrationStatusEnumType, TransactionEventEnumType,
-    TriggerReasonEnumType,
+    BootReasonEnumType, ReasonEnumType, RegistrationStatusEnumType, ResetEnumType,
+    ResetStatusEnumType, TransactionEventEnumType, TriggerReasonEnumType,
 };
 use ocpp_types::{ConnectorId, OcppVersion};
 
@@ -247,6 +247,195 @@ async fn v201_boot_notification_carries_spec_shape_over_the_wire() {
         boot.charging_station.firmware_version.as_deref(),
         Some("1.0.0")
     );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// ---------------------------------------------------------------------------
+// OCPP 2.0.1 CSMS -> CP `Reset` (Issue #428, slice 4b): the CSMS initiates a
+// `Reset` CALL against a `for_version(V201)` CP over a real socket, exercising
+// the version-aware inbound dispatcher wired to the slice-4a decision logic
+// (`crates/ocpp-cp/src/v201_command.rs`, #427). A green run proves an inbound
+// 2.0.1 `Reset.req` routes to the v201 handler, returns a schema-valid
+// `Reset.conf`, and — for an accepted reset — actually drives the reset
+// side-effect through `perform_reset`.
+// ---------------------------------------------------------------------------
+
+/// Shared counter of `BootNotification`s the CSMS has received.
+type BootCount = Arc<std::sync::atomic::AtomicUsize>;
+
+/// Start an in-process 2.0.1 CSMS that counts every `BootNotification` it
+/// receives (still replying `Accepted`), on top of the default 2.0.1 lifecycle
+/// responders. Returns the server, its address, and the shared count. The count
+/// lets a test observe the reset side-effect: a soft reset re-runs the boot
+/// sequence, so a second `BootNotification` arrives on the same socket.
+async fn start_v201_csms_counting_boots() -> (OcppServer, SocketAddr, BootCount) {
+    let boots: BootCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let boots_for_handler = boots.clone();
+    let (server, addr) = start_v201_csms(move |dispatcher| {
+        let boots = boots_for_handler;
+        dispatcher.on(move |_req: V201BootNotificationRequest| {
+            let boots = boots.clone();
+            async move {
+                boots.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(V201BootNotificationResponse {
+                    current_time: chrono::Utc::now()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    interval: 300,
+                    status: RegistrationStatusEnumType::Accepted,
+                    status_info: None,
+                    custom_data: None,
+                })
+            }
+        });
+    })
+    .await;
+    (server, addr, boots)
+}
+
+/// Poll `boots` until it reaches at least `target`, or panic after ~5s. Used to
+/// wait for the reset's re-boot without a fixed sleep.
+async fn wait_for_boot_count(boots: &BootCount, target: usize) {
+    for _ in 0..250 {
+        if boots.load(std::sync::atomic::Ordering::SeqCst) >= target {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "timed out waiting for boot count to reach {target} (last saw {})",
+        boots.load(std::sync::atomic::Ordering::SeqCst)
+    );
+}
+
+#[tokio::test]
+async fn v201_reset_onidle_while_idle_is_accepted_and_reboots() {
+    let (mut server, addr, boots) = start_v201_csms_counting_boots().await;
+
+    let cp = ChargePoint::new(v201_cp_config(addr, "CP201_RESET_IDLE"))
+        .expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+    // connect() returns only after the first boot handshake completed.
+    assert_eq!(
+        boots.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "exactly one BootNotification before the reset"
+    );
+    assert!(server.is_cp_connected("CP201_RESET_IDLE"));
+
+    // CSMS -> CP: an `OnIdle` reset while the station is idle. The pure decision
+    // (slice 4a) returns `Accepted`, and the wiring drives `perform_reset` off
+    // the CALL path. `server.call` returns the typed `Reset.conf`.
+    let resp = server
+        .call::<V201ResetRequest>(
+            "CP201_RESET_IDLE",
+            V201ResetRequest {
+                kind: ResetEnumType::OnIdle,
+                evse_id: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS Reset call round-trips");
+    assert_eq!(
+        resp.status,
+        ResetStatusEnumType::Accepted,
+        "an OnIdle reset on an idle station is Accepted"
+    );
+
+    // The accepted reset maps `OnIdle -> Soft`, so `perform_reset` re-runs the
+    // boot sequence in place: a second BootNotification proves the side-effect
+    // fired (the CALLRESULT is flushed first, so this happens after the call).
+    wait_for_boot_count(&boots, 2).await;
+    assert!(
+        cp.is_connected().await,
+        "a soft reset reboots in place, so the CP stays connected"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_reset_onidle_while_charging_is_scheduled_and_does_not_interrupt() {
+    // A CSMS that records TransactionEvents (so a v201 charging session runs) and
+    // counts boots (so we can assert the deferred reset did NOT reboot yet).
+    let boots: BootCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let log: TxnLog = Arc::new(Mutex::new(Vec::new()));
+    let boots_for_handler = boots.clone();
+    let log_for_handler = log.clone();
+    let (mut server, addr) = start_v201_csms(move |dispatcher| {
+        let boots = boots_for_handler;
+        dispatcher.on(move |_req: V201BootNotificationRequest| {
+            let boots = boots.clone();
+            async move {
+                boots.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(V201BootNotificationResponse {
+                    current_time: chrono::Utc::now()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    interval: 300,
+                    status: RegistrationStatusEnumType::Accepted,
+                    status_info: None,
+                    custom_data: None,
+                })
+            }
+        });
+        let log = log_for_handler;
+        dispatcher.on(move |req: TransactionEventRequest| {
+            let log = log.clone();
+            async move {
+                log.lock().expect("txn log mutex not poisoned").push(req);
+                Ok(TransactionEventResponse::default())
+            }
+        });
+    })
+    .await;
+
+    let cp = ChargePoint::new(v201_cp_config(addr, "CP201_RESET_BUSY"))
+        .expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // Start a transaction so the station is no longer idle.
+    let connector = ConnectorId::new(1).unwrap();
+    let txn_id = cp
+        .start_transaction(connector, "RFID-CAFE", 1000)
+        .await
+        .expect("v201 start_transaction");
+    wait_for_event(&log, TransactionEventEnumType::Started).await;
+    let boots_before = boots.load(std::sync::atomic::Ordering::SeqCst);
+
+    // CSMS -> CP: an `OnIdle` reset while a transaction is in progress. The pure
+    // decision returns `Scheduled` (accept but defer until idle); the wiring
+    // queues no side-effect, so the live session is untouched.
+    let resp = server
+        .call::<V201ResetRequest>(
+            "CP201_RESET_BUSY",
+            V201ResetRequest {
+                kind: ResetEnumType::OnIdle,
+                evse_id: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS Reset call round-trips");
+    assert_eq!(
+        resp.status,
+        ResetStatusEnumType::Scheduled,
+        "an OnIdle reset during a transaction is Scheduled (deferred)"
+    );
+
+    // The Scheduled reset must not have rebooted the station or torn down the
+    // transaction: stopping it still succeeds (it is still active), which it
+    // would not if the reset had force-stopped it.
+    assert_eq!(
+        boots.load(std::sync::atomic::Ordering::SeqCst),
+        boots_before,
+        "a Scheduled reset does not reboot while the transaction is live"
+    );
+    cp.stop_transaction(txn_id, 2000, Reason::EVDisconnected)
+        .await
+        .expect("the still-live transaction stops normally after a Scheduled reset");
 
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");
