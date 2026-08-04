@@ -75,6 +75,7 @@ use ocpp_messages::v201::{
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     ResetRequest as V201ResetRequest, StatusNotificationRequest as V201StatusNotificationRequest,
     TriggerMessageRequest as V201TriggerMessageRequest,
+    UnlockConnectorRequest as V201UnlockConnectorRequest,
 };
 use ocpp_types::v201::{
     AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType, ConnectorStatusEnumType,
@@ -1719,6 +1720,82 @@ impl ChargePoint {
                         },
                     };
                     Ok(UnlockConnectorResponse { status })
+                }
+            });
+        }
+
+        // UnlockConnector (OCPP 2.0.1 Part 2) — the 2.0.1 successor to the 1.6J
+        // `UnlockConnector` handler above. Both dialects name the action
+        // `"UnlockConnector"`, so — like the Reset / TriggerMessage /
+        // ChangeAvailability splits, and unlike RequestStartTransaction (a
+        // distinct action name) — this is registered as exactly one handler per
+        // `protocol_version`: the 1.6J handler stays byte-for-byte on the default
+        // arm, and this V201 handler is added only on the `V201` arm. The pure
+        // Unlocked / UnlockFailed / OngoingAuthorizedTransaction / UnknownConnector
+        // decision + response builder live in `v201_command` (slice 8a, #440);
+        // this is the runtime wiring (slice 8b, #446).
+        //
+        // Where 1.6J addressed a flat `connectorId`, 2.0.1 names both `evseId` and
+        // `connectorId`. On the simulator's flat single-connector-EVSE topology an
+        // `evseId` maps to the same-valued connector (the slice-2 StatusNotification
+        // convention, `evseId = connector_id, connectorId = 1`), and each EVSE has
+        // exactly one connector — so a `connectorId` other than 1 addresses a
+        // connector-within-EVSE that does not exist and is `UnknownConnector`.
+        //
+        // No off-CALL-path side effect: 2.0.1 gained the `OngoingAuthorizedTransaction`
+        // status precisely so the station *refuses* to release the cable while a
+        // session is live, rather than force-stopping the transaction first as the
+        // 1.6J handler does (1.6J has no such status). The pure decision therefore
+        // maps any live transaction on the target to `OngoingAuthorizedTransaction`
+        // (no unlock), and an idle connector has no transaction to stop — so unlike
+        // the 1.6J handler this arm queues no `RemoteCommand`. Reintroducing a
+        // stop-then-unlock path would need an "authorized-vs-stoppable transaction"
+        // policy seam on the pure `v201_command` signature; tracked as a follow-up
+        // rather than dead code here. Ports `@on('UnlockConnector')` from the
+        // Python reference's 2.0.1 charge point.
+        if protocol_version == OcppVersion::V201 {
+            let connectors = connectors.clone();
+            let active_transactions = active_transactions.clone();
+            d.on(move |req: V201UnlockConnectorRequest| {
+                let connectors = connectors.clone();
+                let active_transactions = active_transactions.clone();
+                async move {
+                    // Resolve the target to a live connector. Only `connectorId == 1`
+                    // (the single connector within each EVSE) can map to a real
+                    // connector; the `evseId` then selects the same-valued
+                    // `ConnectorId`. A non-1 connectorId, or an evseId that is 0 /
+                    // negative / out of range / unmapped, leaves the target unknown.
+                    // Structural guards for ids below 1 also live inside the pure
+                    // decision, so feeding `connector_known == false` for those is
+                    // consistent either way.
+                    let (connector_known, transaction_active) = match (req.connector_id == 1)
+                        .then(|| {
+                            u32::try_from(req.evse_id)
+                                .ok()
+                                .and_then(|v| ConnectorId::new(v).ok())
+                        })
+                        .flatten()
+                    {
+                        Some(cid) => {
+                            let known = connectors.read().await.contains_key(&cid);
+                            // Only scan for a live transaction on a connector this CP
+                            // actually has; the map is keyed by transaction id, so
+                            // match on the connector value.
+                            let active = known
+                                && active_transactions.read().await.values().any(|c| *c == cid);
+                            (known, active)
+                        }
+                        None => (false, false),
+                    };
+
+                    let status = v201_command::v201_unlock_status(
+                        req.evse_id,
+                        req.connector_id,
+                        connector_known,
+                        transaction_active,
+                        unlock_outcome,
+                    );
+                    Ok(v201_command::v201_unlock_response(status, None))
                 }
             });
         }

@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ocpp_cp::{ChargePoint, ChargePointConfig};
+use ocpp_cp::{ChargePoint, ChargePointConfig, UnlockConnectorOutcome};
 use ocpp_messages::v16j::RegistrationStatus;
 use ocpp_messages::v201::{
     BootNotificationRequest as V201BootNotificationRequest,
@@ -29,6 +29,7 @@ use ocpp_messages::v201::{
     ResetRequest as V201ResetRequest, StatusNotificationRequest as V201StatusNotificationRequest,
     StatusNotificationResponse as V201StatusNotificationResponse, TransactionEventRequest,
     TransactionEventResponse, TriggerMessageRequest as V201TriggerMessageRequest,
+    UnlockConnectorRequest as V201UnlockConnectorRequest,
 };
 use ocpp_messages::ActionDispatcher;
 use ocpp_transport::server::OcppServer;
@@ -42,7 +43,7 @@ use ocpp_types::v201::{
     IdTokenEnumType, IdTokenType, MessageTriggerEnumType, OperationalStatusEnumType,
     ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType,
     RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType, TransactionEventEnumType,
-    TriggerMessageStatusEnumType, TriggerReasonEnumType,
+    TriggerMessageStatusEnumType, TriggerReasonEnumType, UnlockStatusEnumType,
 };
 use ocpp_types::{ConnectorId, OcppVersion};
 
@@ -1481,6 +1482,222 @@ async fn v201_request_start_transaction_for_an_unknown_evse_is_rejected() {
         started_count(&log),
         0,
         "an unknown EVSE begins no transaction"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+/// Count the `Ended` TransactionEvents recorded so far — used to assert a refused
+/// unlock leaves a live transaction running (no stop was queued).
+fn ended_count(log: &TxnLog) -> usize {
+    log.lock()
+        .expect("txn log mutex not poisoned")
+        .iter()
+        .filter(|e| e.event_type == TransactionEventEnumType::Ended)
+        .count()
+}
+
+/// A 2.0.1 config whose connector lock reports `outcome`, so the wired
+/// `UnlockConnector` handler can be exercised against each mechanical result.
+fn v201_unlock_cp_config(
+    addr: SocketAddr,
+    id: &str,
+    outcome: UnlockConnectorOutcome,
+) -> ChargePointConfig {
+    ChargePointConfig {
+        unlock_connector_outcome: outcome,
+        ..v201_cp_config(addr, id)
+    }
+}
+
+#[tokio::test]
+async fn v201_unlock_connector_idle_connector_is_unlocked() {
+    let (mut server, addr) = start_v201_csms(|_| {}).await;
+
+    let cp =
+        ChargePoint::new(v201_cp_config(addr, "CP201_UNLOCK_OK")).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // CSMS -> CP: unlock the idle EVSE 1 / connector 1. With the default `Unlock`
+    // lock capability and no live transaction, the pure decision releases the
+    // cable → `Unlocked`.
+    let resp = server
+        .call::<V201UnlockConnectorRequest>(
+            "CP201_UNLOCK_OK",
+            V201UnlockConnectorRequest {
+                evse_id: 1,
+                connector_id: 1,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS UnlockConnector call round-trips");
+    assert_eq!(
+        resp.status,
+        UnlockStatusEnumType::Unlocked,
+        "an idle connector with a controllable lock is Unlocked"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_unlock_connector_reports_the_mechanical_unlock_failure() {
+    let (mut server, addr) = start_v201_csms(|_| {}).await;
+
+    // A CP whose lock will not release mechanically. 2.0.1 has no `NotSupported`
+    // status, so both `UnlockFailed` and `NotSupported` lock capabilities fold to
+    // `UnlockFailed`; this exercises the `UnlockFailed` capability.
+    let cp = ChargePoint::new(v201_unlock_cp_config(
+        addr,
+        "CP201_UNLOCK_FAIL",
+        UnlockConnectorOutcome::UnlockFailed,
+    ))
+    .expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    let resp = server
+        .call::<V201UnlockConnectorRequest>(
+            "CP201_UNLOCK_FAIL",
+            V201UnlockConnectorRequest {
+                evse_id: 1,
+                connector_id: 1,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS UnlockConnector call round-trips");
+    assert_eq!(
+        resp.status,
+        UnlockStatusEnumType::UnlockFailed,
+        "a connector whose lock will not release reports UnlockFailed"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_unlock_connector_with_a_live_transaction_is_refused_and_does_not_stop_it() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    // A long meter interval so the only events on the log are the ones the test
+    // drives — no periodic `Updated` noise, and crucially no spurious `Ended`.
+    let config = ChargePointConfig {
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_UNLOCK_BUSY")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // Occupy EVSE 1 with a live local transaction. Waiting on the Started event
+    // guarantees the transaction is registered before the unlock below reads it.
+    let connector = ConnectorId::new(1).unwrap();
+    let txn_id = cp
+        .start_transaction(connector, "RFID-LOCAL", 0)
+        .await
+        .expect("v201 start_transaction");
+    wait_for_event(&log, TransactionEventEnumType::Started).await;
+
+    // CSMS -> CP: unlock the connector that still has an authorized session. 2.0.1
+    // refuses to release the cable → `OngoingAuthorizedTransaction`, and (unlike
+    // 1.6J) does not stop the transaction first.
+    let resp = server
+        .call::<V201UnlockConnectorRequest>(
+            "CP201_UNLOCK_BUSY",
+            V201UnlockConnectorRequest {
+                evse_id: 1,
+                connector_id: 1,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS UnlockConnector call round-trips");
+    assert_eq!(
+        resp.status,
+        UnlockStatusEnumType::OngoingAuthorizedTransaction,
+        "unlocking a connector with a live authorized transaction is refused"
+    );
+
+    // The refusal must not have stopped the transaction. Give any erroneously
+    // queued stop time to land before asserting the negative.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        ended_count(&log),
+        0,
+        "a refused unlock leaves the transaction running (no Ended event)"
+    );
+
+    // The transaction is still stoppable through the normal path — proof it was
+    // genuinely left alive.
+    cp.stop_transaction(txn_id, 0, Reason::EVDisconnected)
+        .await
+        .expect("the still-live transaction stops normally");
+    wait_for_event(&log, TransactionEventEnumType::Ended).await;
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_unlock_connector_for_an_unknown_evse_is_unknown_connector() {
+    let (mut server, addr) = start_v201_csms(|_| {}).await;
+
+    let cp = ChargePoint::new(v201_cp_config(addr, "CP201_UNLOCK_UNKNOWN_EVSE"))
+        .expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // CSMS -> CP: target an EVSE this CP does not have (the default config has 2
+    // connectors, so EVSE 99 is out of range) → `UnknownConnector`.
+    let resp = server
+        .call::<V201UnlockConnectorRequest>(
+            "CP201_UNLOCK_UNKNOWN_EVSE",
+            V201UnlockConnectorRequest {
+                evse_id: 99,
+                connector_id: 1,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS UnlockConnector call round-trips");
+    assert_eq!(
+        resp.status,
+        UnlockStatusEnumType::UnknownConnector,
+        "an out-of-range EVSE target is UnknownConnector"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_unlock_connector_for_a_nonexistent_connector_within_an_evse_is_unknown_connector() {
+    let (mut server, addr) = start_v201_csms(|_| {}).await;
+
+    let cp = ChargePoint::new(v201_cp_config(addr, "CP201_UNLOCK_UNKNOWN_CONN"))
+        .expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // CSMS -> CP: EVSE 1 exists, but on the flat single-connector-EVSE topology it
+    // has exactly one connector (connectorId 1). Connector 2 within EVSE 1 does
+    // not exist → `UnknownConnector`.
+    let resp = server
+        .call::<V201UnlockConnectorRequest>(
+            "CP201_UNLOCK_UNKNOWN_CONN",
+            V201UnlockConnectorRequest {
+                evse_id: 1,
+                connector_id: 2,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS UnlockConnector call round-trips");
+    assert_eq!(
+        resp.status,
+        UnlockStatusEnumType::UnknownConnector,
+        "a connectorId with no matching connector within the EVSE is UnknownConnector"
     );
 
     cp.disconnect().await.expect("disconnect");
