@@ -81,12 +81,12 @@ use ocpp_types::v201::{
     AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType, ChargingProfilePurposeEnumType,
     ConnectorStatusEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
     RegistrationStatusEnumType, RequestStartStopStatusEnumType, ResetStatusEnumType,
-    StatusInfoType, TriggerMessageStatusEnumType,
+    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
@@ -755,6 +755,19 @@ struct V201Session {
     /// `Ended` event each `fetch_add(1)` to claim the next value, so `seqNo`
     /// is strictly increasing across the whole transaction.
     next_seq_no: Arc<AtomicI32>,
+    /// Whether the session's `idToken` is still authorized. `true` at start
+    /// (a transaction only opens on an accepted authorization) and flipped to
+    /// `false` by [`ChargePoint::deauthorize`] when the driver/app stops
+    /// authorizing the session (the 2.0.1 deauthorization event).
+    ///
+    /// This is the "authorized-vs-stoppable" bit `UnlockConnector` consults:
+    /// per OCPP 2.0.1 the station refuses to release the cable
+    /// (`OngoingAuthorizedTransaction`) only while the session is *still
+    /// authorized*; once deauthorized the cable may be released, stopping the
+    /// transaction first (reason `UnlockCommand`). An explicit per-session flag
+    /// — not the volatile auth cache — because a remotely-started transaction
+    /// may hold no cache entry and cache *expiry* is not *deauthorization*.
+    authorized: Arc<AtomicBool>,
 }
 
 /// Main charge point implementation
@@ -983,6 +996,12 @@ impl ChargePoint {
         let pending_v201_availability: Arc<RwLock<Option<PendingAvailability>>> =
             Arc::new(RwLock::new(None));
 
+        // Shared into the dispatcher (the V201 `UnlockConnector` handler reads a
+        // live session's `authorized` bit) and kept on the CP (the metering
+        // sampler, `stop_transaction`, and `deauthorize` own it).
+        let v201_sessions: Arc<RwLock<HashMap<i32, V201Session>>> =
+            Arc::new(RwLock::new(HashMap::new()));
+
         // Wrap the shared state the default handlers need *before* building the
         // dispatcher: RemoteStart/RemoteStop consult live connector status and
         // the active-transaction map to answer Accepted/Rejected faithfully.
@@ -1009,6 +1028,7 @@ impl ChargePoint {
             command_sender.clone(),
             connectors.clone(),
             active_transactions.clone(),
+            v201_sessions.clone(),
             reservations.clone(),
             charging_profiles.clone(),
             expiry_timers.clone(),
@@ -1039,7 +1059,7 @@ impl ChargePoint {
             pending_v201_availability,
             command_sender,
             next_v201_transaction_id: Arc::new(AtomicI32::new(1)),
-            v201_sessions: Arc::new(RwLock::new(HashMap::new())),
+            v201_sessions,
             reservations,
             expiry_timers,
             validator,
@@ -1073,6 +1093,7 @@ impl ChargePoint {
         command_sender: mpsc::UnboundedSender<RemoteCommand>,
         connectors: Arc<RwLock<HashMap<ConnectorId, Connector>>>,
         active_transactions: Arc<RwLock<HashMap<i32, ConnectorId>>>,
+        v201_sessions: Arc<RwLock<HashMap<i32, V201Session>>>,
         reservations: Arc<RwLock<HashMap<i32, ConnectorId>>>,
         charging_profiles: Arc<ChargingProfileStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
@@ -1790,23 +1811,31 @@ impl ChargePoint {
         // exactly one connector — so a `connectorId` other than 1 addresses a
         // connector-within-EVSE that does not exist and is `UnknownConnector`.
         //
-        // No off-CALL-path side effect: 2.0.1 gained the `OngoingAuthorizedTransaction`
-        // status precisely so the station *refuses* to release the cable while a
-        // session is live, rather than force-stopping the transaction first as the
-        // 1.6J handler does (1.6J has no such status). The pure decision therefore
-        // maps any live transaction on the target to `OngoingAuthorizedTransaction`
-        // (no unlock), and an idle connector has no transaction to stop — so unlike
-        // the 1.6J handler this arm queues no `RemoteCommand`. Reintroducing a
-        // stop-then-unlock path would need an "authorized-vs-stoppable transaction"
-        // policy seam on the pure `v201_command` signature; tracked as a follow-up
-        // rather than dead code here. Ports `@on('UnlockConnector')` from the
+        // 2.0.1 gained the `OngoingAuthorizedTransaction` status precisely so the
+        // station *refuses* to release the cable while a session is *still
+        // authorized*, rather than force-stopping it as the 1.6J handler always
+        // does (1.6J has no such status). So a live, still-authorized transaction
+        // on the target maps to `OngoingAuthorizedTransaction` (no unlock).
+        //
+        // A live but *deauthorized* transaction (`deauthorize`, e.g. the driver
+        // re-presented their card / the app revoked authorization) is instead
+        // *stoppable*: like the 1.6J handler, this arm stops it first
+        // (`StopTransaction`, reason `UnlockCommand`) via the shared
+        // `RemoteCommand::UnlockConnector` path — off the inbound-CALL path, the
+        // CALLRESULT flushed before the consumer runs (Issue #55) — then reports
+        // the mechanical outcome. An idle connector has nothing to stop and takes
+        // the mechanical outcome directly. Ports `@on('UnlockConnector')` from the
         // Python reference's 2.0.1 charge point.
         if protocol_version == OcppVersion::V201 {
             let connectors = connectors.clone();
             let active_transactions = active_transactions.clone();
+            let v201_sessions = v201_sessions.clone();
+            let command_sender = command_sender.clone();
             d.on(move |req: V201UnlockConnectorRequest| {
                 let connectors = connectors.clone();
                 let active_transactions = active_transactions.clone();
+                let v201_sessions = v201_sessions.clone();
+                let command_sender = command_sender.clone();
                 async move {
                     // Resolve the target to a live connector. Only `connectorId == 1`
                     // (the single connector within each EVSE) can map to a real
@@ -1816,33 +1845,79 @@ impl ChargePoint {
                     // Structural guards for ids below 1 also live inside the pure
                     // decision, so feeding `connector_known == false` for those is
                     // consistent either way.
-                    let (connector_known, transaction_active) = match (req.connector_id == 1)
+                    let target_cid = (req.connector_id == 1)
                         .then(|| {
                             u32::try_from(req.evse_id)
                                 .ok()
                                 .and_then(|v| ConnectorId::new(v).ok())
                         })
-                        .flatten()
-                    {
+                        .flatten();
+
+                    // `(known, live transaction id on it, still-authorized?)`. Only
+                    // scan for a live transaction on a connector this CP actually
+                    // has; `active_transactions` is keyed by transaction id, so
+                    // match on the connector value.
+                    let (connector_known, live_txn, transaction_authorized) = match target_cid {
                         Some(cid) => {
                             let known = connectors.read().await.contains_key(&cid);
-                            // Only scan for a live transaction on a connector this CP
-                            // actually has; the map is keyed by transaction id, so
-                            // match on the connector value.
-                            let active = known
-                                && active_transactions.read().await.values().any(|c| *c == cid);
-                            (known, active)
+                            let live_txn = if known {
+                                active_transactions
+                                    .read()
+                                    .await
+                                    .iter()
+                                    .find_map(|(tid, c)| (*c == cid).then_some(*tid))
+                            } else {
+                                None
+                            };
+                            // A live transaction is "still authorized" unless it was
+                            // explicitly deauthorized. A *missing* session (a
+                            // transaction being torn down concurrently) is treated as
+                            // still authorized: refuse rather than race a redundant
+                            // force-stop against its own stop.
+                            let authorized = match live_txn {
+                                Some(tid) => v201_sessions
+                                    .read()
+                                    .await
+                                    .get(&tid)
+                                    .is_none_or(|s| s.authorized.load(Ordering::SeqCst)),
+                                None => false,
+                            };
+                            (known, live_txn, authorized)
                         }
-                        None => (false, false),
+                        None => (false, None, false),
                     };
 
-                    let status = v201_command::v201_unlock_status(
+                    let transaction_active = live_txn.is_some();
+                    let mut status = v201_command::v201_unlock_status(
                         req.evse_id,
                         req.connector_id,
                         connector_known,
                         transaction_active,
+                        transaction_authorized,
                         unlock_outcome,
                     );
+
+                    // Stoppable transaction the station is about to release: stop it
+                    // first (reason `UnlockCommand`) off the CALL path, mirroring the
+                    // 1.6J stop-then-unlock. A failed enqueue (consumer gone) downgrades
+                    // to `UnlockFailed` rather than claim a release we cannot complete.
+                    // Guarded by `status == Unlocked`, so a mechanical `UnlockFailed`
+                    // leaves the transaction untouched, and an idle connector (no
+                    // `live_txn`) queues nothing.
+                    if status == UnlockStatusEnumType::Unlocked {
+                        if let (Some(cid), Some(transaction_id)) = (target_cid, live_txn) {
+                            if command_sender
+                                .send(RemoteCommand::UnlockConnector {
+                                    connector_id: cid,
+                                    transaction_id,
+                                })
+                                .is_err()
+                            {
+                                status = UnlockStatusEnumType::UnlockFailed;
+                            }
+                        }
+                    }
+
                     Ok(v201_command::v201_unlock_response(status, None))
                 }
             });
@@ -3332,11 +3407,43 @@ impl ChargePoint {
                     V201Session {
                         id_tag: id_tag.to_string(),
                         next_seq_no: Arc::new(AtomicI32::new(1)),
+                        authorized: Arc::new(AtomicBool::new(true)),
                     },
                 );
                 Ok(transaction_id)
             }
         }
+    }
+
+    /// Deauthorize every live 2.0.1 session started by `id_tag`, returning how
+    /// many were flipped.
+    ///
+    /// Models the OCPP 2.0.1 deauthorization event — the driver re-presents
+    /// their card, or the app/CSMS revokes authorization — after which the
+    /// session is no longer *authorized* but its cable may still be latched. It
+    /// is the local-driver simulation counterpart to [`authorize`](Self::authorize)
+    /// / [`start_transaction`](Self::start_transaction): a way to drive the
+    /// "stopped authorizing" transition the simulator otherwise has no input
+    /// for.
+    ///
+    /// The one behavior this unblocks is `UnlockConnector`: a still-authorized
+    /// session refuses the unlock (`OngoingAuthorizedTransaction`); once
+    /// deauthorized, an inbound `UnlockConnector` stops the transaction first
+    /// (reason `UnlockCommand`) and releases the cable. No-op on the 1.6J path
+    /// (which has no `V201Session`).
+    pub async fn deauthorize(&self, id_tag: &str) -> usize {
+        let sessions = self.v201_sessions.read().await;
+        let mut flipped = 0;
+        for session in sessions.values() {
+            if session.id_tag == id_tag {
+                // Release-then-acquire so the unlock handler that later reads
+                // this flag sees a consistent view; a plain `store` suffices
+                // since the flag only ever moves authorized → deauthorized.
+                session.authorized.store(false, Ordering::SeqCst);
+                flipped += 1;
+            }
+        }
+        flipped
     }
 
     /// Open a charging transaction on `connector_id`, transition it to

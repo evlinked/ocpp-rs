@@ -79,8 +79,12 @@
 //! [`UnlockConnectorOutcome`] seam the 1.6J handler
 //! already uses. Note 2.0.1's `UnlockStatusEnumType` drops 1.6J's `NotSupported`,
 //! so a connector with no controllable lock folds to `UnlockFailed` here (see
-//! [`v201_unlock_status`]). Stopping any live transaction first (reason
-//! `UnlockCommand`) and driving the actuator is the slice-8b wiring layer's job.
+//! [`v201_unlock_status`]). The refusal is scoped to a *still-authorized*
+//! session: a live-but-deauthorized transaction is instead stoppable, and the
+//! wiring layer stops it first (reason `UnlockCommand`) before releasing the
+//! cable — mirroring the 1.6J stop-then-unlock. Resolving the target against the
+//! live topology, reading authorization state, and driving the actuator off the
+//! CALL path is the wiring layer's job.
 
 use ocpp_types::common::Reason;
 use ocpp_types::v16j::ResetType;
@@ -429,13 +433,21 @@ pub fn v201_request_start_response(
 ///   [`UnknownConnector`](UnlockStatusEnumType::UnknownConnector), the 2.0.1
 ///   analogue of the 1.6J "connector this CP does not have" arm (which, lacking a
 ///   dedicated status, answered `UnlockFailed`).
-/// - **Ongoing authorized transaction** — a live transaction is still authorized
-///   on the targeted connector, so the cable must not be released →
+/// - **Ongoing authorized transaction** — a live transaction that is *still
+///   authorized* (`transaction_active && transaction_authorized`) on the
+///   targeted connector, so the cable must not be released →
 ///   [`OngoingAuthorizedTransaction`](UnlockStatusEnumType::OngoingAuthorizedTransaction).
-///   This is a 2.0.1 refinement with no 1.6J equivalent: the 1.6J handler *stops*
-///   the transaction first and then unlocks, whereas 2.0.1 gives the station an
-///   explicit "refused, a session is still authorized here" verdict.
-/// - **Otherwise** — the injected mechanical outcome decides:
+///   This is a 2.0.1 refinement with no 1.6J equivalent: the 1.6J handler *always*
+///   stops the transaction first and then unlocks, whereas 2.0.1 gives the station
+///   an explicit "refused, a session is still authorized here" verdict.
+/// - **Stoppable transaction** — a live transaction whose id token is *no longer*
+///   authorized (`transaction_active && !transaction_authorized`; e.g. the driver
+///   re-presented their card, or the app/CSMS deauthorized) falls through to the
+///   mechanical outcome below. Per OCPP 2.0.1 the station may then release the
+///   cable; the wiring layer stops the transaction first (reason `UnlockCommand`),
+///   mirroring the 1.6J stop-then-unlock, and reports the mechanical result.
+/// - **Otherwise** — an idle connector, or the stoppable case above; the injected
+///   mechanical outcome decides:
 ///   [`Unlock`](UnlockConnectorOutcome::Unlock) →
 ///   [`Unlocked`](UnlockStatusEnumType::Unlocked), and both
 ///   [`UnlockFailed`](UnlockConnectorOutcome::UnlockFailed) and
@@ -446,18 +458,20 @@ pub fn v201_request_start_response(
 ///   "could not release the cable" verdict `UnlockFailed` — the one place the
 ///   shared [`UnlockConnectorOutcome`] seam maps differently across versions.
 ///
-/// This is the *pure* decision, depending only on the request target and two
-/// plain-`bool` reads (knownness, transaction activity) plus the outcome seam —
-/// no runtime handles, so it is unit-testable in isolation. Resolving the target
-/// against the live connector topology, reading transaction state, stopping any
-/// live transaction (reason `UnlockCommand`), and driving the actuator off the
-/// CALL path is the slice-8b wiring layer's job.
+/// This is the *pure* decision, depending only on the request target and three
+/// plain-`bool` reads (knownness, transaction activity, transaction
+/// authorization) plus the outcome seam — no runtime handles, so it is
+/// unit-testable in isolation. Resolving the target against the live connector
+/// topology, reading transaction + authorization state, stopping a stoppable
+/// transaction (reason `UnlockCommand`), and driving the actuator off the CALL
+/// path is the wiring layer's job.
 #[must_use]
 pub fn v201_unlock_status(
     evse_id: i32,
     connector_id: i32,
     connector_known: bool,
     transaction_active: bool,
+    transaction_authorized: bool,
     outcome: UnlockConnectorOutcome,
 ) -> UnlockStatusEnumType {
     // Structural: 2.0.1 evse/connector ids are 1-based; a value below 1 addresses
@@ -471,12 +485,17 @@ pub fn v201_unlock_status(
     if !connector_known {
         return UnlockStatusEnumType::UnknownConnector;
     }
-    // A session is still authorized on the connector: refuse to release the cable.
-    if transaction_active {
+    // A session that is *still authorized* on the connector: refuse to release
+    // the cable. A live-but-*deauthorized* transaction (the driver/app stopped
+    // authorizing) is instead *stoppable* — it falls through to the mechanical
+    // outcome, and the wiring layer stops it first (reason `UnlockCommand`)
+    // before releasing, exactly as the 1.6J handler stops-then-unlocks.
+    if transaction_active && transaction_authorized {
         return UnlockStatusEnumType::OngoingAuthorizedTransaction;
     }
-    // Otherwise the mechanical actuator outcome decides. 2.0.1 has no
-    // `NotSupported`, so an uncontrollable lock folds to `UnlockFailed`.
+    // Otherwise — an idle connector, or a live-but-stoppable one — the mechanical
+    // actuator outcome decides. 2.0.1 has no `NotSupported`, so an uncontrollable
+    // lock folds to `UnlockFailed`.
     match outcome {
         UnlockConnectorOutcome::Unlock => UnlockStatusEnumType::Unlocked,
         UnlockConnectorOutcome::UnlockFailed | UnlockConnectorOutcome::NotSupported => {
@@ -1016,11 +1035,18 @@ mod tests {
     #[test]
     fn unlock_known_idle_connector_follows_mechanical_outcome() {
         assert_eq!(
-            v201_unlock_status(1, 1, true, false, UnlockConnectorOutcome::Unlock),
+            v201_unlock_status(1, 1, true, false, false, UnlockConnectorOutcome::Unlock),
             UnlockStatusEnumType::Unlocked
         );
         assert_eq!(
-            v201_unlock_status(1, 1, true, false, UnlockConnectorOutcome::UnlockFailed),
+            v201_unlock_status(
+                1,
+                1,
+                true,
+                false,
+                false,
+                UnlockConnectorOutcome::UnlockFailed
+            ),
             UnlockStatusEnumType::UnlockFailed
         );
     }
@@ -1032,14 +1058,21 @@ mod tests {
     #[test]
     fn unlock_not_supported_outcome_folds_to_unlock_failed_in_v201() {
         assert_eq!(
-            v201_unlock_status(1, 1, true, false, UnlockConnectorOutcome::NotSupported),
+            v201_unlock_status(
+                1,
+                1,
+                true,
+                false,
+                false,
+                UnlockConnectorOutcome::NotSupported
+            ),
             UnlockStatusEnumType::UnlockFailed
         );
     }
 
-    /// A live authorized transaction on the targeted connector refuses the unlock
-    /// with `OngoingAuthorizedTransaction`, independent of the mechanical outcome
-    /// (the cable must not be released while a session is authorized).
+    /// A live *authorized* transaction on the targeted connector refuses the
+    /// unlock with `OngoingAuthorizedTransaction`, independent of the mechanical
+    /// outcome (the cable must not be released while a session is authorized).
     #[test]
     fn unlock_is_refused_while_a_transaction_is_authorized() {
         for outcome in [
@@ -1048,11 +1081,49 @@ mod tests {
             UnlockConnectorOutcome::NotSupported,
         ] {
             assert_eq!(
-                v201_unlock_status(1, 1, true, true, outcome),
+                v201_unlock_status(1, 1, true, true, true, outcome),
                 UnlockStatusEnumType::OngoingAuthorizedTransaction,
-                "{outcome:?} on a busy connector must be OngoingAuthorizedTransaction"
+                "{outcome:?} on a connector with a still-authorized transaction \
+                 must be OngoingAuthorizedTransaction"
             );
         }
+    }
+
+    /// A live but *deauthorized* (stoppable) transaction no longer refuses: the
+    /// station releases the cable per the mechanical outcome, exactly as an idle
+    /// connector would. The wiring layer stops it first (reason `UnlockCommand`);
+    /// the pure decision only reports the mechanical result.
+    #[test]
+    fn unlock_of_a_deauthorized_transaction_follows_mechanical_outcome() {
+        assert_eq!(
+            v201_unlock_status(1, 1, true, true, false, UnlockConnectorOutcome::Unlock),
+            UnlockStatusEnumType::Unlocked,
+            "a deauthorized (stoppable) transaction releases the cable"
+        );
+        assert_eq!(
+            v201_unlock_status(
+                1,
+                1,
+                true,
+                true,
+                false,
+                UnlockConnectorOutcome::UnlockFailed
+            ),
+            UnlockStatusEnumType::UnlockFailed,
+            "a stoppable transaction still surfaces a mechanical unlock failure"
+        );
+        // 2.0.1 has no `NotSupported`: it folds to `UnlockFailed` here too.
+        assert_eq!(
+            v201_unlock_status(
+                1,
+                1,
+                true,
+                true,
+                false,
+                UnlockConnectorOutcome::NotSupported
+            ),
+            UnlockStatusEnumType::UnlockFailed
+        );
     }
 
     /// A structurally-valid id the station has no connector for
@@ -1068,7 +1139,7 @@ mod tests {
                 UnlockConnectorOutcome::NotSupported,
             ] {
                 assert_eq!(
-                    v201_unlock_status(9, 1, false, transaction_active, outcome),
+                    v201_unlock_status(9, 1, false, transaction_active, true, outcome),
                     UnlockStatusEnumType::UnknownConnector,
                     "an unmapped (evse=9) target must be UnknownConnector \
                      (transaction_active={transaction_active}, {outcome:?})"
@@ -1089,6 +1160,7 @@ mod tests {
                     evse_id,
                     connector_id,
                     true,
+                    false,
                     false,
                     UnlockConnectorOutcome::Unlock
                 ),
