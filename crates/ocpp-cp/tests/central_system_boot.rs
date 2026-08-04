@@ -26,6 +26,7 @@ use ocpp_messages::v201::{
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
     MeterValuesRequest as V201MeterValuesRequest, MeterValuesResponse as V201MeterValuesResponse,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
+    RequestStopTransactionRequest as V201RequestStopTransactionRequest,
     ResetRequest as V201ResetRequest, StatusNotificationRequest as V201StatusNotificationRequest,
     StatusNotificationResponse as V201StatusNotificationResponse, TransactionEventRequest,
     TransactionEventResponse, TriggerMessageRequest as V201TriggerMessageRequest,
@@ -1676,6 +1677,195 @@ async fn v201_request_start_transaction_with_a_non_txprofile_charging_profile_is
         started_count(&log),
         0,
         "a rejected malformed-profile start begins no transaction"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// ---------------------------------------------------------------------------
+// RequestStopTransaction (Issue #452, slice 9): wiring the 2.0.1 successor to
+// 1.6J `RemoteStopTransaction` through the live inbound dispatcher. The CSMS
+// names a running transaction by its `transactionId`; the station answers
+// Accepted iff that id matches a live transaction and then ends it off the
+// inbound-CALL path, emitting a `TransactionEvent(Ended)` with `stoppedReason`
+// = `Remote` / `triggerReason` = `RemoteStop`. An unknown id, or an idle
+// station, is Rejected and ends nothing.
+// ---------------------------------------------------------------------------
+
+/// The `transactionId` string the station put on its first recorded event of
+/// `event_type` (e.g. the `Started` event). Panics if no such event exists yet.
+fn recorded_transaction_id(log: &TxnLog, event_type: TransactionEventEnumType) -> String {
+    log.lock()
+        .expect("txn log mutex not poisoned")
+        .iter()
+        .find(|e| e.event_type == event_type)
+        .map(|e| e.transaction_info.transaction_id.clone())
+        .unwrap_or_else(|| panic!("no {event_type:?} event recorded yet"))
+}
+
+/// Count the recorded events of `event_type`.
+fn event_count(log: &TxnLog, event_type: TransactionEventEnumType) -> usize {
+    log.lock()
+        .expect("txn log mutex not poisoned")
+        .iter()
+        .filter(|e| e.event_type == event_type)
+        .count()
+}
+
+#[tokio::test]
+async fn v201_request_stop_transaction_accepted_stops_the_live_transaction() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    // Long meter interval so the only events are Started and Ended — keeps the
+    // Ended assertion unambiguous (no periodic Updated noise).
+    let config = ChargePointConfig {
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_REQSTOP")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // Bring a transaction up on EVSE 1 and learn the station-minted id from the
+    // Started event (waiting on it guarantees the transaction is live before the
+    // remote stop reads the transaction table).
+    let connector = ConnectorId::new(1).unwrap();
+    cp.start_transaction(connector, "RFID-CAFE", 0)
+        .await
+        .expect("v201 start_transaction");
+    wait_for_event(&log, TransactionEventEnumType::Started).await;
+    let txn_id = recorded_transaction_id(&log, TransactionEventEnumType::Started);
+
+    // CSMS -> CP: stop the live transaction by its id. The decision is Accepted
+    // and the wiring queues the stop off the CALL path.
+    let resp = server
+        .call::<V201RequestStopTransactionRequest>(
+            "CP201_REQSTOP",
+            V201RequestStopTransactionRequest {
+                transaction_id: txn_id.clone(),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStopTransaction call round-trips");
+    assert_eq!(
+        resp.status,
+        RequestStartStopStatusEnumType::Accepted,
+        "stopping a live transaction by its id is Accepted"
+    );
+
+    // The accepted stop actually ends the transaction after the CALLRESULT is
+    // flushed — proof the side effect fired off the CALL path.
+    wait_for_event(&log, TransactionEventEnumType::Ended).await;
+    let ended = log
+        .lock()
+        .expect("txn log mutex not poisoned")
+        .iter()
+        .find(|e| e.event_type == TransactionEventEnumType::Ended)
+        .cloned()
+        .expect("an Ended event was recorded");
+    assert_eq!(
+        ended.transaction_info.transaction_id, txn_id,
+        "the Ended event names the stopped transaction"
+    );
+    assert_eq!(
+        ended.transaction_info.stopped_reason,
+        Some(ReasonEnumType::Remote),
+        "a remote stop ends the transaction with stoppedReason = Remote"
+    );
+    assert_eq!(
+        ended.trigger_reason,
+        TriggerReasonEnumType::RemoteStop,
+        "a remote stop carries triggerReason = RemoteStop"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_request_stop_transaction_for_an_unknown_id_is_rejected() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    let config = ChargePointConfig {
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_REQSTOP_UNKNOWN")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // A transaction is live, but the CSMS names a *different*, non-existent id.
+    let connector = ConnectorId::new(1).unwrap();
+    let txn_id = cp
+        .start_transaction(connector, "RFID-CAFE", 0)
+        .await
+        .expect("v201 start_transaction");
+    wait_for_event(&log, TransactionEventEnumType::Started).await;
+
+    let resp = server
+        .call::<V201RequestStopTransactionRequest>(
+            "CP201_REQSTOP_UNKNOWN",
+            V201RequestStopTransactionRequest {
+                transaction_id: "999999".to_string(),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStopTransaction call round-trips");
+    assert_eq!(
+        resp.status,
+        RequestStartStopStatusEnumType::Rejected,
+        "an unknown transactionId is Rejected"
+    );
+
+    // A rejected stop ends nothing: give any erroneously-queued stop time to land
+    // before asserting the negative, then confirm the transaction is untouched.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        event_count(&log, TransactionEventEnumType::Ended),
+        0,
+        "a rejected remote stop emits no Ended event"
+    );
+    // The live transaction survived and can still be stopped normally.
+    cp.stop_transaction(txn_id, 0, Reason::EVDisconnected)
+        .await
+        .expect("the untouched transaction still stops normally");
+    wait_for_event(&log, TransactionEventEnumType::Ended).await;
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_request_stop_transaction_when_idle_is_rejected() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    let cp = ChargePoint::new(v201_cp_config(addr, "CP201_REQSTOP_IDLE"))
+        .expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // No transaction is running, so there is nothing to stop.
+    let resp = server
+        .call::<V201RequestStopTransactionRequest>(
+            "CP201_REQSTOP_IDLE",
+            V201RequestStopTransactionRequest {
+                transaction_id: "1".to_string(),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStopTransaction call round-trips");
+    assert_eq!(
+        resp.status,
+        RequestStartStopStatusEnumType::Rejected,
+        "a stop on an idle station is Rejected"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        event_count(&log, TransactionEventEnumType::Ended),
+        0,
+        "an idle-station stop emits no Ended event"
     );
 
     cp.disconnect().await.expect("disconnect");

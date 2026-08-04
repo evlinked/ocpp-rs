@@ -73,6 +73,7 @@ use ocpp_messages::v201::{
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
     MeterValuesRequest as V201MeterValuesRequest,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
+    RequestStopTransactionRequest as V201RequestStopTransactionRequest,
     ResetRequest as V201ResetRequest, StatusNotificationRequest as V201StatusNotificationRequest,
     TriggerMessageRequest as V201TriggerMessageRequest,
 };
@@ -1485,6 +1486,75 @@ impl ChargePoint {
                         RemoteStartStopStatus::Rejected
                     };
                     Ok(RemoteStopTransactionResponse { status })
+                }
+            });
+        }
+
+        // RequestStopTransaction (OCPP 2.0.1 Part 2) — the 2.0.1 successor to the
+        // 1.6J `RemoteStopTransaction` above. Like RequestStartTransaction (and
+        // unlike Reset / TriggerMessage / ChangeAvailability), the action name
+        // *differs* between dialects (`"RequestStopTransaction"` vs
+        // `"RemoteStopTransaction"`), so this is a distinct V201-only registration
+        // and the 1.6J handler above stays byte-for-byte unchanged. The pure
+        // Accepted/Rejected decision + response builder live in `v201_command`
+        // (slice 9); this is the runtime wiring.
+        //
+        // A 2.0.1 `transactionId` is an opaque string, but the station mints it as
+        // the decimal of its internal `i32` transaction key, and
+        // `active_transactions` (id → connector) is populated for the V201 path too
+        // (see `start_transaction_with_remote_start_id`). So resolving the requested
+        // string back to that live `i32` lets this reuse the version-aware
+        // `RemoteCommand::StopTransaction { i32 }` path (consumer →
+        // `stop_transaction(id, 0, Reason::Remote)` → `TransactionEvent(Ended)` with
+        // `stoppedReason` = `Remote`), rather than adding a parallel String-keyed
+        // command that would only be parsed back to the same `i32`. Same
+        // off-CALL-path side-effect discipline and `Err(_) => Rejected` outcome as
+        // the 1.6J handler (Issue #55): the CALLRESULT is flushed before the stop.
+        if protocol_version == OcppVersion::V201 {
+            let active_transactions = active_transactions.clone();
+            let command_sender = command_sender.clone();
+            d.on(move |req: V201RequestStopTransactionRequest| {
+                let active_transactions = active_transactions.clone();
+                let command_sender = command_sender.clone();
+                async move {
+                    // Resolve the requested opaque id to a live transaction key by
+                    // exact string match against the decimal spelling of each live
+                    // id — no numeric parse, so a malformed / non-canonical id just
+                    // fails to match and is Rejected (never panics).
+                    let live_ids: Vec<(i32, String)> = active_transactions
+                        .read()
+                        .await
+                        .keys()
+                        .map(|id| (*id, id.to_string()))
+                        .collect();
+                    let matched = live_ids
+                        .iter()
+                        .find(|(_, s)| *s == req.transaction_id)
+                        .map(|(id, _)| *id);
+
+                    let live_id_strs: Vec<&str> =
+                        live_ids.iter().map(|(_, s)| s.as_str()).collect();
+                    let mut status =
+                        v201_command::v201_request_stop_status(&req.transaction_id, &live_id_strs);
+
+                    // Only an Accepted request queues the stop, off the CALL path.
+                    // `Accepted` implies a match, so `matched` is `Some`; a failed
+                    // enqueue (consumer gone, CP shutting down) downgrades to
+                    // `Rejected` rather than accept-and-drop.
+                    if status == RequestStartStopStatusEnumType::Accepted {
+                        if let Some(transaction_id) = matched {
+                            if command_sender
+                                .send(RemoteCommand::StopTransaction { transaction_id })
+                                .is_err()
+                            {
+                                status = RequestStartStopStatusEnumType::Rejected;
+                            }
+                        } else {
+                            status = RequestStartStopStatusEnumType::Rejected;
+                        }
+                    }
+
+                    Ok(v201_command::v201_request_stop_response(status, None))
                 }
             });
         }
