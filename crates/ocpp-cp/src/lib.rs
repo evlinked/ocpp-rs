@@ -71,14 +71,15 @@ use ocpp_types::{
 // above (`StatusNotificationRequest`, `RegistrationStatus`).
 use ocpp_messages::v201::{
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
-    MeterValuesRequest as V201MeterValuesRequest, ResetRequest as V201ResetRequest,
-    StatusNotificationRequest as V201StatusNotificationRequest,
+    MeterValuesRequest as V201MeterValuesRequest,
+    RequestStartTransactionRequest as V201RequestStartTransactionRequest,
+    ResetRequest as V201ResetRequest, StatusNotificationRequest as V201StatusNotificationRequest,
     TriggerMessageRequest as V201TriggerMessageRequest,
 };
 use ocpp_types::v201::{
     AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType, ConnectorStatusEnumType,
     MessageTriggerEnumType, OperationalStatusEnumType, RegistrationStatusEnumType,
-    ResetStatusEnumType, TriggerMessageStatusEnumType,
+    RequestStartStopStatusEnumType, ResetStatusEnumType, TriggerMessageStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1323,6 +1324,85 @@ impl ChargePoint {
                         Err(_) => RemoteStartStopStatus::Rejected,
                     };
                     Ok(RemoteStartTransactionResponse { status })
+                }
+            });
+        }
+
+        // RequestStartTransaction (OCPP 2.0.1 Part 2) — the 2.0.1 successor to the
+        // 1.6J `RemoteStartTransaction` above. Unlike `Reset` / `TriggerMessage` /
+        // `ChangeAvailability` (one action name shared by both dialects, one handler
+        // per `protocol_version`), this is a *distinct action*
+        // (`"RequestStartTransaction"` vs `"RemoteStartTransaction"`), so it gets its
+        // own V201-only registration and the 1.6J handler above is left byte-for-byte
+        // unchanged. The pure Accepted/Rejected decision + response builder live in
+        // `v201_command` (slice 7a, #439); this is the runtime wiring (slice 7b,
+        // #442). Same off-CALL-path side-effect discipline and `Err(_) => Rejected`
+        // capability outcome as the 1.6J handler.
+        if protocol_version == OcppVersion::V201 {
+            let connectors = connectors.clone();
+            let command_sender = command_sender.clone();
+            d.on(move |req: V201RequestStartTransactionRequest| {
+                let connectors = connectors.clone();
+                let command_sender = command_sender.clone();
+                async move {
+                    // Resolve the targeted EVSE. A missing `evseId` defaults to
+                    // EVSE 1, mirroring the 1.6J handler's `connector_id.unwrap_or(1)`.
+                    // The simulator's flat topology maps an EVSE id to the same-valued
+                    // connector (the slice-2 StatusNotification convention). An EVSE
+                    // id of 0 / negative / out of range, or one that maps to no real
+                    // connector, resolves to `None` — i.e. "not free to charge".
+                    let target = req.evse_id.unwrap_or(1);
+                    let resolved: Option<(ConnectorId, bool)> = match u32::try_from(target)
+                        .ok()
+                        .and_then(|v| ConnectorId::new(v).ok())
+                    {
+                        Some(cid) => {
+                            // Clone the connector out of the map so we don't hold the
+                            // map guard across the inner status read.
+                            let connector = connectors.read().await.get(&cid).cloned();
+                            match connector {
+                                Some(connector) => {
+                                    let available = matches!(
+                                        connector.status().await,
+                                        ChargePointStatus::Available | ChargePointStatus::Reserved
+                                    );
+                                    Some((cid, available))
+                                }
+                                // Unknown connector on this CP.
+                                None => None,
+                            }
+                        }
+                        // EVSE 0 / negative / out of range → not a chargeable EVSE.
+                        None => None,
+                    };
+
+                    let evse_available = resolved.is_some_and(|(_, available)| available);
+                    let mut status =
+                        v201_command::v201_request_start_status(req.evse_id, evse_available);
+
+                    // Only an Accepted request queues the local StartTransaction, off
+                    // the CALL path (the CALLRESULT is flushed before the CP re-enters
+                    // the WebSocket). `Accepted` implies the target resolved to a free
+                    // connector, so `resolved` is `Some`; a failed enqueue (consumer
+                    // gone, CP shutting down) downgrades to `Rejected` rather than
+                    // accept-and-drop.
+                    if status == RequestStartStopStatusEnumType::Accepted {
+                        if let Some((cid, _)) = resolved {
+                            if command_sender
+                                .send(RemoteCommand::StartTransaction {
+                                    connector_id: cid,
+                                    id_tag: req.id_token.id_token.clone(),
+                                })
+                                .is_err()
+                            {
+                                status = RequestStartStopStatusEnumType::Rejected;
+                            }
+                        } else {
+                            status = RequestStartStopStatusEnumType::Rejected;
+                        }
+                    }
+
+                    Ok(v201_command::v201_request_start_response(status, None))
                 }
             });
         }
