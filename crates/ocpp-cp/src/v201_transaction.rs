@@ -153,11 +153,20 @@ fn energy_meter_value(
 /// authorizing `idToken` and the `evse` are carried so the CSMS can bind the
 /// transaction to a driver and a connector. Replaces the 1.6J `StartTransaction`
 /// CALL for a `V201` charge point.
+///
+/// `remote_start_id` carries the `remoteStartId` of the CSMS
+/// `RequestStartTransaction` that initiated this session (OCPP 2.0.1 Part 2,
+/// `transactionInfo.remoteStartId`), so the CSMS can correlate its remote-start
+/// request with the `TransactionEvent(Started)` that follows — the 2.0.1
+/// mechanism replacing 1.6J's synchronous `transactionId` in
+/// `RemoteStartTransaction.conf`. It is `None` for a locally initiated (e.g.
+/// cable-plugged-in) start, which has no remote-start request to correlate.
 pub fn transaction_event_started(
     session: &SessionRef,
     id_tag: &str,
     meter_start_wh: f64,
     timestamp: &str,
+    remote_start_id: Option<i32>,
 ) -> TransactionEventRequest {
     TransactionEventRequest {
         event_type: TransactionEventEnumType::Started,
@@ -169,7 +178,7 @@ pub fn transaction_event_started(
             charging_state: Some(ChargingStateEnumType::Charging),
             time_spent_charging: None,
             stopped_reason: None,
-            remote_start_id: None,
+            remote_start_id,
             custom_data: None,
         },
         offline: None,
@@ -416,7 +425,7 @@ mod tests {
     #[test]
     fn started_event_carries_started_shape() {
         let s = session();
-        let req = transaction_event_started(&s, "RFID-CAFE", 1000.0, TS);
+        let req = transaction_event_started(&s, "RFID-CAFE", 1000.0, TS, None);
 
         assert_eq!(req.event_type, TransactionEventEnumType::Started);
         assert_eq!(req.trigger_reason, TriggerReasonEnumType::Authorized);
@@ -427,6 +436,11 @@ mod tests {
             Some(ChargingStateEnumType::Charging)
         );
         assert!(req.transaction_info.stopped_reason.is_none());
+        // A locally initiated start has no remote-start request to correlate.
+        assert!(
+            req.transaction_info.remote_start_id.is_none(),
+            "a local start carries no remoteStartId"
+        );
         let evse = req.evse.as_ref().expect("started carries evse");
         assert_eq!(evse.id, 1);
         assert_eq!(evse.connector_id, Some(1));
@@ -441,6 +455,20 @@ mod tests {
         assert_eq!(
             mv[0].sampled_value[0].context,
             Some(ReadingContextEnumType::TransactionBegin)
+        );
+    }
+
+    #[test]
+    fn started_event_carries_remote_start_id_when_remotely_initiated() {
+        let s = session();
+        // A CSMS RequestStartTransaction carrying remoteStartId = 4242 initiated
+        // this session; the Started event must echo it so the CSMS can correlate.
+        let req = transaction_event_started(&s, "RFID-CAFE", 1000.0, TS, Some(4242));
+
+        assert_eq!(
+            req.transaction_info.remote_start_id,
+            Some(4242),
+            "a remotely initiated start echoes the request's remoteStartId"
         );
     }
 
@@ -557,7 +585,7 @@ mod tests {
         let s = session();
         let validator = SchemaValidator::v201();
         for req in [
-            transaction_event_started(&s, "RFID-CAFE", 1000.0, TS),
+            transaction_event_started(&s, "RFID-CAFE", 1000.0, TS, Some(99)),
             transaction_event_updated(&s, 1, 1500.0, TS),
             transaction_event_ended(&s, 2, "RFID-CAFE", 2000.0, Reason::Remote, TS),
             transaction_event_triggered(&s, 3, 1750.0, TS),
