@@ -76,7 +76,7 @@
 //! connector it does not have, and otherwise attempts the unlock, reporting the
 //! mechanical [`Unlocked`](UnlockStatusEnumType::Unlocked) /
 //! [`UnlockFailed`](UnlockStatusEnumType::UnlockFailed) outcome off the shared
-//! [`UnlockConnectorOutcome`](crate::UnlockConnectorOutcome) seam the 1.6J handler
+//! [`UnlockConnectorOutcome`] seam the 1.6J handler
 //! already uses. Note 2.0.1's `UnlockStatusEnumType` drops 1.6J's `NotSupported`,
 //! so a connector with no controllable lock folds to `UnlockFailed` here (see
 //! [`v201_unlock_status`]). Stopping any live transaction first (reason
