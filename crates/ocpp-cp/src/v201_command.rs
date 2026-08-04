@@ -62,19 +62,40 @@
 //! matching the 1.6J handler's `connector_id.unwrap_or(1)`. The
 //! `remoteStartId` / `groupIdToken` / `chargingProfile` fields are carried
 //! through by the later wire slice (7b), not decided here.
+//!
+//! ## `UnlockConnector`
+//!
+//! Ports `ocpp.v201.call.UnlockConnector` / `ocpp.v201.call_result.UnlockConnector`
+//! — the 2.0.1 successor to the 1.6J `UnlockConnector` the CP already answers on
+//! the `V16J` path. Where 1.6J addressed a flat `connectorId`, 2.0.1 names both an
+//! `evseId` and a `connectorId`. An operator sends it when a driver's cable is
+//! stuck: the station refuses to release the cable while a transaction is still
+//! authorized on the targeted connector
+//! ([`OngoingAuthorizedTransaction`](UnlockStatusEnumType::OngoingAuthorizedTransaction)),
+//! reports [`UnknownConnector`](UnlockStatusEnumType::UnknownConnector) for a
+//! connector it does not have, and otherwise attempts the unlock, reporting the
+//! mechanical [`Unlocked`](UnlockStatusEnumType::Unlocked) /
+//! [`UnlockFailed`](UnlockStatusEnumType::UnlockFailed) outcome off the shared
+//! [`UnlockConnectorOutcome`] seam the 1.6J handler
+//! already uses. Note 2.0.1's `UnlockStatusEnumType` drops 1.6J's `NotSupported`,
+//! so a connector with no controllable lock folds to `UnlockFailed` here (see
+//! [`v201_unlock_status`]). Stopping any live transaction first (reason
+//! `UnlockCommand`) and driving the actuator is the slice-8b wiring layer's job.
 
 use ocpp_types::common::Reason;
 use ocpp_types::v16j::ResetType;
 use ocpp_types::v201::{
     ChangeAvailabilityStatusEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
     RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
-    TriggerMessageStatusEnumType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 
 use ocpp_messages::v201::{
     ChangeAvailabilityResponse, RequestStartTransactionResponse, ResetResponse,
-    TriggerMessageResponse,
+    TriggerMessageResponse, UnlockConnectorResponse,
 };
+
+use crate::UnlockConnectorOutcome;
 
 /// Decide the [`ResetStatusEnumType`] a `V201` station reports for an inbound
 /// `Reset.req`, given the requested [`kind`](ResetEnumType) and whether a
@@ -382,6 +403,102 @@ pub fn v201_request_start_response(
         status,
         status_info,
         transaction_id: None,
+        custom_data: None,
+    }
+}
+
+/// Decide the [`UnlockStatusEnumType`] a `V201` station reports for an inbound
+/// `UnlockConnector.req` targeting `(evse_id, connector_id)`, given whether that
+/// target is a known connector, whether a live authorized transaction is on it,
+/// and the station's injectable mechanical [`UnlockConnectorOutcome`].
+///
+/// Faithful to OCPP 2.0.1 (Part 2, `UnlockConnector`) and a direct port of the
+/// 1.6J `UnlockConnector` handler's decision in [`crate`]'s `ChargePoint`,
+/// re-expressed against the richer 2.0.1 [`UnlockStatusEnumType`]:
+///
+/// - **Structurally-invalid target** — an `evse_id` or `connector_id` below `1`
+///   addresses no physical connector (2.0.1 ids are 1-based; `0` is the whole
+///   station, never a connector to unlock) →
+///   [`UnknownConnector`](UnlockStatusEnumType::UnknownConnector). This mirrors
+///   the 1.6J handler's `ConnectorId::new(..)` `Err` arm for connector `0` / out
+///   of range, and — like [`v201_request_start_status`]'s structural guard — is
+///   decided *before* the knownness read, so even a `connector_known == true`
+///   cannot rescue an invalid id.
+/// - **Unmapped target** — a structurally-valid id the station has no connector
+///   for (`connector_known == false`) →
+///   [`UnknownConnector`](UnlockStatusEnumType::UnknownConnector), the 2.0.1
+///   analogue of the 1.6J "connector this CP does not have" arm (which, lacking a
+///   dedicated status, answered `UnlockFailed`).
+/// - **Ongoing authorized transaction** — a live transaction is still authorized
+///   on the targeted connector, so the cable must not be released →
+///   [`OngoingAuthorizedTransaction`](UnlockStatusEnumType::OngoingAuthorizedTransaction).
+///   This is a 2.0.1 refinement with no 1.6J equivalent: the 1.6J handler *stops*
+///   the transaction first and then unlocks, whereas 2.0.1 gives the station an
+///   explicit "refused, a session is still authorized here" verdict.
+/// - **Otherwise** — the injected mechanical outcome decides:
+///   [`Unlock`](UnlockConnectorOutcome::Unlock) →
+///   [`Unlocked`](UnlockStatusEnumType::Unlocked), and both
+///   [`UnlockFailed`](UnlockConnectorOutcome::UnlockFailed) and
+///   [`NotSupported`](UnlockConnectorOutcome::NotSupported) →
+///   [`UnlockFailed`](UnlockStatusEnumType::UnlockFailed). 2.0.1's
+///   `UnlockStatusEnumType` has no `NotSupported`, so a connector with no
+///   controllable lock (which 1.6J reports as `NotSupported`) folds to the honest
+///   "could not release the cable" verdict `UnlockFailed` — the one place the
+///   shared [`UnlockConnectorOutcome`] seam maps differently across versions.
+///
+/// This is the *pure* decision, depending only on the request target and two
+/// plain-`bool` reads (knownness, transaction activity) plus the outcome seam —
+/// no runtime handles, so it is unit-testable in isolation. Resolving the target
+/// against the live connector topology, reading transaction state, stopping any
+/// live transaction (reason `UnlockCommand`), and driving the actuator off the
+/// CALL path is the slice-8b wiring layer's job.
+#[must_use]
+pub fn v201_unlock_status(
+    evse_id: i32,
+    connector_id: i32,
+    connector_known: bool,
+    transaction_active: bool,
+    outcome: UnlockConnectorOutcome,
+) -> UnlockStatusEnumType {
+    // Structural: 2.0.1 evse/connector ids are 1-based; a value below 1 addresses
+    // no physical connector, so there is nothing to unlock — reject before the
+    // knownness read (mirrors the 1.6J `ConnectorId::new` Err arm and
+    // `v201_request_start_status`'s structural guard).
+    if evse_id < 1 || connector_id < 1 {
+        return UnlockStatusEnumType::UnknownConnector;
+    }
+    // Runtime existence: a structurally-valid id the station has no connector for.
+    if !connector_known {
+        return UnlockStatusEnumType::UnknownConnector;
+    }
+    // A session is still authorized on the connector: refuse to release the cable.
+    if transaction_active {
+        return UnlockStatusEnumType::OngoingAuthorizedTransaction;
+    }
+    // Otherwise the mechanical actuator outcome decides. 2.0.1 has no
+    // `NotSupported`, so an uncontrollable lock folds to `UnlockFailed`.
+    match outcome {
+        UnlockConnectorOutcome::Unlock => UnlockStatusEnumType::Unlocked,
+        UnlockConnectorOutcome::UnlockFailed | UnlockConnectorOutcome::NotSupported => {
+            UnlockStatusEnumType::UnlockFailed
+        }
+    }
+}
+
+/// Build a schema-valid `UnlockConnector.conf` ([`UnlockConnectorResponse`]).
+///
+/// Pure constructor mirroring [`v201_reset_response`]: carries the decided
+/// [`status`](UnlockStatusEnumType) plus the optional 2.0.1 `statusInfo` (a
+/// vendor-agnostic `reasonCode` and human-readable detail — useful, for example,
+/// to explain why an unlock was refused as `OngoingAuthorizedTransaction`).
+#[must_use]
+pub fn v201_unlock_response(
+    status: UnlockStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> UnlockConnectorResponse {
+    UnlockConnectorResponse {
+        status,
+        status_info,
         custom_data: None,
     }
 }
@@ -888,6 +1005,154 @@ mod tests {
                         .validate_call_result("RequestStartTransaction", &payload)
                         .is_ok(),
                     "built {status:?} RequestStartTransactionResponse should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    /// A known, idle connector unlocks per the injected mechanical outcome:
+    /// `Unlock` → `Unlocked`, `UnlockFailed` → `UnlockFailed`. The two mechanical
+    /// values 2.0.1 keeps.
+    #[test]
+    fn unlock_known_idle_connector_follows_mechanical_outcome() {
+        assert_eq!(
+            v201_unlock_status(1, 1, true, false, UnlockConnectorOutcome::Unlock),
+            UnlockStatusEnumType::Unlocked
+        );
+        assert_eq!(
+            v201_unlock_status(1, 1, true, false, UnlockConnectorOutcome::UnlockFailed),
+            UnlockStatusEnumType::UnlockFailed
+        );
+    }
+
+    /// 2.0.1's `UnlockStatusEnumType` has no `NotSupported`, so a connector whose
+    /// lock is not controllable (`UnlockConnectorOutcome::NotSupported`, which
+    /// 1.6J reports verbatim) folds to the honest `UnlockFailed` — the one place
+    /// the shared actuator seam maps differently across versions.
+    #[test]
+    fn unlock_not_supported_outcome_folds_to_unlock_failed_in_v201() {
+        assert_eq!(
+            v201_unlock_status(1, 1, true, false, UnlockConnectorOutcome::NotSupported),
+            UnlockStatusEnumType::UnlockFailed
+        );
+    }
+
+    /// A live authorized transaction on the targeted connector refuses the unlock
+    /// with `OngoingAuthorizedTransaction`, independent of the mechanical outcome
+    /// (the cable must not be released while a session is authorized).
+    #[test]
+    fn unlock_is_refused_while_a_transaction_is_authorized() {
+        for outcome in [
+            UnlockConnectorOutcome::Unlock,
+            UnlockConnectorOutcome::UnlockFailed,
+            UnlockConnectorOutcome::NotSupported,
+        ] {
+            assert_eq!(
+                v201_unlock_status(1, 1, true, true, outcome),
+                UnlockStatusEnumType::OngoingAuthorizedTransaction,
+                "{outcome:?} on a busy connector must be OngoingAuthorizedTransaction"
+            );
+        }
+    }
+
+    /// A structurally-valid id the station has no connector for
+    /// (`connector_known == false`) is `UnknownConnector`, regardless of
+    /// transaction state or mechanical outcome — nothing can rescue an unmapped
+    /// target.
+    #[test]
+    fn unlock_unmapped_target_is_unknown_connector() {
+        for transaction_active in [false, true] {
+            for outcome in [
+                UnlockConnectorOutcome::Unlock,
+                UnlockConnectorOutcome::UnlockFailed,
+                UnlockConnectorOutcome::NotSupported,
+            ] {
+                assert_eq!(
+                    v201_unlock_status(9, 1, false, transaction_active, outcome),
+                    UnlockStatusEnumType::UnknownConnector,
+                    "an unmapped (evse=9) target must be UnknownConnector \
+                     (transaction_active={transaction_active}, {outcome:?})"
+                );
+            }
+        }
+    }
+
+    /// A structurally-invalid target (`evseId` or `connectorId` below `1`) is
+    /// `UnknownConnector` *before* the knownness read — even a `connector_known ==
+    /// true` cannot rescue it, mirroring the 1.6J `ConnectorId::new` Err arm and
+    /// `v201_request_start_status`'s structural guard.
+    #[test]
+    fn unlock_structurally_invalid_target_is_unknown_connector() {
+        for (evse_id, connector_id) in [(0, 1), (1, 0), (-1, 1), (1, -1), (i32::MIN, i32::MIN)] {
+            assert_eq!(
+                v201_unlock_status(
+                    evse_id,
+                    connector_id,
+                    true,
+                    false,
+                    UnlockConnectorOutcome::Unlock
+                ),
+                UnlockStatusEnumType::UnknownConnector,
+                "evse={evse_id}, connector={connector_id} is not a physical \
+                 connector and must be UnknownConnector regardless of the \
+                 knownness read"
+            );
+        }
+    }
+
+    #[test]
+    fn unlock_response_carries_status_and_optional_status_info() {
+        let bare = v201_unlock_response(UnlockStatusEnumType::Unlocked, None);
+        assert_eq!(bare.status, UnlockStatusEnumType::Unlocked);
+        assert!(bare.status_info.is_none());
+
+        let info = StatusInfoType {
+            reason_code: "OngoingTx".to_string(),
+            additional_info: Some("a session is still authorized on this connector".to_string()),
+            custom_data: None,
+        };
+        let refused = v201_unlock_response(
+            UnlockStatusEnumType::OngoingAuthorizedTransaction,
+            Some(info),
+        );
+        assert_eq!(
+            refused.status,
+            UnlockStatusEnumType::OngoingAuthorizedTransaction
+        );
+        assert_eq!(
+            refused.status_info.as_ref().map(|i| i.reason_code.as_str()),
+            Some("OngoingTx")
+        );
+    }
+
+    /// Wire fidelity: every built `UnlockConnector.conf` — with and without
+    /// `statusInfo`, across all four status values — satisfies the bundled OCPP
+    /// 2.0.1 `UnlockConnectorResponse` JSON Schema, the same guarantee the CP's
+    /// version-aware validator gives on the live path. `validate_call_result`
+    /// keys on the base `"UnlockConnector"` action (it appends `Response`
+    /// internally).
+    #[test]
+    fn built_unlock_responses_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        let info = StatusInfoType {
+            reason_code: "OngoingTx".to_string(),
+            additional_info: Some("a session is still authorized on this connector".to_string()),
+            custom_data: None,
+        };
+        for status in [
+            UnlockStatusEnumType::Unlocked,
+            UnlockStatusEnumType::UnlockFailed,
+            UnlockStatusEnumType::OngoingAuthorizedTransaction,
+            UnlockStatusEnumType::UnknownConnector,
+        ] {
+            for status_info in [None, Some(info.clone())] {
+                let resp = v201_unlock_response(status, status_info);
+                let payload = serde_json::to_value(&resp).unwrap();
+                assert!(
+                    validator
+                        .validate_call_result("UnlockConnector", &payload)
+                        .is_ok(),
+                    "built {status:?} UnlockConnectorResponse should be schema-valid, got: {payload}"
                 );
             }
         }
