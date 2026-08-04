@@ -77,9 +77,10 @@ use ocpp_messages::v201::{
     TriggerMessageRequest as V201TriggerMessageRequest,
 };
 use ocpp_types::v201::{
-    AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType, ConnectorStatusEnumType,
-    MessageTriggerEnumType, OperationalStatusEnumType, RegistrationStatusEnumType,
-    RequestStartStopStatusEnumType, ResetStatusEnumType, TriggerMessageStatusEnumType,
+    AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType, ChargingProfilePurposeEnumType,
+    ConnectorStatusEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
+    RegistrationStatusEnumType, RequestStartStopStatusEnumType, ResetStatusEnumType,
+    StatusInfoType, TriggerMessageStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -500,10 +501,18 @@ enum RemoteCommand {
     /// Perform a CSMS-initiated Reset (OCPP 1.6J §5.13).
     Reset { reset_type: ResetType },
     /// Drive the local `StartTransaction` for an `Accepted`
-    /// `RemoteStartTransaction` (OCPP 1.6J §5.11).
+    /// `RemoteStartTransaction` (OCPP 1.6J §5.11) or `RequestStartTransaction`
+    /// (OCPP 2.0.1 Part 2).
+    ///
+    /// `remote_start_id` carries the 2.0.1 `RequestStartTransaction.remoteStartId`
+    /// so the started transaction's `TransactionEvent(Started)` can echo it for
+    /// CSMS correlation. It is `None` on the 1.6J path (1.6J has no
+    /// `remoteStartId` — its correlation is the synchronous `transactionId` in
+    /// `RemoteStartTransaction.conf`).
     StartTransaction {
         connector_id: ConnectorId,
         id_tag: String,
+        remote_start_id: Option<i32>,
     },
     /// End the matching transaction for an `Accepted` `RemoteStopTransaction`
     /// (OCPP 1.6J §5.12).
@@ -1311,6 +1320,8 @@ impl ChargePoint {
                                     match command_sender.send(RemoteCommand::StartTransaction {
                                         connector_id: cid,
                                         id_tag: req.id_tag.clone(),
+                                        // 1.6J has no remoteStartId to correlate.
+                                        remote_start_id: None,
                                     }) {
                                         Ok(()) => RemoteStartStopStatus::Accepted,
                                         Err(_) => RemoteStartStopStatus::Rejected,
@@ -1345,6 +1356,39 @@ impl ChargePoint {
                 let connectors = connectors.clone();
                 let command_sender = command_sender.clone();
                 async move {
+                    // A `chargingProfile` attached to a RequestStartTransaction
+                    // SHALL be a `TxProfile` — it bounds the single transaction
+                    // this request starts (OCPP 2.0.1 Part 2). Reject any other
+                    // purpose up front with an explanatory `statusInfo`, before
+                    // resolving the EVSE, so a malformed request starts nothing.
+                    //
+                    // A valid `TxProfile` is accepted here; installing and
+                    // enforcing its schedule is deliberately out of this slice
+                    // (see the slice-7d follow-up). The `charging_profiles`
+                    // store is 1.6J-typed, so honoring a 2.0.1 `TxProfile` needs
+                    // a dedicated v201 profile store rather than a lossy
+                    // conversion — a design decision of its own. Until then the
+                    // profile is validated but not yet enforced.
+                    if let Some(profile) = req.charging_profile.as_ref() {
+                        if profile.charging_profile_purpose
+                            != ChargingProfilePurposeEnumType::TxProfile
+                        {
+                            let info = StatusInfoType {
+                                reason_code: "InvalidProfile".to_string(),
+                                additional_info: Some(
+                                    "RequestStartTransaction.chargingProfile.\
+                                     chargingProfilePurpose must be TxProfile"
+                                        .to_string(),
+                                ),
+                                custom_data: None,
+                            };
+                            return Ok(v201_command::v201_request_start_response(
+                                RequestStartStopStatusEnumType::Rejected,
+                                Some(info),
+                            ));
+                        }
+                    }
+
                     // Resolve the targeted EVSE. A missing `evseId` defaults to
                     // EVSE 1, mirroring the 1.6J handler's `connector_id.unwrap_or(1)`.
                     // The simulator's flat topology maps an EVSE id to the same-valued
@@ -1392,6 +1436,10 @@ impl ChargePoint {
                                 .send(RemoteCommand::StartTransaction {
                                     connector_id: cid,
                                     id_tag: req.id_token.id_token.clone(),
+                                    // Echoed onto the started transaction's
+                                    // TransactionEvent(Started) for CSMS
+                                    // correlation (2.0.1 remoteStartId).
+                                    remote_start_id: Some(req.remote_start_id),
                                 })
                                 .is_err()
                             {
@@ -2256,10 +2304,22 @@ impl ChargePoint {
                         RemoteCommand::StartTransaction {
                             connector_id,
                             id_tag,
+                            remote_start_id,
                         } => {
                             // meter_start is unknown for a remote-initiated start;
                             // report 0, matching the Python reference's example CP.
-                            if let Err(e) = cp.start_transaction(connector_id, &id_tag, 0).await {
+                            // `remote_start_id` is `Some` only on the 2.0.1
+                            // RequestStartTransaction path and is echoed onto the
+                            // Started event for CSMS correlation.
+                            if let Err(e) = cp
+                                .start_transaction_with_remote_start_id(
+                                    connector_id,
+                                    &id_tag,
+                                    0,
+                                    remote_start_id,
+                                )
+                                .await
+                            {
                                 warn!(
                                     "remote start: failed to start transaction on \
                                      connector {}: {e}",
@@ -3121,9 +3181,14 @@ impl ChargePoint {
         connector_id: ConnectorId,
         id_tag: &str,
         meter_start: i32,
+        remote_start_id: Option<i32>,
     ) -> OcppResult<i32> {
         match self.config.protocol_version {
             OcppVersion::V16J => {
+                // 1.6J `StartTransaction` has no `remoteStartId` field; the
+                // remote-start correlation on 1.6J is the synchronous
+                // `transactionId` returned in `RemoteStartTransaction.conf`.
+                let _ = remote_start_id;
                 let response = self
                     .call(StartTransactionRequest {
                         connector_id: connector_id.value(),
@@ -3165,6 +3230,7 @@ impl ChargePoint {
                         id_tag,
                         meter_start as f64,
                         &v201_now(),
+                        remote_start_id,
                     ))
                     .await?;
 
@@ -3219,6 +3285,26 @@ impl ChargePoint {
         id_tag: &str,
         meter_start: i32,
     ) -> OcppResult<i32> {
+        // A locally initiated start (e.g. the cable was plugged in) has no
+        // remote-start request to correlate; the remote 2.0.1 path threads the
+        // `remoteStartId` via `start_transaction_with_remote_start_id`.
+        self.start_transaction_with_remote_start_id(connector_id, id_tag, meter_start, None)
+            .await
+    }
+
+    /// [`start_transaction`](Self::start_transaction) plus the optional 2.0.1
+    /// `RequestStartTransaction.remoteStartId`, echoed onto the started
+    /// transaction's `TransactionEvent(Started)` so a CSMS can correlate its
+    /// remote-start request with the session that follows. `remote_start_id` is
+    /// `None` on the local-start and 1.6J paths (neither carries a
+    /// `remoteStartId`), keeping their behavior byte-for-byte unchanged.
+    async fn start_transaction_with_remote_start_id(
+        &self,
+        connector_id: ConnectorId,
+        id_tag: &str,
+        meter_start: i32,
+        remote_start_id: Option<i32>,
+    ) -> OcppResult<i32> {
         // Connector is now preparing for a transaction (Available -> Preparing).
         self.send_status_notification(
             connector_id.value(),
@@ -3228,7 +3314,7 @@ impl ChargePoint {
         .await?;
 
         let transaction_id = self
-            .open_transaction(connector_id, id_tag, meter_start)
+            .open_transaction(connector_id, id_tag, meter_start, remote_start_id)
             .await?;
 
         // Map transaction ID → connector ID for stop_transaction lookup
