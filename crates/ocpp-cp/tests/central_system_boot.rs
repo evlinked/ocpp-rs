@@ -39,7 +39,9 @@ use ocpp_transport::{
 };
 use ocpp_types::common::Reason;
 use ocpp_types::v201::{
-    BootReasonEnumType, ChangeAvailabilityStatusEnumType, ConnectorStatusEnumType, EvseType,
+    BootReasonEnumType, ChangeAvailabilityStatusEnumType, ChargingProfileKindEnumType,
+    ChargingProfilePurposeEnumType, ChargingProfileType, ChargingRateUnitEnumType,
+    ChargingSchedulePeriodType, ChargingScheduleType, ConnectorStatusEnumType, EvseType,
     IdTokenEnumType, IdTokenType, MessageTriggerEnumType, OperationalStatusEnumType,
     ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType,
     RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType, TransactionEventEnumType,
@@ -1698,6 +1700,199 @@ async fn v201_unlock_connector_for_a_nonexistent_connector_within_an_evse_is_unk
         resp.status,
         UnlockStatusEnumType::UnknownConnector,
         "a connectorId with no matching connector within the EVSE is UnknownConnector"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// ---------------------------------------------------------------------------
+// RequestStartTransaction — acting on the request's `remoteStartId` and
+// `chargingProfile` (Issue #445, slice 7c). Slice 7b accepted these fields on
+// the wire but did not yet act on them; this slice (a) echoes `remoteStartId`
+// onto the started transaction's TransactionEvent(Started) for CSMS
+// correlation, and (b) guards `chargingProfile.chargingProfilePurpose` — only a
+// `TxProfile` is permitted on a RequestStartTransaction.
+// ---------------------------------------------------------------------------
+
+/// A minimal schema-valid `ChargingProfileType` of the given purpose, bounding
+/// the session to a single flat power limit. Enough to exercise the handler's
+/// purpose guard on the wire.
+fn charging_profile(purpose: ChargingProfilePurposeEnumType) -> ChargingProfileType {
+    ChargingProfileType {
+        id: 1,
+        stack_level: 0,
+        charging_profile_purpose: purpose,
+        charging_profile_kind: ChargingProfileKindEnumType::Relative,
+        charging_schedule: vec![ChargingScheduleType {
+            id: 1,
+            charging_rate_unit: ChargingRateUnitEnumType::W,
+            charging_schedule_period: vec![ChargingSchedulePeriodType {
+                start_period: 0,
+                limit: 11_000.0,
+                number_phases: None,
+                phase_to_use: None,
+                custom_data: None,
+            }],
+            start_schedule: None,
+            duration: None,
+            min_charging_rate: None,
+            sales_tariff: None,
+            custom_data: None,
+        }],
+        recurrency_kind: None,
+        valid_from: None,
+        valid_to: None,
+        transaction_id: None,
+        custom_data: None,
+    }
+}
+
+#[tokio::test]
+async fn v201_request_start_transaction_carries_remote_start_id_to_the_started_event() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    let config = ChargePointConfig {
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_REQSTART_CORRELATE")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // CSMS -> CP: remote start on the free EVSE 1 carrying a distinctive
+    // remoteStartId the back office will use to correlate the resulting session.
+    let resp = server
+        .call::<V201RequestStartTransactionRequest>(
+            "CP201_REQSTART_CORRELATE",
+            V201RequestStartTransactionRequest {
+                id_token: central_id_token("RFID-CAFE"),
+                remote_start_id: 4242,
+                evse_id: Some(1),
+                group_id_token: None,
+                charging_profile: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStartTransaction call round-trips");
+    assert_eq!(resp.status, RequestStartStopStatusEnumType::Accepted);
+
+    // The started transaction's TransactionEvent(Started) must echo the
+    // remoteStartId in transactionInfo.remoteStartId (2.0.1's correlation
+    // mechanism, replacing 1.6J's synchronous conf transactionId).
+    wait_for_event(&log, TransactionEventEnumType::Started).await;
+    let started = log
+        .lock()
+        .expect("txn log mutex not poisoned")
+        .iter()
+        .find(|e| e.event_type == TransactionEventEnumType::Started)
+        .cloned()
+        .expect("a Started event was recorded");
+    assert_eq!(
+        started.transaction_info.remote_start_id,
+        Some(4242),
+        "the Started event correlates back to the RequestStartTransaction's remoteStartId"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_request_start_transaction_with_a_valid_txprofile_is_accepted() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    let config = ChargePointConfig {
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_REQSTART_TXPROFILE")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // CSMS -> CP: remote start bounding the session with a TxProfile — the one
+    // profile purpose 2.0.1 permits on a RequestStartTransaction. It is accepted
+    // and the transaction starts (installing/enforcing the schedule is the
+    // slice-7d follow-up; the profile is validated here, not yet enforced).
+    let resp = server
+        .call::<V201RequestStartTransactionRequest>(
+            "CP201_REQSTART_TXPROFILE",
+            V201RequestStartTransactionRequest {
+                id_token: central_id_token("RFID-CAFE"),
+                remote_start_id: 5,
+                evse_id: Some(1),
+                group_id_token: None,
+                charging_profile: Some(charging_profile(ChargingProfilePurposeEnumType::TxProfile)),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStartTransaction call round-trips");
+    assert_eq!(
+        resp.status,
+        RequestStartStopStatusEnumType::Accepted,
+        "a valid TxProfile is accepted"
+    );
+
+    wait_for_event(&log, TransactionEventEnumType::Started).await;
+    assert_eq!(
+        started_count(&log),
+        1,
+        "a TxProfile-bounded remote start begins the transaction"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_request_start_transaction_with_a_non_txprofile_charging_profile_is_rejected() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    let config = ChargePointConfig {
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_REQSTART_BADPROFILE")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // CSMS -> CP: remote start on the free EVSE 1, but the attached profile is a
+    // TxDefaultProfile — not a TxProfile. 2.0.1 permits only a TxProfile on a
+    // RequestStartTransaction, so the station rejects the request with an
+    // explanatory statusInfo and starts nothing (even though the EVSE is free).
+    let resp = server
+        .call::<V201RequestStartTransactionRequest>(
+            "CP201_REQSTART_BADPROFILE",
+            V201RequestStartTransactionRequest {
+                id_token: central_id_token("RFID-CAFE"),
+                remote_start_id: 6,
+                evse_id: Some(1),
+                group_id_token: None,
+                charging_profile: Some(charging_profile(
+                    ChargingProfilePurposeEnumType::TxDefaultProfile,
+                )),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStartTransaction call round-trips");
+    assert_eq!(
+        resp.status,
+        RequestStartStopStatusEnumType::Rejected,
+        "a non-TxProfile chargingProfile is Rejected"
+    );
+    let info = resp
+        .status_info
+        .as_ref()
+        .expect("the rejection carries an explanatory statusInfo");
+    assert_eq!(info.reason_code, "InvalidProfile");
+
+    // A rejected request queues no StartTransaction — nothing starts on the free
+    // EVSE. Give any erroneously-queued start time to land before the negative.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        started_count(&log),
+        0,
+        "a rejected malformed-profile start begins no transaction"
     );
 
     cp.disconnect().await.expect("disconnect");
