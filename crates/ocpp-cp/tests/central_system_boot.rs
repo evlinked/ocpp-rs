@@ -25,6 +25,7 @@ use ocpp_messages::v201::{
     BootNotificationResponse as V201BootNotificationResponse,
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
     MeterValuesRequest as V201MeterValuesRequest, MeterValuesResponse as V201MeterValuesResponse,
+    RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     ResetRequest as V201ResetRequest, StatusNotificationRequest as V201StatusNotificationRequest,
     StatusNotificationResponse as V201StatusNotificationResponse, TransactionEventRequest,
     TransactionEventResponse, TriggerMessageRequest as V201TriggerMessageRequest,
@@ -38,8 +39,9 @@ use ocpp_transport::{
 use ocpp_types::common::Reason;
 use ocpp_types::v201::{
     BootReasonEnumType, ChangeAvailabilityStatusEnumType, ConnectorStatusEnumType, EvseType,
-    MessageTriggerEnumType, OperationalStatusEnumType, ReadingContextEnumType, ReasonEnumType,
-    RegistrationStatusEnumType, ResetEnumType, ResetStatusEnumType, TransactionEventEnumType,
+    IdTokenEnumType, IdTokenType, MessageTriggerEnumType, OperationalStatusEnumType,
+    ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType,
+    RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType, TransactionEventEnumType,
     TriggerMessageStatusEnumType, TriggerReasonEnumType,
 };
 use ocpp_types::{ConnectorId, OcppVersion};
@@ -1242,6 +1244,244 @@ async fn v201_change_availability_whole_station_takes_every_connector_inoperativ
     // Both connectors flip to Unavailable after the CALLRESULT.
     wait_for_status_count(&status_log, 1, ConnectorStatusEnumType::Unavailable, 1).await;
     wait_for_status_count(&status_log, 2, ConnectorStatusEnumType::Unavailable, 1).await;
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// ---------------------------------------------------------------------------
+// OCPP 2.0.1 RequestStartTransaction (Issue #442, slice 7b): the 2.0.1 successor
+// to 1.6J `RemoteStartTransaction`. An inbound `RequestStartTransaction.req`
+// routes to the pure slice-7a decision (`v201_request_start_status`) and, on
+// `Accepted`, actually begins a transaction on the targeted EVSE off the CALL
+// path — observed via a `TransactionEvent(Started)` on the recording CSMS. A busy
+// or unknown EVSE is `Rejected` and starts nothing.
+// ---------------------------------------------------------------------------
+
+/// Count the `Started` events currently in the transaction log.
+fn started_count(log: &TxnLog) -> usize {
+    log.lock()
+        .expect("txn log mutex not poisoned")
+        .iter()
+        .filter(|e| e.event_type == TransactionEventEnumType::Started)
+        .count()
+}
+
+/// A CSMS-central id token, as a remote start would carry.
+fn central_id_token(id: &str) -> IdTokenType {
+    IdTokenType {
+        id_token: id.to_string(),
+        kind: IdTokenEnumType::Central,
+        additional_info: None,
+        custom_data: None,
+    }
+}
+
+#[tokio::test]
+async fn v201_request_start_transaction_accepted_starts_a_transaction() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    // A long meter interval so the only event we assert on is the Started one the
+    // remote start produces (the periodic Updated sampler stays quiet).
+    let config = ChargePointConfig {
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_REQSTART")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // CSMS -> CP: remotely start a session on the free EVSE 1. The slice-7a
+    // decision returns Accepted, and the wiring queues the local StartTransaction
+    // off the CALL path.
+    let resp = server
+        .call::<V201RequestStartTransactionRequest>(
+            "CP201_REQSTART",
+            V201RequestStartTransactionRequest {
+                id_token: central_id_token("RFID-CAFE"),
+                remote_start_id: 42,
+                evse_id: Some(1),
+                group_id_token: None,
+                charging_profile: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStartTransaction call round-trips");
+    assert_eq!(
+        resp.status,
+        RequestStartStopStatusEnumType::Accepted,
+        "a remote start on a free EVSE is Accepted"
+    );
+
+    // The accepted request actually begins a transaction after the CALLRESULT is
+    // flushed — proof the side effect fired off the CALL path — targeting EVSE 1.
+    wait_for_event(&log, TransactionEventEnumType::Started).await;
+    let started = log
+        .lock()
+        .expect("txn log mutex not poisoned")
+        .iter()
+        .find(|e| e.event_type == TransactionEventEnumType::Started)
+        .cloned()
+        .expect("a Started event was recorded");
+    assert_eq!(
+        started.evse.as_ref().map(|e| e.id),
+        Some(1),
+        "the started transaction targets EVSE 1"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_request_start_transaction_missing_evse_id_defaults_to_evse_1() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    let config = ChargePointConfig {
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_REQSTART_DEFAULT")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // CSMS -> CP: remote start with NO `evseId`. The handler defaults a missing
+    // target to EVSE 1 (mirroring the 1.6J `connector_id.unwrap_or(1)`), so it is
+    // Accepted and starts on EVSE 1.
+    let resp = server
+        .call::<V201RequestStartTransactionRequest>(
+            "CP201_REQSTART_DEFAULT",
+            V201RequestStartTransactionRequest {
+                id_token: central_id_token("RFID-CAFE"),
+                remote_start_id: 7,
+                evse_id: None,
+                group_id_token: None,
+                charging_profile: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStartTransaction call round-trips");
+    assert_eq!(
+        resp.status,
+        RequestStartStopStatusEnumType::Accepted,
+        "a remote start with no evseId defaults to EVSE 1 and is Accepted"
+    );
+
+    wait_for_event(&log, TransactionEventEnumType::Started).await;
+    let started = log
+        .lock()
+        .expect("txn log mutex not poisoned")
+        .iter()
+        .find(|e| e.event_type == TransactionEventEnumType::Started)
+        .cloned()
+        .expect("a Started event was recorded");
+    assert_eq!(
+        started.evse.as_ref().map(|e| e.id),
+        Some(1),
+        "a missing evseId defaults the started transaction to EVSE 1"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_request_start_transaction_for_a_busy_evse_is_rejected() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    let config = ChargePointConfig {
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_REQSTART_BUSY")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // Occupy EVSE 1 with a live local transaction, so it is no longer free to
+    // charge. Waiting on the Started event guarantees the connector has flipped to
+    // Charging before the remote start below reads its chargeability.
+    let connector = ConnectorId::new(1).unwrap();
+    let txn_id = cp
+        .start_transaction(connector, "RFID-LOCAL", 0)
+        .await
+        .expect("v201 start_transaction");
+    wait_for_event(&log, TransactionEventEnumType::Started).await;
+    assert_eq!(started_count(&log), 1, "exactly one transaction is running");
+
+    // CSMS -> CP: remote start targeting the busy EVSE 1. A busy EVSE is not free
+    // to charge, so the decision is Rejected.
+    let resp = server
+        .call::<V201RequestStartTransactionRequest>(
+            "CP201_REQSTART_BUSY",
+            V201RequestStartTransactionRequest {
+                id_token: central_id_token("RFID-CAFE"),
+                remote_start_id: 1,
+                evse_id: Some(1),
+                group_id_token: None,
+                charging_profile: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStartTransaction call round-trips");
+    assert_eq!(
+        resp.status,
+        RequestStartStopStatusEnumType::Rejected,
+        "a remote start on a busy EVSE is Rejected"
+    );
+
+    // A Rejected request queues no StartTransaction, so no second session begins.
+    // Give any erroneously-queued start time to land before asserting the negative.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        started_count(&log),
+        1,
+        "a rejected remote start begins no new transaction"
+    );
+
+    cp.stop_transaction(txn_id, 0, Reason::EVDisconnected)
+        .await
+        .expect("v201 stop_transaction");
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_request_start_transaction_for_an_unknown_evse_is_rejected() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    let cp = ChargePoint::new(v201_cp_config(addr, "CP201_REQSTART_UNKNOWN"))
+        .expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // CSMS -> CP: target an EVSE that does not exist on this CP (the default config
+    // has 2 connectors, so EVSE 99 is out of range). The station cannot start a
+    // session there, so it answers Rejected and begins nothing.
+    let resp = server
+        .call::<V201RequestStartTransactionRequest>(
+            "CP201_REQSTART_UNKNOWN",
+            V201RequestStartTransactionRequest {
+                id_token: central_id_token("RFID-CAFE"),
+                remote_start_id: 2,
+                evse_id: Some(99),
+                group_id_token: None,
+                charging_profile: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStartTransaction call round-trips");
+    assert_eq!(
+        resp.status,
+        RequestStartStopStatusEnumType::Rejected,
+        "an unknown / out-of-range EVSE target is Rejected"
+    );
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        started_count(&log),
+        0,
+        "an unknown EVSE begins no transaction"
+    );
 
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");
