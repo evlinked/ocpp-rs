@@ -95,8 +95,8 @@ use ocpp_types::v201::{
 };
 
 use ocpp_messages::v201::{
-    ChangeAvailabilityResponse, RequestStartTransactionResponse, ResetResponse,
-    TriggerMessageResponse, UnlockConnectorResponse,
+    ChangeAvailabilityResponse, RequestStartTransactionResponse, RequestStopTransactionResponse,
+    ResetResponse, TriggerMessageResponse, UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -407,6 +407,72 @@ pub fn v201_request_start_response(
         status,
         status_info,
         transaction_id: None,
+        custom_data: None,
+    }
+}
+
+/// Decide the [`RequestStartStopStatusEnumType`] a `V201` station reports for an
+/// inbound `RequestStopTransaction.req`, given the requested
+/// [`transaction_id`](ocpp_messages::v201::RequestStopTransactionRequest::transaction_id)
+/// and the ids of every transaction the station currently has live.
+///
+/// Faithful to OCPP 2.0.1 (Part 2, `RequestStopTransaction`) and a direct port
+/// of the 1.6J `RemoteStopTransaction` handler's decision in [`crate`]'s
+/// `ChargePoint`:
+///
+/// - [`Accepted`](RequestStartStopStatusEnumType::Accepted) iff `requested`
+///   equals one of `live_transaction_ids` — the CSMS named a transaction this
+///   station is actually running, so it can honor the stop. This mirrors the
+///   1.6J handler's `active_transactions.contains_key(&transaction_id)` guard,
+///   re-expressed over the 2.0.1 string `transactionId`.
+/// - [`Rejected`](RequestStartStopStatusEnumType::Rejected) otherwise — an
+///   unknown id, *or* an idle station (`live_transaction_ids` empty), both fold
+///   to "no such live transaction to stop", exactly as the 1.6J handler folds
+///   them into one `Rejected` arm.
+///
+/// Matching is exact string equality, not a numeric parse: a 2.0.1
+/// `transactionId` is an opaque string (here the station-minted decimal), and a
+/// CSMS echoes back the exact id the station issued — so a non-canonical
+/// spelling (`"01"`, whitespace, a huge value) simply fails to match and is
+/// `Rejected`, never parsed and never panicking. Taking the *set* of live ids
+/// (rather than a single `Option`) is deliberate: a station can run one
+/// transaction per EVSE concurrently, so the requested id is checked against all
+/// of them.
+///
+/// This is the *pure* decision, depending only on the requested id and the
+/// station's live-id read — no runtime handles, so it is unit-testable in
+/// isolation. Resolving the live ids from the transaction table and queuing the
+/// stop off the CALL path is the wiring layer's job.
+/// `RequestStartStopStatusEnumType` has exactly `Accepted` / `Rejected`, so —
+/// like [`v201_request_start_status`] — this is a clean two-way split.
+#[must_use]
+pub fn v201_request_stop_status(
+    requested: &str,
+    live_transaction_ids: &[&str],
+) -> RequestStartStopStatusEnumType {
+    if live_transaction_ids.contains(&requested) {
+        RequestStartStopStatusEnumType::Accepted
+    } else {
+        // Unknown id or idle station — nothing to stop.
+        RequestStartStopStatusEnumType::Rejected
+    }
+}
+
+/// Build a schema-valid `RequestStopTransaction.conf`
+/// ([`RequestStopTransactionResponse`]).
+///
+/// Pure constructor mirroring [`v201_request_start_response`]: carries the
+/// decided [`status`](RequestStartStopStatusEnumType) plus the optional 2.0.1
+/// `statusInfo` (a vendor-agnostic `reasonCode` and human-readable detail —
+/// useful, for example, to explain why a stop was `Rejected`).
+#[must_use]
+pub fn v201_request_stop_response(
+    status: RequestStartStopStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> RequestStopTransactionResponse {
+    RequestStopTransactionResponse {
+        status,
+        status_info,
         custom_data: None,
     }
 }
@@ -1024,6 +1090,103 @@ mod tests {
                         .validate_call_result("RequestStartTransaction", &payload)
                         .is_ok(),
                     "built {status:?} RequestStartTransactionResponse should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn request_stop_is_accepted_only_for_a_live_transaction_id() {
+        // The requested id names a transaction the station is running.
+        assert_eq!(
+            v201_request_stop_status("1", &["1"]),
+            RequestStartStopStatusEnumType::Accepted
+        );
+        // ...even when several sessions are live concurrently (one per EVSE).
+        assert_eq!(
+            v201_request_stop_status("3", &["1", "2", "3"]),
+            RequestStartStopStatusEnumType::Accepted
+        );
+    }
+
+    #[test]
+    fn request_stop_is_rejected_for_an_unknown_id_or_idle_station() {
+        // Unknown id while other transactions are live.
+        assert_eq!(
+            v201_request_stop_status("9", &["1", "2"]),
+            RequestStartStopStatusEnumType::Rejected
+        );
+        // Idle station — no live transaction to stop.
+        assert_eq!(
+            v201_request_stop_status("1", &[]),
+            RequestStartStopStatusEnumType::Rejected
+        );
+    }
+
+    #[test]
+    fn request_stop_matches_exactly_never_by_numeric_value_or_substring() {
+        // Exact string equality: a non-canonical spelling of a live id does not
+        // match (the station only ever issued the canonical decimal), and a
+        // substring / prefix relationship is not a match either. Nothing is
+        // parsed, so a huge or malformed id simply fails to match — never panics.
+        for requested in [
+            "01",
+            " 1",
+            "1 ",
+            "10",
+            "",
+            "not-a-number",
+            "99999999999999999999",
+        ] {
+            assert_eq!(
+                v201_request_stop_status(requested, &["1"]),
+                RequestStartStopStatusEnumType::Rejected,
+                "{requested:?} must not match the live id \"1\""
+            );
+        }
+    }
+
+    #[test]
+    fn request_stop_response_carries_status_and_optional_status_info() {
+        let bare = v201_request_stop_response(RequestStartStopStatusEnumType::Accepted, None);
+        assert_eq!(bare.status, RequestStartStopStatusEnumType::Accepted);
+        assert!(bare.status_info.is_none());
+        assert!(bare.custom_data.is_none());
+
+        let info = StatusInfoType {
+            reason_code: "NoTransaction".to_string(),
+            additional_info: Some("no live transaction with that id".to_string()),
+            custom_data: None,
+        };
+        let rejected =
+            v201_request_stop_response(RequestStartStopStatusEnumType::Rejected, Some(info));
+        assert_eq!(rejected.status, RequestStartStopStatusEnumType::Rejected);
+        assert_eq!(rejected.status_info.unwrap().reason_code, "NoTransaction");
+    }
+
+    /// Wire fidelity: every built `RequestStopTransaction.conf` — with and
+    /// without `statusInfo`, across both status values — satisfies the bundled
+    /// OCPP 2.0.1 `RequestStopTransactionResponse` JSON Schema.
+    #[test]
+    fn built_request_stop_responses_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        let info = StatusInfoType {
+            reason_code: "NoTransaction".to_string(),
+            additional_info: Some("no live transaction with that id".to_string()),
+            custom_data: None,
+        };
+        for status in [
+            RequestStartStopStatusEnumType::Accepted,
+            RequestStartStopStatusEnumType::Rejected,
+        ] {
+            for status_info in [None, Some(info.clone())] {
+                let resp = v201_request_stop_response(status, status_info);
+                let payload = serde_json::to_value(&resp).unwrap();
+                assert!(
+                    validator
+                        .validate_call_result("RequestStopTransaction", &payload)
+                        .is_ok(),
+                    "built {status:?} RequestStopTransactionResponse should be schema-valid, got: {payload}"
                 );
             }
         }
