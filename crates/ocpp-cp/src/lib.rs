@@ -77,7 +77,9 @@ use ocpp_messages::v201::{
     GetVariablesResponse as V201GetVariablesResponse, MeterValuesRequest as V201MeterValuesRequest,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     RequestStopTransactionRequest as V201RequestStopTransactionRequest,
-    ResetRequest as V201ResetRequest, StatusNotificationRequest as V201StatusNotificationRequest,
+    ResetRequest as V201ResetRequest, SetVariablesRequest as V201SetVariablesRequest,
+    SetVariablesResponse as V201SetVariablesResponse,
+    StatusNotificationRequest as V201StatusNotificationRequest,
     TriggerMessageRequest as V201TriggerMessageRequest,
     UnlockConnectorRequest as V201UnlockConnectorRequest,
 };
@@ -85,7 +87,7 @@ use ocpp_types::v201::{
     AttributeEnumType, AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType,
     ChargingProfilePurposeEnumType, ConnectorStatusEnumType, GetVariableResultType,
     MessageTriggerEnumType, OperationalStatusEnumType, RegistrationStatusEnumType,
-    RequestStartStopStatusEnumType, ResetStatusEnumType, StatusInfoType,
+    RequestStartStopStatusEnumType, ResetStatusEnumType, SetVariableResultType, StatusInfoType,
     TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
@@ -1359,6 +1361,61 @@ impl ChargePoint {
                         .collect();
                     Ok(V201GetVariablesResponse {
                         get_variable_result,
+                        custom_data: None,
+                    })
+                }
+            });
+        }
+
+        // SetVariables (OCPP 2.0.1 only) — write one or more component-variable
+        // attributes into the device model. The 2.0.1 replacement for 1.6J
+        // `ChangeConfiguration`, and the write counterpart to `GetVariables`
+        // above: it shares the same `V201DeviceModel` store (behind the write
+        // lock here). Registered only on the V201 arm — "SetVariables" has no
+        // 1.6J twin, and the negotiated subprotocol + version-aware inbound
+        // validator keep a 1.6J CP from ever seeing this action.
+        //
+        // Trust boundary: each `attributeValue` is an untrusted, schema-bounded
+        // string stored verbatim (no parse/exec), so there are no panics on wire
+        // input. The write is applied on the CALL path (a device-model store
+        // update is cheap and must be visible to the CALLRESULT and to any
+        // subsequent `GetVariables`), serialized by the model's write lock.
+        // Ports `ocpp.v201.call.SetVariables`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let device_model = v201_device_model.clone();
+            d.on(move |req: V201SetVariablesRequest| {
+                let device_model = device_model.clone();
+                async move {
+                    let mut model = device_model.write().await;
+                    // One result per requested entry, in request order. Each
+                    // result echoes the CSMS's original (un-normalized)
+                    // `component` / `variable` / `attributeType`; an omitted
+                    // `attributeType` resolves to `Actual` for the write but is
+                    // echoed back as `None`, mirroring the read seam.
+                    let set_variable_result: Vec<SetVariableResultType> = req
+                        .set_variable_data
+                        .iter()
+                        .map(|data| {
+                            let attribute =
+                                data.attribute_type.unwrap_or(AttributeEnumType::Actual);
+                            let attribute_status = model.set(
+                                &data.component,
+                                &data.variable,
+                                attribute,
+                                &data.attribute_value,
+                            );
+                            SetVariableResultType {
+                                attribute_status,
+                                component: data.component.clone(),
+                                variable: data.variable.clone(),
+                                attribute_type: data.attribute_type,
+                                attribute_status_info: None,
+                                custom_data: None,
+                            }
+                        })
+                        .collect();
+                    Ok(V201SetVariablesResponse {
+                        set_variable_result,
                         custom_data: None,
                     })
                 }
