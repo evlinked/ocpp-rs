@@ -24,7 +24,9 @@ use ocpp_messages::v201::{
     BootNotificationRequest as V201BootNotificationRequest,
     BootNotificationResponse as V201BootNotificationResponse,
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
-    MeterValuesRequest as V201MeterValuesRequest, MeterValuesResponse as V201MeterValuesResponse,
+    GetVariablesRequest as V201GetVariablesRequest,
+    GetVariablesResponse as V201GetVariablesResponse, MeterValuesRequest as V201MeterValuesRequest,
+    MeterValuesResponse as V201MeterValuesResponse,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     RequestStopTransactionRequest as V201RequestStopTransactionRequest,
     ResetRequest as V201ResetRequest, StatusNotificationRequest as V201StatusNotificationRequest,
@@ -40,13 +42,14 @@ use ocpp_transport::{
 };
 use ocpp_types::common::Reason;
 use ocpp_types::v201::{
-    BootReasonEnumType, ChangeAvailabilityStatusEnumType, ChargingProfileKindEnumType,
-    ChargingProfilePurposeEnumType, ChargingProfileType, ChargingRateUnitEnumType,
-    ChargingSchedulePeriodType, ChargingScheduleType, ConnectorStatusEnumType, EvseType,
+    AttributeEnumType, BootReasonEnumType, ChangeAvailabilityStatusEnumType,
+    ChargingProfileKindEnumType, ChargingProfilePurposeEnumType, ChargingProfileType,
+    ChargingRateUnitEnumType, ChargingSchedulePeriodType, ChargingScheduleType, ComponentType,
+    ConnectorStatusEnumType, EvseType, GetVariableDataType, GetVariableStatusEnumType,
     IdTokenEnumType, IdTokenType, MessageTriggerEnumType, OperationalStatusEnumType,
     ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType,
     RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType, TransactionEventEnumType,
-    TriggerMessageStatusEnumType, TriggerReasonEnumType, UnlockStatusEnumType,
+    TriggerMessageStatusEnumType, TriggerReasonEnumType, UnlockStatusEnumType, VariableType,
 };
 use ocpp_types::{ConnectorId, OcppVersion};
 
@@ -2160,6 +2163,111 @@ async fn v201_request_stop_transaction_when_idle_is_rejected() {
         0,
         "an idle-station stop emits no Ended event"
     );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// ---------------------------------------------------------------------------
+// OCPP 2.0.1 `GetVariables` (Issue #457): the device-model read seam. The CSMS
+// reads component-variable attributes from the CP's seeded standard profile
+// over a real socket, and the CP answers one `GetVariableResultType` per
+// requested entry — in request order, echoing the requested component/variable
+// — with the right per-entry status. This is the 2.0.1 replacement for the
+// 1.6J `GetConfiguration` path, exercised end to end.
+// ---------------------------------------------------------------------------
+
+fn v201_component(name: &str) -> ComponentType {
+    ComponentType {
+        name: name.to_string(),
+        instance: None,
+        evse: None,
+        custom_data: None,
+    }
+}
+
+fn v201_variable(name: &str) -> VariableType {
+    VariableType {
+        name: name.to_string(),
+        instance: None,
+        custom_data: None,
+    }
+}
+
+fn get_variable_data(component: &str, variable: &str) -> GetVariableDataType {
+    GetVariableDataType {
+        component: v201_component(component),
+        variable: v201_variable(variable),
+        attribute_type: None,
+        custom_data: None,
+    }
+}
+
+#[tokio::test]
+async fn v201_get_variables_reads_the_device_model_with_per_entry_status() {
+    let (mut server, addr) = start_v201_csms(|_| {}).await;
+
+    let cp =
+        ChargePoint::new(v201_cp_config(addr, "CP201_GETVARS")).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+    assert!(server.is_cp_connected("CP201_GETVARS"));
+
+    // Four entries spanning every outcome:
+    //   0: seeded, Actual (default attributeType)         -> Accepted "300"
+    //   1: unknown component                              -> UnknownComponent
+    //   2: known component, unknown variable              -> UnknownVariable
+    //   3: seeded variable, unsupported attributeType     -> NotSupportedAttributeType
+    let mut not_supported = get_variable_data("OCPPCommCtrlr", "HeartbeatInterval");
+    not_supported.attribute_type = Some(AttributeEnumType::Target);
+    let resp: V201GetVariablesResponse = server
+        .call::<V201GetVariablesRequest>(
+            "CP201_GETVARS",
+            V201GetVariablesRequest {
+                get_variable_data: vec![
+                    get_variable_data("OCPPCommCtrlr", "HeartbeatInterval"),
+                    get_variable_data("NoSuchCtrlr", "HeartbeatInterval"),
+                    get_variable_data("OCPPCommCtrlr", "NoSuchVariable"),
+                    not_supported,
+                ],
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS GetVariables call round-trips");
+
+    // One result per requested entry, in request order.
+    assert_eq!(resp.get_variable_result.len(), 4);
+
+    let accepted = &resp.get_variable_result[0];
+    assert_eq!(
+        accepted.attribute_status,
+        GetVariableStatusEnumType::Accepted
+    );
+    assert_eq!(accepted.attribute_value.as_deref(), Some("300"));
+    // The result echoes back the requested component/variable.
+    assert_eq!(accepted.component.name, "OCPPCommCtrlr");
+    assert_eq!(accepted.variable.name, "HeartbeatInterval");
+
+    assert_eq!(
+        resp.get_variable_result[1].attribute_status,
+        GetVariableStatusEnumType::UnknownComponent
+    );
+    assert_eq!(resp.get_variable_result[1].attribute_value, None);
+
+    assert_eq!(
+        resp.get_variable_result[2].attribute_status,
+        GetVariableStatusEnumType::UnknownVariable
+    );
+    assert_eq!(resp.get_variable_result[2].attribute_value, None);
+
+    let ns = &resp.get_variable_result[3];
+    assert_eq!(
+        ns.attribute_status,
+        GetVariableStatusEnumType::NotSupportedAttributeType
+    );
+    assert_eq!(ns.attribute_value, None);
+    // The unsupported attributeType is echoed back verbatim.
+    assert_eq!(ns.attribute_type, Some(AttributeEnumType::Target));
 
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");
