@@ -29,7 +29,9 @@ use ocpp_messages::v201::{
     MeterValuesResponse as V201MeterValuesResponse,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     RequestStopTransactionRequest as V201RequestStopTransactionRequest,
-    ResetRequest as V201ResetRequest, StatusNotificationRequest as V201StatusNotificationRequest,
+    ResetRequest as V201ResetRequest, SetVariablesRequest as V201SetVariablesRequest,
+    SetVariablesResponse as V201SetVariablesResponse,
+    StatusNotificationRequest as V201StatusNotificationRequest,
     StatusNotificationResponse as V201StatusNotificationResponse, TransactionEventRequest,
     TransactionEventResponse, TriggerMessageRequest as V201TriggerMessageRequest,
     UnlockConnectorRequest as V201UnlockConnectorRequest,
@@ -48,8 +50,9 @@ use ocpp_types::v201::{
     ConnectorStatusEnumType, EvseType, GetVariableDataType, GetVariableStatusEnumType,
     IdTokenEnumType, IdTokenType, MessageTriggerEnumType, OperationalStatusEnumType,
     ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType,
-    RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType, TransactionEventEnumType,
-    TriggerMessageStatusEnumType, TriggerReasonEnumType, UnlockStatusEnumType, VariableType,
+    RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType, SetVariableDataType,
+    SetVariableStatusEnumType, TransactionEventEnumType, TriggerMessageStatusEnumType,
+    TriggerReasonEnumType, UnlockStatusEnumType, VariableType,
 };
 use ocpp_types::{ConnectorId, OcppVersion};
 
@@ -2268,6 +2271,112 @@ async fn v201_get_variables_reads_the_device_model_with_per_entry_status() {
     assert_eq!(ns.attribute_value, None);
     // The unsupported attributeType is echoed back verbatim.
     assert_eq!(ns.attribute_type, Some(AttributeEnumType::Target));
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// ---------------------------------------------------------------------------
+// OCPP 2.0.1 `SetVariables` (Issue #458): the device-model write seam. The CSMS
+// writes component-variable attributes into the CP's device model over a real
+// socket, and the CP answers one `SetVariableResultType` per requested entry —
+// in request order, echoing the requested component/variable — with the right
+// per-entry status. A subsequent `GetVariables` proves the round-trip: an
+// accepted write is read back, while a rejected (read-only) write leaves the
+// stored value untouched. The 2.0.1 replacement for the 1.6J
+// `ChangeConfiguration` path, exercised end to end.
+// ---------------------------------------------------------------------------
+
+fn set_variable_data(component: &str, variable: &str, value: &str) -> SetVariableDataType {
+    SetVariableDataType {
+        attribute_value: value.to_string(),
+        component: v201_component(component),
+        variable: v201_variable(variable),
+        attribute_type: None,
+        custom_data: None,
+    }
+}
+
+#[tokio::test]
+async fn v201_set_variables_writes_the_device_model_and_round_trips_via_get() {
+    let (mut server, addr) = start_v201_csms(|_| {}).await;
+
+    let cp =
+        ChargePoint::new(v201_cp_config(addr, "CP201_SETVARS")).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+    assert!(server.is_cp_connected("CP201_SETVARS"));
+
+    // Three entries spanning distinct write outcomes:
+    //   0: writable variable                     -> Accepted (new value stored)
+    //   1: read-only capability constant         -> Rejected (value unchanged)
+    //   2: unknown component                     -> UnknownComponent
+    let set_resp: V201SetVariablesResponse = server
+        .call::<V201SetVariablesRequest>(
+            "CP201_SETVARS",
+            V201SetVariablesRequest {
+                set_variable_data: vec![
+                    set_variable_data("OCPPCommCtrlr", "HeartbeatInterval", "600"),
+                    set_variable_data("SecurityCtrlr", "MaxCertificateChainSize", "9"),
+                    set_variable_data("NoSuchCtrlr", "HeartbeatInterval", "1"),
+                ],
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS SetVariables call round-trips");
+
+    // One result per requested entry, in request order.
+    assert_eq!(set_resp.set_variable_result.len(), 3);
+
+    let accepted = &set_resp.set_variable_result[0];
+    assert_eq!(
+        accepted.attribute_status,
+        SetVariableStatusEnumType::Accepted
+    );
+    // The result echoes back the requested component/variable.
+    assert_eq!(accepted.component.name, "OCPPCommCtrlr");
+    assert_eq!(accepted.variable.name, "HeartbeatInterval");
+
+    assert_eq!(
+        set_resp.set_variable_result[1].attribute_status,
+        SetVariableStatusEnumType::Rejected
+    );
+    assert_eq!(
+        set_resp.set_variable_result[2].attribute_status,
+        SetVariableStatusEnumType::UnknownComponent
+    );
+
+    // Round-trip: read the two written-to variables back over the same socket.
+    //   - the accepted write is now visible ("600"),
+    //   - the rejected (read-only) write left the seed value ("3") intact.
+    let get_resp: V201GetVariablesResponse = server
+        .call::<V201GetVariablesRequest>(
+            "CP201_SETVARS",
+            V201GetVariablesRequest {
+                get_variable_data: vec![
+                    get_variable_data("OCPPCommCtrlr", "HeartbeatInterval"),
+                    get_variable_data("SecurityCtrlr", "MaxCertificateChainSize"),
+                ],
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS GetVariables call round-trips");
+
+    assert_eq!(
+        get_resp.get_variable_result[0].attribute_status,
+        GetVariableStatusEnumType::Accepted
+    );
+    assert_eq!(
+        get_resp.get_variable_result[0].attribute_value.as_deref(),
+        Some("600"),
+        "the accepted SetVariables write must be read back"
+    );
+    assert_eq!(
+        get_resp.get_variable_result[1].attribute_value.as_deref(),
+        Some("3"),
+        "a rejected write must leave the read-only value unchanged"
+    );
 
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");
