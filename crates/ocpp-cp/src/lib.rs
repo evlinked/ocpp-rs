@@ -18,6 +18,7 @@ pub mod message_handler;
 pub mod meter_sampler;
 pub mod state_machine;
 pub mod transaction;
+pub mod v201_charging_profiles;
 pub mod v201_command;
 pub mod v201_transaction;
 
@@ -66,6 +67,7 @@ use ocpp_types::{
     CallErrorCode, CallErrorMessage, CallResultMessage, ConnectorId, OcppError, OcppResult,
     OcppVersion,
 };
+use v201_charging_profiles::V201TxProfileStore;
 // 2.0.1 provisioning message + enum types used by the version-aware runtime
 // (slice 2). Aliased to avoid clashing with the unqualified 1.6J names imported
 // above (`StatusNotificationRequest`, `RegistrationStatus`).
@@ -80,9 +82,10 @@ use ocpp_messages::v201::{
 };
 use ocpp_types::v201::{
     AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType, ChargingProfilePurposeEnumType,
-    ConnectorStatusEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
-    RegistrationStatusEnumType, RequestStartStopStatusEnumType, ResetStatusEnumType,
-    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    ChargingProfileType, ConnectorStatusEnumType, IdTokenType as V201IdTokenType,
+    MessageTriggerEnumType, OperationalStatusEnumType, RegistrationStatusEnumType,
+    RequestStartStopStatusEnumType, ResetStatusEnumType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -511,10 +514,21 @@ enum RemoteCommand {
     /// CSMS correlation. It is `None` on the 1.6J path (1.6J has no
     /// `remoteStartId` — its correlation is the synchronous `transactionId` in
     /// `RemoteStartTransaction.conf`).
+    ///
+    /// `charging_profile` carries the 2.0.1 `RequestStartTransaction.chargingProfile`
+    /// (a validated `TxProfile`) to install against the started transaction, and
+    /// `group_id_token` its optional `groupIdToken`, threaded onto the session's
+    /// auth context (slice 7d, Issue #450). Both are `None` on the 1.6J path and
+    /// whenever the request omitted them.
     StartTransaction {
         connector_id: ConnectorId,
         id_tag: String,
         remote_start_id: Option<i32>,
+        // Boxed: a 2.0.1 `ChargingProfileType` is a large value (nested
+        // schedules), and boxing it keeps this rarely-large command variant from
+        // bloating every `RemoteCommand` (clippy::large_enum_variant).
+        charging_profile: Option<Box<ChargingProfileType>>,
+        group_id_token: Option<V201IdTokenType>,
     },
     /// End the matching transaction for an `Accepted` `RemoteStopTransaction`
     /// (OCPP 1.6J §5.12).
@@ -769,6 +783,17 @@ struct V201Session {
     /// — not the volatile auth cache — because a remotely-started transaction
     /// may hold no cache entry and cache *expiry* is not *deauthorization*.
     authorized: Arc<AtomicBool>,
+    /// The optional `groupIdToken` a `RequestStartTransaction` carried — the
+    /// parent/group token the driver `idToken` belongs to (a fleet card, a
+    /// household account) that a CSMS may use to group or co-authorize sessions
+    /// (OCPP 2.0.1 Part 2, `RequestStartTransaction.groupIdToken`).
+    ///
+    /// Captured onto the session's auth context at start (slice 7d, Issue #450)
+    /// so it travels with the live transaction rather than being read off the
+    /// wire and dropped. `None` for a locally-started transaction and whenever
+    /// the request omitted it. Read back via
+    /// [`ChargePoint::transaction_group_id_token`].
+    group_id_token: Option<V201IdTokenType>,
 }
 
 /// Main charge point implementation
@@ -847,6 +872,15 @@ pub struct ChargePoint {
     /// alongside the `active_transactions` entry and removed by
     /// `stop_transaction` in lockstep. See [`V201Session`].
     v201_sessions: Arc<RwLock<HashMap<i32, V201Session>>>,
+    /// v201-typed `TxProfile`s installed by an accepted `RequestStartTransaction`,
+    /// keyed by EVSE id (slice 7d, Issue #450). Populated by `open_transaction`
+    /// atomically with the [`V201Session`] the profile bounds and cleared by
+    /// `close_transaction` in lockstep, so an installed profile never outlives
+    /// its transaction. A distinct, v201-typed store rather than the 1.6J
+    /// [`charging_profiles`](Self::charging_profiles) (which is typed on
+    /// `v16j::ChargingProfile`). Read back via
+    /// [`installed_tx_profile`](Self::installed_tx_profile). Empty on the 1.6J path.
+    v201_tx_profiles: Arc<V201TxProfileStore>,
     /// Maps an active reservation ID → the connector it holds (OCPP 1.6J §5.14).
     /// Populated by the default `ReserveNow` handler, consulted/cleared by
     /// `CancelReservation`, and emptied for a connector when a transaction
@@ -1003,6 +1037,13 @@ impl ChargePoint {
         let v201_sessions: Arc<RwLock<HashMap<i32, V201Session>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
+        // Slice 7d (#450): v201-typed TxProfile store, kept on the CP (installed
+        // by `open_transaction`, cleared by `close_transaction`, read by
+        // `installed_tx_profile`). Not shared into the dispatcher — the handler
+        // only *queues* the profile via `RemoteCommand::StartTransaction`; the
+        // install itself happens on the `&self` transaction-open path.
+        let v201_tx_profiles = Arc::new(V201TxProfileStore::new());
+
         // Wrap the shared state the default handlers need *before* building the
         // dispatcher: RemoteStart/RemoteStop consult live connector status and
         // the active-transaction map to answer Accepted/Rejected faithfully.
@@ -1061,6 +1102,7 @@ impl ChargePoint {
             command_sender,
             next_v201_transaction_id: Arc::new(AtomicI32::new(1)),
             v201_sessions,
+            v201_tx_profiles,
             reservations,
             expiry_timers,
             validator,
@@ -1343,8 +1385,12 @@ impl ChargePoint {
                                     match command_sender.send(RemoteCommand::StartTransaction {
                                         connector_id: cid,
                                         id_tag: req.id_tag.clone(),
-                                        // 1.6J has no remoteStartId to correlate.
+                                        // 1.6J has no remoteStartId to correlate,
+                                        // nor a chargingProfile / groupIdToken on
+                                        // RemoteStartTransaction to thread.
                                         remote_start_id: None,
+                                        charging_profile: None,
+                                        group_id_token: None,
                                     }) {
                                         Ok(()) => RemoteStartStopStatus::Accepted,
                                         Err(_) => RemoteStartStopStatus::Rejected,
@@ -1385,13 +1431,14 @@ impl ChargePoint {
                     // purpose up front with an explanatory `statusInfo`, before
                     // resolving the EVSE, so a malformed request starts nothing.
                     //
-                    // A valid `TxProfile` is accepted here; installing and
-                    // enforcing its schedule is deliberately out of this slice
-                    // (see the slice-7d follow-up). The `charging_profiles`
-                    // store is 1.6J-typed, so honoring a 2.0.1 `TxProfile` needs
-                    // a dedicated v201 profile store rather than a lossy
-                    // conversion — a design decision of its own. Until then the
-                    // profile is validated but not yet enforced.
+                    // A valid `TxProfile` is threaded through the queued
+                    // `StartTransaction` and installed into the v201-typed
+                    // `v201_tx_profiles` store when the transaction actually opens
+                    // (slice 7d, Issue #450). Installing it here — before the EVSE
+                    // resolves and the CSMS accepts the `Started` — would risk a
+                    // profile lingering behind a start that never happened, so the
+                    // install is tied to `open_transaction` instead. Enforcing the
+                    // schedule (bounding the metering) is the enforcement follow-up.
                     if let Some(profile) = req.charging_profile.as_ref() {
                         if profile.charging_profile_purpose
                             != ChargingProfilePurposeEnumType::TxProfile
@@ -1463,6 +1510,12 @@ impl ChargePoint {
                                     // TransactionEvent(Started) for CSMS
                                     // correlation (2.0.1 remoteStartId).
                                     remote_start_id: Some(req.remote_start_id),
+                                    // A validated TxProfile (purpose guarded
+                                    // above) to install against the started
+                                    // transaction, and the optional groupIdToken
+                                    // to thread onto its auth context (slice 7d).
+                                    charging_profile: req.charging_profile.clone().map(Box::new),
+                                    group_id_token: req.group_id_token.clone(),
                                 })
                                 .is_err()
                             {
@@ -2527,18 +2580,24 @@ impl ChargePoint {
                             connector_id,
                             id_tag,
                             remote_start_id,
+                            charging_profile,
+                            group_id_token,
                         } => {
                             // meter_start is unknown for a remote-initiated start;
                             // report 0, matching the Python reference's example CP.
                             // `remote_start_id` is `Some` only on the 2.0.1
                             // RequestStartTransaction path and is echoed onto the
-                            // Started event for CSMS correlation.
+                            // Started event for CSMS correlation; `charging_profile`
+                            // / `group_id_token` are the 2.0.1 TxProfile install +
+                            // groupIdToken threading (slice 7d).
                             if let Err(e) = cp
                                 .start_transaction_with_remote_start_id(
                                     connector_id,
                                     &id_tag,
                                     0,
                                     remote_start_id,
+                                    charging_profile.map(|b| *b),
+                                    group_id_token,
                                 )
                                 .await
                             {
@@ -3404,13 +3463,18 @@ impl ChargePoint {
         id_tag: &str,
         meter_start: i32,
         remote_start_id: Option<i32>,
+        charging_profile: Option<ChargingProfileType>,
+        group_id_token: Option<V201IdTokenType>,
     ) -> OcppResult<i32> {
         match self.config.protocol_version {
             OcppVersion::V16J => {
                 // 1.6J `StartTransaction` has no `remoteStartId` field; the
                 // remote-start correlation on 1.6J is the synchronous
                 // `transactionId` returned in `RemoteStartTransaction.conf`.
+                // Nor does 1.6J thread a 2.0.1 `chargingProfile` / `groupIdToken`
+                // through a start (its `SetChargingProfile` installs separately).
                 let _ = remote_start_id;
+                let _ = (&charging_profile, &group_id_token);
                 let response = self
                     .call(StartTransactionRequest {
                         connector_id: connector_id.value(),
@@ -3471,15 +3535,31 @@ impl ChargePoint {
 
                 // Record the session before the sampler starts so both share the
                 // seqNo counter (Started took 0; the sampler and Ended hand out
-                // 1, 2, …) and the authorizing idTag for the Ended event.
+                // 1, 2, …) and the authorizing idTag for the Ended event. The
+                // optional `groupIdToken` rides on the session's auth context so
+                // it travels with the live transaction (slice 7d, Issue #450).
                 self.v201_sessions.write().await.insert(
                     transaction_id,
                     V201Session {
                         id_tag: id_tag.to_string(),
                         next_seq_no: Arc::new(AtomicI32::new(1)),
                         authorized: Arc::new(AtomicBool::new(true)),
+                        group_id_token,
                     },
                 );
+
+                // Install a `TxProfile` (already validated as such by the
+                // RequestStartTransaction handler) against this transaction's
+                // EVSE, atomically with the session it bounds. A `TxProfile` is
+                // transaction-scoped, so `close_transaction` clears it in lockstep
+                // when the transaction ends. The install is done only after the
+                // CSMS accepted the `Started` above, so a rejected start leaves no
+                // dangling profile. (Enforcing the schedule is the follow-up.)
+                if let Some(profile) = charging_profile {
+                    self.v201_tx_profiles
+                        .install(connector_id.value() as i32, profile)
+                        .await;
+                }
                 Ok(transaction_id)
             }
         }
@@ -3516,6 +3596,36 @@ impl ChargePoint {
         flipped
     }
 
+    /// The 2.0.1 `TxProfile` currently installed on `evse_id` by an accepted
+    /// `RequestStartTransaction`, if any (slice 7d, Issue #450).
+    ///
+    /// The read path making an installed profile observable: an operator (or a
+    /// test) can confirm a remote start's `chargingProfile` was actually taken up
+    /// against its EVSE, rather than parsed off the wire and dropped. A profile is
+    /// present only for the lifetime of the transaction it bounds — installed when
+    /// the transaction opens, cleared when it ends — so a `Some` here means a live,
+    /// profile-bounded transaction on that EVSE. Always `None` on the 1.6J path
+    /// (which has no v201 profile store) and for a transaction that carried no
+    /// `chargingProfile`.
+    pub async fn installed_tx_profile(&self, evse_id: i32) -> Option<ChargingProfileType> {
+        self.v201_tx_profiles.get(evse_id).await
+    }
+
+    /// The `groupIdToken` threaded onto the live 2.0.1 transaction `transaction_id`
+    /// at start, if the `RequestStartTransaction` carried one (slice 7d, Issue #450).
+    ///
+    /// The read path making the group/parent token observable on the session's
+    /// auth context. `None` when the transaction is unknown, carried no
+    /// `groupIdToken`, or was started locally / on the 1.6J path (no live 2.0.1
+    /// session).
+    pub async fn transaction_group_id_token(&self, transaction_id: i32) -> Option<V201IdTokenType> {
+        self.v201_sessions
+            .read()
+            .await
+            .get(&transaction_id)
+            .and_then(|s| s.group_id_token.clone())
+    }
+
     /// Open a charging transaction on `connector_id`, transition it to
     /// `Charging`, and start periodic metering.
     ///
@@ -3541,9 +3651,17 @@ impl ChargePoint {
     ) -> OcppResult<i32> {
         // A locally initiated start (e.g. the cable was plugged in) has no
         // remote-start request to correlate; the remote 2.0.1 path threads the
-        // `remoteStartId` via `start_transaction_with_remote_start_id`.
-        self.start_transaction_with_remote_start_id(connector_id, id_tag, meter_start, None)
-            .await
+        // `remoteStartId`, `chargingProfile`, and `groupIdToken` via
+        // `start_transaction_with_remote_start_id`.
+        self.start_transaction_with_remote_start_id(
+            connector_id,
+            id_tag,
+            meter_start,
+            None,
+            None,
+            None,
+        )
+        .await
     }
 
     /// [`start_transaction`](Self::start_transaction) plus the optional 2.0.1
@@ -3552,12 +3670,21 @@ impl ChargePoint {
     /// remote-start request with the session that follows. `remote_start_id` is
     /// `None` on the local-start and 1.6J paths (neither carries a
     /// `remoteStartId`), keeping their behavior byte-for-byte unchanged.
+    ///
+    /// `charging_profile` (a validated `TxProfile`) and `group_id_token` carry
+    /// the 2.0.1 `RequestStartTransaction.chargingProfile` / `groupIdToken`
+    /// (slice 7d, Issue #450): the profile is installed against the started
+    /// transaction's EVSE and the group token onto its [`V201Session`], both in
+    /// `open_transaction` so they land atomically with the session. `None` on the
+    /// local-start and 1.6J paths.
     async fn start_transaction_with_remote_start_id(
         &self,
         connector_id: ConnectorId,
         id_tag: &str,
         meter_start: i32,
         remote_start_id: Option<i32>,
+        charging_profile: Option<ChargingProfileType>,
+        group_id_token: Option<V201IdTokenType>,
     ) -> OcppResult<i32> {
         // Connector is now preparing for a transaction (Available -> Preparing).
         self.send_status_notification(
@@ -3568,7 +3695,14 @@ impl ChargePoint {
         .await?;
 
         let transaction_id = self
-            .open_transaction(connector_id, id_tag, meter_start, remote_start_id)
+            .open_transaction(
+                connector_id,
+                id_tag,
+                meter_start,
+                remote_start_id,
+                charging_profile,
+                group_id_token,
+            )
             .await?;
 
         // Map transaction ID → connector ID for stop_transaction lookup
@@ -3669,6 +3803,15 @@ impl ChargePoint {
                 // Silence the periodic sampler before drawing the final seqNo, so
                 // no in-flight Updated can claim a number after the Ended event.
                 self.stop_meter_sampler(transaction_id).await;
+
+                // A `TxProfile` is transaction-scoped: clear any installed against
+                // this EVSE now that its transaction is ending, in lockstep with
+                // removing the session (slice 7d, Issue #450). Keyed by EVSE id
+                // (= connector value), matching `open_transaction`'s install.
+                // Idempotent — a transaction that carried no profile clears nothing.
+                self.v201_tx_profiles
+                    .clear(connector_id.value() as i32)
+                    .await;
 
                 let session = self.v201_sessions.write().await.remove(&transaction_id);
                 let session = match session {
