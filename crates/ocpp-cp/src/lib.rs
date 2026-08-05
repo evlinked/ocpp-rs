@@ -20,6 +20,7 @@ pub mod state_machine;
 pub mod transaction;
 pub mod v201_charging_profiles;
 pub mod v201_command;
+pub mod v201_device_model;
 pub mod v201_transaction;
 
 use anyhow::Result;
@@ -68,24 +69,29 @@ use ocpp_types::{
     OcppVersion,
 };
 use v201_charging_profiles::V201TxProfileStore;
+use v201_device_model::V201DeviceModel;
 // 2.0.1 provisioning message + enum types used by the version-aware runtime
 // (slice 2). Aliased to avoid clashing with the unqualified 1.6J names imported
 // above (`StatusNotificationRequest`, `RegistrationStatus`).
 use ocpp_messages::v201::{
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
-    MeterValuesRequest as V201MeterValuesRequest,
+    GetVariablesRequest as V201GetVariablesRequest,
+    GetVariablesResponse as V201GetVariablesResponse, MeterValuesRequest as V201MeterValuesRequest,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     RequestStopTransactionRequest as V201RequestStopTransactionRequest,
-    ResetRequest as V201ResetRequest, StatusNotificationRequest as V201StatusNotificationRequest,
+    ResetRequest as V201ResetRequest, SetVariablesRequest as V201SetVariablesRequest,
+    SetVariablesResponse as V201SetVariablesResponse,
+    StatusNotificationRequest as V201StatusNotificationRequest,
     TriggerMessageRequest as V201TriggerMessageRequest,
     UnlockConnectorRequest as V201UnlockConnectorRequest,
 };
 use ocpp_types::v201::{
-    AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType, ChargingProfilePurposeEnumType,
-    ChargingProfileType, ConnectorStatusEnumType, IdTokenType as V201IdTokenType,
-    MessageTriggerEnumType, OperationalStatusEnumType, RegistrationStatusEnumType,
-    RequestStartStopStatusEnumType, ResetStatusEnumType, StatusInfoType,
-    TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    AttributeEnumType, AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType,
+    ChargingProfilePurposeEnumType, ChargingProfileType, ConnectorStatusEnumType,
+    GetVariableResultType, IdTokenType as V201IdTokenType, MessageTriggerEnumType,
+    OperationalStatusEnumType, RegistrationStatusEnumType, RequestStartStopStatusEnumType,
+    ResetStatusEnumType, SetVariableResultType, StatusInfoType, TriggerMessageStatusEnumType,
+    UnlockStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1063,9 +1069,15 @@ impl ChargePoint {
             );
             Arc::new(RwLock::new(store))
         };
+        // The 2.0.1 device model the `GetVariables` handler reads. Seeded with a
+        // representative standard profile; station-wide (no per-EVSE variables)
+        // for now. Behind an `RwLock` so a future `SetVariables` write seam
+        // (#458) can share and mutate it.
+        let v201_device_model = Arc::new(RwLock::new(V201DeviceModel::with_standard_profile()));
         let mut dispatcher = Self::build_default_dispatcher(
             config.protocol_version,
             config_store.clone(),
+            v201_device_model.clone(),
             auth_cache.clone(),
             command_sender.clone(),
             connectors.clone(),
@@ -1132,6 +1144,7 @@ impl ChargePoint {
     fn build_default_dispatcher(
         protocol_version: OcppVersion,
         config_store: Arc<RwLock<ConfigurationStore>>,
+        v201_device_model: Arc<RwLock<V201DeviceModel>>,
         auth_cache: Arc<AuthCache>,
         command_sender: mpsc::UnboundedSender<RemoteCommand>,
         connectors: Arc<RwLock<HashMap<ConnectorId, Connector>>>,
@@ -1345,6 +1358,107 @@ impl ChargePoint {
                     Ok(GetConfigurationResponse {
                         configuration_keys,
                         unknown_keys,
+                    })
+                }
+            });
+        }
+
+        // GetVariables (OCPP 2.0.1 only) — read one or more component-variable
+        // attributes from the device model. The 2.0.1 replacement for 1.6J
+        // `GetConfiguration`: instead of flat keys, each entry names a
+        // `component`/`variable` pair (see `v201_device_model`). Registered only
+        // on the V201 arm — "GetVariables" has no 1.6J twin, and the negotiated
+        // subprotocol + version-aware inbound validator keep a 1.6J CP from ever
+        // seeing this action. Read-only: no side effects, so nothing is deferred
+        // off the CALL path. Ports `ocpp.v201.call.GetVariables`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let device_model = v201_device_model.clone();
+            d.on(move |req: V201GetVariablesRequest| {
+                let device_model = device_model.clone();
+                async move {
+                    let model = device_model.read().await;
+                    // One result per requested entry, in request order. Each
+                    // result echoes the CSMS's original (un-normalized)
+                    // `component` / `variable` / `attributeType`, as the schema
+                    // requires; an omitted `attributeType` resolves to `Actual`
+                    // for the lookup but is echoed back as `None`.
+                    let get_variable_result: Vec<GetVariableResultType> = req
+                        .get_variable_data
+                        .iter()
+                        .map(|data| {
+                            let attribute =
+                                data.attribute_type.unwrap_or(AttributeEnumType::Actual);
+                            let (attribute_status, attribute_value) =
+                                model.get(&data.component, &data.variable, attribute);
+                            GetVariableResultType {
+                                attribute_status,
+                                component: data.component.clone(),
+                                variable: data.variable.clone(),
+                                attribute_type: data.attribute_type,
+                                attribute_value,
+                                attribute_status_info: None,
+                                custom_data: None,
+                            }
+                        })
+                        .collect();
+                    Ok(V201GetVariablesResponse {
+                        get_variable_result,
+                        custom_data: None,
+                    })
+                }
+            });
+        }
+
+        // SetVariables (OCPP 2.0.1 only) — write one or more component-variable
+        // attributes into the device model. The 2.0.1 replacement for 1.6J
+        // `ChangeConfiguration`, and the write counterpart to `GetVariables`
+        // above: it shares the same `V201DeviceModel` store (behind the write
+        // lock here). Registered only on the V201 arm — "SetVariables" has no
+        // 1.6J twin, and the negotiated subprotocol + version-aware inbound
+        // validator keep a 1.6J CP from ever seeing this action.
+        //
+        // Trust boundary: each `attributeValue` is an untrusted, schema-bounded
+        // string stored verbatim (no parse/exec), so there are no panics on wire
+        // input. The write is applied on the CALL path (a device-model store
+        // update is cheap and must be visible to the CALLRESULT and to any
+        // subsequent `GetVariables`), serialized by the model's write lock.
+        // Ports `ocpp.v201.call.SetVariables`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let device_model = v201_device_model.clone();
+            d.on(move |req: V201SetVariablesRequest| {
+                let device_model = device_model.clone();
+                async move {
+                    let mut model = device_model.write().await;
+                    // One result per requested entry, in request order. Each
+                    // result echoes the CSMS's original (un-normalized)
+                    // `component` / `variable` / `attributeType`; an omitted
+                    // `attributeType` resolves to `Actual` for the write but is
+                    // echoed back as `None`, mirroring the read seam.
+                    let set_variable_result: Vec<SetVariableResultType> = req
+                        .set_variable_data
+                        .iter()
+                        .map(|data| {
+                            let attribute =
+                                data.attribute_type.unwrap_or(AttributeEnumType::Actual);
+                            let attribute_status = model.set(
+                                &data.component,
+                                &data.variable,
+                                attribute,
+                                &data.attribute_value,
+                            );
+                            SetVariableResultType {
+                                attribute_status,
+                                component: data.component.clone(),
+                                variable: data.variable.clone(),
+                                attribute_type: data.attribute_type,
+                                attribute_status_info: None,
+                                custom_data: None,
+                            }
+                        })
+                        .collect();
+                    Ok(V201SetVariablesResponse {
+                        set_variable_result,
+                        custom_data: None,
                     })
                 }
             });
