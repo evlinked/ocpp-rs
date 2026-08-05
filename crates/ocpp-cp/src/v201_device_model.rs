@@ -36,7 +36,8 @@
 //! requires.
 
 use ocpp_types::v201::{
-    AttributeEnumType, ComponentType, GetVariableStatusEnumType, SetVariableStatusEnumType,
+    AttributeEnumType, ComponentType, GetVariableStatusEnumType, MutabilityEnumType,
+    ReportBaseEnumType, ReportDataType, SetVariableStatusEnumType, VariableAttributeType,
     VariableType,
 };
 use std::collections::{HashMap, HashSet};
@@ -93,15 +94,24 @@ struct WritePolicy {
     reboot_required: bool,
 }
 
-/// One variable's stored state: its attribute values plus its write policy.
+/// One variable's stored state: its attribute values, its write policy, and the
+/// **display forms** of its component / variable identity.
 ///
 /// A variable exposes at most the four `AttributeEnumType`s, so a small `Vec`
 /// (linear scan) is cheaper and simpler than a map — and `AttributeEnumType` is
 /// not `Hash`.
-#[derive(Debug, Default, Clone)]
+///
+/// The [`VariableKey`] that addresses this entry is lowercased for
+/// case-insensitive lookup, which loses the original casing. `component` /
+/// `variable` keep the identity in its CSMS-visible form so `GetBaseReport` →
+/// `NotifyReport` can reproduce the real names (`OCPPCommCtrlr`, not
+/// `ocppcommctrlr`) rather than the normalized keys.
+#[derive(Debug, Clone)]
 struct VariableEntry {
     attributes: Vec<(AttributeEnumType, String)>,
     policy: WritePolicy,
+    component: ComponentType,
+    variable: VariableType,
 }
 
 /// The Charge Point simulator's OCPP 2.0.1 device model: the attribute values a
@@ -169,7 +179,26 @@ impl V201DeviceModel {
             instance: None,
         };
         self.components.insert(component_key);
-        let entry = self.variables.entry(variable_key).or_default();
+        // Seed the display forms once, on first insert, so a later attribute
+        // added to the same variable keeps the original casing.
+        let entry = self
+            .variables
+            .entry(variable_key)
+            .or_insert_with(|| VariableEntry {
+                attributes: Vec::new(),
+                policy,
+                component: ComponentType {
+                    name: component.to_string(),
+                    instance: None,
+                    evse: None,
+                    custom_data: None,
+                },
+                variable: VariableType {
+                    name: variable.to_string(),
+                    instance: None,
+                    custom_data: None,
+                },
+            });
         entry.policy = policy;
         let value = value.into();
         match entry.attributes.iter_mut().find(|(a, _)| *a == attribute) {
@@ -318,6 +347,98 @@ impl V201DeviceModel {
         } else {
             SetVariableStatusEnumType::Accepted
         }
+    }
+
+    /// Enumerate the device model as `NotifyReport` [`ReportDataType`] entries,
+    /// selected by the requested [`ReportBaseEnumType`].
+    ///
+    /// This is the pure data half of the `GetBaseReport` → `NotifyReport` report
+    /// seam: the handler acks `GetBaseReport` and then streams whatever this
+    /// returns. Each entry reports a variable in its **display** (CSMS-visible)
+    /// casing with one [`VariableAttributeType`] per stored attribute, carrying
+    /// the value and the mutability derived from the write policy
+    /// (`read_only` → `ReadOnly`, otherwise `ReadWrite`).
+    ///
+    /// `reportBase` selects the slice:
+    /// - [`FullInventory`](ReportBaseEnumType::FullInventory) — every variable.
+    /// - [`ConfigurationInventory`](ReportBaseEnumType::ConfigurationInventory) —
+    ///   the writable configuration only (read-only capability constants are
+    ///   omitted).
+    /// - [`SummaryInventory`](ReportBaseEnumType::SummaryInventory) — variables
+    ///   in a non-default / abnormal state. A freshly-booted simulator has none,
+    ///   so this is empty (the handler turns an empty report into
+    ///   `EmptyResultSet`). Precise summary semantics (changed-from-default,
+    ///   Faulted components) are a later slice.
+    ///
+    /// The result is **deterministically ordered** — sorted by component name /
+    /// instance / EVSE then variable name / instance — so callers (and tests) see
+    /// a stable report independent of the backing `HashMap`'s iteration order.
+    /// `variableCharacteristics` is left unset: the seed does not model typed
+    /// characteristics yet (a documented follow-up); the schema makes it
+    /// optional.
+    pub fn report(&self, report_base: ReportBaseEnumType) -> Vec<ReportDataType> {
+        // SummaryInventory: nothing noteworthy on a healthy, freshly-booted
+        // simulator — an empty report the handler maps to EmptyResultSet.
+        if matches!(report_base, ReportBaseEnumType::SummaryInventory) {
+            return Vec::new();
+        }
+        let mut report: Vec<ReportDataType> = self
+            .variables
+            .values()
+            .filter(|entry| match report_base {
+                // Configuration inventory is the *writable* configuration only.
+                ReportBaseEnumType::ConfigurationInventory => !entry.policy.read_only,
+                // Full inventory reports everything.
+                ReportBaseEnumType::FullInventory => true,
+                // Handled above; keep the match exhaustive without a wildcard so
+                // a new report base is a compile error to triage here.
+                ReportBaseEnumType::SummaryInventory => false,
+            })
+            .map(|entry| {
+                let mutability = if entry.policy.read_only {
+                    MutabilityEnumType::ReadOnly
+                } else {
+                    MutabilityEnumType::ReadWrite
+                };
+                let variable_attribute = entry
+                    .attributes
+                    .iter()
+                    .map(|(kind, value)| VariableAttributeType {
+                        kind: Some(*kind),
+                        value: Some(value.clone()),
+                        mutability: Some(mutability),
+                        persistent: None,
+                        constant: None,
+                        custom_data: None,
+                    })
+                    .collect();
+                ReportDataType {
+                    component: entry.component.clone(),
+                    variable: entry.variable.clone(),
+                    variable_attribute,
+                    variable_characteristics: None,
+                    custom_data: None,
+                }
+            })
+            .collect();
+        // Stable, reviewable order independent of HashMap iteration.
+        report.sort_by(|a, b| {
+            (
+                &a.component.name,
+                &a.component.instance,
+                a.component.evse.as_ref().map(|e| e.id),
+                &a.variable.name,
+                &a.variable.instance,
+            )
+                .cmp(&(
+                    &b.component.name,
+                    &b.component.instance,
+                    b.component.evse.as_ref().map(|e| e.id),
+                    &b.variable.name,
+                    &b.variable.instance,
+                ))
+        });
+        report
     }
 }
 
@@ -540,5 +661,135 @@ mod tests {
             "600",
         );
         assert_eq!(status, SetVariableStatusEnumType::Accepted);
+    }
+
+    /// Find the single report entry for a component/variable name pair.
+    fn find<'a>(
+        report: &'a [ReportDataType],
+        component: &str,
+        variable: &str,
+    ) -> Option<&'a ReportDataType> {
+        report
+            .iter()
+            .find(|d| d.component.name == component && d.variable.name == variable)
+    }
+
+    #[test]
+    fn report_full_inventory_lists_seeded_variables_in_display_casing() {
+        let model = V201DeviceModel::with_standard_profile();
+        let report = model.report(ReportBaseEnumType::FullInventory);
+
+        // The report reproduces the CSMS-visible casing, not the normalized key.
+        let heartbeat = find(&report, "OCPPCommCtrlr", "HeartbeatInterval")
+            .expect("FullInventory includes the heartbeat interval in its display casing");
+        assert_eq!(heartbeat.variable_attribute.len(), 1);
+        let attr = &heartbeat.variable_attribute[0];
+        assert_eq!(attr.kind, Some(AttributeEnumType::Actual));
+        assert_eq!(attr.value.as_deref(), Some("300"));
+        assert_eq!(attr.mutability, Some(MutabilityEnumType::ReadWrite));
+        // No typed characteristics modeled yet.
+        assert!(heartbeat.variable_characteristics.is_none());
+
+        // FullInventory includes read-only capability constants too.
+        assert!(
+            find(&report, "SecurityCtrlr", "MaxCertificateChainSize").is_some(),
+            "FullInventory includes read-only variables"
+        );
+    }
+
+    #[test]
+    fn report_read_only_variable_reports_read_only_mutability() {
+        let model = V201DeviceModel::with_standard_profile();
+        let report = model.report(ReportBaseEnumType::FullInventory);
+        let max_chain = find(&report, "SecurityCtrlr", "MaxCertificateChainSize")
+            .expect("read-only constant is in the full inventory");
+        assert_eq!(
+            max_chain.variable_attribute[0].mutability,
+            Some(MutabilityEnumType::ReadOnly),
+            "a read-only variable reports ReadOnly mutability"
+        );
+    }
+
+    #[test]
+    fn report_configuration_inventory_excludes_read_only_variables() {
+        let model = V201DeviceModel::with_standard_profile();
+        let full = model.report(ReportBaseEnumType::FullInventory);
+        let config = model.report(ReportBaseEnumType::ConfigurationInventory);
+
+        // The read-only capability constant is the only non-writable seed entry,
+        // so configuration is exactly the full inventory minus it.
+        assert!(
+            find(&config, "SecurityCtrlr", "MaxCertificateChainSize").is_none(),
+            "ConfigurationInventory omits the read-only MaxCertificateChainSize"
+        );
+        assert!(
+            find(&config, "OCPPCommCtrlr", "HeartbeatInterval").is_some(),
+            "ConfigurationInventory keeps writable variables"
+        );
+        assert_eq!(
+            config.len(),
+            full.len() - 1,
+            "configuration is the full inventory minus the one read-only variable"
+        );
+    }
+
+    #[test]
+    fn report_configuration_includes_reboot_required_variable() {
+        // A reboot-required variable is still writable, so it belongs to the
+        // configuration inventory (only `read_only` variables are excluded).
+        let model = V201DeviceModel::with_standard_profile();
+        let config = model.report(ReportBaseEnumType::ConfigurationInventory);
+        let net = find(&config, "OCPPCommCtrlr", "NetworkConfigurationPriority")
+            .expect("reboot-required variable is writable, so it is in the configuration report");
+        assert_eq!(
+            net.variable_attribute[0].mutability,
+            Some(MutabilityEnumType::ReadWrite),
+        );
+    }
+
+    #[test]
+    fn report_summary_inventory_is_empty() {
+        let model = V201DeviceModel::with_standard_profile();
+        assert!(
+            model
+                .report(ReportBaseEnumType::SummaryInventory)
+                .is_empty(),
+            "a freshly-booted simulator has nothing noteworthy to summarize"
+        );
+    }
+
+    #[test]
+    fn report_is_deterministically_ordered() {
+        let model = V201DeviceModel::with_standard_profile();
+        let first = model.report(ReportBaseEnumType::FullInventory);
+        let second = model.report(ReportBaseEnumType::FullInventory);
+        assert_eq!(first, second, "report ordering is stable across calls");
+
+        // Sorted by component name then variable name.
+        let keys: Vec<(&str, &str)> = first
+            .iter()
+            .map(|d| (d.component.name.as_str(), d.variable.name.as_str()))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(keys, sorted, "report is sorted by component then variable");
+    }
+
+    #[test]
+    fn report_reflects_a_written_value() {
+        // A SetVariables write is visible to a subsequent report.
+        let mut model = V201DeviceModel::with_standard_profile();
+        model.set(
+            &component("OCPPCommCtrlr"),
+            &variable("HeartbeatInterval"),
+            AttributeEnumType::Actual,
+            "600",
+        );
+        let report = model.report(ReportBaseEnumType::FullInventory);
+        let heartbeat = find(&report, "OCPPCommCtrlr", "HeartbeatInterval").unwrap();
+        assert_eq!(
+            heartbeat.variable_attribute[0].value.as_deref(),
+            Some("600")
+        );
     }
 }
