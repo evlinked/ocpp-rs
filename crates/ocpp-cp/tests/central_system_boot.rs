@@ -1644,6 +1644,82 @@ async fn v201_unlock_connector_with_a_live_transaction_is_refused_and_does_not_s
 }
 
 #[tokio::test]
+async fn v201_unlock_connector_stops_a_deauthorized_transaction_then_unlocks() {
+    // The other half of the 2.0.1 policy: a live transaction that has been
+    // *deauthorized* (the driver re-presented their card / the app revoked
+    // authorization) is no longer refused. An inbound `UnlockConnector` stops it
+    // first (reason `UnlockCommand`) and releases the cable — the 2.0.1 analogue
+    // of the 1.6J stop-then-unlock, reachable only once the session is
+    // deauthorized (a still-authorized session stays refused, above).
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    // A long meter interval so the only `Ended` on the log is the unlock-triggered
+    // stop — no periodic `Updated`/`Ended` noise to race the assertion.
+    let config = ChargePointConfig {
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_UNLOCK_DEAUTH")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // Occupy EVSE 1, wait for the Started so the session is registered, then
+    // deauthorize it: the cable stays latched but the driver is no longer
+    // authorized.
+    let connector = ConnectorId::new(1).unwrap();
+    cp.start_transaction(connector, "RFID-DEAUTH", 0)
+        .await
+        .expect("v201 start_transaction");
+    wait_for_event(&log, TransactionEventEnumType::Started).await;
+    assert_eq!(
+        cp.deauthorize("RFID-DEAUTH").await,
+        1,
+        "the one live session started by this idTag is deauthorized"
+    );
+
+    // CSMS -> CP: unlock the now-deauthorized connector → the station stops the
+    // transaction (reason `UnlockCommand`) and releases the cable (`Unlocked`).
+    let resp = server
+        .call::<V201UnlockConnectorRequest>(
+            "CP201_UNLOCK_DEAUTH",
+            V201UnlockConnectorRequest {
+                evse_id: 1,
+                connector_id: 1,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS UnlockConnector call round-trips");
+    assert_eq!(
+        resp.status,
+        UnlockStatusEnumType::Unlocked,
+        "a deauthorized transaction is stopped and the cable released"
+    );
+
+    // The stop lands off the CALL path (CALLRESULT flushed first); wait for the
+    // `Ended` it emits, then assert it names the transaction and the trigger.
+    wait_for_event(&log, TransactionEventEnumType::Ended).await;
+    {
+        let events = log.lock().expect("txn log mutex not poisoned");
+        let ended = events
+            .iter()
+            .rfind(|e| e.event_type == TransactionEventEnumType::Ended)
+            .expect("an Ended event was recorded");
+        assert_eq!(
+            ended.trigger_reason,
+            TriggerReasonEnumType::UnlockCommand,
+            "the unlock-triggered stop reports triggerReason = UnlockCommand"
+        );
+        assert_eq!(
+            ended.transaction_info.transaction_id, "1",
+            "the Ended names the transaction that was unlocked"
+        );
+    }
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
 async fn v201_unlock_connector_for_an_unknown_evse_is_unknown_connector() {
     let (mut server, addr) = start_v201_csms(|_| {}).await;
 
