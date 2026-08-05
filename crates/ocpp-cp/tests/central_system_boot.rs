@@ -1894,8 +1894,10 @@ async fn v201_request_start_transaction_with_a_valid_txprofile_is_accepted() {
 
     // CSMS -> CP: remote start bounding the session with a TxProfile — the one
     // profile purpose 2.0.1 permits on a RequestStartTransaction. It is accepted
-    // and the transaction starts (installing/enforcing the schedule is the
-    // slice-7d follow-up; the profile is validated here, not yet enforced).
+    // and the transaction starts. (This case asserts acceptance; the install of
+    // the profile is asserted by
+    // `v201_request_start_installs_the_txprofile_and_threads_group_id_token`;
+    // enforcing the schedule is the follow-up.)
     let resp = server
         .call::<V201RequestStartTransactionRequest>(
             "CP201_REQSTART_TXPROFILE",
@@ -1976,6 +1978,102 @@ async fn v201_request_start_transaction_with_a_non_txprofile_charging_profile_is
         started_count(&log),
         0,
         "a rejected malformed-profile start begins no transaction"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// RequestStartTransaction — slice 7d (Issue #450): a valid TxProfile is now
+// *installed* against the started transaction's EVSE (observable via
+// `installed_tx_profile`) and the request's `groupIdToken` is threaded onto the
+// session's auth context (observable via `transaction_group_id_token`), both for
+// the lifetime of the transaction. Stopping the transaction clears the installed
+// profile (a TxProfile is transaction-scoped). Enforcing the schedule is a
+// follow-up; this asserts install + threading + teardown.
+#[tokio::test]
+async fn v201_request_start_installs_the_txprofile_and_threads_group_id_token() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    let config = ChargePointConfig {
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_REQSTART_INSTALL")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // No profile installed and no session before the remote start.
+    assert_eq!(
+        cp.installed_tx_profile(1).await,
+        None,
+        "no TxProfile is installed on an idle EVSE"
+    );
+
+    // CSMS -> CP: remote start on the free EVSE 1, bounding it with a TxProfile
+    // and naming a parent/group token (a fleet card the driver token belongs to).
+    let profile = charging_profile(ChargingProfilePurposeEnumType::TxProfile);
+    let group_token = central_id_token("GROUP-FLEET-01");
+    let resp = server
+        .call::<V201RequestStartTransactionRequest>(
+            "CP201_REQSTART_INSTALL",
+            V201RequestStartTransactionRequest {
+                id_token: central_id_token("RFID-CAFE"),
+                remote_start_id: 77,
+                evse_id: Some(1),
+                group_id_token: Some(group_token.clone()),
+                charging_profile: Some(profile.clone()),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStartTransaction call round-trips");
+    assert_eq!(resp.status, RequestStartStopStatusEnumType::Accepted);
+
+    // Wait for the Started event: it guarantees the transaction actually opened
+    // (the install + group-token threading happen in `open_transaction`, on the
+    // same path, before this event is sent) and hands us the station-minted id.
+    wait_for_event(&log, TransactionEventEnumType::Started).await;
+    let txn_id_str = recorded_transaction_id(&log, TransactionEventEnumType::Started);
+    let txn_id: i32 = txn_id_str.parse().expect("station-minted id is decimal");
+
+    // The TxProfile the request carried is installed against EVSE 1, byte-for-byte
+    // (round-tripped over the wire), rather than parsed and dropped.
+    assert_eq!(
+        cp.installed_tx_profile(1).await,
+        Some(profile),
+        "the accepted RequestStartTransaction installs its TxProfile against the targeted EVSE"
+    );
+    // The groupIdToken rides on the started transaction's auth context.
+    assert_eq!(
+        cp.transaction_group_id_token(txn_id).await,
+        Some(group_token),
+        "the request's groupIdToken is threaded onto the started transaction"
+    );
+
+    // CSMS -> CP: stop the live transaction. A TxProfile is transaction-scoped, so
+    // ending the transaction clears the installed profile in lockstep.
+    let stop = server
+        .call::<V201RequestStopTransactionRequest>(
+            "CP201_REQSTART_INSTALL",
+            V201RequestStopTransactionRequest {
+                transaction_id: txn_id_str,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStopTransaction call round-trips");
+    assert_eq!(stop.status, RequestStartStopStatusEnumType::Accepted);
+
+    wait_for_event(&log, TransactionEventEnumType::Ended).await;
+    assert_eq!(
+        cp.installed_tx_profile(1).await,
+        None,
+        "ending the transaction clears its transaction-scoped TxProfile"
+    );
+    assert_eq!(
+        cp.transaction_group_id_token(txn_id).await,
+        None,
+        "the session (and its group token) is gone once the transaction ends"
     );
 
     cp.disconnect().await.expect("disconnect");
