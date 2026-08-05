@@ -48,8 +48,8 @@ use ocpp_types::v201::{
     ChargingProfileKindEnumType, ChargingProfilePurposeEnumType, ChargingProfileType,
     ChargingRateUnitEnumType, ChargingSchedulePeriodType, ChargingScheduleType, ComponentType,
     ConnectorStatusEnumType, EvseType, GetVariableDataType, GetVariableStatusEnumType,
-    IdTokenEnumType, IdTokenType, MessageTriggerEnumType, OperationalStatusEnumType,
-    ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType,
+    IdTokenEnumType, IdTokenType, MeasurandEnumType, MessageTriggerEnumType,
+    OperationalStatusEnumType, ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType,
     RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType, SetVariableDataType,
     SetVariableStatusEnumType, TransactionEventEnumType, TriggerMessageStatusEnumType,
     TriggerReasonEnumType, UnlockStatusEnumType, VariableType,
@@ -2075,6 +2075,189 @@ async fn v201_request_start_installs_the_txprofile_and_threads_group_id_token() 
         None,
         "the session (and its group token) is gone once the transaction ends"
     );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// ---------------------------------------------------------------------------
+// RequestStartTransaction — slice 7e (Issue #455): the installed TxProfile is
+// now *binding*. When its chargingSchedule limit is tighter than the connector's
+// natural rate, the periodic TransactionEvent(Updated) surfaces the bounded
+// power as a Power.Active.Import sample alongside the energy reading. A
+// profile-less session (or one whose limit is above the natural rate) is
+// unchanged — energy only.
+// ---------------------------------------------------------------------------
+
+/// A schema-valid `TxProfile` bounding the session to a single flat watt limit.
+fn tx_profile_limited_w(limit_w: f64) -> ChargingProfileType {
+    ChargingProfileType {
+        id: 1,
+        stack_level: 0,
+        charging_profile_purpose: ChargingProfilePurposeEnumType::TxProfile,
+        charging_profile_kind: ChargingProfileKindEnumType::Relative,
+        charging_schedule: vec![ChargingScheduleType {
+            id: 1,
+            charging_rate_unit: ChargingRateUnitEnumType::W,
+            charging_schedule_period: vec![ChargingSchedulePeriodType {
+                start_period: 0,
+                limit: limit_w,
+                number_phases: None,
+                phase_to_use: None,
+                custom_data: None,
+            }],
+            start_schedule: None,
+            duration: None,
+            min_charging_rate: None,
+            sales_tariff: None,
+            custom_data: None,
+        }],
+        recurrency_kind: None,
+        valid_from: None,
+        valid_to: None,
+        transaction_id: None,
+        custom_data: None,
+    }
+}
+
+/// The first `Power.Active.Import` value on the first recorded `Updated` event,
+/// or `None` if the sampler has emitted no `Updated` carrying one yet.
+fn recorded_bounded_power(log: &TxnLog) -> Option<f64> {
+    log.lock()
+        .expect("txn log mutex not poisoned")
+        .iter()
+        .find(|e| e.event_type == TransactionEventEnumType::Updated)
+        .and_then(|e| e.meter_value.as_ref())
+        .and_then(|mv| mv.first())
+        .and_then(|m| {
+            m.sampled_value
+                .iter()
+                .find(|s| s.measurand == Some(MeasurandEnumType::PowerActiveImport))
+        })
+        .map(|s| s.value)
+}
+
+#[tokio::test]
+async fn v201_periodic_update_reflects_the_installed_txprofile_limit() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    // A 1s meter interval so the periodic Updated sampler ticks promptly; the
+    // test waits on the recorded log rather than sleeping a fixed duration.
+    let config = ChargePointConfig {
+        meter_values_interval: 1,
+        ..v201_cp_config(addr, "CP201_ENFORCE")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // CSMS -> CP: remote start bounding the session to 3 680 W — tighter than the
+    // connector's 7 360 W natural rate, so the limit is binding.
+    let profile = tx_profile_limited_w(3_680.0);
+    let resp = server
+        .call::<V201RequestStartTransactionRequest>(
+            "CP201_ENFORCE",
+            V201RequestStartTransactionRequest {
+                id_token: central_id_token("RFID-CAFE"),
+                remote_start_id: 55,
+                evse_id: Some(1),
+                group_id_token: None,
+                charging_profile: Some(profile),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStartTransaction call round-trips");
+    assert_eq!(
+        resp.status,
+        RequestStartStopStatusEnumType::Accepted,
+        "a valid TxProfile-bounded remote start is Accepted"
+    );
+
+    // Wait for the background sampler to emit at least one periodic Updated — the
+    // positive is waited, never slept.
+    wait_for_event(&log, TransactionEventEnumType::Updated).await;
+
+    // The periodic reading surfaces the profile-bounded power (3 680 W) as a
+    // Power.Active.Import sample beside the energy one.
+    assert_eq!(
+        recorded_bounded_power(&log),
+        Some(3_680.0),
+        "the Updated reflects the installed TxProfile's binding limit"
+    );
+
+    // Every Updated carries two samples: the energy reading plus the bound. The
+    // energy sample is preserved, first, and unchanged in kind.
+    {
+        let events = log.lock().expect("txn log mutex not poisoned");
+        let updated = events
+            .iter()
+            .find(|e| e.event_type == TransactionEventEnumType::Updated)
+            .expect("an Updated was recorded");
+        let samples = &updated.meter_value.as_ref().expect("meterValue")[0].sampled_value;
+        assert_eq!(samples.len(), 2, "energy + bounded-power");
+        assert_eq!(
+            samples[0].measurand,
+            Some(MeasurandEnumType::EnergyActiveImportRegister),
+            "the energy sample is still first"
+        );
+    }
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_periodic_update_is_unchanged_without_a_binding_profile() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    let config = ChargePointConfig {
+        meter_values_interval: 1,
+        ..v201_cp_config(addr, "CP201_NOENFORCE")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // CSMS -> CP: remote start with a TxProfile whose 11 kW limit is *looser*
+    // than the 7.36 kW connector — not binding, so the reading must be unchanged.
+    let profile = tx_profile_limited_w(11_000.0);
+    let resp = server
+        .call::<V201RequestStartTransactionRequest>(
+            "CP201_NOENFORCE",
+            V201RequestStartTransactionRequest {
+                id_token: central_id_token("RFID-CAFE"),
+                remote_start_id: 56,
+                evse_id: Some(1),
+                group_id_token: None,
+                charging_profile: Some(profile),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStartTransaction call round-trips");
+    assert_eq!(resp.status, RequestStartStopStatusEnumType::Accepted);
+
+    wait_for_event(&log, TransactionEventEnumType::Updated).await;
+
+    // No Power.Active.Import sample: an above-natural-rate profile does not bend
+    // the reading, and the Updated stays the single energy sample.
+    assert_eq!(
+        recorded_bounded_power(&log),
+        None,
+        "a profile above the natural rate adds no bounded-power sample"
+    );
+    {
+        let events = log.lock().expect("txn log mutex not poisoned");
+        let updated = events
+            .iter()
+            .find(|e| e.event_type == TransactionEventEnumType::Updated)
+            .expect("an Updated was recorded");
+        let samples = &updated.meter_value.as_ref().expect("meterValue")[0].sampled_value;
+        assert_eq!(samples.len(), 1, "energy only — unchanged");
+        assert_eq!(
+            samples[0].measurand,
+            Some(MeasurandEnumType::EnergyActiveImportRegister)
+        );
+    }
 
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");
