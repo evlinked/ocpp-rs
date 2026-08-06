@@ -24,9 +24,12 @@ use ocpp_messages::v201::{
     BootNotificationRequest as V201BootNotificationRequest,
     BootNotificationResponse as V201BootNotificationResponse,
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
+    GetBaseReportRequest as V201GetBaseReportRequest,
+    GetBaseReportResponse as V201GetBaseReportResponse,
     GetVariablesRequest as V201GetVariablesRequest,
     GetVariablesResponse as V201GetVariablesResponse, MeterValuesRequest as V201MeterValuesRequest,
-    MeterValuesResponse as V201MeterValuesResponse,
+    MeterValuesResponse as V201MeterValuesResponse, NotifyReportRequest as V201NotifyReportRequest,
+    NotifyReportResponse as V201NotifyReportResponse,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     RequestStopTransactionRequest as V201RequestStopTransactionRequest,
     ResetRequest as V201ResetRequest, SetVariablesRequest as V201SetVariablesRequest,
@@ -47,12 +50,13 @@ use ocpp_types::v201::{
     AttributeEnumType, BootReasonEnumType, ChangeAvailabilityStatusEnumType,
     ChargingProfileKindEnumType, ChargingProfilePurposeEnumType, ChargingProfileType,
     ChargingRateUnitEnumType, ChargingSchedulePeriodType, ChargingScheduleType, ComponentType,
-    ConnectorStatusEnumType, EvseType, GetVariableDataType, GetVariableStatusEnumType,
-    IdTokenEnumType, IdTokenType, MeasurandEnumType, MessageTriggerEnumType,
-    OperationalStatusEnumType, ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType,
-    RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType, SetVariableDataType,
-    SetVariableStatusEnumType, TransactionEventEnumType, TriggerMessageStatusEnumType,
-    TriggerReasonEnumType, UnlockStatusEnumType, VariableType,
+    ConnectorStatusEnumType, EvseType, GenericDeviceModelStatusEnumType, GetVariableDataType,
+    GetVariableStatusEnumType, IdTokenEnumType, IdTokenType, MeasurandEnumType,
+    MessageTriggerEnumType, MutabilityEnumType, OperationalStatusEnumType, ReadingContextEnumType,
+    ReasonEnumType, RegistrationStatusEnumType, ReportBaseEnumType, RequestStartStopStatusEnumType,
+    ResetEnumType, ResetStatusEnumType, SetVariableDataType, SetVariableStatusEnumType,
+    TransactionEventEnumType, TriggerMessageStatusEnumType, TriggerReasonEnumType,
+    UnlockStatusEnumType, VariableType,
 };
 use ocpp_types::{ConnectorId, OcppVersion};
 
@@ -2657,6 +2661,194 @@ async fn v201_set_variables_writes_the_device_model_and_round_trips_via_get() {
         get_resp.get_variable_result[1].attribute_value.as_deref(),
         Some("3"),
         "a rejected write must leave the read-only value unchanged"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// ---------------------------------------------------------------------------
+// OCPP 2.0.1 `GetBaseReport` -> `NotifyReport` (Issue #461): the device-model
+// **report** seam, completing the read (`GetVariables`) / write
+// (`SetVariables`) / report triad over the same device model. Unlike the
+// synchronous read/write, `GetBaseReport` is a two-part exchange: the station
+// acknowledges with a `GenericDeviceModelStatusEnumType` and then streams the
+// inventory back asynchronously as `NotifyReport` CALL(s), correlated by
+// `requestId` — the same ack-then-side-effect discipline as `TriggerMessage`.
+// Exercised end to end over a real socket: the CSMS asks, the CP acks, and the
+// CP's follow-up `NotifyReport` is observed off the CALL path.
+// ---------------------------------------------------------------------------
+
+type ReportLog = Arc<Mutex<Vec<V201NotifyReportRequest>>>;
+
+/// Start an in-process 2.0.1 CSMS that records every `NotifyReport` it receives
+/// (on top of the default 2.0.1 lifecycle responders), so a `GetBaseReport`
+/// side effect can be observed end to end.
+async fn start_v201_csms_recording_reports() -> (OcppServer, SocketAddr, ReportLog) {
+    let reports: ReportLog = Arc::new(Mutex::new(Vec::new()));
+    let reports_for_handler = reports.clone();
+    let (server, addr) = start_v201_csms(move |dispatcher| {
+        let reports = reports_for_handler;
+        dispatcher.on(move |req: V201NotifyReportRequest| {
+            let reports = reports.clone();
+            async move {
+                reports
+                    .lock()
+                    .expect("report log mutex not poisoned")
+                    .push(req);
+                Ok(V201NotifyReportResponse::default())
+            }
+        });
+    })
+    .await;
+    (server, addr, reports)
+}
+
+/// Poll `reports` until it holds at least `target` entries, or panic after ~5s.
+/// Waits for a streamed `NotifyReport` without a fixed sleep.
+async fn wait_for_reports(reports: &ReportLog, target: usize) {
+    for _ in 0..250 {
+        if reports.lock().expect("report log mutex not poisoned").len() >= target {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "timed out waiting for {target} NotifyReport(s) (last saw {})",
+        reports.lock().expect("report log mutex not poisoned").len()
+    );
+}
+
+#[tokio::test]
+async fn v201_get_base_report_full_inventory_is_accepted_and_streams_notify_report() {
+    let (mut server, addr, reports) = start_v201_csms_recording_reports().await;
+
+    let cp = ChargePoint::new(v201_cp_config(addr, "CP201_BASEREPORT"))
+        .expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+    assert!(server.is_cp_connected("CP201_BASEREPORT"));
+
+    // CSMS -> CP: GetBaseReport(FullInventory). The station acks synchronously...
+    let resp: V201GetBaseReportResponse = server
+        .call::<V201GetBaseReportRequest>(
+            "CP201_BASEREPORT",
+            V201GetBaseReportRequest {
+                request_id: 77,
+                report_base: ReportBaseEnumType::FullInventory,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS GetBaseReport call round-trips");
+    assert_eq!(
+        resp.status,
+        GenericDeviceModelStatusEnumType::Accepted,
+        "a non-empty full inventory is Accepted"
+    );
+
+    // ...then streams the inventory as a NotifyReport off the CALL path.
+    wait_for_reports(&reports, 1).await;
+    let recorded = reports
+        .lock()
+        .expect("report log mutex not poisoned")
+        .clone();
+    assert_eq!(recorded.len(), 1, "FullInventory streams exactly one page");
+    let report = &recorded[0];
+    assert_eq!(
+        report.request_id, 77,
+        "NotifyReport echoes the GetBaseReport requestId"
+    );
+    assert_eq!(report.seq_no, 0, "the single page is seqNo 0");
+    assert!(
+        !report.tbc.unwrap_or(false),
+        "a single page is not 'to be continued'"
+    );
+
+    let data = report
+        .report_data
+        .as_ref()
+        .expect("an Accepted report carries reportData");
+
+    // The report reproduces the CSMS-visible casing, not the normalized key.
+    let heartbeat = data
+        .iter()
+        .find(|d| d.component.name == "OCPPCommCtrlr" && d.variable.name == "HeartbeatInterval")
+        .expect("full inventory reports the heartbeat interval in display casing");
+    let attr = &heartbeat.variable_attribute[0];
+    assert_eq!(attr.value.as_deref(), Some("300"));
+    assert_eq!(attr.mutability, Some(MutabilityEnumType::ReadWrite));
+
+    // Full inventory includes the read-only capability constant, reported ReadOnly.
+    let read_only = data
+        .iter()
+        .find(|d| d.variable.name == "MaxCertificateChainSize")
+        .expect("full inventory includes read-only variables");
+    assert_eq!(
+        read_only.variable_attribute[0].mutability,
+        Some(MutabilityEnumType::ReadOnly)
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_get_base_report_summary_inventory_is_empty_result_set_and_streams_nothing() {
+    let (mut server, addr, reports) = start_v201_csms_recording_reports().await;
+
+    let cp = ChargePoint::new(v201_cp_config(addr, "CP201_BASEREPORT_SUM"))
+        .expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // SummaryInventory on a freshly-booted simulator has nothing noteworthy, so
+    // the station acks EmptyResultSet and streams no NotifyReport.
+    let summary: V201GetBaseReportResponse = server
+        .call::<V201GetBaseReportRequest>(
+            "CP201_BASEREPORT_SUM",
+            V201GetBaseReportRequest {
+                request_id: 78,
+                report_base: ReportBaseEnumType::SummaryInventory,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS GetBaseReport(Summary) round-trips");
+    assert_eq!(
+        summary.status,
+        GenericDeviceModelStatusEnumType::EmptyResultSet,
+        "an empty summary is EmptyResultSet, not Accepted"
+    );
+
+    // Prove the summary emitted nothing *deterministically* (no fixed sleep): a
+    // subsequent FullInventory does stream a report, and because the command
+    // channel is FIFO, the first — and only — report we ever see must be that
+    // FullInventory's (requestId 79), never the summary's (78).
+    let full: V201GetBaseReportResponse = server
+        .call::<V201GetBaseReportRequest>(
+            "CP201_BASEREPORT_SUM",
+            V201GetBaseReportRequest {
+                request_id: 79,
+                report_base: ReportBaseEnumType::FullInventory,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS GetBaseReport(Full) round-trips");
+    assert_eq!(full.status, GenericDeviceModelStatusEnumType::Accepted);
+
+    wait_for_reports(&reports, 1).await;
+    let recorded = reports
+        .lock()
+        .expect("report log mutex not poisoned")
+        .clone();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "only the FullInventory streamed a report; the summary streamed none"
+    );
+    assert_eq!(
+        recorded[0].request_id, 79,
+        "the one report is the FullInventory's (79), never the empty summary's (78)"
     );
 
     cp.disconnect().await.expect("disconnect");
