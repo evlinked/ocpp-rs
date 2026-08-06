@@ -196,6 +196,52 @@ pub fn transaction_event_started(
     }
 }
 
+/// The periodic `Sample.Periodic` meter value: the active-import energy reading,
+/// plus — when `bounded_power_w` is `Some` — a `Power.Active.Import` reading of
+/// the profile-bounded power the station may draw (slice 7e, Issue #455).
+///
+/// A `TxProfile` installed by a `RequestStartTransaction` becomes *binding* here:
+/// once its `chargingSchedule` limit is tighter than the connector's natural
+/// rate, the station reports the bounded power it is actually drawing. Without a
+/// binding profile (`None`) the array is byte-for-byte the single energy sample
+/// the unbounded path always emitted, so the 1.6J and profile-less 2.0.1 paths
+/// are unchanged.
+fn periodic_meter_value(
+    energy_wh: f64,
+    bounded_power_w: Option<f64>,
+    timestamp: &str,
+) -> Vec<MeterValueType> {
+    let mut sampled_value = vec![SampledValueType {
+        value: energy_wh,
+        context: Some(ReadingContextEnumType::SamplePeriodic),
+        measurand: Some(MeasurandEnumType::EnergyActiveImportRegister),
+        phase: None,
+        location: None,
+        signed_meter_value: None,
+        unit_of_measure: None,
+        custom_data: None,
+    }];
+    if let Some(power_w) = bounded_power_w {
+        sampled_value.push(SampledValueType {
+            value: power_w,
+            context: Some(ReadingContextEnumType::SamplePeriodic),
+            measurand: Some(MeasurandEnumType::PowerActiveImport),
+            phase: None,
+            location: None,
+            signed_meter_value: None,
+            // Power.Active.Import defaults to W, so `unitOfMeasure` is omitted —
+            // the same default-unit convention the energy sample uses for Wh.
+            unit_of_measure: None,
+            custom_data: None,
+        });
+    }
+    vec![MeterValueType {
+        timestamp: timestamp.to_string(),
+        sampled_value,
+        custom_data: None,
+    }]
+}
+
 /// Build a `TransactionEvent(Updated)` — a periodic mid-transaction sample.
 ///
 /// `triggerReason = MeterValuePeriodic`, `chargingState = Charging`, and a
@@ -203,10 +249,17 @@ pub fn transaction_event_started(
 /// transaction's events so the CSMS can detect gaps and reorder. No `idToken`
 /// (the session is already authorized). Replaces the 1.6J periodic `MeterValues`
 /// CALL for a `V201` charge point.
+///
+/// `bounded_power_w` carries the profile-bounded power when a `TxProfile`
+/// installed on this EVSE imposes a limit tighter than the connector's natural
+/// rate (slice 7e, Issue #455); it adds a `Power.Active.Import` sample alongside
+/// the energy reading. `None` — no profile, or a profile no tighter than the
+/// natural rate — leaves the reading exactly as the unbounded path emits it.
 pub fn transaction_event_updated(
     session: &SessionRef,
     seq_no: i32,
     meter_wh: f64,
+    bounded_power_w: Option<f64>,
     timestamp: &str,
 ) -> TransactionEventRequest {
     TransactionEventRequest {
@@ -227,11 +280,7 @@ pub fn transaction_event_updated(
         cable_max_current: None,
         reservation_id: None,
         evse: Some(evse_of(session)),
-        meter_value: Some(energy_meter_value(
-            meter_wh,
-            ReadingContextEnumType::SamplePeriodic,
-            timestamp,
-        )),
+        meter_value: Some(periodic_meter_value(meter_wh, bounded_power_w, timestamp)),
         id_token: None,
         custom_data: None,
     }
@@ -475,7 +524,7 @@ mod tests {
     #[test]
     fn updated_event_carries_periodic_shape() {
         let s = session();
-        let req = transaction_event_updated(&s, 3, 1500.0, TS);
+        let req = transaction_event_updated(&s, 3, 1500.0, None, TS);
 
         assert_eq!(req.event_type, TransactionEventEnumType::Updated);
         assert_eq!(
@@ -489,9 +538,50 @@ mod tests {
             .meter_value
             .as_ref()
             .expect("updated carries meterValue");
+        // With no binding profile the reading is the single energy sample the
+        // unbounded path always emitted — nothing added.
+        assert_eq!(mv[0].sampled_value.len(), 1);
+        assert_eq!(
+            mv[0].sampled_value[0].measurand,
+            Some(MeasurandEnumType::EnergyActiveImportRegister)
+        );
         assert_eq!(
             mv[0].sampled_value[0].context,
             Some(ReadingContextEnumType::SamplePeriodic)
+        );
+    }
+
+    #[test]
+    fn updated_event_appends_a_bounded_power_sample_when_profile_binds() {
+        let s = session();
+        // A binding TxProfile bounds the station to 3 680 W; the periodic sample
+        // surfaces that as a Power.Active.Import reading alongside the energy one.
+        let req = transaction_event_updated(&s, 3, 1500.0, Some(3_680.0), TS);
+
+        let mv = req
+            .meter_value
+            .as_ref()
+            .expect("updated carries meterValue");
+        assert_eq!(
+            mv[0].sampled_value.len(),
+            2,
+            "a binding profile adds a power sample beside the energy one"
+        );
+        // The energy sample is still first and unchanged.
+        assert_eq!(
+            mv[0].sampled_value[0].measurand,
+            Some(MeasurandEnumType::EnergyActiveImportRegister)
+        );
+        assert_eq!(mv[0].sampled_value[0].value, 1500.0);
+        // The appended sample is the bounded active-import power, SamplePeriodic,
+        // default (W) unit.
+        let power = &mv[0].sampled_value[1];
+        assert_eq!(power.measurand, Some(MeasurandEnumType::PowerActiveImport));
+        assert_eq!(power.value, 3_680.0);
+        assert_eq!(power.context, Some(ReadingContextEnumType::SamplePeriodic));
+        assert!(
+            power.unit_of_measure.is_none(),
+            "Power.Active.Import defaults to W, so unitOfMeasure is omitted"
         );
     }
 
@@ -586,9 +676,12 @@ mod tests {
         let validator = SchemaValidator::v201();
         for req in [
             transaction_event_started(&s, "RFID-CAFE", 1000.0, TS, Some(99)),
-            transaction_event_updated(&s, 1, 1500.0, TS),
-            transaction_event_ended(&s, 2, "RFID-CAFE", 2000.0, Reason::Remote, TS),
-            transaction_event_triggered(&s, 3, 1750.0, TS),
+            transaction_event_updated(&s, 1, 1500.0, None, TS),
+            // The bounded-power variant must also satisfy the schema — a second
+            // sampled value on the periodic reading.
+            transaction_event_updated(&s, 2, 1500.0, Some(3_680.0), TS),
+            transaction_event_ended(&s, 3, "RFID-CAFE", 2000.0, Reason::Remote, TS),
+            transaction_event_triggered(&s, 4, 1750.0, TS),
         ] {
             let payload = serde_json::to_value(&req).unwrap();
             assert!(

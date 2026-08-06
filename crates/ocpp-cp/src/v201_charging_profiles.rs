@@ -23,7 +23,7 @@
 
 use std::collections::HashMap;
 
-use ocpp_types::v201::ChargingProfileType;
+use ocpp_types::v201::{ChargingProfileType, ChargingRateUnitEnumType};
 use tokio::sync::RwLock;
 
 /// A v201-typed store of installed `TxProfile`s, keyed by EVSE id.
@@ -72,6 +72,73 @@ impl V201TxProfileStore {
     pub async fn clear(&self, evse_id: i32) -> Option<ChargingProfileType> {
         self.by_evse.write().await.remove(&evse_id)
     }
+}
+
+/// Resolve the charging limit a `TxProfile` imposes `elapsed_s` seconds into the
+/// transaction it bounds, as `(limit, unit)` — or `None` if the profile imposes
+/// no limit at that offset.
+///
+/// The `chargingSchedule` (OCPP 2.0.1 Part 2, §K01 / the Python reference's
+/// [`ocpp.v201.call.RequestStartTransaction`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py)
+/// `chargingProfile.chargingSchedule`) is a list of `chargingSchedulePeriod`s,
+/// each starting at a `startPeriod` second-offset from the schedule's start and
+/// holding a flat `limit` in the schedule's `chargingRateUnit` until the next
+/// period begins. The limit in force at `elapsed_s` is therefore the period
+/// with the **greatest `startPeriod ≤ elapsed_s`**.
+///
+/// **First-slice scope (Issue #455):** only the profile's *first*
+/// `chargingSchedule` is honored, and periods are resolved by their relative
+/// `startPeriod` alone. Composing multiple schedules, `validFrom`/`validTo`
+/// windows, `Absolute`-vs-`Relative` kinds, and `startSchedule` offsets is the
+/// composite-schedule follow-up. Returns `None` when the first schedule has no
+/// period yet in force — an empty period list, or every `startPeriod` still in
+/// the future — so the caller reports the unbounded reading rather than
+/// inventing a limit of `0`.
+#[must_use]
+pub fn active_limit(
+    profile: &ChargingProfileType,
+    elapsed_s: i32,
+) -> Option<(f64, ChargingRateUnitEnumType)> {
+    let schedule = profile.charging_schedule.first()?;
+    let period = schedule
+        .charging_schedule_period
+        .iter()
+        .filter(|p| p.start_period <= elapsed_s)
+        .max_by_key(|p| p.start_period)?;
+    Some((period.limit, schedule.charging_rate_unit))
+}
+
+/// The charging power (in watts) `profile` binds the connector to `elapsed_s`
+/// into the transaction, given the connector's unbounded `natural_power_w` and
+/// its `nominal_voltage_v` (for an ampere limit's A→W conversion) — or `None`
+/// when the profile imposes **no binding** power limit at this offset.
+///
+/// `None` is returned both when [`active_limit`] finds no period in force and
+/// when the resolved limit is **at or above** the connector's natural rate: a
+/// limit no tighter than what the connector would draw anyway does not bend the
+/// reading, so the caller leaves the periodic sample untouched (the issue's "a
+/// profile above the natural rate is unchanged"). Only a genuinely-tighter
+/// limit yields `Some(bounded_power)`, which the sampler surfaces as a
+/// `Power.Active.Import` reading on the `TransactionEvent(Updated)`.
+///
+/// An ampere limit is converted at the connector's nominal voltage,
+/// single-phase (`limit_a × nominal_voltage_v`); a poly-phase conversion that
+/// honors the period's `numberPhases` is a follow-up, so a three-phase station
+/// is bounded conservatively (to its single-phase equivalent) rather than
+/// wrongly. A watt limit is used directly.
+#[must_use]
+pub fn bounded_power_w(
+    profile: &ChargingProfileType,
+    elapsed_s: i32,
+    natural_power_w: f64,
+    nominal_voltage_v: f64,
+) -> Option<f64> {
+    let (limit, unit) = active_limit(profile, elapsed_s)?;
+    let limit_w = match unit {
+        ChargingRateUnitEnumType::W => limit,
+        ChargingRateUnitEnumType::A => limit * nominal_voltage_v,
+    };
+    (limit_w < natural_power_w).then_some(limit_w)
 }
 
 #[cfg(test)]
@@ -159,5 +226,147 @@ mod tests {
             None,
             "clearing an empty EVSE is a no-op"
         );
+    }
+
+    /// A `TxProfile` whose single schedule steps through several periods, so
+    /// `active_limit` has more than one candidate to resolve by `elapsed`. Each
+    /// `(start_period, limit)` pair is one step in the schedule.
+    fn stepped_profile(
+        unit: ChargingRateUnitEnumType,
+        steps: &[(i32, f64)],
+    ) -> ChargingProfileType {
+        ChargingProfileType {
+            id: 1,
+            stack_level: 0,
+            charging_profile_purpose: ChargingProfilePurposeEnumType::TxProfile,
+            charging_profile_kind: ChargingProfileKindEnumType::Relative,
+            charging_schedule: vec![ChargingScheduleType {
+                id: 1,
+                charging_rate_unit: unit,
+                charging_schedule_period: steps
+                    .iter()
+                    .map(|&(start_period, limit)| ChargingSchedulePeriodType {
+                        start_period,
+                        limit,
+                        number_phases: None,
+                        phase_to_use: None,
+                        custom_data: None,
+                    })
+                    .collect(),
+                start_schedule: None,
+                duration: None,
+                min_charging_rate: None,
+                sales_tariff: None,
+                custom_data: None,
+            }],
+            recurrency_kind: None,
+            valid_from: None,
+            valid_to: None,
+            transaction_id: None,
+            custom_data: None,
+        }
+    }
+
+    #[test]
+    fn active_limit_resolves_the_first_period_of_a_flat_schedule() {
+        let profile = tx_profile(1, 11_000.0);
+        // A single period at startPeriod 0 is in force from the very start and
+        // stays in force however far in we look.
+        assert_eq!(
+            active_limit(&profile, 0),
+            Some((11_000.0, ChargingRateUnitEnumType::W))
+        );
+        assert_eq!(
+            active_limit(&profile, 3_600),
+            Some((11_000.0, ChargingRateUnitEnumType::W))
+        );
+    }
+
+    #[test]
+    fn active_limit_picks_the_period_in_force_at_the_elapsed_offset() {
+        // 7.4 kW for the first 30 min, then a taper to 3.68 kW.
+        let profile = stepped_profile(
+            ChargingRateUnitEnumType::W,
+            &[(0, 7_400.0), (1_800, 3_680.0)],
+        );
+        // Before the second period begins, the first is in force.
+        assert_eq!(
+            active_limit(&profile, 0),
+            Some((7_400.0, ChargingRateUnitEnumType::W))
+        );
+        assert_eq!(
+            active_limit(&profile, 1_799),
+            Some((7_400.0, ChargingRateUnitEnumType::W))
+        );
+        // At and after its startPeriod, the second period wins (greatest
+        // startPeriod ≤ elapsed).
+        assert_eq!(
+            active_limit(&profile, 1_800),
+            Some((3_680.0, ChargingRateUnitEnumType::W))
+        );
+        assert_eq!(
+            active_limit(&profile, 10_000),
+            Some((3_680.0, ChargingRateUnitEnumType::W))
+        );
+    }
+
+    #[test]
+    fn active_limit_is_none_when_no_period_is_yet_in_force_or_the_schedule_is_empty() {
+        // Every period starts in the future relative to elapsed 0 → nothing in
+        // force yet.
+        let deferred = stepped_profile(ChargingRateUnitEnumType::W, &[(600, 7_400.0)]);
+        assert_eq!(active_limit(&deferred, 0), None);
+        assert_eq!(active_limit(&deferred, 599), None);
+        assert_eq!(
+            active_limit(&deferred, 600),
+            Some((7_400.0, ChargingRateUnitEnumType::W)),
+            "the deferred period comes into force at its startPeriod"
+        );
+
+        // A degenerate schedule with no periods resolves to nothing rather than
+        // panicking or inventing a limit.
+        let empty = stepped_profile(ChargingRateUnitEnumType::W, &[]);
+        assert_eq!(active_limit(&empty, 0), None);
+    }
+
+    #[test]
+    fn bounded_power_w_binds_only_a_watt_limit_below_the_natural_rate() {
+        let natural = 7_360.0;
+        // A 3.68 kW limit is tighter than the 7.36 kW connector → binds.
+        let tight = tx_profile(1, 3_680.0);
+        assert_eq!(bounded_power_w(&tight, 0, natural, 230.0), Some(3_680.0));
+
+        // An 11 kW limit is looser than the connector's natural rate → no bind,
+        // the reading is left unchanged.
+        let loose = tx_profile(2, 11_000.0);
+        assert_eq!(bounded_power_w(&loose, 0, natural, 230.0), None);
+
+        // A limit exactly at the natural rate is not *tighter*, so it does not
+        // bend the reading either.
+        let at_rate = tx_profile(3, natural);
+        assert_eq!(bounded_power_w(&at_rate, 0, natural, 230.0), None);
+    }
+
+    #[test]
+    fn bounded_power_w_converts_an_ampere_limit_at_nominal_voltage() {
+        let natural = 7_360.0;
+        let voltage = 230.0;
+        // 16 A × 230 V = 3 680 W, below the natural rate → binds at the
+        // converted wattage.
+        let amps = stepped_profile(ChargingRateUnitEnumType::A, &[(0, 16.0)]);
+        assert_eq!(
+            bounded_power_w(&amps, 0, natural, voltage),
+            Some(16.0 * voltage)
+        );
+        // 32 A × 230 V = 7 360 W == natural rate → not tighter → no bind.
+        let full = stepped_profile(ChargingRateUnitEnumType::A, &[(0, 32.0)]);
+        assert_eq!(bounded_power_w(&full, 0, natural, voltage), None);
+    }
+
+    #[test]
+    fn bounded_power_w_is_none_when_no_period_is_in_force() {
+        // No period yet in force → nothing to bind, whatever the connector rate.
+        let deferred = stepped_profile(ChargingRateUnitEnumType::W, &[(600, 1_000.0)]);
+        assert_eq!(bounded_power_w(&deferred, 0, 7_360.0, 230.0), None);
     }
 }
