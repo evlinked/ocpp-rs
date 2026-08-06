@@ -23,7 +23,11 @@
 
 use std::collections::HashMap;
 
-use ocpp_types::v201::{ChargingProfileType, ChargingRateUnitEnumType};
+use ocpp_types::v201::{
+    ChargingProfileKindEnumType, ChargingProfileType, ChargingRateUnitEnumType,
+    ChargingScheduleType, RecurrencyKindEnumType,
+};
+use ocpp_types::{DateTime, Utc};
 use tokio::sync::RwLock;
 
 /// A v201-typed store of installed `TxProfile`s, keyed by EVSE id.
@@ -74,6 +78,55 @@ impl V201TxProfileStore {
     }
 }
 
+/// Parse an optional RFC 3339 timestamp field (`validFrom`, `validTo`,
+/// `startSchedule`) into a UTC instant, tolerating a malformed value as absent.
+///
+/// The store's profiles arrive from an accepted `RequestStartTransaction` and so
+/// have passed schema validation, but the schema constrains only the *shape* of a
+/// `date-time` string; a value the `chrono` parser rejects is treated as "field
+/// not set" rather than allowed to abort resolution — a lenient trust boundary on
+/// CSMS-supplied input, matching how [`active_limit`] never panics on a profile.
+fn parse_rfc3339(field: &Option<String>) -> Option<DateTime<Utc>> {
+    field
+        .as_deref()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.with_timezone(&Utc))
+}
+
+/// The absolute instant a `schedule` is anchored to.
+///
+/// Mirrors [`crate::composite::anchor`]: a `Relative` schedule is offset from the
+/// transaction start (`tx_start`); `Absolute`/`Recurring` schedules anchor on
+/// their `startSchedule` when present (the recurrence base for `Recurring` — only
+/// its time-of-day/-week phase matters), else fall back to `tx_start`.
+fn anchor(
+    profile: &ChargingProfileType,
+    schedule: &ChargingScheduleType,
+    tx_start: DateTime<Utc>,
+) -> DateTime<Utc> {
+    match profile.charging_profile_kind {
+        ChargingProfileKindEnumType::Relative => tx_start,
+        ChargingProfileKindEnumType::Absolute | ChargingProfileKindEnumType::Recurring => {
+            parse_rfc3339(&schedule.start_schedule).unwrap_or(tx_start)
+        }
+    }
+}
+
+/// The recurrence period in seconds for a `Recurring` profile, or `None` for a
+/// non-recurring profile (and for a malformed `Recurring` profile carrying no
+/// `recurrencyKind`, which cannot be unrolled and so evaluates once, like
+/// `Absolute`). Mirrors [`crate::composite::recurrence_period`].
+fn recurrence_period(profile: &ChargingProfileType) -> Option<i64> {
+    if profile.charging_profile_kind != ChargingProfileKindEnumType::Recurring {
+        return None;
+    }
+    match profile.recurrency_kind {
+        Some(RecurrencyKindEnumType::Daily) => Some(86_400),
+        Some(RecurrencyKindEnumType::Weekly) => Some(604_800),
+        None => None,
+    }
+}
+
 /// Resolve the charging limit a `TxProfile` imposes `elapsed_s` seconds into the
 /// transaction it bounds, as `(limit, unit)` — or `None` if the profile imposes
 /// no limit at that offset.
@@ -83,27 +136,83 @@ impl V201TxProfileStore {
 /// `chargingProfile.chargingSchedule`) is a list of `chargingSchedulePeriod`s,
 /// each starting at a `startPeriod` second-offset from the schedule's start and
 /// holding a flat `limit` in the schedule's `chargingRateUnit` until the next
-/// period begins. The limit in force at `elapsed_s` is therefore the period
-/// with the **greatest `startPeriod ≤ elapsed_s`**.
+/// period begins. The limit in force is the period with the **greatest
+/// `startPeriod ≤ offset`**, where `offset` is the position *within the schedule*
+/// of the sample instant `tx_start + elapsed_s`.
 ///
-/// **First-slice scope (Issue #455):** only the profile's *first*
-/// `chargingSchedule` is honored, and periods are resolved by their relative
-/// `startPeriod` alone. Composing multiple schedules, `validFrom`/`validTo`
-/// windows, `Absolute`-vs-`Relative` kinds, and `startSchedule` offsets is the
-/// composite-schedule follow-up. Returns `None` when the first schedule has no
-/// period yet in force — an empty period list, or every `startPeriod` still in
-/// the future — so the caller reports the unbounded reading rather than
-/// inventing a limit of `0`.
+/// This is the composite-schedule resolution (Issue #464), generalizing the flat
+/// single-period first slice (#455). It still honors only the profile's *first*
+/// `chargingSchedule` (a `TxProfile` carries one), but now:
+///
+/// * **anchors by kind** — `Relative` schedules are offset from `tx_start`,
+///   `Absolute`/`Recurring` from `startSchedule` (so `elapsed_s` is mapped to a
+///   schedule-relative offset before period selection);
+/// * **honors `validFrom`/`validTo`** — a profile whose validity window does not
+///   contain the sample instant imposes no limit (`None`);
+/// * **honors the schedule `duration`** — once the schedule has elapsed the
+///   resolution falls back to no-limit rather than pinning the last period
+///   forever; for `Recurring` profiles the offset wraps into the daily/weekly
+///   recurrence period (phased off `startSchedule`) so each occurrence's
+///   `duration` bounds that occurrence's active span.
+///
+/// Returns `None` when the profile is outside its validity window, past its
+/// schedule `duration`, or has no period yet in force (an empty period list, or
+/// every `startPeriod` still in the future) — so the caller reports the unbounded
+/// reading rather than inventing a limit of `0`.
 #[must_use]
 pub fn active_limit(
     profile: &ChargingProfileType,
     elapsed_s: i32,
+    tx_start: DateTime<Utc>,
 ) -> Option<(f64, ChargingRateUnitEnumType)> {
+    // The absolute instant of this sample: `elapsed_s` seconds into the
+    // transaction. `validFrom`/`validTo` and an `Absolute`/`Recurring` anchor are
+    // calendar quantities, so period selection is done against this instant, not
+    // the bare relative offset.
+    let now = tx_start + chrono::Duration::seconds(i64::from(elapsed_s));
+
+    if let Some(valid_from) = parse_rfc3339(&profile.valid_from) {
+        if now < valid_from {
+            return None;
+        }
+    }
+    if let Some(valid_to) = parse_rfc3339(&profile.valid_to) {
+        if now > valid_to {
+            return None;
+        }
+    }
+
     let schedule = profile.charging_schedule.first()?;
+    let raw_offset = (now - anchor(profile, schedule, tx_start)).num_seconds();
+    // `Recurring`: map the instant into `[0, period)` phased off the recurrence
+    // base — the pattern is fully periodic, with `validFrom`/`validTo` bounding
+    // the calendar range. Non-recurring schedules evaluate once and do not apply
+    // before their anchor.
+    let offset = match recurrence_period(profile) {
+        Some(period) => raw_offset.rem_euclid(period),
+        None => {
+            if raw_offset < 0 {
+                return None;
+            }
+            raw_offset
+        }
+    };
+    // `duration` bounds the active span — of the single schedule for a
+    // non-recurring profile, or of each occurrence for a recurring one (the rest
+    // of the recurrence period is an unconstrained gap → no limit).
+    if let Some(duration) = schedule.duration {
+        if offset >= i64::from(duration) {
+            return None;
+        }
+    }
+
+    // The applicable period is the last one whose `startPeriod` has been reached.
+    // Periods are kept in `startPeriod` order per the spec; tolerate unordered
+    // input by scanning for the greatest start that is ≤ the schedule offset.
     let period = schedule
         .charging_schedule_period
         .iter()
-        .filter(|p| p.start_period <= elapsed_s)
+        .filter(|p| i64::from(p.start_period) <= offset)
         .max_by_key(|p| p.start_period)?;
     Some((period.limit, schedule.charging_rate_unit))
 }
@@ -130,10 +239,11 @@ pub fn active_limit(
 pub fn bounded_power_w(
     profile: &ChargingProfileType,
     elapsed_s: i32,
+    tx_start: DateTime<Utc>,
     natural_power_w: f64,
     nominal_voltage_v: f64,
 ) -> Option<f64> {
-    let (limit, unit) = active_limit(profile, elapsed_s)?;
+    let (limit, unit) = active_limit(profile, elapsed_s, tx_start)?;
     let limit_w = match unit {
         ChargingRateUnitEnumType::W => limit,
         ChargingRateUnitEnumType::A => limit * nominal_voltage_v,
@@ -145,9 +255,16 @@ pub fn bounded_power_w(
 mod tests {
     use super::*;
     use ocpp_types::v201::{
-        ChargingProfileKindEnumType, ChargingProfilePurposeEnumType, ChargingRateUnitEnumType,
-        ChargingSchedulePeriodType, ChargingScheduleType,
+        ChargingProfilePurposeEnumType, ChargingRateUnitEnumType, ChargingSchedulePeriodType,
     };
+
+    /// A fixed transaction-start anchor for resolution tests, so `validFrom` /
+    /// `validTo` / `startSchedule` can be positioned relative to a known instant.
+    fn t0() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .expect("valid RFC 3339")
+            .with_timezone(&Utc)
+    }
 
     /// A minimal schema-shaped `TxProfile` bounding the session to one flat
     /// power limit, tagged with `id` so tests can tell two profiles apart.
@@ -273,11 +390,11 @@ mod tests {
         // A single period at startPeriod 0 is in force from the very start and
         // stays in force however far in we look.
         assert_eq!(
-            active_limit(&profile, 0),
+            active_limit(&profile, 0, t0()),
             Some((11_000.0, ChargingRateUnitEnumType::W))
         );
         assert_eq!(
-            active_limit(&profile, 3_600),
+            active_limit(&profile, 3_600, t0()),
             Some((11_000.0, ChargingRateUnitEnumType::W))
         );
     }
@@ -291,21 +408,21 @@ mod tests {
         );
         // Before the second period begins, the first is in force.
         assert_eq!(
-            active_limit(&profile, 0),
+            active_limit(&profile, 0, t0()),
             Some((7_400.0, ChargingRateUnitEnumType::W))
         );
         assert_eq!(
-            active_limit(&profile, 1_799),
+            active_limit(&profile, 1_799, t0()),
             Some((7_400.0, ChargingRateUnitEnumType::W))
         );
         // At and after its startPeriod, the second period wins (greatest
         // startPeriod ≤ elapsed).
         assert_eq!(
-            active_limit(&profile, 1_800),
+            active_limit(&profile, 1_800, t0()),
             Some((3_680.0, ChargingRateUnitEnumType::W))
         );
         assert_eq!(
-            active_limit(&profile, 10_000),
+            active_limit(&profile, 10_000, t0()),
             Some((3_680.0, ChargingRateUnitEnumType::W))
         );
     }
@@ -315,10 +432,10 @@ mod tests {
         // Every period starts in the future relative to elapsed 0 → nothing in
         // force yet.
         let deferred = stepped_profile(ChargingRateUnitEnumType::W, &[(600, 7_400.0)]);
-        assert_eq!(active_limit(&deferred, 0), None);
-        assert_eq!(active_limit(&deferred, 599), None);
+        assert_eq!(active_limit(&deferred, 0, t0()), None);
+        assert_eq!(active_limit(&deferred, 599, t0()), None);
         assert_eq!(
-            active_limit(&deferred, 600),
+            active_limit(&deferred, 600, t0()),
             Some((7_400.0, ChargingRateUnitEnumType::W)),
             "the deferred period comes into force at its startPeriod"
         );
@@ -326,7 +443,7 @@ mod tests {
         // A degenerate schedule with no periods resolves to nothing rather than
         // panicking or inventing a limit.
         let empty = stepped_profile(ChargingRateUnitEnumType::W, &[]);
-        assert_eq!(active_limit(&empty, 0), None);
+        assert_eq!(active_limit(&empty, 0, t0()), None);
     }
 
     #[test]
@@ -334,17 +451,20 @@ mod tests {
         let natural = 7_360.0;
         // A 3.68 kW limit is tighter than the 7.36 kW connector → binds.
         let tight = tx_profile(1, 3_680.0);
-        assert_eq!(bounded_power_w(&tight, 0, natural, 230.0), Some(3_680.0));
+        assert_eq!(
+            bounded_power_w(&tight, 0, t0(), natural, 230.0),
+            Some(3_680.0)
+        );
 
         // An 11 kW limit is looser than the connector's natural rate → no bind,
         // the reading is left unchanged.
         let loose = tx_profile(2, 11_000.0);
-        assert_eq!(bounded_power_w(&loose, 0, natural, 230.0), None);
+        assert_eq!(bounded_power_w(&loose, 0, t0(), natural, 230.0), None);
 
         // A limit exactly at the natural rate is not *tighter*, so it does not
         // bend the reading either.
         let at_rate = tx_profile(3, natural);
-        assert_eq!(bounded_power_w(&at_rate, 0, natural, 230.0), None);
+        assert_eq!(bounded_power_w(&at_rate, 0, t0(), natural, 230.0), None);
     }
 
     #[test]
@@ -355,18 +475,274 @@ mod tests {
         // converted wattage.
         let amps = stepped_profile(ChargingRateUnitEnumType::A, &[(0, 16.0)]);
         assert_eq!(
-            bounded_power_w(&amps, 0, natural, voltage),
+            bounded_power_w(&amps, 0, t0(), natural, voltage),
             Some(16.0 * voltage)
         );
         // 32 A × 230 V = 7 360 W == natural rate → not tighter → no bind.
         let full = stepped_profile(ChargingRateUnitEnumType::A, &[(0, 32.0)]);
-        assert_eq!(bounded_power_w(&full, 0, natural, voltage), None);
+        assert_eq!(bounded_power_w(&full, 0, t0(), natural, voltage), None);
     }
 
     #[test]
     fn bounded_power_w_is_none_when_no_period_is_in_force() {
         // No period yet in force → nothing to bind, whatever the connector rate.
         let deferred = stepped_profile(ChargingRateUnitEnumType::W, &[(600, 1_000.0)]);
-        assert_eq!(bounded_power_w(&deferred, 0, 7_360.0, 230.0), None);
+        assert_eq!(bounded_power_w(&deferred, 0, t0(), 7_360.0, 230.0), None);
+    }
+
+    /// A single-period profile of a given kind, letting a test set `startSchedule`
+    /// / `duration` / `validFrom` / `validTo` to exercise composite resolution.
+    #[allow(clippy::too_many_arguments)]
+    fn kinded_profile(
+        kind: ChargingProfileKindEnumType,
+        recurrency: Option<RecurrencyKindEnumType>,
+        start_schedule: Option<&str>,
+        duration: Option<i32>,
+        valid_from: Option<&str>,
+        valid_to: Option<&str>,
+        steps: &[(i32, f64)],
+    ) -> ChargingProfileType {
+        ChargingProfileType {
+            id: 1,
+            stack_level: 0,
+            charging_profile_purpose: ChargingProfilePurposeEnumType::TxProfile,
+            charging_profile_kind: kind,
+            charging_schedule: vec![ChargingScheduleType {
+                id: 1,
+                charging_rate_unit: ChargingRateUnitEnumType::W,
+                charging_schedule_period: steps
+                    .iter()
+                    .map(|&(start_period, limit)| ChargingSchedulePeriodType {
+                        start_period,
+                        limit,
+                        number_phases: None,
+                        phase_to_use: None,
+                        custom_data: None,
+                    })
+                    .collect(),
+                start_schedule: start_schedule.map(str::to_owned),
+                duration,
+                min_charging_rate: None,
+                sales_tariff: None,
+                custom_data: None,
+            }],
+            recurrency_kind: recurrency,
+            valid_from: valid_from.map(str::to_owned),
+            valid_to: valid_to.map(str::to_owned),
+            transaction_id: None,
+            custom_data: None,
+        }
+    }
+
+    #[test]
+    fn absolute_kind_anchors_period_selection_on_start_schedule() {
+        // An Absolute schedule starting 1 h *after* the transaction opened: at
+        // t0 the schedule has not begun (raw offset negative → no limit); the
+        // second period comes into force 30 min into the schedule, i.e. 90 min
+        // after tx start.
+        let profile = kinded_profile(
+            ChargingProfileKindEnumType::Absolute,
+            None,
+            Some("2026-01-01T01:00:00Z"),
+            None,
+            None,
+            None,
+            &[(0, 7_400.0), (1_800, 3_680.0)],
+        );
+        // 0 and 30 min in: before the schedule's own start → nothing in force.
+        assert_eq!(active_limit(&profile, 0, t0()), None);
+        assert_eq!(active_limit(&profile, 1_800, t0()), None);
+        // 1 h in: schedule start, first period.
+        assert_eq!(
+            active_limit(&profile, 3_600, t0()),
+            Some((7_400.0, ChargingRateUnitEnumType::W))
+        );
+        // 90 min in: 30 min into the schedule → second period.
+        assert_eq!(
+            active_limit(&profile, 5_400, t0()),
+            Some((3_680.0, ChargingRateUnitEnumType::W))
+        );
+    }
+
+    #[test]
+    fn absolute_kind_without_start_schedule_falls_back_to_tx_start() {
+        // No startSchedule on an Absolute profile → anchor at the transaction
+        // start, so it behaves like a Relative schedule for offset selection.
+        let profile = kinded_profile(
+            ChargingProfileKindEnumType::Absolute,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[(0, 7_400.0), (1_800, 3_680.0)],
+        );
+        assert_eq!(
+            active_limit(&profile, 0, t0()),
+            Some((7_400.0, ChargingRateUnitEnumType::W))
+        );
+        assert_eq!(
+            active_limit(&profile, 1_800, t0()),
+            Some((3_680.0, ChargingRateUnitEnumType::W))
+        );
+    }
+
+    #[test]
+    fn validity_window_gates_the_limit() {
+        // Valid only for the second hour of the transaction.
+        let profile = kinded_profile(
+            ChargingProfileKindEnumType::Relative,
+            None,
+            None,
+            None,
+            Some("2026-01-01T01:00:00Z"),
+            Some("2026-01-01T02:00:00Z"),
+            &[(0, 7_400.0)],
+        );
+        // Before validFrom → no limit.
+        assert_eq!(active_limit(&profile, 0, t0()), None);
+        assert_eq!(active_limit(&profile, 3_599, t0()), None);
+        // Inside the window → the limit binds.
+        assert_eq!(
+            active_limit(&profile, 3_600, t0()),
+            Some((7_400.0, ChargingRateUnitEnumType::W))
+        );
+        assert_eq!(
+            active_limit(&profile, 7_200, t0()),
+            Some((7_400.0, ChargingRateUnitEnumType::W))
+        );
+        // After validTo → no limit again.
+        assert_eq!(active_limit(&profile, 7_201, t0()), None);
+    }
+
+    #[test]
+    fn schedule_duration_releases_the_limit_after_it_elapses() {
+        // A Relative schedule bounded to its first hour; past that it imposes no
+        // limit rather than pinning the last period forever.
+        let profile = kinded_profile(
+            ChargingProfileKindEnumType::Relative,
+            None,
+            None,
+            Some(3_600),
+            None,
+            None,
+            &[(0, 7_400.0)],
+        );
+        assert_eq!(
+            active_limit(&profile, 0, t0()),
+            Some((7_400.0, ChargingRateUnitEnumType::W))
+        );
+        assert_eq!(
+            active_limit(&profile, 3_599, t0()),
+            Some((7_400.0, ChargingRateUnitEnumType::W))
+        );
+        // At exactly `duration` the schedule has elapsed → no limit.
+        assert_eq!(active_limit(&profile, 3_600, t0()), None);
+        assert_eq!(active_limit(&profile, 10_000, t0()), None);
+    }
+
+    #[test]
+    fn recurring_daily_wraps_the_offset_into_each_day() {
+        // A daily-recurring schedule anchored at tx start: 16 A-equivalent for the
+        // first hour of each day, then a taper — active again at the same offset
+        // 24 h later.
+        let profile = kinded_profile(
+            ChargingProfileKindEnumType::Recurring,
+            Some(RecurrencyKindEnumType::Daily),
+            Some("2026-01-01T00:00:00Z"),
+            None,
+            None,
+            None,
+            &[(0, 7_400.0), (3_600, 3_680.0)],
+        );
+        // Day 1.
+        assert_eq!(
+            active_limit(&profile, 0, t0()),
+            Some((7_400.0, ChargingRateUnitEnumType::W))
+        );
+        assert_eq!(
+            active_limit(&profile, 3_600, t0()),
+            Some((3_680.0, ChargingRateUnitEnumType::W))
+        );
+        // Day 2, same wrapped offsets (86 400 s later).
+        assert_eq!(
+            active_limit(&profile, 86_400, t0()),
+            Some((7_400.0, ChargingRateUnitEnumType::W))
+        );
+        assert_eq!(
+            active_limit(&profile, 90_000, t0()),
+            Some((3_680.0, ChargingRateUnitEnumType::W))
+        );
+    }
+
+    #[test]
+    fn recurring_daily_duration_leaves_a_gap_each_day() {
+        // Active only the first hour of each day; the rest of the day is an
+        // unconstrained gap that re-opens at the next occurrence.
+        let profile = kinded_profile(
+            ChargingProfileKindEnumType::Recurring,
+            Some(RecurrencyKindEnumType::Daily),
+            Some("2026-01-01T00:00:00Z"),
+            Some(3_600),
+            None,
+            None,
+            &[(0, 7_400.0)],
+        );
+        assert_eq!(
+            active_limit(&profile, 0, t0()),
+            Some((7_400.0, ChargingRateUnitEnumType::W))
+        );
+        // 2 h into day 1: past the 1 h duration → gap.
+        assert_eq!(active_limit(&profile, 7_200, t0()), None);
+        // Start of day 2: the occurrence re-opens.
+        assert_eq!(
+            active_limit(&profile, 86_400, t0()),
+            Some((7_400.0, ChargingRateUnitEnumType::W))
+        );
+        assert_eq!(active_limit(&profile, 93_600, t0()), None);
+    }
+
+    #[test]
+    fn malformed_recurring_without_recurrency_kind_evaluates_once() {
+        // A Recurring profile carrying no recurrencyKind cannot be unrolled; it is
+        // evaluated as a single, non-repeating schedule (like Absolute) rather
+        // than panicking or wrapping.
+        let profile = kinded_profile(
+            ChargingProfileKindEnumType::Recurring,
+            None,
+            Some("2026-01-01T00:00:00Z"),
+            Some(3_600),
+            None,
+            None,
+            &[(0, 7_400.0)],
+        );
+        assert_eq!(
+            active_limit(&profile, 0, t0()),
+            Some((7_400.0, ChargingRateUnitEnumType::W))
+        );
+        // Past the single occurrence's duration → gone, not repeated on day two.
+        assert_eq!(active_limit(&profile, 3_600, t0()), None);
+        assert_eq!(active_limit(&profile, 86_400, t0()), None);
+    }
+
+    #[test]
+    fn unparseable_date_fields_are_treated_as_absent() {
+        // A garbage validFrom does not gate the limit (lenient trust boundary),
+        // and a garbage startSchedule on an Absolute profile falls back to the
+        // tx-start anchor rather than aborting resolution.
+        let profile = kinded_profile(
+            ChargingProfileKindEnumType::Absolute,
+            None,
+            Some("not-a-timestamp"),
+            None,
+            Some("also-garbage"),
+            None,
+            &[(0, 7_400.0)],
+        );
+        assert_eq!(
+            active_limit(&profile, 0, t0()),
+            Some((7_400.0, ChargingRateUnitEnumType::W)),
+            "malformed date fields are ignored; the limit still resolves"
+        );
     }
 }
