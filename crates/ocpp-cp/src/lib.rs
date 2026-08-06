@@ -3312,18 +3312,31 @@ impl ChargePoint {
     /// increasing sequence. If the session has already been torn down (a stop
     /// racing the tick), the tick is skipped rather than inventing a `seqNo`.
     async fn start_v201_meter_sampler(&self, connector_id: ConnectorId, transaction_id: i32) {
-        let interval = Duration::from_secs(self.config.meter_values_interval.max(1));
+        let interval_secs = self.config.meter_values_interval.max(1);
+        let interval = Duration::from_secs(interval_secs);
         let client = self.client.clone();
         let is_connected = self.is_connected.clone();
         let connectors = self.connectors.clone();
         let sessions = self.v201_sessions.clone();
+        // The v201 `TxProfile` store lets each tick consult the profile bounding
+        // this transaction (slice 7e, Issue #455), so the periodic reading
+        // reflects an installed limit rather than ignoring it.
+        let tx_profiles = self.v201_tx_profiles.clone();
         let evse_id = connector_id.value() as i32;
         let txid_str = transaction_id.to_string();
 
         let handle = tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
+            // Seconds elapsed since the transaction opened, used to resolve which
+            // `chargingSchedulePeriod` of a `TxProfile` is in force. Advanced on
+            // every tick (even skipped ones) so it tracks wall time, not the
+            // count of emitted samples. The first `interval` tick fires
+            // immediately, so the first sample resolves at offset 0.
+            let mut elapsed_s: i32 = 0;
             loop {
                 timer.tick().await;
+                let now_elapsed = elapsed_s;
+                elapsed_s = elapsed_s.saturating_add(interval_secs as i32);
 
                 if !*is_connected.read().await {
                     continue;
@@ -3336,14 +3349,35 @@ impl ChargePoint {
                     None => continue,
                 };
 
-                // Read the connector's latest meter value, releasing the lock
-                // before building/sending so we never hold it across the send.
-                let reading = {
+                // Read the connector's latest meter value plus its unbounded
+                // rate (for profile enforcement), releasing the lock before
+                // building/sending so we never hold it across the send.
+                let (reading, natural_power_w, nominal_voltage_v) = {
                     let connectors = connectors.read().await;
                     match connectors.get(&connector_id) {
-                        Some(connector) => connector.last_meter_reading().await,
+                        Some(connector) => {
+                            let cfg = connector.config();
+                            (
+                                connector.last_meter_reading().await,
+                                cfg.max_power,
+                                cfg.max_voltage,
+                            )
+                        }
                         None => continue,
                     }
+                };
+
+                // If a `TxProfile` bounds this EVSE and its active limit is
+                // tighter than the connector's natural rate, surface the bounded
+                // power on the reading; otherwise the sample is unchanged.
+                let bounded_power_w = match tx_profiles.get(evse_id).await {
+                    Some(profile) => crate::v201_charging_profiles::bounded_power_w(
+                        &profile,
+                        now_elapsed,
+                        natural_power_w,
+                        nominal_voltage_v,
+                    ),
+                    None => None,
                 };
 
                 let session = v201_transaction::SessionRef {
@@ -3355,6 +3389,7 @@ impl ChargePoint {
                     &session,
                     seq_no,
                     reading.energy_wh,
+                    bounded_power_w,
                     &reading.timestamp.to_rfc3339(),
                 );
 
