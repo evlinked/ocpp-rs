@@ -95,7 +95,7 @@ fn parse_rfc3339(field: &Option<String>) -> Option<DateTime<Utc>> {
 
 /// The absolute instant a `schedule` is anchored to.
 ///
-/// Mirrors [`crate::composite::anchor`]: a `Relative` schedule is offset from the
+/// Mirrors the 1.6J `composite::anchor`: a `Relative` schedule is offset from the
 /// transaction start (`tx_start`); `Absolute`/`Recurring` schedules anchor on
 /// their `startSchedule` when present (the recurrence base for `Recurring` — only
 /// its time-of-day/-week phase matters), else fall back to `tx_start`.
@@ -115,7 +115,7 @@ fn anchor(
 /// The recurrence period in seconds for a `Recurring` profile, or `None` for a
 /// non-recurring profile (and for a malformed `Recurring` profile carrying no
 /// `recurrencyKind`, which cannot be unrolled and so evaluates once, like
-/// `Absolute`). Mirrors [`crate::composite::recurrence_period`].
+/// `Absolute`). Mirrors the 1.6J `composite::recurrence_period`.
 fn recurrence_period(profile: &ChargingProfileType) -> Option<i64> {
     if profile.charging_profile_kind != ChargingProfileKindEnumType::Recurring {
         return None;
