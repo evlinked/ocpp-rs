@@ -94,6 +94,17 @@ impl V201TxProfileStore {
 /// period yet in force — an empty period list, or every `startPeriod` still in
 /// the future — so the caller reports the unbounded reading rather than
 /// inventing a limit of `0`.
+///
+/// **`minChargingRate` floor (Issue #467):** the resolved period `limit` is
+/// floored at the schedule's `minChargingRate` — the EV's minimum draw (OCPP
+/// 2.0.1 Part 2, §K01 / the Python reference's
+/// [`ocpp.v201.datatypes.ChargingScheduleType.min_charging_rate`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/datatypes.py)).
+/// A period whose `limit` dips below the floor is lifted to it, expressed in the
+/// schedule's own `chargingRateUnit`, *before* any A→W conversion in
+/// [`bounded_power_w`]. The floor changes only the schedule-unit value returned,
+/// never whether that value ends up binding against the connector's natural rate.
+/// A `minChargingRate`-absent schedule (the common case) returns the period
+/// `limit` unchanged.
 #[must_use]
 pub fn active_limit(
     profile: &ChargingProfileType,
@@ -105,7 +116,17 @@ pub fn active_limit(
         .iter()
         .filter(|p| p.start_period <= elapsed_s)
         .max_by_key(|p| p.start_period)?;
-    Some((period.limit, schedule.charging_rate_unit))
+    // Floor the period limit at the schedule's `minChargingRate`, in the
+    // schedule's `chargingRateUnit` (so an ampere floor lifts an ampere limit, a
+    // watt floor a watt limit). `f64::max` is total — a floor at or below the
+    // period limit is a no-op, and even a degenerate floor cannot panic — so a
+    // CSMS-supplied `minChargingRate` only ever raises the schedule-unit value,
+    // never poisons resolution.
+    let limit = match schedule.min_charging_rate {
+        Some(floor) => period.limit.max(floor),
+        None => period.limit,
+    };
+    Some((limit, schedule.charging_rate_unit))
 }
 
 /// The charging power (in watts) `profile` binds the connector to `elapsed_s`
@@ -120,6 +141,10 @@ pub fn active_limit(
 /// profile above the natural rate is unchanged"). Only a genuinely-tighter
 /// limit yields `Some(bounded_power)`, which the sampler surfaces as a
 /// `Power.Active.Import` reading on the `TransactionEvent(Updated)`.
+///
+/// The limit fed in has already been floored at the schedule's
+/// `minChargingRate` by [`active_limit`] (Issue #467), so a schedule that
+/// declares a floor above the natural rate simply yields no bind here.
 ///
 /// An ampere limit is converted at the connector's nominal voltage,
 /// single-phase (`limit_a × nominal_voltage_v`); a poly-phase conversion that
@@ -368,5 +393,91 @@ mod tests {
         // No period yet in force → nothing to bind, whatever the connector rate.
         let deferred = stepped_profile(ChargingRateUnitEnumType::W, &[(600, 1_000.0)]);
         assert_eq!(bounded_power_w(&deferred, 0, 7_360.0, 230.0), None);
+    }
+
+    /// A single-schedule `TxProfile` carrying a `minChargingRate` floor, so a
+    /// test can drive a period `limit` below it (lifted) or above it (unchanged).
+    fn floored_profile(
+        unit: ChargingRateUnitEnumType,
+        min_charging_rate: f64,
+        steps: &[(i32, f64)],
+    ) -> ChargingProfileType {
+        let mut profile = stepped_profile(unit, steps);
+        profile.charging_schedule[0].min_charging_rate = Some(min_charging_rate);
+        profile
+    }
+
+    #[test]
+    fn active_limit_floors_a_watt_limit_at_min_charging_rate() {
+        // A 3 kW period under a 5 kW floor is lifted to the floor; a 6 kW period
+        // already above it is returned unchanged. The unit stays the schedule's.
+        let below = floored_profile(ChargingRateUnitEnumType::W, 5_000.0, &[(0, 3_000.0)]);
+        assert_eq!(
+            active_limit(&below, 0),
+            Some((5_000.0, ChargingRateUnitEnumType::W)),
+            "a period limit below minChargingRate is lifted to the floor"
+        );
+        let above = floored_profile(ChargingRateUnitEnumType::W, 5_000.0, &[(0, 6_000.0)]);
+        assert_eq!(
+            active_limit(&above, 0),
+            Some((6_000.0, ChargingRateUnitEnumType::W)),
+            "a period limit at or above minChargingRate is unchanged"
+        );
+    }
+
+    #[test]
+    fn active_limit_floors_an_ampere_limit_in_its_own_unit() {
+        // The floor is applied in the schedule's chargingRateUnit: a 6 A period
+        // under a 10 A floor resolves to 10 A, still amperes — the A→W conversion
+        // is bounded_power_w's job, downstream of the floor.
+        let profile = floored_profile(ChargingRateUnitEnumType::A, 10.0, &[(0, 6.0)]);
+        assert_eq!(
+            active_limit(&profile, 0),
+            Some((10.0, ChargingRateUnitEnumType::A))
+        );
+    }
+
+    #[test]
+    fn active_limit_without_min_charging_rate_is_unchanged() {
+        // The common case: no floor set → the raw period limit, unchanged (no
+        // regression to the pre-#467 resolution).
+        let profile = stepped_profile(ChargingRateUnitEnumType::W, &[(0, 3_000.0)]);
+        assert_eq!(
+            active_limit(&profile, 0),
+            Some((3_000.0, ChargingRateUnitEnumType::W))
+        );
+    }
+
+    #[test]
+    fn bounded_power_w_binds_at_the_floored_limit() {
+        // A 2 kW period under a 3.68 kW floor: the floor lifts the schedule-unit
+        // limit to 3.68 kW, still below the 7.36 kW connector → binds there, not
+        // at the un-floored 2 kW.
+        let natural = 7_360.0;
+        let profile = floored_profile(ChargingRateUnitEnumType::W, 3_680.0, &[(0, 2_000.0)]);
+        assert_eq!(bounded_power_w(&profile, 0, natural, 230.0), Some(3_680.0));
+    }
+
+    #[test]
+    fn bounded_power_w_floored_above_the_natural_rate_does_not_bind() {
+        // A floor above the connector's natural rate lifts the limit past it, so
+        // it is no longer tighter → no bind, the reading is left untouched. The
+        // floor never *creates* a binding limit against the natural rate.
+        let natural = 7_360.0;
+        let profile = floored_profile(ChargingRateUnitEnumType::W, 20_000.0, &[(0, 3_000.0)]);
+        assert_eq!(bounded_power_w(&profile, 0, natural, 230.0), None);
+    }
+
+    #[test]
+    fn bounded_power_w_floors_an_ampere_limit_before_conversion() {
+        // 8 A floored to 16 A, converted at 230 V → 3 680 W, below the 7.36 kW
+        // connector → binds at the converted, floored wattage.
+        let natural = 7_360.0;
+        let voltage = 230.0;
+        let profile = floored_profile(ChargingRateUnitEnumType::A, 16.0, &[(0, 8.0)]);
+        assert_eq!(
+            bounded_power_w(&profile, 0, natural, voltage),
+            Some(16.0 * voltage)
+        );
     }
 }
