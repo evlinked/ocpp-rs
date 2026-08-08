@@ -75,8 +75,11 @@ use v201_device_model::V201DeviceModel;
 // above (`StatusNotificationRequest`, `RegistrationStatus`).
 use ocpp_messages::v201::{
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
+    GetBaseReportRequest as V201GetBaseReportRequest,
+    GetBaseReportResponse as V201GetBaseReportResponse,
     GetVariablesRequest as V201GetVariablesRequest,
     GetVariablesResponse as V201GetVariablesResponse, MeterValuesRequest as V201MeterValuesRequest,
+    NotifyReportRequest as V201NotifyReportRequest,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     RequestStopTransactionRequest as V201RequestStopTransactionRequest,
     ResetRequest as V201ResetRequest, SetVariablesRequest as V201SetVariablesRequest,
@@ -88,10 +91,10 @@ use ocpp_messages::v201::{
 use ocpp_types::v201::{
     AttributeEnumType, AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType,
     ChargingProfilePurposeEnumType, ChargingProfileType, ConnectorStatusEnumType,
-    GetVariableResultType, IdTokenType as V201IdTokenType, MessageTriggerEnumType,
-    OperationalStatusEnumType, RegistrationStatusEnumType, RequestStartStopStatusEnumType,
-    ResetStatusEnumType, SetVariableResultType, StatusInfoType, TriggerMessageStatusEnumType,
-    UnlockStatusEnumType,
+    GenericDeviceModelStatusEnumType, GetVariableResultType, IdTokenType as V201IdTokenType,
+    MessageTriggerEnumType, OperationalStatusEnumType, RegistrationStatusEnumType, ReportDataType,
+    RequestStartStopStatusEnumType, ResetStatusEnumType, SetVariableResultType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -557,6 +560,18 @@ enum RemoteCommand {
     V201TriggerMessage {
         requested_message: MessageTriggerEnumType,
         evse_id: Option<i32>,
+    },
+    /// Stream the device-model report a CSMS asked for with an `Accepted` OCPP
+    /// 2.0.1 `GetBaseReport` (Part 2). The synchronous `GetBaseReport.conf` only
+    /// acknowledges; the actual inventory follows as a `NotifyReport` CALL,
+    /// correlated back by `request_id`. `report_data` is the already-computed
+    /// report snapshot (taken under the device-model read lock on the CALL path,
+    /// so the send touches no shared state). Queued off the inbound-CALL path for
+    /// the same reason as the other side effects — the outbound `NotifyReport`
+    /// CALL must not re-enter the receive loop mid-dispatch.
+    V201NotifyReport {
+        request_id: i32,
+        report_data: Vec<ReportDataType>,
     },
     /// Run the simulated diagnostics-upload state machine for an `Accepted`
     /// `GetDiagnostics` (OCPP 1.6J §4.x, firmware-management profile). Emits
@@ -1458,6 +1473,66 @@ impl ChargePoint {
                         .collect();
                     Ok(V201SetVariablesResponse {
                         set_variable_result,
+                        custom_data: None,
+                    })
+                }
+            });
+        }
+
+        // GetBaseReport (OCPP 2.0.1 only) — the device-model **report** seam,
+        // completing the read (`GetVariables`) / write (`SetVariables`) / report
+        // triad over the same `V201DeviceModel`. Unlike the synchronous read/write
+        // handlers, `GetBaseReport` is a two-part exchange: the station
+        // acknowledges here with a `GenericDeviceModelStatusEnumType` and then
+        // streams the actual inventory back asynchronously as `NotifyReport`
+        // CALL(s), correlated by `requestId`.
+        //
+        // The report snapshot is computed here, under the model's *read* lock, so
+        // the queued side effect carries owned data and touches no shared state
+        // when it runs. Status:
+        // - a non-empty report → `Accepted`, and a `V201NotifyReport` is queued
+        //   on the command channel (sent after this CALLRESULT is flushed, off the
+        //   inbound-CALL path — same discipline as `TriggerMessage`);
+        // - an empty report (e.g. `SummaryInventory` on a healthy simulator) →
+        //   `EmptyResultSet`, and nothing is queued (no data to stream);
+        // - if the command consumer has gone away (CP shutting down) an accepted
+        //   report cannot be delivered, so we answer `Rejected` rather than
+        //   promise a `NotifyReport` that will never arrive.
+        //
+        // Trust boundary: the request carries only a numeric `requestId` and an
+        // enum `reportBase` — both schema-bounded, nothing stored — so there is no
+        // panic/unwrap surface on wire input. Registered on the V201 arm only;
+        // "GetBaseReport" has no 1.6J twin. Ports `ocpp.v201.call.GetBaseReport` →
+        // `ocpp.v201.call.NotifyReport`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let device_model = v201_device_model.clone();
+            let command_sender = command_sender.clone();
+            d.on(move |req: V201GetBaseReportRequest| {
+                let device_model = device_model.clone();
+                let command_sender = command_sender.clone();
+                async move {
+                    let report_data = device_model.read().await.report(req.report_base);
+                    let status = if report_data.is_empty() {
+                        // Request understood, but nothing matched — a legitimate
+                        // outcome (e.g. SummaryInventory on a fresh station). No
+                        // NotifyReport follows.
+                        GenericDeviceModelStatusEnumType::EmptyResultSet
+                    } else if command_sender
+                        .send(RemoteCommand::V201NotifyReport {
+                            request_id: req.request_id,
+                            report_data,
+                        })
+                        .is_ok()
+                    {
+                        GenericDeviceModelStatusEnumType::Accepted
+                    } else {
+                        // Consumer gone: we cannot stream the report, so don't
+                        // claim we will.
+                        GenericDeviceModelStatusEnumType::Rejected
+                    };
+                    Ok(V201GetBaseReportResponse {
+                        status,
+                        status_info: None,
                         custom_data: None,
                     })
                 }
@@ -2747,6 +2822,12 @@ impl ChargePoint {
                         } => {
                             cp.send_v201_triggered_message(requested_message, evse_id)
                                 .await;
+                        }
+                        RemoteCommand::V201NotifyReport {
+                            request_id,
+                            report_data,
+                        } => {
+                            cp.send_v201_notify_report(request_id, report_data).await;
                         }
                         RemoteCommand::V201ApplyAvailability {
                             connector_id,
@@ -4547,6 +4628,33 @@ impl ChargePoint {
             | PublishFirmwareStatusNotification) => {
                 warn!("v201 TriggerMessage({other:?}): not implemented by the simulator");
             }
+        }
+    }
+
+    /// Stream the device-model report an `Accepted` OCPP 2.0.1 `GetBaseReport`
+    /// asked for, as a `NotifyReport` CALL (`ocpp.v201.call.NotifyReport`).
+    ///
+    /// Runs on the command-consumer task (off the inbound-CALL path), so the
+    /// outbound `NotifyReport` is sent only after the `GetBaseReport` CALLRESULT
+    /// is flushed and never re-enters the receive loop. `request_id` correlates
+    /// the report back to the triggering `GetBaseReport`; `report_data` is the
+    /// snapshot the handler already computed.
+    ///
+    /// A single page carries the whole report (`seqNo` 0, `tbc` omitted =
+    /// `false`) — correct for the simulator's small seeded device model.
+    /// Multi-page chunking (`tbc` paging) is a later slice once the inventory
+    /// grows beyond one frame.
+    async fn send_v201_notify_report(&self, request_id: i32, report_data: Vec<ReportDataType>) {
+        let request = V201NotifyReportRequest {
+            request_id,
+            generated_at: v201_now(),
+            report_data: Some(report_data),
+            tbc: None,
+            seq_no: 0,
+            custom_data: None,
+        };
+        if let Err(e) = self.call(request).await {
+            warn!("v201 GetBaseReport: NotifyReport send failed for request {request_id}: {e}");
         }
     }
 
