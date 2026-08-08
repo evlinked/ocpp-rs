@@ -3406,6 +3406,14 @@ impl ChargePoint {
         let evse_id = connector_id.value() as i32;
         let txid_str = transaction_id.to_string();
 
+        // The absolute instant the transaction opened, captured as the sampler
+        // spawns (the `Started` event has just been sent). It anchors a
+        // `TxProfile`'s composite-schedule resolution (slice 7f, Issue #464):
+        // `Relative` schedules offset from it, `Absolute`/`Recurring` schedules
+        // and `validFrom`/`validTo` windows are evaluated against `tx_start +
+        // elapsed`.
+        let tx_start = chrono::Utc::now();
+
         let handle = tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
             // Seconds elapsed since the transaction opened, used to resolve which
@@ -3455,6 +3463,7 @@ impl ChargePoint {
                     Some(profile) => crate::v201_charging_profiles::bounded_power_w(
                         &profile,
                         now_elapsed,
+                        tx_start,
                         natural_power_w,
                         nominal_voltage_v,
                     ),
