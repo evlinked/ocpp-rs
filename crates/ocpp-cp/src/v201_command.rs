@@ -89,14 +89,15 @@
 use ocpp_types::common::Reason;
 use ocpp_types::v16j::ResetType;
 use ocpp_types::v201::{
-    ChangeAvailabilityStatusEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
+    ChangeAvailabilityStatusEnumType, ChargingProfilePurposeEnumType,
+    ChargingProfileStatusEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
     RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
     TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 
 use ocpp_messages::v201::{
     ChangeAvailabilityResponse, RequestStartTransactionResponse, RequestStopTransactionResponse,
-    ResetResponse, TriggerMessageResponse, UnlockConnectorResponse,
+    ResetResponse, SetChargingProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -582,6 +583,102 @@ pub fn v201_unlock_response(
     status_info: Option<StatusInfoType>,
 ) -> UnlockConnectorResponse {
     UnlockConnectorResponse {
+        status,
+        status_info,
+        custom_data: None,
+    }
+}
+
+/// Decide the [`ChargingProfileStatusEnumType`] a `V201` station reports for an
+/// inbound `SetChargingProfile.req`, given the incoming profile's
+/// [`purpose`](ChargingProfilePurposeEnumType) and whether an ongoing
+/// transaction exists on the targeted EVSE — returning the decided status
+/// together with the optional `statusInfo` explaining a rejection.
+///
+/// Faithful to OCPP 2.0.1 (Part 2, `SetChargingProfile`) and a direct port of
+/// the `RequestStartTransaction` handler's `TxProfile` guard in [`crate`]'s
+/// `ChargePoint` (`lib.rs`), which enforces the same "a `chargingProfile`
+/// attached to a transaction-scoped install SHALL be a `TxProfile`" contract:
+///
+/// - **Non-`TxProfile` purpose** — `TxDefaultProfile`,
+///   `ChargingStationMaxProfile`, and `ChargingStationExternalConstraints` are
+///   station-scoped / default profiles the simulator does not yet install; they
+///   are
+///   [`Rejected`](ChargingProfileStatusEnumType::Rejected) with an
+///   `UnsupportedPurpose` `statusInfo`, checked *before* the transaction read so
+///   the reason never depends on whether a session happens to be live.
+/// - **`TxProfile` with no ongoing transaction on the target EVSE** — a
+///   `TxProfile` is transaction-scoped, so with nothing to bind it to it is
+///   [`Rejected`](ChargingProfileStatusEnumType::Rejected) with a `NoTransaction`
+///   `statusInfo`. `has_active_transaction == false` folds a `0` / out-of-range
+///   `evseId` (never a chargeable EVSE) and an idle-but-valid EVSE into one arm,
+///   exactly as the 1.6J handler folds unknown and idle connectors into one
+///   rejection.
+/// - **`TxProfile` on an EVSE with a live transaction** —
+///   [`Accepted`](ChargingProfileStatusEnumType::Accepted), no `statusInfo`. The
+///   wiring layer then installs (replacing any profile already bound to that
+///   EVSE) so the periodic-metering resolver enforces it on the next tick.
+///
+/// This is the *pure* decision, depending only on the profile purpose and a
+/// single `bool` read — no runtime handles, so it is unit-testable in isolation.
+/// Resolving `evse_id` to a live transaction and performing the install off the
+/// CALL path is the wiring layer's job.
+#[must_use]
+pub fn v201_set_charging_profile_status(
+    purpose: ChargingProfilePurposeEnumType,
+    has_active_transaction: bool,
+) -> (ChargingProfileStatusEnumType, Option<StatusInfoType>) {
+    // Only a TxProfile is honored: it is the sole purpose the simulator installs
+    // and enforces today (the transaction-scoped store + metering resolver).
+    // Checked first so a station-scoped purpose is rejected for *being*
+    // unsupported, independent of the live-transaction state.
+    if purpose != ChargingProfilePurposeEnumType::TxProfile {
+        return (
+            ChargingProfileStatusEnumType::Rejected,
+            Some(StatusInfoType {
+                reason_code: "UnsupportedPurpose".to_string(),
+                additional_info: Some(
+                    "SetChargingProfile.chargingProfile.chargingProfilePurpose must be \
+                     TxProfile; TxDefaultProfile / ChargingStationMaxProfile / \
+                     ChargingStationExternalConstraints are not yet handled by the \
+                     simulator"
+                        .to_string(),
+                ),
+                custom_data: None,
+            }),
+        );
+    }
+    // A TxProfile is transaction-scoped: with no ongoing transaction on the
+    // targeted EVSE there is nothing to bind it to.
+    if !has_active_transaction {
+        return (
+            ChargingProfileStatusEnumType::Rejected,
+            Some(StatusInfoType {
+                reason_code: "NoTransaction".to_string(),
+                additional_info: Some(
+                    "SetChargingProfile carrying a TxProfile requires an ongoing \
+                     transaction on the targeted EVSE"
+                        .to_string(),
+                ),
+                custom_data: None,
+            }),
+        );
+    }
+    (ChargingProfileStatusEnumType::Accepted, None)
+}
+
+/// Build a schema-valid `SetChargingProfile.conf` ([`SetChargingProfileResponse`]).
+///
+/// Pure constructor mirroring [`v201_request_start_response`]: carries the
+/// decided [`status`](ChargingProfileStatusEnumType) plus the optional 2.0.1
+/// `statusInfo` (a vendor-agnostic `reasonCode` and human-readable detail —
+/// useful, for example, to explain why an install was `Rejected`).
+#[must_use]
+pub fn v201_set_charging_profile_response(
+    status: ChargingProfileStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> SetChargingProfileResponse {
+    SetChargingProfileResponse {
         status,
         status_info,
         custom_data: None,
@@ -1388,6 +1485,111 @@ mod tests {
                         .validate_call_result("UnlockConnector", &payload)
                         .is_ok(),
                     "built {status:?} UnlockConnectorResponse should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn set_charging_profile_accepts_a_txprofile_with_an_active_transaction() {
+        let (status, info) = v201_set_charging_profile_status(
+            ChargingProfilePurposeEnumType::TxProfile,
+            /* has_active_transaction */ true,
+        );
+        assert_eq!(status, ChargingProfileStatusEnumType::Accepted);
+        // An accepted install carries no rejection detail.
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn set_charging_profile_rejects_a_txprofile_with_no_active_transaction() {
+        let (status, info) = v201_set_charging_profile_status(
+            ChargingProfilePurposeEnumType::TxProfile,
+            /* has_active_transaction */ false,
+        );
+        assert_eq!(status, ChargingProfileStatusEnumType::Rejected);
+        assert_eq!(
+            info.as_ref().map(|i| i.reason_code.as_str()),
+            Some("NoTransaction"),
+            "a TxProfile with nothing to bind to is rejected with NoTransaction"
+        );
+    }
+
+    #[test]
+    fn set_charging_profile_rejects_every_non_txprofile_purpose_before_the_transaction_read() {
+        // The purpose guard is checked first: a station-scoped / default profile is
+        // rejected for being unsupported regardless of whether a session is live.
+        for purpose in [
+            ChargingProfilePurposeEnumType::TxDefaultProfile,
+            ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
+            ChargingProfilePurposeEnumType::ChargingStationExternalConstraints,
+        ] {
+            for has_tx in [false, true] {
+                let (status, info) = v201_set_charging_profile_status(purpose, has_tx);
+                assert_eq!(
+                    status,
+                    ChargingProfileStatusEnumType::Rejected,
+                    "{purpose:?} is not honored by the simulator (has_tx={has_tx})"
+                );
+                assert_eq!(
+                    info.as_ref().map(|i| i.reason_code.as_str()),
+                    Some("UnsupportedPurpose"),
+                    "{purpose:?} is rejected with UnsupportedPurpose (has_tx={has_tx})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn set_charging_profile_response_carries_status_and_optional_status_info() {
+        let bare =
+            v201_set_charging_profile_response(ChargingProfileStatusEnumType::Accepted, None);
+        assert_eq!(bare.status, ChargingProfileStatusEnumType::Accepted);
+        assert!(bare.status_info.is_none());
+
+        let info = StatusInfoType {
+            reason_code: "NoTransaction".to_string(),
+            additional_info: Some("no ongoing transaction on the targeted EVSE".to_string()),
+            custom_data: None,
+        };
+        let rejected =
+            v201_set_charging_profile_response(ChargingProfileStatusEnumType::Rejected, Some(info));
+        assert_eq!(rejected.status, ChargingProfileStatusEnumType::Rejected);
+        assert_eq!(
+            rejected
+                .status_info
+                .as_ref()
+                .map(|i| i.reason_code.as_str()),
+            Some("NoTransaction")
+        );
+    }
+
+    /// Wire fidelity: every built `SetChargingProfile.conf` — with and without
+    /// `statusInfo`, across both status values — satisfies the bundled OCPP 2.0.1
+    /// `SetChargingProfileResponse` JSON Schema, the same guarantee the CP's
+    /// version-aware validator gives on the live path. `validate_call_result` keys
+    /// on the base `"SetChargingProfile"` action (it appends `Response`
+    /// internally).
+    #[test]
+    fn built_set_charging_profile_responses_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        let info = StatusInfoType {
+            reason_code: "UnsupportedPurpose".to_string(),
+            additional_info: Some("only TxProfile is handled by the simulator".to_string()),
+            custom_data: None,
+        };
+        for status in [
+            ChargingProfileStatusEnumType::Accepted,
+            ChargingProfileStatusEnumType::Rejected,
+        ] {
+            for status_info in [None, Some(info.clone())] {
+                let resp = v201_set_charging_profile_response(status, status_info);
+                let payload = serde_json::to_value(&resp).unwrap();
+                assert!(
+                    validator
+                        .validate_call_result("SetChargingProfile", &payload)
+                        .is_ok(),
+                    "built {status:?} SetChargingProfileResponse should be schema-valid, got: {payload}"
                 );
             }
         }
