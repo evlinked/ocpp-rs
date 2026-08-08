@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 use ocpp_types::v201::{
     ChargingProfileKindEnumType, ChargingProfileType, ChargingRateUnitEnumType,
-    ChargingScheduleType, RecurrencyKindEnumType,
+    ChargingSchedulePeriodType, ChargingScheduleType, RecurrencyKindEnumType,
 };
 use ocpp_types::{DateTime, Utc};
 use tokio::sync::RwLock;
@@ -176,6 +176,22 @@ pub fn active_limit(
     elapsed_s: i32,
     tx_start: DateTime<Utc>,
 ) -> Option<(f64, ChargingRateUnitEnumType)> {
+    let (schedule, period) = resolve_active(profile, elapsed_s, tx_start)?;
+    Some((floored_limit(schedule, period), schedule.charging_rate_unit))
+}
+
+/// Resolve the `(schedule, period)` in force `elapsed_s` seconds into the
+/// transaction — the shared core of [`active_limit`] and [`bounded_power_w`].
+/// Applies, in order: the profile's `validFrom`/`validTo` window, the recurrence
+/// phasing, the schedule `duration` bound, and the "last period whose
+/// `startPeriod` has been reached" selection. Returns `None` when the profile
+/// imposes nothing at this instant (outside its validity window, past its
+/// schedule `duration`, or with no period yet in force).
+fn resolve_active(
+    profile: &ChargingProfileType,
+    elapsed_s: i32,
+    tx_start: DateTime<Utc>,
+) -> Option<(&ChargingScheduleType, &ChargingSchedulePeriodType)> {
     // The absolute instant of this sample: `elapsed_s` seconds into the
     // transaction. `validFrom`/`validTo` and an `Absolute`/`Recurring` anchor are
     // calendar quantities, so period selection is done against this instant, not
@@ -225,17 +241,34 @@ pub fn active_limit(
         .iter()
         .filter(|p| i64::from(p.start_period) <= offset)
         .max_by_key(|p| p.start_period)?;
-    // Floor the period limit at the schedule's `minChargingRate`, in the
-    // schedule's `chargingRateUnit` (so an ampere floor lifts an ampere limit, a
-    // watt floor a watt limit). `f64::max` is total — a floor at or below the
-    // period limit is a no-op, and even a degenerate floor cannot panic — so a
-    // CSMS-supplied `minChargingRate` only ever raises the schedule-unit value,
-    // never poisons resolution.
-    let limit = match schedule.min_charging_rate {
+    Some((schedule, period))
+}
+
+/// The period `limit` lifted to the schedule's `minChargingRate` floor (Issue
+/// #467), in the schedule's own `chargingRateUnit` (so an ampere floor lifts an
+/// ampere limit, a watt floor a watt limit). `f64::max` is total — a floor at or
+/// below the period limit is a no-op, and even a degenerate floor cannot panic —
+/// so a CSMS-supplied `minChargingRate` only ever raises the schedule-unit
+/// value, never poisons resolution.
+fn floored_limit(schedule: &ChargingScheduleType, period: &ChargingSchedulePeriodType) -> f64 {
+    match schedule.min_charging_rate {
         Some(floor) => period.limit.max(floor),
         None => period.limit,
-    };
-    Some((limit, schedule.charging_rate_unit))
+    }
+}
+
+/// The number of phases `period`'s ampere→watt conversion applies (Issue #465),
+/// honoring its `numberPhases` and defaulting to **3** when absent — OCPP 2.0.1
+/// `ChargingSchedulePeriodType.numberPhases` ("if a number of phases is needed,
+/// numberPhases=3 will be assumed unless another number is given"; the Python
+/// reference's
+/// [`ocpp.v201.datatypes.ChargingSchedulePeriodType`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/datatypes.py)).
+/// The value is clamped into the schema's `1..=3` band so a malformed CSMS
+/// `numberPhases` (0, negative, or >3 — this is an incoming-WebSocket trust
+/// boundary) can neither zero the bound (stall the car at 0 W) nor inflate it
+/// past a genuine three-phase draw.
+fn effective_phases(period: &ChargingSchedulePeriodType) -> i32 {
+    period.number_phases.unwrap_or(3).clamp(1, 3)
 }
 
 /// The charging power (in watts) `profile` binds the connector to `elapsed_s`
@@ -251,15 +284,17 @@ pub fn active_limit(
 /// limit yields `Some(bounded_power)`, which the sampler surfaces as a
 /// `Power.Active.Import` reading on the `TransactionEvent(Updated)`.
 ///
-/// The limit fed in has already been floored at the schedule's
-/// `minChargingRate` by [`active_limit`] (Issue #467), so a schedule that
-/// declares a floor above the natural rate simply yields no bind here.
+/// The resolved limit is floored at the schedule's `minChargingRate` (Issue
+/// #467, via [`floored_limit`]) before conversion, so a schedule that declares a
+/// floor above the natural rate simply yields no bind here.
 ///
-/// An ampere limit is converted at the connector's nominal voltage,
-/// single-phase (`limit_a × nominal_voltage_v`); a poly-phase conversion that
-/// honors the period's `numberPhases` is a follow-up, so a three-phase station
-/// is bounded conservatively (to its single-phase equivalent) rather than
-/// wrongly. A watt limit is used directly.
+/// An ampere limit is converted at the connector's nominal voltage across the
+/// period's phase count (`limit_a × nominal_voltage_v × numberPhases`, Issue
+/// #465), so a three-phase station is bounded to its real capacity rather than
+/// the ~⅓ single-phase equivalent it was pinned to before. The phase count
+/// defaults to 3 when `numberPhases` is absent and is clamped to `1..=3` — see
+/// [`effective_phases`]. A watt limit is used directly (its magnitude already
+/// accounts for phases, so `numberPhases` does not apply).
 #[must_use]
 pub fn bounded_power_w(
     profile: &ChargingProfileType,
@@ -268,10 +303,13 @@ pub fn bounded_power_w(
     natural_power_w: f64,
     nominal_voltage_v: f64,
 ) -> Option<f64> {
-    let (limit, unit) = active_limit(profile, elapsed_s, tx_start)?;
-    let limit_w = match unit {
+    let (schedule, period) = resolve_active(profile, elapsed_s, tx_start)?;
+    let limit = floored_limit(schedule, period);
+    let limit_w = match schedule.charging_rate_unit {
         ChargingRateUnitEnumType::W => limit,
-        ChargingRateUnitEnumType::A => limit * nominal_voltage_v,
+        ChargingRateUnitEnumType::A => {
+            limit * nominal_voltage_v * f64::from(effective_phases(period))
+        }
     };
     (limit_w < natural_power_w).then_some(limit_w)
 }
@@ -492,20 +530,105 @@ mod tests {
         assert_eq!(bounded_power_w(&at_rate, 0, t0(), natural, 230.0), None);
     }
 
+    /// A single-period ampere `TxProfile` with an explicit `numberPhases`, for
+    /// the poly-phase A→W conversion tests. `None` exercises the absent-default.
+    fn ampere_profile(number_phases: Option<i32>, limit_a: f64) -> ChargingProfileType {
+        let mut profile = stepped_profile(ChargingRateUnitEnumType::A, &[(0, limit_a)]);
+        profile.charging_schedule[0].charging_schedule_period[0].number_phases = number_phases;
+        profile
+    }
+
     #[test]
-    fn bounded_power_w_converts_an_ampere_limit_at_nominal_voltage() {
+    fn bounded_power_w_converts_a_single_phase_ampere_limit_at_nominal_voltage() {
         let natural = 7_360.0;
         let voltage = 230.0;
-        // 16 A × 230 V = 3 680 W, below the natural rate → binds at the
+        // 16 A × 230 V × 1φ = 3 680 W, below the natural rate → binds at the
         // converted wattage.
-        let amps = stepped_profile(ChargingRateUnitEnumType::A, &[(0, 16.0)]);
+        let amps = ampere_profile(Some(1), 16.0);
         assert_eq!(
             bounded_power_w(&amps, 0, t0(), natural, voltage),
             Some(16.0 * voltage)
         );
-        // 32 A × 230 V = 7 360 W == natural rate → not tighter → no bind.
-        let full = stepped_profile(ChargingRateUnitEnumType::A, &[(0, 32.0)]);
+        // 32 A × 230 V × 1φ = 7 360 W == natural rate → not tighter → no bind.
+        let full = ampere_profile(Some(1), 32.0);
         assert_eq!(bounded_power_w(&full, 0, t0(), natural, voltage), None);
+    }
+
+    #[test]
+    fn bounded_power_w_scales_an_ampere_limit_by_number_phases() {
+        // The same 16 A limit resolves to a wider bound as the phase count
+        // rises: 1φ → 3 680 W, 2φ → 7 360 W, 3φ → 11 040 W. A three-phase
+        // station is bounded to its real capacity, not the single-phase
+        // equivalent it was pinned to before (Issue #465). `natural` is high
+        // enough that every phase count binds, isolating the scaling.
+        let voltage = 230.0;
+        let natural = 20_000.0;
+        for (phases, expected_w) in [(1, 3_680.0), (2, 7_360.0), (3, 11_040.0)] {
+            let amps = ampere_profile(Some(phases), 16.0);
+            assert_eq!(
+                bounded_power_w(&amps, 0, t0(), natural, voltage),
+                Some(expected_w),
+                "{phases}-phase 16 A at 230 V should bind at {expected_w} W"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_power_w_defaults_absent_number_phases_to_three() {
+        // A `numberPhases`-absent period assumes 3 (the OCPP 2.0.1 default), so
+        // it converts identically to an explicit 3-phase period.
+        let voltage = 230.0;
+        let natural = 20_000.0;
+        let absent = ampere_profile(None, 16.0);
+        let explicit = ampere_profile(Some(3), 16.0);
+        assert_eq!(
+            bounded_power_w(&absent, 0, t0(), natural, voltage),
+            bounded_power_w(&explicit, 0, t0(), natural, voltage),
+            "an absent numberPhases resolves to the 3-phase conversion"
+        );
+        assert_eq!(
+            bounded_power_w(&absent, 0, t0(), natural, voltage),
+            Some(16.0 * voltage * 3.0)
+        );
+    }
+
+    #[test]
+    fn bounded_power_w_clamps_out_of_range_number_phases() {
+        // A malformed CSMS `numberPhases` (an incoming-WebSocket trust boundary)
+        // is clamped into 1..=3: 0 / negative → single-phase (never a 0 W bound
+        // that would stall the car), >3 → three-phase (never inflated past a
+        // real three-phase draw).
+        let voltage = 230.0;
+        let natural = 20_000.0;
+        assert_eq!(
+            bounded_power_w(&ampere_profile(Some(0), 16.0), 0, t0(), natural, voltage),
+            Some(16.0 * voltage),
+            "0 phases clamps up to single-phase"
+        );
+        assert_eq!(
+            bounded_power_w(&ampere_profile(Some(-1), 16.0), 0, t0(), natural, voltage),
+            Some(16.0 * voltage),
+            "a negative phase count clamps up to single-phase"
+        );
+        assert_eq!(
+            bounded_power_w(&ampere_profile(Some(9), 16.0), 0, t0(), natural, voltage),
+            Some(16.0 * voltage * 3.0),
+            ">3 phases clamps down to three-phase"
+        );
+    }
+
+    #[test]
+    fn bounded_power_w_ignores_number_phases_for_a_watt_limit() {
+        // `numberPhases` only scales an ampere→watt conversion; a watt limit is
+        // already a power, so the phase count must not touch it.
+        let natural = 7_360.0;
+        let mut profile = tx_profile(1, 3_680.0); // watt-unit
+        profile.charging_schedule[0].charging_schedule_period[0].number_phases = Some(3);
+        assert_eq!(
+            bounded_power_w(&profile, 0, t0(), natural, 230.0),
+            Some(3_680.0),
+            "a 3-phase tag does not triple a watt limit"
+        );
     }
 
     #[test]
@@ -849,11 +972,13 @@ mod tests {
 
     #[test]
     fn bounded_power_w_floors_an_ampere_limit_before_conversion() {
-        // 8 A floored to 16 A, converted at 230 V → 3 680 W, below the 7.36 kW
-        // connector → binds at the converted, floored wattage.
+        // 8 A floored to 16 A, converted single-phase at 230 V → 3 680 W, below
+        // the 7.36 kW connector → binds at the converted, floored wattage. Pinned
+        // to 1 phase so this exercises the floor, not the phase scaling (#465).
         let natural = 7_360.0;
         let voltage = 230.0;
-        let profile = floored_profile(ChargingRateUnitEnumType::A, 16.0, &[(0, 8.0)]);
+        let mut profile = floored_profile(ChargingRateUnitEnumType::A, 16.0, &[(0, 8.0)]);
+        profile.charging_schedule[0].charging_schedule_period[0].number_phases = Some(1);
         assert_eq!(
             bounded_power_w(&profile, 0, t0(), natural, voltage),
             Some(16.0 * voltage)
