@@ -285,7 +285,7 @@ fn effective_phases(period: &ChargingSchedulePeriodType) -> i32 {
 /// `Power.Active.Import` reading on the `TransactionEvent(Updated)`.
 ///
 /// The resolved limit is floored at the schedule's `minChargingRate` (Issue
-/// #467, via [`floored_limit`]) before conversion, so a schedule that declares a
+/// #467, via `floored_limit`) before conversion, so a schedule that declares a
 /// floor above the natural rate simply yields no bind here.
 ///
 /// An ampere limit is converted at the connector's nominal voltage across the
@@ -293,7 +293,7 @@ fn effective_phases(period: &ChargingSchedulePeriodType) -> i32 {
 /// #465), so a three-phase station is bounded to its real capacity rather than
 /// the ~⅓ single-phase equivalent it was pinned to before. The phase count
 /// defaults to 3 when `numberPhases` is absent and is clamped to `1..=3` — see
-/// [`effective_phases`]. A watt limit is used directly (its magnitude already
+/// `effective_phases`. A watt limit is used directly (its magnitude already
 /// accounts for phases, so `numberPhases` does not apply).
 #[must_use]
 pub fn bounded_power_w(
