@@ -24,6 +24,7 @@ use ocpp_messages::v201::{
     BootNotificationRequest as V201BootNotificationRequest,
     BootNotificationResponse as V201BootNotificationResponse,
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
+    ClearChargingProfileRequest as V201ClearChargingProfileRequest,
     DataTransferRequest as V201DataTransferRequest,
     GetBaseReportRequest as V201GetBaseReportRequest,
     GetBaseReportResponse as V201GetBaseReportResponse,
@@ -52,8 +53,9 @@ use ocpp_types::v201::{
     AttributeEnumType, BootReasonEnumType, ChangeAvailabilityStatusEnumType,
     ChargingProfileKindEnumType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
     ChargingProfileType, ChargingRateUnitEnumType, ChargingSchedulePeriodType,
-    ChargingScheduleType, ComponentType, ConnectorStatusEnumType, DataTransferStatusEnumType,
-    EvseType, GenericDeviceModelStatusEnumType, GetVariableDataType, GetVariableStatusEnumType,
+    ChargingScheduleType, ClearChargingProfileStatusEnumType, ClearChargingProfileType,
+    ComponentType, ConnectorStatusEnumType, DataTransferStatusEnumType, EvseType,
+    GenericDeviceModelStatusEnumType, GetVariableDataType, GetVariableStatusEnumType,
     IdTokenEnumType, IdTokenType, MeasurandEnumType, MessageTriggerEnumType, MutabilityEnumType,
     OperationalStatusEnumType, ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType,
     ReportBaseEnumType, RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType,
@@ -2252,6 +2254,155 @@ async fn v201_set_charging_profile_installs_replaces_and_rejects_faithfully() {
         None,
         "ending the transaction clears its transaction-scoped TxProfile"
     );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// ClearChargingProfile — Issue #474: the teardown counterpart to
+// SetChargingProfile removes an installed TxProfile mid-session, without ending
+// the transaction. This drives the full V201 handler over the wire: install via
+// SetChargingProfile, confirm a *non-matching* selector returns Unknown and
+// leaves the store intact, then confirm a matching selector returns Accepted and
+// lifts the bound (the profile is gone from `installed_tx_profile`) — all while
+// the transaction stays live.
+#[tokio::test]
+async fn v201_clear_charging_profile_removes_the_installed_txprofile_over_the_wire() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    let config = ChargePointConfig {
+        // Long interval: this test asserts store state, not metering ticks.
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_CLEARPROFILE")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // Bring EVSE 1 up with a profile-less remote start, then install a TxProfile
+    // via SetChargingProfile — so the only path a profile could be installed by is
+    // the one this test then clears.
+    let start = server
+        .call::<V201RequestStartTransactionRequest>(
+            "CP201_CLEARPROFILE",
+            V201RequestStartTransactionRequest {
+                id_token: central_id_token("RFID-CAFE"),
+                remote_start_id: 42,
+                evse_id: Some(1),
+                group_id_token: None,
+                charging_profile: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStartTransaction call round-trips");
+    assert_eq!(start.status, RequestStartStopStatusEnumType::Accepted);
+    wait_for_event(&log, TransactionEventEnumType::Started).await;
+    let txn_id_str = recorded_transaction_id(&log, TransactionEventEnumType::Started);
+
+    let profile = tx_profile_limited_w(6_000.0); // id 1, stack_level 0
+    let set = server
+        .call::<V201SetChargingProfileRequest>(
+            "CP201_CLEARPROFILE",
+            V201SetChargingProfileRequest {
+                evse_id: 1,
+                charging_profile: profile.clone(),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS SetChargingProfile call round-trips");
+    assert_eq!(set.status, ChargingProfileStatusEnumType::Accepted);
+    assert_eq!(
+        cp.installed_tx_profile(1).await,
+        Some(profile),
+        "the TxProfile is installed and ready to be cleared"
+    );
+
+    // (1) A selector that matches nothing installed → Unknown, store untouched.
+    // EVSE 2 holds no profile, so an evseId=2 criterion clears nothing.
+    let miss = server
+        .call::<V201ClearChargingProfileRequest>(
+            "CP201_CLEARPROFILE",
+            V201ClearChargingProfileRequest {
+                charging_profile_id: None,
+                charging_profile_criteria: Some(ClearChargingProfileType {
+                    evse_id: Some(2),
+                    charging_profile_purpose: None,
+                    stack_level: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS ClearChargingProfile call round-trips");
+    assert_eq!(
+        miss.status,
+        ClearChargingProfileStatusEnumType::Unknown,
+        "a selector matching no installed profile returns Unknown"
+    );
+    assert!(
+        cp.installed_tx_profile(1).await.is_some(),
+        "a non-matching ClearChargingProfile leaves the store untouched"
+    );
+
+    // (2) A matching selector (by chargingProfileId) → Accepted, profile removed,
+    // the transaction still live (this did not stop it).
+    let hit = server
+        .call::<V201ClearChargingProfileRequest>(
+            "CP201_CLEARPROFILE",
+            V201ClearChargingProfileRequest {
+                charging_profile_id: Some(1),
+                charging_profile_criteria: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS ClearChargingProfile call round-trips");
+    assert_eq!(
+        hit.status,
+        ClearChargingProfileStatusEnumType::Accepted,
+        "a selector matching the installed profile returns Accepted"
+    );
+    assert_eq!(
+        cp.installed_tx_profile(1).await,
+        None,
+        "the matched ClearChargingProfile lifts the bound: the TxProfile is gone"
+    );
+
+    // The transaction is still live — clearing a profile does not end it. A second
+    // clear of the now-empty store is Unknown.
+    let again = server
+        .call::<V201ClearChargingProfileRequest>(
+            "CP201_CLEARPROFILE",
+            V201ClearChargingProfileRequest::default(),
+        )
+        .await
+        .expect("CSMS ClearChargingProfile call round-trips");
+    assert_eq!(
+        again.status,
+        ClearChargingProfileStatusEnumType::Unknown,
+        "an empty-store clear matches nothing"
+    );
+
+    // Teardown: the transaction still exists to be stopped, proving the clear left
+    // the session alone.
+    let stop = server
+        .call::<V201RequestStopTransactionRequest>(
+            "CP201_CLEARPROFILE",
+            V201RequestStopTransactionRequest {
+                transaction_id: txn_id_str,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStopTransaction call round-trips");
+    assert_eq!(
+        stop.status,
+        RequestStartStopStatusEnumType::Accepted,
+        "the transaction outlived the ClearChargingProfile and is stoppable"
+    );
+    wait_for_event(&log, TransactionEventEnumType::Ended).await;
 
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");
