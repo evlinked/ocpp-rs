@@ -82,7 +82,8 @@ use ocpp_messages::v201::{
     NotifyReportRequest as V201NotifyReportRequest,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     RequestStopTransactionRequest as V201RequestStopTransactionRequest,
-    ResetRequest as V201ResetRequest, SetVariablesRequest as V201SetVariablesRequest,
+    ResetRequest as V201ResetRequest, SetChargingProfileRequest as V201SetChargingProfileRequest,
+    SetVariablesRequest as V201SetVariablesRequest,
     SetVariablesResponse as V201SetVariablesResponse,
     StatusNotificationRequest as V201StatusNotificationRequest,
     TriggerMessageRequest as V201TriggerMessageRequest,
@@ -90,11 +91,12 @@ use ocpp_messages::v201::{
 };
 use ocpp_types::v201::{
     AttributeEnumType, AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType,
-    ChargingProfilePurposeEnumType, ChargingProfileType, ConnectorStatusEnumType,
-    GenericDeviceModelStatusEnumType, GetVariableResultType, IdTokenType as V201IdTokenType,
-    MessageTriggerEnumType, OperationalStatusEnumType, RegistrationStatusEnumType, ReportDataType,
-    RequestStartStopStatusEnumType, ResetStatusEnumType, SetVariableResultType, StatusInfoType,
-    TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
+    ConnectorStatusEnumType, GenericDeviceModelStatusEnumType, GetVariableResultType,
+    IdTokenType as V201IdTokenType, MessageTriggerEnumType, OperationalStatusEnumType,
+    RegistrationStatusEnumType, ReportDataType, RequestStartStopStatusEnumType,
+    ResetStatusEnumType, SetVariableResultType, StatusInfoType, TriggerMessageStatusEnumType,
+    UnlockStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1060,9 +1062,11 @@ impl ChargePoint {
 
         // Slice 7d (#450): v201-typed TxProfile store, kept on the CP (installed
         // by `open_transaction`, cleared by `close_transaction`, read by
-        // `installed_tx_profile`). Not shared into the dispatcher — the handler
-        // only *queues* the profile via `RemoteCommand::StartTransaction`; the
-        // install itself happens on the `&self` transaction-open path.
+        // `installed_tx_profile`). The `RequestStartTransaction` install path only
+        // *queues* the profile via `RemoteCommand::StartTransaction` — that install
+        // happens on the `&self` transaction-open path — but the direct
+        // `SetChargingProfile` command (#469) installs straight into this store
+        // from the dispatcher, so it is shared into the default dispatcher too.
         let v201_tx_profiles = Arc::new(V201TxProfileStore::new());
 
         // Wrap the shared state the default handlers need *before* building the
@@ -1100,6 +1104,7 @@ impl ChargePoint {
             v201_sessions.clone(),
             reservations.clone(),
             charging_profiles.clone(),
+            v201_tx_profiles.clone(),
             expiry_timers.clone(),
             config.unlock_connector_outcome,
             data_transfer.clone(),
@@ -1167,6 +1172,7 @@ impl ChargePoint {
         v201_sessions: Arc<RwLock<HashMap<i32, V201Session>>>,
         reservations: Arc<RwLock<HashMap<i32, ConnectorId>>>,
         charging_profiles: Arc<ChargingProfileStore>,
+        v201_tx_profiles: Arc<V201TxProfileStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
         unlock_outcome: UnlockConnectorOutcome,
         data_transfer: Arc<DataTransferRegistry>,
@@ -2383,54 +2389,129 @@ impl ChargePoint {
             });
         }
 
-        // SetChargingProfile — install a Smart Charging profile against a
-        // connector (0 = charge-point-wide) per the 1.6J stacking rules (§5.16).
-        // Placement is validated faithfully first (ChargePointMaxProfile only at
-        // connector 0, TxProfile only at a real connector, unknown connector
-        // rejected); only an Accepted profile is stored, replacing any prior one
-        // with the same id or (purpose, stackLevel) slot. Storing is a local
-        // state change — enforcing the limit on delivered power and computing the
-        // composite schedule are out of scope (the latter is GetCompositeSchedule,
-        // Issue #95). Ports `SetChargingProfile` from the Python reference's
-        // `call.py`/`enums.py`.
-        {
-            let connectors = connectors.clone();
-            let charging_profiles = charging_profiles.clone();
-            let active_transactions = active_transactions.clone();
-            d.on(move |req: SetChargingProfileRequest| {
+        // SetChargingProfile — install a Smart Charging profile on the station.
+        // Both dialects name the action `"SetChargingProfile"` but carry different
+        // request shapes (1.6J `connectorId`/`csChargingProfiles` vs 2.0.1
+        // `evseId`/`chargingProfile`), so — like ChangeAvailability / Reset above —
+        // exactly one handler is registered per `protocol_version`; the negotiated
+        // subprotocol and the version-aware inbound validator keep the wire on a
+        // single dialect, so the other version's request shape never reaches this
+        // dispatcher.
+        match protocol_version {
+            // OCPP 1.6J §5.16 — install a Smart Charging profile against a
+            // connector (0 = charge-point-wide) per the 1.6J stacking rules.
+            // Placement is validated faithfully first (ChargePointMaxProfile only
+            // at connector 0, TxProfile only at a real connector, unknown connector
+            // rejected); only an Accepted profile is stored, replacing any prior
+            // one with the same id or (purpose, stackLevel) slot. Storing is a
+            // local state change — enforcing the limit on delivered power and
+            // computing the composite schedule are out of scope (the latter is
+            // GetCompositeSchedule, Issue #95). Ports `SetChargingProfile` from the
+            // Python reference's `call.py`/`enums.py`.
+            OcppVersion::V16J => {
                 let connectors = connectors.clone();
                 let charging_profiles = charging_profiles.clone();
                 let active_transactions = active_transactions.clone();
-                async move {
-                    let connector_id = req.connector_id;
-                    // connector 0 is the CP-wide slot (not in the connector map);
-                    // any other id must name a connector this CP exposes.
-                    let connector_known = match ConnectorId::new(connector_id as u32) {
-                        Ok(cid) => connectors.read().await.contains_key(&cid),
-                        Err(_) => false,
-                    };
-                    // A TxProfile is transaction-scoped (§5.16.1): it is only
-                    // valid on a connector that currently has an ongoing
-                    // transaction. `active_transactions` maps transactionId →
-                    // ConnectorId, so the connector is busy iff it appears as a
-                    // value. (Connector 0 never has a transaction; its TxProfile
-                    // rejection is handled by `set_profile_status`.)
-                    let transaction_active = match ConnectorId::new(connector_id as u32) {
-                        Ok(cid) => active_transactions.read().await.values().any(|c| *c == cid),
-                        Err(_) => false,
-                    };
-                    let status = crate::charging_profiles::set_profile_status(
-                        connector_id,
-                        connector_known,
-                        transaction_active,
-                        &req.cs_charging_profiles.charging_profile_purpose,
-                    );
-                    if status == ChargingProfileStatus::Accepted {
-                        charging_profiles.set(connector_id, req.cs_charging_profiles);
+                d.on(move |req: SetChargingProfileRequest| {
+                    let connectors = connectors.clone();
+                    let charging_profiles = charging_profiles.clone();
+                    let active_transactions = active_transactions.clone();
+                    async move {
+                        let connector_id = req.connector_id;
+                        // connector 0 is the CP-wide slot (not in the connector map);
+                        // any other id must name a connector this CP exposes.
+                        let connector_known = match ConnectorId::new(connector_id as u32) {
+                            Ok(cid) => connectors.read().await.contains_key(&cid),
+                            Err(_) => false,
+                        };
+                        // A TxProfile is transaction-scoped (§5.16.1): it is only
+                        // valid on a connector that currently has an ongoing
+                        // transaction. `active_transactions` maps transactionId →
+                        // ConnectorId, so the connector is busy iff it appears as a
+                        // value. (Connector 0 never has a transaction; its TxProfile
+                        // rejection is handled by `set_profile_status`.)
+                        let transaction_active = match ConnectorId::new(connector_id as u32) {
+                            Ok(cid) => active_transactions.read().await.values().any(|c| *c == cid),
+                            Err(_) => false,
+                        };
+                        let status = crate::charging_profiles::set_profile_status(
+                            connector_id,
+                            connector_known,
+                            transaction_active,
+                            &req.cs_charging_profiles.charging_profile_purpose,
+                        );
+                        if status == ChargingProfileStatus::Accepted {
+                            charging_profiles.set(connector_id, req.cs_charging_profiles);
+                        }
+                        Ok(SetChargingProfileResponse { status })
                     }
-                    Ok(SetChargingProfileResponse { status })
-                }
-            });
+                });
+            }
+            // OCPP 2.0.1 (Part 2, `SetChargingProfile`) — the direct CSMS→CS command
+            // to install a charging profile on an EVSE, out-of-band from a remote
+            // start. The simulator installs a transaction-scoped `TxProfile` into
+            // the same `v201_tx_profiles` store the `RequestStartTransaction` path
+            // uses (slice 7d, #450), so the periodic-metering resolver (slice 7e,
+            // #455/#463) enforces it on the next tick with no further wiring. The
+            // pure Accepted/Rejected decision + response builder live in
+            // `v201_command` (#469); this is the runtime wiring. Ports
+            // `ocpp.v201.call.SetChargingProfile` and the
+            // `@on(Action.set_charging_profile)` dispatch shape from
+            // `ocpp/charge_point.py`.
+            //
+            // Non-`TxProfile` purposes (TxDefaultProfile / ChargingStationMaxProfile
+            // / ChargingStationExternalConstraints) and a `TxProfile` with no
+            // ongoing transaction on the target EVSE are Rejected
+            // with an explanatory `statusInfo`, mirroring the RequestStartTransaction
+            // guard above. Supporting the station-scoped purposes is deferred to a
+            // follow-up (see #469).
+            OcppVersion::V201 => {
+                let active_transactions = active_transactions.clone();
+                let v201_tx_profiles = v201_tx_profiles.clone();
+                d.on(move |req: V201SetChargingProfileRequest| {
+                    let active_transactions = active_transactions.clone();
+                    let v201_tx_profiles = v201_tx_profiles.clone();
+                    async move {
+                        let evse_id = req.evse_id;
+                        // An ongoing transaction on the target EVSE. The v201 store
+                        // and metering resolver key by EVSE id (= connector value)
+                        // in the simulator's flat topology, and `active_transactions`
+                        // maps transactionId → ConnectorId, so the EVSE is busy iff a
+                        // live transaction's connector matches it. An `evseId` of 0 /
+                        // negative / out of range simply matches nothing (never
+                        // panics) → "no transaction to bind the TxProfile to".
+                        let has_active_transaction = evse_id >= 1
+                            && active_transactions
+                                .read()
+                                .await
+                                .values()
+                                .any(|cid| i64::from(cid.value()) == i64::from(evse_id));
+
+                        let (status, status_info) = v201_command::v201_set_charging_profile_status(
+                            req.charging_profile.charging_profile_purpose,
+                            has_active_transaction,
+                        );
+
+                        // Only an accepted install mutates the store; a rejection
+                        // leaves any profile already bound to the EVSE untouched. The
+                        // install replaces (does not stack) — the store holds one
+                        // TxProfile per EVSE, so a SetChargingProfile supersedes a
+                        // RequestStartTransaction-installed one on the same EVSE, and
+                        // `close_transaction` still clears it when the transaction
+                        // ends.
+                        if status == ChargingProfileStatusEnumType::Accepted {
+                            v201_tx_profiles
+                                .install(evse_id, req.charging_profile)
+                                .await;
+                        }
+
+                        Ok(v201_command::v201_set_charging_profile_response(
+                            status,
+                            status_info,
+                        ))
+                    }
+                });
+            }
         }
 
         // ClearChargingProfile — clear installed profiles matching the optional

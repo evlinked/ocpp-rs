@@ -32,7 +32,8 @@ use ocpp_messages::v201::{
     NotifyReportResponse as V201NotifyReportResponse,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     RequestStopTransactionRequest as V201RequestStopTransactionRequest,
-    ResetRequest as V201ResetRequest, SetVariablesRequest as V201SetVariablesRequest,
+    ResetRequest as V201ResetRequest, SetChargingProfileRequest as V201SetChargingProfileRequest,
+    SetVariablesRequest as V201SetVariablesRequest,
     SetVariablesResponse as V201SetVariablesResponse,
     StatusNotificationRequest as V201StatusNotificationRequest,
     StatusNotificationResponse as V201StatusNotificationResponse, TransactionEventRequest,
@@ -48,15 +49,15 @@ use ocpp_transport::{
 use ocpp_types::common::Reason;
 use ocpp_types::v201::{
     AttributeEnumType, BootReasonEnumType, ChangeAvailabilityStatusEnumType,
-    ChargingProfileKindEnumType, ChargingProfilePurposeEnumType, ChargingProfileType,
-    ChargingRateUnitEnumType, ChargingSchedulePeriodType, ChargingScheduleType, ComponentType,
-    ConnectorStatusEnumType, EvseType, GenericDeviceModelStatusEnumType, GetVariableDataType,
-    GetVariableStatusEnumType, IdTokenEnumType, IdTokenType, MeasurandEnumType,
-    MessageTriggerEnumType, MutabilityEnumType, OperationalStatusEnumType, ReadingContextEnumType,
-    ReasonEnumType, RegistrationStatusEnumType, ReportBaseEnumType, RequestStartStopStatusEnumType,
-    ResetEnumType, ResetStatusEnumType, SetVariableDataType, SetVariableStatusEnumType,
-    TransactionEventEnumType, TriggerMessageStatusEnumType, TriggerReasonEnumType,
-    UnlockStatusEnumType, VariableType,
+    ChargingProfileKindEnumType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
+    ChargingProfileType, ChargingRateUnitEnumType, ChargingSchedulePeriodType,
+    ChargingScheduleType, ComponentType, ConnectorStatusEnumType, EvseType,
+    GenericDeviceModelStatusEnumType, GetVariableDataType, GetVariableStatusEnumType,
+    IdTokenEnumType, IdTokenType, MeasurandEnumType, MessageTriggerEnumType, MutabilityEnumType,
+    OperationalStatusEnumType, ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType,
+    ReportBaseEnumType, RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType,
+    SetVariableDataType, SetVariableStatusEnumType, TransactionEventEnumType,
+    TriggerMessageStatusEnumType, TriggerReasonEnumType, UnlockStatusEnumType, VariableType,
 };
 use ocpp_types::{ConnectorId, OcppVersion};
 
@@ -2078,6 +2079,177 @@ async fn v201_request_start_installs_the_txprofile_and_threads_group_id_token() 
         cp.transaction_group_id_token(txn_id).await,
         None,
         "the session (and its group token) is gone once the transaction ends"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// SetChargingProfile — Issue #469: the direct CSMS→CS command installs a
+// transaction-scoped TxProfile straight into the v201 store the metering
+// resolver reads, out-of-band from a remote start. This exercises the full
+// handler contract end to end: rejected when there is no transaction to bind
+// to, accepted once a session is live (observable via `installed_tx_profile`),
+// a non-TxProfile purpose rejected without mutating the store, a second
+// TxProfile *replacing* the first, and teardown clearing it when the
+// transaction ends.
+#[tokio::test]
+async fn v201_set_charging_profile_installs_replaces_and_rejects_faithfully() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    let config = ChargePointConfig {
+        // Long interval: this test asserts store state, not metering ticks.
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_SETPROFILE")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // Two distinct TxProfiles (different limits) so a replace is observable, and a
+    // non-TxProfile profile the simulator does not honor.
+    let profile_a = tx_profile_limited_w(6_000.0);
+    let profile_b = tx_profile_limited_w(3_000.0);
+    let default_profile = charging_profile(ChargingProfilePurposeEnumType::TxDefaultProfile);
+
+    // (1) Before any transaction: a TxProfile has nothing to bind to → Rejected
+    // with `NoTransaction`, and the store stays empty.
+    let resp = server
+        .call::<V201SetChargingProfileRequest>(
+            "CP201_SETPROFILE",
+            V201SetChargingProfileRequest {
+                evse_id: 1,
+                charging_profile: profile_a.clone(),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS SetChargingProfile call round-trips");
+    assert_eq!(
+        resp.status,
+        ChargingProfileStatusEnumType::Rejected,
+        "a TxProfile with no ongoing transaction is Rejected"
+    );
+    assert_eq!(
+        resp.status_info.as_ref().map(|i| i.reason_code.as_str()),
+        Some("NoTransaction"),
+        "the rejection explains there is no transaction to bind to"
+    );
+    assert_eq!(
+        cp.installed_tx_profile(1).await,
+        None,
+        "a rejected SetChargingProfile installs nothing"
+    );
+
+    // Bring EVSE 1 up with a *profile-less* remote start, so any installed profile
+    // afterwards can only have come from SetChargingProfile.
+    let start = server
+        .call::<V201RequestStartTransactionRequest>(
+            "CP201_SETPROFILE",
+            V201RequestStartTransactionRequest {
+                id_token: central_id_token("RFID-CAFE"),
+                remote_start_id: 99,
+                evse_id: Some(1),
+                group_id_token: None,
+                charging_profile: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStartTransaction call round-trips");
+    assert_eq!(start.status, RequestStartStopStatusEnumType::Accepted);
+    wait_for_event(&log, TransactionEventEnumType::Started).await;
+    let txn_id_str = recorded_transaction_id(&log, TransactionEventEnumType::Started);
+    assert_eq!(
+        cp.installed_tx_profile(1).await,
+        None,
+        "the profile-less start installs no TxProfile"
+    );
+
+    // (2) A valid TxProfile for the live transaction → Accepted, installed against
+    // EVSE 1 byte-for-byte (round-tripped over the wire).
+    let resp = server
+        .call::<V201SetChargingProfileRequest>(
+            "CP201_SETPROFILE",
+            V201SetChargingProfileRequest {
+                evse_id: 1,
+                charging_profile: profile_a.clone(),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS SetChargingProfile call round-trips");
+    assert_eq!(resp.status, ChargingProfileStatusEnumType::Accepted);
+    assert!(
+        resp.status_info.is_none(),
+        "an accepted install carries no reason"
+    );
+    assert_eq!(
+        cp.installed_tx_profile(1).await,
+        Some(profile_a.clone()),
+        "an accepted SetChargingProfile installs its TxProfile against the EVSE"
+    );
+
+    // (3) A non-TxProfile purpose → Rejected with `UnsupportedPurpose`, and the
+    // store is left untouched (profile_a still installed).
+    let resp = server
+        .call::<V201SetChargingProfileRequest>(
+            "CP201_SETPROFILE",
+            V201SetChargingProfileRequest {
+                evse_id: 1,
+                charging_profile: default_profile,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS SetChargingProfile call round-trips");
+    assert_eq!(resp.status, ChargingProfileStatusEnumType::Rejected);
+    assert_eq!(
+        resp.status_info.as_ref().map(|i| i.reason_code.as_str()),
+        Some("UnsupportedPurpose"),
+        "a non-TxProfile purpose is rejected as unsupported"
+    );
+    assert_eq!(
+        cp.installed_tx_profile(1).await,
+        Some(profile_a),
+        "a rejected non-TxProfile leaves the installed profile untouched"
+    );
+
+    // (4) A second TxProfile *replaces* the first (the store holds one per EVSE).
+    let resp = server
+        .call::<V201SetChargingProfileRequest>(
+            "CP201_SETPROFILE",
+            V201SetChargingProfileRequest {
+                evse_id: 1,
+                charging_profile: profile_b.clone(),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS SetChargingProfile call round-trips");
+    assert_eq!(resp.status, ChargingProfileStatusEnumType::Accepted);
+    assert_eq!(
+        cp.installed_tx_profile(1).await,
+        Some(profile_b),
+        "a second SetChargingProfile replaces, not stacks, the installed TxProfile"
+    );
+
+    // (5) Ending the transaction clears the transaction-scoped profile.
+    let stop = server
+        .call::<V201RequestStopTransactionRequest>(
+            "CP201_SETPROFILE",
+            V201RequestStopTransactionRequest {
+                transaction_id: txn_id_str,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStopTransaction call round-trips");
+    assert_eq!(stop.status, RequestStartStopStatusEnumType::Accepted);
+    wait_for_event(&log, TransactionEventEnumType::Ended).await;
+    assert_eq!(
+        cp.installed_tx_profile(1).await,
+        None,
+        "ending the transaction clears its transaction-scoped TxProfile"
     );
 
     cp.disconnect().await.expect("disconnect");
