@@ -93,14 +93,15 @@ use ocpp_types::v201::{
     ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
     ClearChargingProfileStatusEnumType, ClearChargingProfileType, GetChargingProfileStatusEnumType,
     MessageTriggerEnumType, OperationalStatusEnumType, RequestStartStopStatusEnumType,
-    ResetEnumType, ResetStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
-    UnlockStatusEnumType,
+    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 
 use ocpp_messages::v201::{
     ChangeAvailabilityResponse, ClearChargingProfileResponse, GetChargingProfilesResponse,
     ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
-    ResetResponse, SetChargingProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
+    ReserveNowResponse, ResetResponse, SetChargingProfileResponse, TriggerMessageResponse,
+    UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -912,6 +913,169 @@ pub fn v201_report_charging_profiles_pages(
             custom_data: None,
         })
         .collect()
+}
+
+/// The reservability of a `ReserveNow` target EVSE, distilled by the wiring
+/// layer from the targeted connector's live `ChargePointStatus` (or its
+/// absence).
+///
+/// Keeping this a small closed enum — rather than threading a
+/// `ChargePointStatus` or a runtime
+/// handle into [`v201_reserve_now_status`] — is what lets the reservation
+/// decision stay a *pure* function of plain values, unit-testable without a
+/// connector map. The wiring layer performs the one classification (idle → free,
+/// anything else → the matching refusal) and the decision maps it onto the wire
+/// status. Mirrors the shared [`UnlockConnectorOutcome`] seam
+/// [`v201_unlock_status`] uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectorReservState {
+    /// The connector exists and is `Available` — reservable.
+    Free,
+    /// The connector exists but is in use (a transaction is under way, it is
+    /// already `Reserved`, or it is otherwise mid-cycle:
+    /// `Preparing`/`Charging`/`SuspendedEV`/`SuspendedEVSE`/`Finishing`).
+    Busy,
+    /// The connector exists but is `Faulted`.
+    Faulted,
+    /// The connector exists but is `Unavailable` (administratively inoperative).
+    Unavailable,
+    /// No connector answers the requested `evseId` — an id the station exposes
+    /// no EVSE for (out of range, or `0` in the flat simulator topology).
+    Missing,
+}
+
+/// Decide the [`ReserveNowStatusEnumType`] a `V201` station reports for an
+/// inbound `ReserveNow.req`, given whether the reservation has already expired,
+/// the requested `evse_id`, and the targeted EVSE's distilled live
+/// [`state`](ConnectorReservState) — returning the decided
+/// status together with the optional `statusInfo` explaining a refusal.
+///
+/// Faithful to OCPP 2.0.1 (Part 2, `ReserveNow`) and the direct 2.0.1 successor
+/// to the 1.6J `ReserveNow` handler in [`crate`]'s `ChargePoint` (`lib.rs`),
+/// keyed off the same connector-status matrix:
+///
+/// - **Already expired** — a reservation whose `expiryDateTime` is at or before
+///   now would auto-free instantly, so it is
+///   [`Rejected`](ReserveNowStatusEnumType::Rejected) outright (mirrors the 1.6J
+///   handler's past-expiry guard, Issue #85), checked *first* so the reason
+///   never depends on the target's live state.
+/// - **Station-level (`evseId` omitted)** — 2.0.1 allows reserving the whole
+///   station; the flat simulator topology holds no whole-station reservation, so
+///   it is [`Rejected`](ReserveNowStatusEnumType::Rejected) with a
+///   `StationLevel` `statusInfo` rather than silently reserving a
+///   connector the CSMS did not name.
+/// - **Structural (`evseId` &lt; 1)** — `0` / negative addresses no EVSE (2.0.1
+///   evse ids are 1-based), so
+///   [`Rejected`](ReserveNowStatusEnumType::Rejected) with an `UnknownEvse`
+///   `statusInfo`, before the state read (mirrors the 1.6J `ConnectorId::new`
+///   `Err` arm and [`v201_unlock_status`]'s structural guard).
+/// - **Live state** — for a structurally-valid targeted EVSE the distilled
+///   [`ConnectorReservState`] decides:
+///   [`Free`](ConnectorReservState::Free) →
+///   [`Accepted`](ReserveNowStatusEnumType::Accepted);
+///   [`Busy`](ConnectorReservState::Busy) →
+///   [`Occupied`](ReserveNowStatusEnumType::Occupied);
+///   [`Faulted`](ConnectorReservState::Faulted) →
+///   [`Faulted`](ReserveNowStatusEnumType::Faulted);
+///   [`Unavailable`](ConnectorReservState::Unavailable) →
+///   [`Unavailable`](ReserveNowStatusEnumType::Unavailable); and
+///   [`Missing`](ConnectorReservState::Missing) (a structurally-valid id the
+///   station has no EVSE for) →
+///   [`Rejected`](ReserveNowStatusEnumType::Rejected) with an `UnknownEvse`
+///   `statusInfo` — the same fold of "unknown target → Rejected" the 1.6J
+///   handler applies.
+///
+/// This is the *pure* decision, depending only on the request target and a
+/// distilled [`ConnectorReservState`] — no runtime handles, so it is
+/// unit-testable in isolation. Resolving `evse_id` against the live connector
+/// topology, recording the reservation, arming the auto-expiry timer, and
+/// queueing the `Reserved` `StatusNotification` off the CALL path is the wiring
+/// layer's job.
+#[must_use]
+pub fn v201_reserve_now_status(
+    already_expired: bool,
+    evse_id: Option<i32>,
+    state: ConnectorReservState,
+) -> (ReserveNowStatusEnumType, Option<StatusInfoType>) {
+    // A reservation whose expiry has already passed would auto-free instantly —
+    // reject before any state read (mirrors the 1.6J past-expiry guard, #85).
+    if already_expired {
+        return (
+            ReserveNowStatusEnumType::Rejected,
+            reserve_now_status_info(
+                "ExpiredReservation",
+                "ReserveNow.expiryDateTime is at or before now; the reservation would \
+                 auto-free instantly",
+            ),
+        );
+    }
+    // Station-level reservation (evseId omitted): the flat simulator holds no
+    // whole-station reservation to make.
+    let Some(evse_id) = evse_id else {
+        return (
+            ReserveNowStatusEnumType::Rejected,
+            reserve_now_status_info(
+                "StationLevel",
+                "ReserveNow without an evseId reserves the whole Charging Station; the \
+                 simulator only reserves a specific EVSE",
+            ),
+        );
+    };
+    // Structural: 2.0.1 evse ids are 1-based; a value below 1 addresses no EVSE.
+    if evse_id < 1 {
+        return (
+            ReserveNowStatusEnumType::Rejected,
+            reserve_now_status_info(
+                "UnknownEvse",
+                "ReserveNow.evseId must name an EVSE the station exposes (2.0.1 evse ids \
+                 are 1-based)",
+            ),
+        );
+    }
+    match state {
+        ConnectorReservState::Free => (ReserveNowStatusEnumType::Accepted, None),
+        ConnectorReservState::Busy => (ReserveNowStatusEnumType::Occupied, None),
+        ConnectorReservState::Faulted => (ReserveNowStatusEnumType::Faulted, None),
+        ConnectorReservState::Unavailable => (ReserveNowStatusEnumType::Unavailable, None),
+        ConnectorReservState::Missing => (
+            ReserveNowStatusEnumType::Rejected,
+            reserve_now_status_info(
+                "UnknownEvse",
+                "ReserveNow.evseId is structurally valid but names no EVSE on this station",
+            ),
+        ),
+    }
+}
+
+/// Build a `Some(StatusInfoType)` carrying a `ReserveNow` refusal reason.
+///
+/// A tiny helper so [`v201_reserve_now_status`]'s refusal arms read as one line
+/// each; mirrors the inline `StatusInfoType { .. }` the
+/// [`v201_set_charging_profile_status`] rejections build.
+fn reserve_now_status_info(reason_code: &str, detail: &str) -> Option<StatusInfoType> {
+    Some(StatusInfoType {
+        reason_code: reason_code.to_string(),
+        additional_info: Some(detail.to_string()),
+        custom_data: None,
+    })
+}
+
+/// Build a schema-valid `ReserveNow.conf` ([`ReserveNowResponse`]).
+///
+/// Pure constructor mirroring [`v201_unlock_response`]: carries the decided
+/// [`status`](ReserveNowStatusEnumType) plus the optional 2.0.1 `statusInfo`
+/// (a vendor-agnostic `reasonCode` and human-readable detail explaining a
+/// refusal).
+#[must_use]
+pub fn v201_reserve_now_response(
+    status: ReserveNowStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> ReserveNowResponse {
+    ReserveNowResponse {
+        status,
+        status_info,
+        custom_data: None,
+    }
 }
 
 #[cfg(test)]
@@ -2354,5 +2518,119 @@ mod tests {
                 page.evse_id
             );
         }
+    }
+
+    // --- ReserveNow (v201) -------------------------------------------------
+
+    #[test]
+    fn reserve_now_accepts_a_free_evse() {
+        // The happy path: a known, idle EVSE with a still-valid expiry → Accepted,
+        // no statusInfo (the enum is the whole story).
+        let (status, info) = v201_reserve_now_status(false, Some(1), ConnectorReservState::Free);
+        assert_eq!(status, ReserveNowStatusEnumType::Accepted);
+        assert!(
+            info.is_none(),
+            "an accepted reservation carries no statusInfo"
+        );
+    }
+
+    #[test]
+    fn reserve_now_reports_occupied_for_a_busy_evse() {
+        // A connector mid-cycle (transaction under way / already reserved) → Occupied.
+        let (status, info) = v201_reserve_now_status(false, Some(1), ConnectorReservState::Busy);
+        assert_eq!(status, ReserveNowStatusEnumType::Occupied);
+        assert!(info.is_none());
+    }
+
+    #[test]
+    fn reserve_now_maps_inoperative_states_faithfully() {
+        // Faulted → Faulted, Unavailable → Unavailable — the connector-status
+        // matrix mirrored from the 1.6J handler, each reported in its own dialect.
+        assert_eq!(
+            v201_reserve_now_status(false, Some(2), ConnectorReservState::Faulted).0,
+            ReserveNowStatusEnumType::Faulted
+        );
+        assert_eq!(
+            v201_reserve_now_status(false, Some(2), ConnectorReservState::Unavailable).0,
+            ReserveNowStatusEnumType::Unavailable
+        );
+    }
+
+    #[test]
+    fn reserve_now_rejects_an_unknown_evse() {
+        // A structurally-valid id the station has no EVSE for → Rejected + reason.
+        let (status, info) =
+            v201_reserve_now_status(false, Some(99), ConnectorReservState::Missing);
+        assert_eq!(status, ReserveNowStatusEnumType::Rejected);
+        assert_eq!(
+            info.expect("a refusal carries a reason").reason_code,
+            "UnknownEvse"
+        );
+    }
+
+    #[test]
+    fn reserve_now_rejects_station_level_reservation() {
+        // evseId omitted = reserve the whole station, which the flat simulator
+        // cannot hold → Rejected, regardless of any connector's state.
+        let (status, info) = v201_reserve_now_status(false, None, ConnectorReservState::Free);
+        assert_eq!(status, ReserveNowStatusEnumType::Rejected);
+        assert_eq!(
+            info.expect("a refusal carries a reason").reason_code,
+            "StationLevel"
+        );
+    }
+
+    #[test]
+    fn reserve_now_rejects_a_structurally_invalid_evse_id() {
+        // evseId 0 / negative addresses no EVSE — never a panic, always Rejected,
+        // even when the (irrelevant) distilled state would otherwise be Free.
+        for evse_id in [0, -1, i32::MIN] {
+            let (status, info) =
+                v201_reserve_now_status(false, Some(evse_id), ConnectorReservState::Free);
+            assert_eq!(
+                status,
+                ReserveNowStatusEnumType::Rejected,
+                "evseId {evse_id} must be rejected"
+            );
+            assert_eq!(info.unwrap().reason_code, "UnknownEvse");
+        }
+    }
+
+    #[test]
+    fn reserve_now_rejects_an_already_expired_reservation() {
+        // An expiry at or before now would auto-free instantly; rejected outright,
+        // ahead of (and independent of) the target's live state.
+        let (status, info) = v201_reserve_now_status(true, Some(1), ConnectorReservState::Free);
+        assert_eq!(status, ReserveNowStatusEnumType::Rejected);
+        assert_eq!(
+            info.expect("a refusal carries a reason").reason_code,
+            "ExpiredReservation"
+        );
+    }
+
+    #[test]
+    fn reserve_now_response_round_trips_status_and_info_and_is_schema_valid() {
+        let validator = SchemaValidator::v201();
+        // Accepted, no statusInfo.
+        let accepted = v201_reserve_now_response(ReserveNowStatusEnumType::Accepted, None);
+        assert_eq!(accepted.status, ReserveNowStatusEnumType::Accepted);
+        assert!(accepted.status_info.is_none());
+        let payload = serde_json::to_value(&accepted).unwrap();
+        assert!(
+            validator
+                .validate_call_result("ReserveNow", &payload)
+                .is_ok(),
+            "built ReserveNow Accepted response should be schema-valid, got: {payload}"
+        );
+        // Rejected carrying the refusal reason.
+        let (status, info) = v201_reserve_now_status(false, None, ConnectorReservState::Free);
+        let rejected = v201_reserve_now_response(status, info);
+        let payload = serde_json::to_value(&rejected).unwrap();
+        assert!(
+            validator
+                .validate_call_result("ReserveNow", &payload)
+                .is_ok(),
+            "built ReserveNow Rejected response should be schema-valid, got: {payload}"
+        );
     }
 }
