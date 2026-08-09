@@ -81,6 +81,8 @@ use ocpp_messages::v201::{
     GetBaseReportRequest as V201GetBaseReportRequest,
     GetBaseReportResponse as V201GetBaseReportResponse,
     GetChargingProfilesRequest as V201GetChargingProfilesRequest,
+    GetCompositeScheduleRequest as V201GetCompositeScheduleRequest,
+    GetCompositeScheduleResponse as V201GetCompositeScheduleResponse,
     GetVariablesRequest as V201GetVariablesRequest,
     GetVariablesResponse as V201GetVariablesResponse, MeterValuesRequest as V201MeterValuesRequest,
     NotifyReportRequest as V201NotifyReportRequest,
@@ -96,11 +98,11 @@ use ocpp_messages::v201::{
 use ocpp_types::v201::{
     AttributeEnumType, AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType,
     ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
-    ConnectorStatusEnumType, GenericDeviceModelStatusEnumType, GetVariableResultType,
-    IdTokenType as V201IdTokenType, MessageTriggerEnumType, OperationalStatusEnumType,
-    RegistrationStatusEnumType, ReportDataType, RequestStartStopStatusEnumType,
-    ResetStatusEnumType, SetVariableResultType, StatusInfoType, TriggerMessageStatusEnumType,
-    UnlockStatusEnumType,
+    ConnectorStatusEnumType, GenericDeviceModelStatusEnumType, GenericStatusEnumType,
+    GetVariableResultType, IdTokenType as V201IdTokenType, MessageTriggerEnumType,
+    OperationalStatusEnumType, RegistrationStatusEnumType, ReportDataType,
+    RequestStartStopStatusEnumType, ResetStatusEnumType, SetVariableResultType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -2679,66 +2681,140 @@ impl ChargePoint {
         // composite schedule is computed by `crate::composite`. The Python
         // reference ships only the wire types (its example CP returns a canned
         // response), so the computation follows the 1.6J spec (Issue #95).
-        {
-            let connectors = connectors.clone();
-            let charging_profiles = charging_profiles.clone();
-            d.on(move |req: GetCompositeScheduleRequest| {
+        //
+        // Both dialects name the action `"GetCompositeSchedule"` but carry
+        // different request/response shapes (1.6J `connectorId` /
+        // `chargingSchedule` vs 2.0.1 `evseId` / `CompositeScheduleType`), so —
+        // like `SetChargingProfile` above — exactly one handler is registered per
+        // `protocol_version`; the negotiated subprotocol and the version-aware
+        // inbound validator keep the wire on a single dialect.
+        match protocol_version {
+            OcppVersion::V16J => {
                 let connectors = connectors.clone();
                 let charging_profiles = charging_profiles.clone();
-                async move {
-                    let connector_id = req.connector_id;
-                    let connector_known = match ConnectorId::new(connector_id as u32) {
-                        Ok(cid) => connectors.read().await.contains_key(&cid),
-                        Err(_) => false,
-                    };
-                    // connector 0 is the CP-wide slot; any other id must exist.
-                    let rejected = GetCompositeScheduleResponse {
-                        status: GetCompositeScheduleStatus::Rejected,
-                        connector_id: None,
-                        schedule_start: None,
-                        charging_schedule: None,
-                    };
-                    if connector_id != 0 && !connector_known {
-                        return Ok(rejected);
-                    }
+                d.on(move |req: GetCompositeScheduleRequest| {
+                    let connectors = connectors.clone();
+                    let charging_profiles = charging_profiles.clone();
+                    async move {
+                        let connector_id = req.connector_id;
+                        let connector_known = match ConnectorId::new(connector_id as u32) {
+                            Ok(cid) => connectors.read().await.contains_key(&cid),
+                            Err(_) => false,
+                        };
+                        // connector 0 is the CP-wide slot; any other id must exist.
+                        let rejected = GetCompositeScheduleResponse {
+                            status: GetCompositeScheduleStatus::Rejected,
+                            connector_id: None,
+                            schedule_start: None,
+                            charging_schedule: None,
+                        };
+                        if connector_id != 0 && !connector_known {
+                            return Ok(rejected);
+                        }
 
-                    // Gather candidates: the connector's own profiles (specific)
-                    // plus connector-0 profiles (inherited), avoiding a double
-                    // count when the request *is* connector 0.
-                    let mut candidates: Vec<composite::ScopedProfile> = charging_profiles
-                        .profiles_for(connector_id)
-                        .into_iter()
-                        .map(|profile| composite::ScopedProfile {
-                            specific: true,
-                            profile,
-                        })
-                        .collect();
-                    if connector_id != 0 {
-                        candidates.extend(charging_profiles.profiles_for(0).into_iter().map(
-                            |profile| composite::ScopedProfile {
-                                specific: false,
+                        // Gather candidates: the connector's own profiles (specific)
+                        // plus connector-0 profiles (inherited), avoiding a double
+                        // count when the request *is* connector 0.
+                        let mut candidates: Vec<composite::ScopedProfile> = charging_profiles
+                            .profiles_for(connector_id)
+                            .into_iter()
+                            .map(|profile| composite::ScopedProfile {
+                                specific: true,
                                 profile,
-                            },
-                        ));
-                    }
+                            })
+                            .collect();
+                        if connector_id != 0 {
+                            candidates.extend(charging_profiles.profiles_for(0).into_iter().map(
+                                |profile| composite::ScopedProfile {
+                                    specific: false,
+                                    profile,
+                                },
+                            ));
+                        }
 
-                    let start = chrono::Utc::now();
-                    match composite::compute_composite(
-                        &candidates,
-                        start,
-                        req.duration,
-                        req.charging_rate_unit,
-                    ) {
-                        Some(schedule) => Ok(GetCompositeScheduleResponse {
-                            status: GetCompositeScheduleStatus::Accepted,
-                            connector_id: Some(connector_id),
-                            schedule_start: Some(start),
-                            charging_schedule: Some(schedule),
-                        }),
-                        None => Ok(rejected),
+                        let start = chrono::Utc::now();
+                        match composite::compute_composite(
+                            &candidates,
+                            start,
+                            req.duration,
+                            req.charging_rate_unit,
+                        ) {
+                            Some(schedule) => Ok(GetCompositeScheduleResponse {
+                                status: GetCompositeScheduleStatus::Accepted,
+                                connector_id: Some(connector_id),
+                                schedule_start: Some(start),
+                                charging_schedule: Some(schedule),
+                            }),
+                            None => Ok(rejected),
+                        }
                     }
-                }
-            });
+                });
+            }
+            // OCPP 2.0.1 (Part 2, `GetCompositeSchedule`) — the CSMS asks the
+            // station to compute the net schedule it will enforce for an EVSE over
+            // the requested window, after stacking the applicable profiles. The
+            // simulator holds at most one `TxProfile` per EVSE in
+            // `v201_tx_profiles`, so the composite is that profile resolved over the
+            // window by the same core the periodic-metering path uses
+            // (`v201_charging_profiles`, #464/#466). An EVSE with no installed
+            // profile — or a profile that constrains no instant in the window (incl.
+            // a non-positive `duration`) — yields `Rejected` with no schedule. Ports
+            // `ocpp.v201.call.GetCompositeSchedule` and the
+            // `@on(Action.get_composite_schedule)` dispatch shape from
+            // `ocpp/charge_point.py`.
+            OcppVersion::V201 => {
+                let connectors = connectors.clone();
+                let v201_tx_profiles = v201_tx_profiles.clone();
+                d.on(move |req: V201GetCompositeScheduleRequest| {
+                    let connectors = connectors.clone();
+                    let v201_tx_profiles = v201_tx_profiles.clone();
+                    async move {
+                        let rejected = V201GetCompositeScheduleResponse {
+                            status: GenericStatusEnumType::Rejected,
+                            schedule: None,
+                            status_info: None,
+                            custom_data: None,
+                        };
+                        // No profile installed on the EVSE → nothing to compose. An
+                        // out-of-range / 0 / negative `evseId` simply misses the
+                        // store (never panics) and falls here.
+                        let profile = match v201_tx_profiles.get(req.evse_id).await {
+                            Some(profile) => profile,
+                            None => return Ok(rejected),
+                        };
+                        // Nominal voltage for any A↔W conversion, read from the
+                        // EVSE's connector config (the value the metering resolver
+                        // uses); fall back to the European single-phase nominal if
+                        // the connector is somehow absent, so a conversion never
+                        // divides by zero.
+                        let nominal_voltage_v = match ConnectorId::new(req.evse_id as u32) {
+                            Ok(cid) => connectors
+                                .read()
+                                .await
+                                .get(&cid)
+                                .map_or(230.0, |c| c.config().max_voltage),
+                            Err(_) => 230.0,
+                        };
+                        let window_start = chrono::Utc::now();
+                        match v201_charging_profiles::compose_composite_schedule(
+                            req.evse_id,
+                            &profile,
+                            window_start,
+                            req.duration,
+                            req.charging_rate_unit,
+                            nominal_voltage_v,
+                        ) {
+                            Some(schedule) => Ok(V201GetCompositeScheduleResponse {
+                                status: GenericStatusEnumType::Accepted,
+                                schedule: Some(schedule),
+                                status_info: None,
+                                custom_data: None,
+                            }),
+                            None => Ok(rejected),
+                        }
+                    }
+                });
+            }
         }
 
         // ClearCache — empty the authorization cache, then accept (Issue #23).
@@ -5421,6 +5497,19 @@ fn id_tag_info_expired(info: &IdTagInfo) -> bool {
     matches!(info.expiry_date, Some(expiry) if chrono::Utc::now() >= expiry)
 }
 
+/// Test-only seams onto private state, so wire tests can arrange a scenario the
+/// live path reaches only through a transport (e.g. an installed `TxProfile`,
+/// normally landed by an accepted `RequestStartTransaction` / `SetChargingProfile`).
+#[cfg(test)]
+impl ChargePoint {
+    /// Install a v201 `TxProfile` directly into the store the
+    /// `GetCompositeSchedule` and periodic-metering handlers read, bypassing the
+    /// transaction-start plumbing (which needs a live client).
+    async fn test_install_v201_tx_profile(&self, evse_id: i32, profile: ChargingProfileType) {
+        self.v201_tx_profiles.install(evse_id, profile).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5786,6 +5875,96 @@ mod tests {
         // (Smart Charging, §5.x, #95) + GetLocalListVersion + SendLocalList
         // (Local Authorization List, §5.x, #93).
         assert_eq!(cp.handler_count().await, 19);
+    }
+
+    #[tokio::test]
+    async fn v201_get_composite_schedule_rejects_an_evse_with_no_profile() {
+        // A V201 CP with no installed TxProfile has nothing to compose → Rejected
+        // with no schedule. Exercises the wired V201 handler end-to-end over the
+        // dispatcher: a 2.0.1 CP now answers `GetCompositeSchedule` with the 2.0.1
+        // `evseId`/`GenericStatus` shape rather than the 1.6J one.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let call = make_call(V201GetCompositeScheduleRequest {
+            duration: 3_600,
+            charging_rate_unit: None,
+            evse_id: 1,
+            custom_data: None,
+        });
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: V201GetCompositeScheduleResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, GenericStatusEnumType::Rejected);
+                assert!(
+                    body.schedule.is_none(),
+                    "a rejected response carries no schedule"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_get_composite_schedule_accepts_and_composes_an_installed_profile() {
+        use ocpp_types::v201::{
+            ChargingProfileKindEnumType, ChargingRateUnitEnumType, ChargingSchedulePeriodType,
+            ChargingScheduleType,
+        };
+        // A flat 11 kW TxProfile on EVSE 1, installed as an accepted
+        // RequestStartTransaction / SetChargingProfile would land it.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let profile = ChargingProfileType {
+            id: 1,
+            stack_level: 0,
+            charging_profile_purpose: ChargingProfilePurposeEnumType::TxProfile,
+            charging_profile_kind: ChargingProfileKindEnumType::Relative,
+            charging_schedule: vec![ChargingScheduleType {
+                id: 1,
+                charging_rate_unit: ChargingRateUnitEnumType::W,
+                charging_schedule_period: vec![ChargingSchedulePeriodType {
+                    start_period: 0,
+                    limit: 11_000.0,
+                    number_phases: None,
+                    phase_to_use: None,
+                    custom_data: None,
+                }],
+                start_schedule: None,
+                duration: None,
+                min_charging_rate: None,
+                sales_tariff: None,
+                custom_data: None,
+            }],
+            recurrency_kind: None,
+            valid_from: None,
+            valid_to: None,
+            transaction_id: None,
+            custom_data: None,
+        };
+        cp.test_install_v201_tx_profile(1, profile).await;
+
+        let call = make_call(V201GetCompositeScheduleRequest {
+            duration: 3_600,
+            charging_rate_unit: None,
+            evse_id: 1,
+            custom_data: None,
+        });
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: V201GetCompositeScheduleResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, GenericStatusEnumType::Accepted);
+                let schedule = body
+                    .schedule
+                    .expect("an accepted response carries the composed schedule");
+                assert_eq!(schedule.evse_id, 1);
+                assert_eq!(schedule.duration, 3_600);
+                assert_eq!(schedule.charging_rate_unit, ChargingRateUnitEnumType::W);
+                assert_eq!(schedule.charging_schedule_period.len(), 1);
+                assert_eq!(schedule.charging_schedule_period[0].start_period, 0);
+                assert_eq!(schedule.charging_schedule_period[0].limit, 11_000.0);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
     }
 
     #[tokio::test]

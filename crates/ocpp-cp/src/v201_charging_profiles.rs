@@ -25,7 +25,8 @@ use std::collections::HashMap;
 
 use ocpp_types::v201::{
     ChargingProfileKindEnumType, ChargingProfileType, ChargingRateUnitEnumType,
-    ChargingSchedulePeriodType, ChargingScheduleType, RecurrencyKindEnumType,
+    ChargingSchedulePeriodType, ChargingScheduleType, CompositeScheduleType,
+    RecurrencyKindEnumType,
 };
 use ocpp_types::{DateTime, Utc};
 use tokio::sync::RwLock;
@@ -331,6 +332,228 @@ pub fn bounded_power_w(
         }
     };
     (limit_w < natural_power_w).then_some(limit_w)
+}
+
+/// Convert a rate `limit` from unit `from` to unit `to`, using the connector's
+/// `nominal_voltage_v` and the period's `phases` for an A↔W conversion; identity
+/// when the units already match.
+///
+/// `GetCompositeSchedule` lets the CSMS force the reported unit
+/// ([`GetCompositeScheduleRequest::charging_rate_unit`](ocpp_messages::v201::GetCompositeScheduleRequest)),
+/// so a schedule authored in amperes may have to be reported in watts (or vice
+/// versa). The conversion mirrors [`bounded_power_w`]'s poly-phase A→W
+/// (`limit_a × nominal_voltage_v × numberPhases`, Issue #465), so a reported
+/// schedule agrees with the limit the metering resolver actually enforces.
+///
+/// `phases` arrives from [`effective_phases`] (already clamped to `1..=3`, so
+/// never `0`) and `nominal_voltage_v` from the connector config; the W→A branch
+/// still guards a zero denominator defensively (a degenerate `0 V` connector)
+/// rather than divide by zero, returning the watt value unchanged.
+fn convert_rate(
+    limit: f64,
+    from: ChargingRateUnitEnumType,
+    to: ChargingRateUnitEnumType,
+    phases: i32,
+    nominal_voltage_v: f64,
+) -> f64 {
+    match (from, to) {
+        (ChargingRateUnitEnumType::A, ChargingRateUnitEnumType::A)
+        | (ChargingRateUnitEnumType::W, ChargingRateUnitEnumType::W) => limit,
+        (ChargingRateUnitEnumType::A, ChargingRateUnitEnumType::W) => {
+            limit * nominal_voltage_v * f64::from(phases)
+        }
+        (ChargingRateUnitEnumType::W, ChargingRateUnitEnumType::A) => {
+            let denom = nominal_voltage_v * f64::from(phases);
+            if denom == 0.0 {
+                limit
+            } else {
+                limit / denom
+            }
+        }
+    }
+}
+
+/// The limit (already expressed in `out_unit`) and the period's raw `numberPhases`
+/// the profile imposes `offset` seconds into the query window, or `None` when it
+/// imposes nothing then (a gap).
+///
+/// Reuses [`resolve_active`] verbatim — the same period-selection,
+/// `validFrom`/`validTo`, recurrence-phasing, schedule-`duration` and
+/// `minChargingRate`-floor logic the metering path applies — then converts into
+/// the reported unit. The stored `numberPhases` is the period's raw value (so the
+/// coalescer distinguishes a phase change), while the A↔W conversion uses the
+/// clamped [`effective_phases`].
+fn composite_contribution_at(
+    profile: &ChargingProfileType,
+    offset: i32,
+    window_start: DateTime<Utc>,
+    out_unit: ChargingRateUnitEnumType,
+    nominal_voltage_v: f64,
+) -> Option<(f64, Option<i32>)> {
+    let (schedule, period) = resolve_active(profile, offset, window_start)?;
+    let limit = floored_limit(schedule, period);
+    let value = convert_rate(
+        limit,
+        schedule.charging_rate_unit,
+        out_unit,
+        effective_phases(period),
+        nominal_voltage_v,
+    );
+    Some((value, period.number_phases))
+}
+
+/// Candidate window-relative offsets (seconds within `[0, duration)`) at which the
+/// composite limit may change: the schedule's period starts, its `duration` end,
+/// and the profile's `validFrom`/`validTo` edges — repeated for every recurrence
+/// occurrence that overlaps the window.
+///
+/// A superset of the true breakpoints is fine: [`compose_composite_schedule`]
+/// coalesces adjacent equal periods, so an extra boundary that does not actually
+/// change the limit is dropped. Mirrors the 1.6J `composite::boundary_offsets`;
+/// the walk is bounded by the number of schedule periods times the occurrence
+/// count (`duration / recurrence_period`), never a per-second scan — so an
+/// attacker-supplied `duration` cannot force an unbounded loop.
+fn composite_boundary_offsets(
+    profile: &ChargingProfileType,
+    window_start: DateTime<Utc>,
+    duration: i32,
+) -> Vec<i32> {
+    let mut offsets = vec![0i32];
+    let dur = i64::from(duration);
+    let push = |offsets: &mut Vec<i32>, o: i64| {
+        if o > 0 && o < dur {
+            offsets.push(o as i32);
+        }
+    };
+    if let Some(schedule) = profile.charging_schedule.first() {
+        let base = (anchor(profile, schedule, window_start) - window_start).num_seconds();
+        match recurrence_period(profile) {
+            // Recurring: emit boundaries for every occurrence overlapping the
+            // window. Start one occurrence at or before offset 0 (so an active
+            // span ending inside the window is captured) and step until the next
+            // occurrence begins at or after the window end.
+            Some(period) if period > 0 => {
+                let mut k = (-base).div_euclid(period);
+                loop {
+                    let start = base + k * period;
+                    if start >= dur {
+                        break;
+                    }
+                    for p in &schedule.charging_schedule_period {
+                        push(&mut offsets, start + i64::from(p.start_period));
+                    }
+                    if let Some(d) = schedule.duration {
+                        push(&mut offsets, start + i64::from(d));
+                    }
+                    k += 1;
+                }
+            }
+            // Non-recurring (and the unreachable non-positive recurrence period):
+            // a single schedule anchored at `base`.
+            _ => {
+                for p in &schedule.charging_schedule_period {
+                    push(&mut offsets, base + i64::from(p.start_period));
+                }
+                if let Some(d) = schedule.duration {
+                    push(&mut offsets, base + i64::from(d));
+                }
+            }
+        }
+    }
+    if let Some(vf) = parse_rfc3339(&profile.valid_from) {
+        push(&mut offsets, (vf - window_start).num_seconds());
+    }
+    if let Some(vt) = parse_rfc3339(&profile.valid_to) {
+        // The limit is gone the second after validTo.
+        push(&mut offsets, (vt - window_start).num_seconds() + 1);
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets
+}
+
+/// Build the composite [`CompositeScheduleType`] a `GetCompositeSchedule` reports
+/// for `evse_id` over `[window_start, window_start + duration)`, from the single
+/// `TxProfile` installed on that EVSE — or `None` when the profile constrains no
+/// instant in the window (the caller maps that to `GenericStatusEnumType::Rejected`).
+///
+/// This is the query counterpart of the periodic-metering resolver: it walks the
+/// candidate breakpoints (`composite_boundary_offsets`) and reads the effective
+/// limit at each via `composite_contribution_at` (reusing `resolve_active`), then
+/// coalesces adjacent equal periods into the reported schedule. The output unit is
+/// the CSMS-requested unit when present, else the schedule's own unit; limits are
+/// converted into it (`convert_rate`).
+///
+/// **Anchoring.** `window_start` is passed to the resolver as its `tx_start`, so a
+/// `Relative` schedule is anchored at the reported window start and
+/// `Absolute`/`Recurring` schedules at their own `startSchedule` — matching the
+/// 1.6J `GetCompositeSchedule` composite (`composite::compute_composite`).
+/// Anchoring a mid-transaction `Relative` profile at its *true* transaction start
+/// (rather than the query instant) would require persisting the transaction start
+/// in `V201Session`; it is left as a follow-up (the two coincide for a query at
+/// transaction start).
+///
+/// Returns `None` when `duration <= 0` or no period is ever in force, so an
+/// `Accepted` response always carries a schema-valid, non-empty period list.
+#[must_use]
+pub fn compose_composite_schedule(
+    evse_id: i32,
+    profile: &ChargingProfileType,
+    window_start: DateTime<Utc>,
+    duration: i32,
+    requested_unit: Option<ChargingRateUnitEnumType>,
+    nominal_voltage_v: f64,
+) -> Option<CompositeScheduleType> {
+    if duration <= 0 {
+        return None;
+    }
+    let out_unit = requested_unit.unwrap_or_else(|| {
+        profile
+            .charging_schedule
+            .first()
+            .map_or(ChargingRateUnitEnumType::W, |s| s.charging_rate_unit)
+    });
+
+    let mut periods: Vec<ChargingSchedulePeriodType> = Vec::new();
+    // The (limit, phases) at the previous boundary, or `None` if that boundary was
+    // a gap. Coalescing compares against this rather than the last emitted period,
+    // so a limit that disappears into a gap and returns at the same value is
+    // re-emitted (the gap between carried a different, unconstrained limit) —
+    // matters for a recurring profile whose `duration` leaves a daily/weekly gap.
+    let mut prev: Option<(f64, Option<i32>)> = None;
+    for offset in composite_boundary_offsets(profile, window_start, duration) {
+        let current =
+            composite_contribution_at(profile, offset, window_start, out_unit, nominal_voltage_v);
+        if let Some((limit, phases)) = current {
+            let unchanged = matches!(
+                prev,
+                Some((pl, pp)) if (pl - limit).abs() < f64::EPSILON && pp == phases
+            );
+            if !unchanged {
+                periods.push(ChargingSchedulePeriodType {
+                    start_period: offset,
+                    limit,
+                    number_phases: phases,
+                    phase_to_use: None,
+                    custom_data: None,
+                });
+            }
+        }
+        prev = current;
+    }
+
+    if periods.is_empty() {
+        return None;
+    }
+
+    Some(CompositeScheduleType {
+        evse_id,
+        duration,
+        schedule_start: window_start.to_rfc3339(),
+        charging_rate_unit: out_unit,
+        charging_schedule_period: periods,
+        custom_data: None,
+    })
 }
 
 #[cfg(test)]
@@ -1031,5 +1254,150 @@ mod tests {
             bounded_power_w(&profile, 0, t0(), natural, voltage),
             Some(16.0 * voltage)
         );
+    }
+
+    // --- compose_composite_schedule (GetCompositeSchedule builder, #475) ------
+
+    #[test]
+    fn compose_flat_profile_yields_one_period_over_the_window() {
+        let profile = tx_profile(1, 11_000.0);
+        let sched = compose_composite_schedule(1, &profile, t0(), 3_600, None, 230.0)
+            .expect("a flat profile constrains the whole window → Accepted");
+        assert_eq!(sched.evse_id, 1);
+        assert_eq!(sched.duration, 3_600);
+        assert_eq!(sched.charging_rate_unit, ChargingRateUnitEnumType::W);
+        assert_eq!(sched.schedule_start, t0().to_rfc3339());
+        assert_eq!(sched.charging_schedule_period.len(), 1);
+        let p = &sched.charging_schedule_period[0];
+        assert_eq!(p.start_period, 0);
+        assert_eq!(p.limit, 11_000.0);
+    }
+
+    #[test]
+    fn compose_multi_period_schedule_steps_at_each_breakpoint() {
+        // 11 kW for the first 30 min, then a taper to 7.4 kW.
+        let profile = stepped_profile(
+            ChargingRateUnitEnumType::W,
+            &[(0, 11_000.0), (1_800, 7_400.0)],
+        );
+        let sched = compose_composite_schedule(1, &profile, t0(), 3_600, None, 230.0)
+            .expect("both periods fall inside the window");
+        let periods = &sched.charging_schedule_period;
+        assert_eq!(periods.len(), 2, "one period per limit step, coalesced");
+        assert_eq!((periods[0].start_period, periods[0].limit), (0, 11_000.0));
+        assert_eq!(
+            (periods[1].start_period, periods[1].limit),
+            (1_800, 7_400.0)
+        );
+    }
+
+    #[test]
+    fn compose_honors_a_requested_watt_unit_over_an_ampere_schedule() {
+        // A three-phase 16 A schedule reported in watts: 16 A × 230 V × 3φ.
+        let profile = ampere_profile(Some(3), 16.0);
+        let sched = compose_composite_schedule(
+            1,
+            &profile,
+            t0(),
+            3_600,
+            Some(ChargingRateUnitEnumType::W),
+            230.0,
+        )
+        .expect("the ampere schedule constrains the window");
+        assert_eq!(sched.charging_rate_unit, ChargingRateUnitEnumType::W);
+        assert_eq!(sched.charging_schedule_period.len(), 1);
+        let p = &sched.charging_schedule_period[0];
+        assert_eq!(p.limit, 16.0 * 230.0 * 3.0);
+        assert_eq!(
+            p.number_phases,
+            Some(3),
+            "the reported period keeps the schedule's raw numberPhases"
+        );
+    }
+
+    #[test]
+    fn compose_is_rejected_when_no_period_is_in_force_over_the_window() {
+        // The only period starts at 600 s but the window is just 300 s long, so
+        // nothing constrains any instant in it → None (Rejected, no schedule).
+        let deferred = stepped_profile(ChargingRateUnitEnumType::W, &[(600, 7_400.0)]);
+        assert_eq!(
+            compose_composite_schedule(1, &deferred, t0(), 300, None, 230.0),
+            None
+        );
+    }
+
+    #[test]
+    fn compose_is_rejected_for_a_non_positive_duration() {
+        let profile = tx_profile(1, 11_000.0);
+        assert_eq!(
+            compose_composite_schedule(1, &profile, t0(), 0, None, 230.0),
+            None
+        );
+        assert_eq!(
+            compose_composite_schedule(1, &profile, t0(), -5, None, 230.0),
+            None
+        );
+    }
+
+    #[test]
+    fn compose_stops_at_the_schedule_duration_leaving_the_tail_a_gap() {
+        // A flat 5 kW schedule bounded to its first 1 800 s, queried over a
+        // 3 600 s window: the limit applies for the first half and then lapses
+        // (no period pinned forever) → a single reported period, gap after.
+        let mut profile = stepped_profile(ChargingRateUnitEnumType::W, &[(0, 5_000.0)]);
+        profile.charging_schedule[0].duration = Some(1_800);
+        let sched = compose_composite_schedule(1, &profile, t0(), 3_600, None, 230.0)
+            .expect("the schedule constrains the first half of the window");
+        assert_eq!(sched.charging_schedule_period.len(), 1);
+        assert_eq!(
+            (
+                sched.charging_schedule_period[0].start_period,
+                sched.charging_schedule_period[0].limit
+            ),
+            (0, 5_000.0)
+        );
+    }
+
+    /// Wire fidelity: a built `GetCompositeSchedule.conf` — both the `Accepted`
+    /// case carrying the composed `CompositeScheduleType` and the bare `Rejected`
+    /// case — satisfies the bundled OCPP 2.0.1 `GetCompositeScheduleResponse`
+    /// schema (the `minItems: 1` period list included), the same guarantee the
+    /// CP's version-aware validator gives on the live path.
+    #[test]
+    fn built_get_composite_schedule_responses_are_schema_valid() {
+        use ocpp_messages::v201::GetCompositeScheduleResponse;
+        use ocpp_messages::SchemaValidator;
+        use ocpp_types::v201::GenericStatusEnumType;
+
+        let validator = SchemaValidator::v201();
+        let profile = stepped_profile(
+            ChargingRateUnitEnumType::W,
+            &[(0, 11_000.0), (1_800, 7_400.0)],
+        );
+        let schedule = compose_composite_schedule(1, &profile, t0(), 3_600, None, 230.0)
+            .expect("the profile constrains the window");
+
+        let accepted = GetCompositeScheduleResponse {
+            status: GenericStatusEnumType::Accepted,
+            schedule: Some(schedule),
+            status_info: None,
+            custom_data: None,
+        };
+        let rejected = GetCompositeScheduleResponse {
+            status: GenericStatusEnumType::Rejected,
+            schedule: None,
+            status_info: None,
+            custom_data: None,
+        };
+        for resp in [accepted, rejected] {
+            let payload = serde_json::to_value(&resp).unwrap();
+            assert!(
+                validator
+                    .validate_call_result("GetCompositeSchedule", &payload)
+                    .is_ok(),
+                "built {:?} GetCompositeScheduleResponse should be schema-valid, got: {payload}",
+                resp.status
+            );
+        }
     }
 }
