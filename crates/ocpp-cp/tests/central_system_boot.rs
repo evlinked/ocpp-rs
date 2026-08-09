@@ -24,13 +24,18 @@ use ocpp_messages::v201::{
     BootNotificationRequest as V201BootNotificationRequest,
     BootNotificationResponse as V201BootNotificationResponse,
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
+    ClearChargingProfileRequest as V201ClearChargingProfileRequest,
     DataTransferRequest as V201DataTransferRequest,
     GetBaseReportRequest as V201GetBaseReportRequest,
     GetBaseReportResponse as V201GetBaseReportResponse,
+    GetChargingProfilesRequest as V201GetChargingProfilesRequest,
+    GetChargingProfilesResponse as V201GetChargingProfilesResponse,
     GetVariablesRequest as V201GetVariablesRequest,
     GetVariablesResponse as V201GetVariablesResponse, MeterValuesRequest as V201MeterValuesRequest,
     MeterValuesResponse as V201MeterValuesResponse, NotifyReportRequest as V201NotifyReportRequest,
     NotifyReportResponse as V201NotifyReportResponse,
+    ReportChargingProfilesRequest as V201ReportChargingProfilesRequest,
+    ReportChargingProfilesResponse as V201ReportChargingProfilesResponse,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     RequestStopTransactionRequest as V201RequestStopTransactionRequest,
     ResetRequest as V201ResetRequest, SetChargingProfileRequest as V201SetChargingProfileRequest,
@@ -50,15 +55,17 @@ use ocpp_transport::{
 use ocpp_types::common::Reason;
 use ocpp_types::v201::{
     AttributeEnumType, BootReasonEnumType, ChangeAvailabilityStatusEnumType,
-    ChargingProfileKindEnumType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
-    ChargingProfileType, ChargingRateUnitEnumType, ChargingSchedulePeriodType,
-    ChargingScheduleType, ComponentType, ConnectorStatusEnumType, DataTransferStatusEnumType,
-    EvseType, GenericDeviceModelStatusEnumType, GetVariableDataType, GetVariableStatusEnumType,
-    IdTokenEnumType, IdTokenType, MeasurandEnumType, MessageTriggerEnumType, MutabilityEnumType,
-    OperationalStatusEnumType, ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType,
-    ReportBaseEnumType, RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType,
-    SetVariableDataType, SetVariableStatusEnumType, TransactionEventEnumType,
-    TriggerMessageStatusEnumType, TriggerReasonEnumType, UnlockStatusEnumType, VariableType,
+    ChargingProfileCriterionType, ChargingProfileKindEnumType, ChargingProfilePurposeEnumType,
+    ChargingProfileStatusEnumType, ChargingProfileType, ChargingRateUnitEnumType,
+    ChargingSchedulePeriodType, ChargingScheduleType, ClearChargingProfileStatusEnumType,
+    ClearChargingProfileType, ComponentType, ConnectorStatusEnumType, DataTransferStatusEnumType,
+    EvseType, GenericDeviceModelStatusEnumType, GetChargingProfileStatusEnumType,
+    GetVariableDataType, GetVariableStatusEnumType, IdTokenEnumType, IdTokenType,
+    MeasurandEnumType, MessageTriggerEnumType, MutabilityEnumType, OperationalStatusEnumType,
+    ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType, ReportBaseEnumType,
+    RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType, SetVariableDataType,
+    SetVariableStatusEnumType, TransactionEventEnumType, TriggerMessageStatusEnumType,
+    TriggerReasonEnumType, UnlockStatusEnumType, VariableType,
 };
 use ocpp_types::{ConnectorId, OcppVersion};
 
@@ -2257,6 +2264,155 @@ async fn v201_set_charging_profile_installs_replaces_and_rejects_faithfully() {
     server.stop().await.expect("server stop");
 }
 
+// ClearChargingProfile — Issue #474: the teardown counterpart to
+// SetChargingProfile removes an installed TxProfile mid-session, without ending
+// the transaction. This drives the full V201 handler over the wire: install via
+// SetChargingProfile, confirm a *non-matching* selector returns Unknown and
+// leaves the store intact, then confirm a matching selector returns Accepted and
+// lifts the bound (the profile is gone from `installed_tx_profile`) — all while
+// the transaction stays live.
+#[tokio::test]
+async fn v201_clear_charging_profile_removes_the_installed_txprofile_over_the_wire() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    let config = ChargePointConfig {
+        // Long interval: this test asserts store state, not metering ticks.
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_CLEARPROFILE")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // Bring EVSE 1 up with a profile-less remote start, then install a TxProfile
+    // via SetChargingProfile — so the only path a profile could be installed by is
+    // the one this test then clears.
+    let start = server
+        .call::<V201RequestStartTransactionRequest>(
+            "CP201_CLEARPROFILE",
+            V201RequestStartTransactionRequest {
+                id_token: central_id_token("RFID-CAFE"),
+                remote_start_id: 42,
+                evse_id: Some(1),
+                group_id_token: None,
+                charging_profile: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStartTransaction call round-trips");
+    assert_eq!(start.status, RequestStartStopStatusEnumType::Accepted);
+    wait_for_event(&log, TransactionEventEnumType::Started).await;
+    let txn_id_str = recorded_transaction_id(&log, TransactionEventEnumType::Started);
+
+    let profile = tx_profile_limited_w(6_000.0); // id 1, stack_level 0
+    let set = server
+        .call::<V201SetChargingProfileRequest>(
+            "CP201_CLEARPROFILE",
+            V201SetChargingProfileRequest {
+                evse_id: 1,
+                charging_profile: profile.clone(),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS SetChargingProfile call round-trips");
+    assert_eq!(set.status, ChargingProfileStatusEnumType::Accepted);
+    assert_eq!(
+        cp.installed_tx_profile(1).await,
+        Some(profile),
+        "the TxProfile is installed and ready to be cleared"
+    );
+
+    // (1) A selector that matches nothing installed → Unknown, store untouched.
+    // EVSE 2 holds no profile, so an evseId=2 criterion clears nothing.
+    let miss = server
+        .call::<V201ClearChargingProfileRequest>(
+            "CP201_CLEARPROFILE",
+            V201ClearChargingProfileRequest {
+                charging_profile_id: None,
+                charging_profile_criteria: Some(ClearChargingProfileType {
+                    evse_id: Some(2),
+                    charging_profile_purpose: None,
+                    stack_level: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS ClearChargingProfile call round-trips");
+    assert_eq!(
+        miss.status,
+        ClearChargingProfileStatusEnumType::Unknown,
+        "a selector matching no installed profile returns Unknown"
+    );
+    assert!(
+        cp.installed_tx_profile(1).await.is_some(),
+        "a non-matching ClearChargingProfile leaves the store untouched"
+    );
+
+    // (2) A matching selector (by chargingProfileId) → Accepted, profile removed,
+    // the transaction still live (this did not stop it).
+    let hit = server
+        .call::<V201ClearChargingProfileRequest>(
+            "CP201_CLEARPROFILE",
+            V201ClearChargingProfileRequest {
+                charging_profile_id: Some(1),
+                charging_profile_criteria: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS ClearChargingProfile call round-trips");
+    assert_eq!(
+        hit.status,
+        ClearChargingProfileStatusEnumType::Accepted,
+        "a selector matching the installed profile returns Accepted"
+    );
+    assert_eq!(
+        cp.installed_tx_profile(1).await,
+        None,
+        "the matched ClearChargingProfile lifts the bound: the TxProfile is gone"
+    );
+
+    // The transaction is still live — clearing a profile does not end it. A second
+    // clear of the now-empty store is Unknown.
+    let again = server
+        .call::<V201ClearChargingProfileRequest>(
+            "CP201_CLEARPROFILE",
+            V201ClearChargingProfileRequest::default(),
+        )
+        .await
+        .expect("CSMS ClearChargingProfile call round-trips");
+    assert_eq!(
+        again.status,
+        ClearChargingProfileStatusEnumType::Unknown,
+        "an empty-store clear matches nothing"
+    );
+
+    // Teardown: the transaction still exists to be stopped, proving the clear left
+    // the session alone.
+    let stop = server
+        .call::<V201RequestStopTransactionRequest>(
+            "CP201_CLEARPROFILE",
+            V201RequestStopTransactionRequest {
+                transaction_id: txn_id_str,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStopTransaction call round-trips");
+    assert_eq!(
+        stop.status,
+        RequestStartStopStatusEnumType::Accepted,
+        "the transaction outlived the ClearChargingProfile and is stoppable"
+    );
+    wait_for_event(&log, TransactionEventEnumType::Ended).await;
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
 // ---------------------------------------------------------------------------
 // RequestStartTransaction — slice 7e (Issue #455): the installed TxProfile is
 // now *binding*. When its chargingSchedule limit is tighter than the connector's
@@ -3128,6 +3284,247 @@ async fn v201_data_transfer_routes_through_the_shared_registry_over_the_wire() {
         resp.status,
         DataTransferStatusEnumType::UnknownMessageId,
         "a known vendor with an unregistered messageId is UnknownMessageId"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// ---------------------------------------------------------------------------
+// OCPP 2.0.1 CSMS -> CP `GetChargingProfiles` → `ReportChargingProfiles`
+// (Issue #476): the query half of the smart-charging report flow. A
+// `for_version(V201)` CP answers a `GetChargingProfiles` synchronously with
+// `Accepted` / `NoProfiles`, then — on `Accepted` — streams the matching
+// installed profiles asynchronously as one or more `ReportChargingProfiles`
+// CALLs, correlated by `requestId`, off the inbound-CALL path (reusing the
+// `GetBaseReport → NotifyReport` seam from #462). A green run proves the
+// version-gated handler, the pure selector + page builder in `v201_command`,
+// and the async report stream carry the 2.0.1 flow end to end.
+// ---------------------------------------------------------------------------
+
+type ProfileReportLog = Arc<Mutex<Vec<V201ReportChargingProfilesRequest>>>;
+
+/// Start an in-process 2.0.1 CSMS that records every `ReportChargingProfiles` it
+/// receives (on top of the default 2.0.1 lifecycle responders), so a
+/// `GetChargingProfiles` side effect can be observed end to end.
+async fn start_v201_csms_recording_charging_profile_reports(
+) -> (OcppServer, SocketAddr, ProfileReportLog) {
+    let reports: ProfileReportLog = Arc::new(Mutex::new(Vec::new()));
+    let reports_for_handler = reports.clone();
+    let (server, addr) = start_v201_csms(move |dispatcher| {
+        let reports = reports_for_handler;
+        dispatcher.on(move |req: V201ReportChargingProfilesRequest| {
+            let reports = reports.clone();
+            async move {
+                reports
+                    .lock()
+                    .expect("profile report log mutex not poisoned")
+                    .push(req);
+                Ok(V201ReportChargingProfilesResponse::default())
+            }
+        });
+    })
+    .await;
+    (server, addr, reports)
+}
+
+/// Poll `reports` until it holds at least `target` entries, or panic after ~5s.
+/// Waits for a streamed `ReportChargingProfiles` without a fixed sleep.
+async fn wait_for_profile_reports(reports: &ProfileReportLog, target: usize) {
+    for _ in 0..250 {
+        if reports
+            .lock()
+            .expect("profile report log mutex not poisoned")
+            .len()
+            >= target
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!(
+        "timed out waiting for {target} ReportChargingProfiles CALL(s) (last saw {})",
+        reports
+            .lock()
+            .expect("profile report log mutex not poisoned")
+            .len()
+    );
+}
+
+/// Poll until the CP has a `TxProfile` installed on `evse_id`, or panic after
+/// ~5s. The install happens in `open_transaction` on the command-consumer path
+/// (queued off the synchronous `RequestStartTransaction.conf`), so tests wait for
+/// it deterministically rather than with a fixed sleep.
+async fn wait_for_installed_profile(cp: &ChargePoint, evse_id: i32) {
+    for _ in 0..250 {
+        if cp.installed_tx_profile(evse_id).await.is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("timed out waiting for a TxProfile to be installed on EVSE {evse_id}");
+}
+
+#[tokio::test]
+async fn v201_get_charging_profiles_accepts_and_streams_report_then_no_profiles_streams_nothing() {
+    let (mut server, addr, reports) = start_v201_csms_recording_charging_profile_reports().await;
+
+    // A long meter interval keeps periodic TransactionEvents from cluttering the
+    // command stream while we observe the report side effect.
+    let config = ChargePointConfig {
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_GETPROFILES")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+    assert!(server.is_cp_connected("CP201_GETPROFILES"));
+
+    // Install a TxProfile on EVSE 1 by remotely starting a transaction that
+    // carries it (slice 7d). This is the only profile the query should later find.
+    let profile = charging_profile(ChargingProfilePurposeEnumType::TxProfile);
+    let start = server
+        .call::<V201RequestStartTransactionRequest>(
+            "CP201_GETPROFILES",
+            V201RequestStartTransactionRequest {
+                id_token: central_id_token("RFID-CAFE"),
+                remote_start_id: 1,
+                evse_id: Some(1),
+                group_id_token: None,
+                charging_profile: Some(profile.clone()),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStartTransaction call round-trips");
+    assert_eq!(start.status, RequestStartStopStatusEnumType::Accepted);
+    // The install is queued off the CALLRESULT; wait until it lands before querying.
+    wait_for_installed_profile(&cp, 1).await;
+
+    // CSMS -> CP: GetChargingProfiles with an empty criterion (report every
+    // installed profile). The station acks Accepted synchronously...
+    let resp: V201GetChargingProfilesResponse = server
+        .call::<V201GetChargingProfilesRequest>(
+            "CP201_GETPROFILES",
+            V201GetChargingProfilesRequest {
+                request_id: 55,
+                evse_id: None,
+                charging_profile: ChargingProfileCriterionType {
+                    charging_profile_purpose: None,
+                    stack_level: None,
+                    charging_profile_id: None,
+                    charging_limit_source: None,
+                    custom_data: None,
+                },
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS GetChargingProfiles call round-trips");
+    assert_eq!(
+        resp.status,
+        GetChargingProfileStatusEnumType::Accepted,
+        "a query matching the installed TxProfile is Accepted"
+    );
+
+    // ...then streams the matching profile as a ReportChargingProfiles CALL.
+    wait_for_profile_reports(&reports, 1).await;
+    let first = reports
+        .lock()
+        .expect("profile report log mutex not poisoned")
+        .clone();
+    assert_eq!(
+        first.len(),
+        1,
+        "one installed profile streams exactly one page"
+    );
+    let report = &first[0];
+    assert_eq!(
+        report.request_id, 55,
+        "the ReportChargingProfiles echoes the GetChargingProfiles requestId"
+    );
+    assert_eq!(
+        report.evse_id, 1,
+        "the report names the EVSE the profile is on"
+    );
+    assert_eq!(
+        report.charging_profile.len(),
+        1,
+        "the page carries the installed profile"
+    );
+    assert_eq!(
+        report.charging_profile[0].id, profile.id,
+        "the reported profile is the one installed, round-tripped over the wire"
+    );
+    assert!(
+        !report.tbc.unwrap_or(false),
+        "a single page is not 'to be continued'"
+    );
+
+    // CSMS -> CP: a GetChargingProfiles whose criterion matches nothing installed
+    // (the store holds a TxProfile, not a TxDefaultProfile) is NoProfiles...
+    let none: V201GetChargingProfilesResponse = server
+        .call::<V201GetChargingProfilesRequest>(
+            "CP201_GETPROFILES",
+            V201GetChargingProfilesRequest {
+                request_id: 56,
+                evse_id: None,
+                charging_profile: ChargingProfileCriterionType {
+                    charging_profile_purpose: Some(
+                        ChargingProfilePurposeEnumType::TxDefaultProfile,
+                    ),
+                    stack_level: None,
+                    charging_profile_id: None,
+                    charging_limit_source: None,
+                    custom_data: None,
+                },
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS GetChargingProfiles(non-matching) call round-trips");
+    assert_eq!(
+        none.status,
+        GetChargingProfileStatusEnumType::NoProfiles,
+        "a query matching nothing installed is NoProfiles"
+    );
+
+    // Prove the NoProfiles query streamed nothing *deterministically* (no fixed
+    // sleep): a subsequent matching query does stream a report, and because the
+    // command channel is FIFO, the second — and last — report we ever see must be
+    // that matching query's (requestId 57), never the NoProfiles one's (56).
+    let again: V201GetChargingProfilesResponse = server
+        .call::<V201GetChargingProfilesRequest>(
+            "CP201_GETPROFILES",
+            V201GetChargingProfilesRequest {
+                request_id: 57,
+                evse_id: Some(1),
+                charging_profile: ChargingProfileCriterionType {
+                    charging_profile_purpose: None,
+                    stack_level: None,
+                    charging_profile_id: None,
+                    charging_limit_source: None,
+                    custom_data: None,
+                },
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS GetChargingProfiles(rematch) call round-trips");
+    assert_eq!(again.status, GetChargingProfileStatusEnumType::Accepted);
+
+    wait_for_profile_reports(&reports, 2).await;
+    let all = reports
+        .lock()
+        .expect("profile report log mutex not poisoned")
+        .clone();
+    assert_eq!(
+        all.len(),
+        2,
+        "only the two matching queries streamed reports; the NoProfiles one streamed none"
+    );
+    assert_eq!(
+        all[1].request_id, 57,
+        "the second report is the rematch's (57), never the NoProfiles query's (56)"
     );
 
     cp.disconnect().await.expect("disconnect");

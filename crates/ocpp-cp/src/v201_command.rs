@@ -89,14 +89,17 @@
 use ocpp_types::common::Reason;
 use ocpp_types::v16j::ResetType;
 use ocpp_types::v201::{
-    ChangeAvailabilityStatusEnumType, ChargingProfilePurposeEnumType,
-    ChargingProfileStatusEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
-    RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
-    TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType, ChargingProfileCriterionType,
+    ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
+    ClearChargingProfileStatusEnumType, ClearChargingProfileType, GetChargingProfileStatusEnumType,
+    MessageTriggerEnumType, OperationalStatusEnumType, RequestStartStopStatusEnumType,
+    ResetEnumType, ResetStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
+    UnlockStatusEnumType,
 };
 
 use ocpp_messages::v201::{
-    ChangeAvailabilityResponse, RequestStartTransactionResponse, RequestStopTransactionResponse,
+    ChangeAvailabilityResponse, ClearChargingProfileResponse, GetChargingProfilesResponse,
+    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
     ResetResponse, SetChargingProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
 };
 
@@ -683,6 +686,232 @@ pub fn v201_set_charging_profile_response(
         status_info,
         custom_data: None,
     }
+}
+
+/// Decide which installed `TxProfile` slots an inbound `ClearChargingProfile.req`
+/// removes, returning the EVSE keys to clear.
+///
+/// The teardown counterpart to [`v201_set_charging_profile_status`]: given the
+/// request's selector and a `(evse_id, profile)` snapshot of the
+/// [`V201TxProfileStore`](crate::v201_charging_profiles::V201TxProfileStore), it
+/// returns every EVSE key whose installed profile matches — the wiring layer
+/// then [`clear`](crate::v201_charging_profiles::V201TxProfileStore::clear)s each
+/// and reports [`Accepted`](ClearChargingProfileStatusEnumType::Accepted) when
+/// the returned slice is non-empty,
+/// [`Unknown`](ClearChargingProfileStatusEnumType::Unknown) otherwise.
+///
+/// Matching is faithful to OCPP 2.0.1 (Part 2, `ClearChargingProfile`) over the
+/// simulator's one-`TxProfile`-per-EVSE store:
+///
+/// - **`chargingProfileId` present** — an exclusive selector (spec J01 note): the
+///   `chargingProfileCriteria` are ignored and a slot matches iff its stored
+///   `profile.id` equals it. A profile id that names nothing installed matches
+///   nothing → `Unknown`.
+/// - **`chargingProfileCriteria` present** (and no id) — a *filter*, each field
+///   independently narrowing: `evseId` against the slot's EVSE key,
+///   `chargingProfilePurpose` and `stackLevel` against the stored profile. An
+///   absent field means "any", so it does not exclude. `evseId == 0` targets the
+///   station-wide profile, which the transaction-scoped store never holds, so it
+///   matches nothing here (faithful — no station-scoped install exists to clear).
+/// - **Neither present** (an empty `{}` request) — matches *every* installed
+///   profile, clearing the whole store (the "clear all" wildcard the message
+///   documents).
+///
+/// Pure over its inputs (the selector plus an owned snapshot), so it is
+/// unit-testable without a runtime or the store lock; taking the snapshot and
+/// performing the removals is the wiring layer's job.
+#[must_use]
+pub fn v201_clear_charging_profile_matches(
+    charging_profile_id: Option<i32>,
+    criteria: Option<&ClearChargingProfileType>,
+    installed: &[(i32, ChargingProfileType)],
+) -> Vec<i32> {
+    installed
+        .iter()
+        .filter(|(evse_id, profile)| {
+            if let Some(id) = charging_profile_id {
+                // An explicit profile id is the exclusive selector: the criteria
+                // are ignored (spec J01), a slot matches purely on its stored id.
+                profile.id == id
+            } else if let Some(c) = criteria {
+                // Each criterion is an independent filter; an absent field is a
+                // wildcard that never excludes.
+                c.evse_id.is_none_or(|e| e == *evse_id)
+                    && c.charging_profile_purpose
+                        .is_none_or(|p| p == profile.charging_profile_purpose)
+                    && c.stack_level.is_none_or(|s| s == profile.stack_level)
+            } else {
+                // Neither id nor criteria: the "clear all" wildcard.
+                true
+            }
+        })
+        .map(|(evse_id, _)| *evse_id)
+        .collect()
+}
+
+/// Build a schema-valid `ClearChargingProfile.conf`
+/// ([`ClearChargingProfileResponse`]).
+///
+/// Pure constructor mirroring [`v201_set_charging_profile_response`]: the station
+/// reports [`Accepted`](ClearChargingProfileStatusEnumType::Accepted) when it
+/// cleared at least one matching profile (`matched == true`), or
+/// [`Unknown`](ClearChargingProfileStatusEnumType::Unknown) when the selector
+/// matched nothing installed — exactly the two-value contract
+/// `ocpp.v201.enums.ClearChargingProfileStatusEnumType` defines.
+#[must_use]
+pub fn v201_clear_charging_profile_response(matched: bool) -> ClearChargingProfileResponse {
+    ClearChargingProfileResponse {
+        status: if matched {
+            ClearChargingProfileStatusEnumType::Accepted
+        } else {
+            ClearChargingProfileStatusEnumType::Unknown
+        },
+        status_info: None,
+        custom_data: None,
+    }
+}
+
+/// Select the installed `TxProfile` slots an inbound `GetChargingProfiles.req`
+/// asks the station to report, returning the matching `(evse_id, profile)` pairs.
+///
+/// The query counterpart to [`v201_clear_charging_profile_matches`]: given the
+/// request's optional top-level `evse_id` and its
+/// [`ChargingProfileCriterionType`], plus a `(evse_id, profile)` snapshot of the
+/// [`V201TxProfileStore`](crate::v201_charging_profiles::V201TxProfileStore), it
+/// returns every installed slot that matches — the wiring layer then streams them
+/// as `ReportChargingProfiles` and answers
+/// [`Accepted`](GetChargingProfileStatusEnumType::Accepted) when the returned
+/// slice is non-empty, [`NoProfiles`](GetChargingProfileStatusEnumType::NoProfiles)
+/// otherwise.
+///
+/// Matching is faithful to OCPP 2.0.1 (Part 2, `GetChargingProfiles`) over the
+/// simulator's one-`TxProfile`-per-EVSE store:
+///
+/// - **top-level `evseId`** — restricts the report to that EVSE key; absent means
+///   "every EVSE". `evseId == 0` targets the station-wide profiles, which the
+///   transaction-scoped store never holds, so it matches nothing (faithful — no
+///   station-scoped install exists to report), as does any out-of-range id (it is
+///   simply absent from the snapshot). This is a trust boundary on CSMS-supplied
+///   input: a `0`, negative, or huge `evseId` never panics, it just misses.
+/// - **`chargingProfilePurpose`** — absent = any; present must equal the stored
+///   profile's purpose.
+/// - **`stackLevel`** — absent = any; present must equal the stored profile's
+///   stack level.
+/// - **`chargingProfileId`** — absent = any; present = the stored profile's `id`
+///   must be one of the listed ids (an id list naming nothing installed matches
+///   nothing).
+/// - **`chargingLimitSource`** — absent = any; present must contain
+///   [`Cso`](ChargingLimitSourceEnumType::Cso). Every profile the simulator
+///   installs (via `RequestStartTransaction` / `SetChargingProfile`) originates
+///   from the CSMS — the `CSO` source — so a criterion that excludes `CSO`
+///   matches nothing here, faithful to the store's provenance.
+///
+/// An empty criterion `{}` with no `evseId` matches every installed profile. Each
+/// criterion field is an independent, conjunctive filter and an absent field is a
+/// wildcard that never excludes — the same shape as
+/// [`v201_clear_charging_profile_matches`].
+///
+/// Pure over its inputs (the request selector plus an owned snapshot), so it is
+/// unit-testable without a runtime or the store lock; taking the snapshot and
+/// streaming the report is the wiring layer's job.
+#[must_use]
+pub fn v201_get_charging_profiles_matches(
+    evse_id: Option<i32>,
+    criterion: &ChargingProfileCriterionType,
+    installed: &[(i32, ChargingProfileType)],
+) -> Vec<(i32, ChargingProfileType)> {
+    installed
+        .iter()
+        .filter(|(slot_evse, profile)| {
+            evse_id.is_none_or(|e| e == *slot_evse)
+                && criterion
+                    .charging_profile_purpose
+                    .is_none_or(|p| p == profile.charging_profile_purpose)
+                && criterion
+                    .stack_level
+                    .is_none_or(|s| s == profile.stack_level)
+                && criterion
+                    .charging_profile_id
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&profile.id))
+                && criterion
+                    .charging_limit_source
+                    .as_ref()
+                    .is_none_or(|srcs| srcs.contains(&ChargingLimitSourceEnumType::Cso))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Build a schema-valid `GetChargingProfiles.conf`
+/// ([`GetChargingProfilesResponse`]).
+///
+/// Pure constructor mirroring [`v201_clear_charging_profile_response`]: the
+/// station reports [`Accepted`](GetChargingProfileStatusEnumType::Accepted) when
+/// at least one installed profile matched the query (`matched == true`) — those
+/// profiles then stream asynchronously as `ReportChargingProfiles` — or
+/// [`NoProfiles`](GetChargingProfileStatusEnumType::NoProfiles) when the selector
+/// matched nothing installed, exactly the two-value contract
+/// `ocpp.v201.enums.GetChargingProfileStatusEnumType` defines. No profile data
+/// rides on this synchronous response.
+#[must_use]
+pub fn v201_get_charging_profiles_response(matched: bool) -> GetChargingProfilesResponse {
+    GetChargingProfilesResponse {
+        status: if matched {
+            GetChargingProfileStatusEnumType::Accepted
+        } else {
+            GetChargingProfileStatusEnumType::NoProfiles
+        },
+        status_info: None,
+        custom_data: None,
+    }
+}
+
+/// Page the profiles a `GetChargingProfiles` query matched into the
+/// `ReportChargingProfiles` CALL(s) the station streams back.
+///
+/// The asynchronous data half of the report flow:
+/// [`v201_get_charging_profiles_matches`] resolves which installed slots to
+/// report, and this builds one [`ReportChargingProfilesRequest`] per **EVSE** —
+/// each echoing the triggering `request_id`, tagged with the
+/// [`Cso`](ChargingLimitSourceEnumType::Cso) source (every stored profile is
+/// CSMS-installed), and carrying that EVSE's profile. Pages are ordered by
+/// ascending `evse_id` (the store snapshot is an unordered `HashMap` walk, so
+/// sorting makes the paging deterministic), and every page but the last is
+/// flagged `tbc` ("to be continued"); the final page leaves `tbc` absent
+/// (= `false`). An empty match set builds no pages — there is nothing to stream.
+///
+/// The simulator keys one `TxProfile` per EVSE, so each page carries a single
+/// profile and the page count equals the matched-EVSE count; every built
+/// `ReportChargingProfiles` therefore satisfies the schema's `minItems: 1` on
+/// `chargingProfile`. Multi-profile-per-page batching arrives if the store ever
+/// holds stacked profiles per EVSE (tracks with #471).
+///
+/// Pure over its inputs, so it is unit-testable without a runtime; sending the
+/// pages over the wire is the wiring layer's job.
+#[must_use]
+pub fn v201_report_charging_profiles_pages(
+    request_id: i32,
+    matched: &[(i32, ChargingProfileType)],
+) -> Vec<ReportChargingProfilesRequest> {
+    // Deterministic paging order: the store snapshot is a HashMap walk.
+    let mut ordered: Vec<&(i32, ChargingProfileType)> = matched.iter().collect();
+    ordered.sort_by_key(|(evse_id, _)| *evse_id);
+
+    let last = ordered.len().saturating_sub(1);
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(i, (evse_id, profile))| ReportChargingProfilesRequest {
+            request_id,
+            charging_limit_source: ChargingLimitSourceEnumType::Cso,
+            charging_profile: vec![profile.clone()],
+            evse_id: *evse_id,
+            // Every page but the last announces that more follow.
+            tbc: (i < last).then_some(true),
+            custom_data: None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1592,6 +1821,538 @@ mod tests {
                     "built {status:?} SetChargingProfileResponse should be schema-valid, got: {payload}"
                 );
             }
+        }
+    }
+
+    // ---- ClearChargingProfile (#474) ----
+
+    /// A minimal but schema-shaped `TxProfile` whose selector fields (`id`,
+    /// `stackLevel`, `chargingProfilePurpose`) are set from the arguments; the
+    /// schedule is an unremarkable single 11 kW period, since the matcher never
+    /// reads it.
+    fn clear_test_profile(
+        id: i32,
+        stack_level: i32,
+        purpose: ChargingProfilePurposeEnumType,
+    ) -> ChargingProfileType {
+        use ocpp_types::v201::{
+            ChargingProfileKindEnumType, ChargingRateUnitEnumType, ChargingSchedulePeriodType,
+            ChargingScheduleType,
+        };
+        ChargingProfileType {
+            id,
+            stack_level,
+            charging_profile_purpose: purpose,
+            charging_profile_kind: ChargingProfileKindEnumType::Relative,
+            charging_schedule: vec![ChargingScheduleType {
+                id: 1,
+                charging_rate_unit: ChargingRateUnitEnumType::W,
+                charging_schedule_period: vec![ChargingSchedulePeriodType {
+                    start_period: 0,
+                    limit: 11_000.0,
+                    number_phases: None,
+                    phase_to_use: None,
+                    custom_data: None,
+                }],
+                start_schedule: None,
+                duration: None,
+                min_charging_rate: None,
+                sales_tariff: None,
+                custom_data: None,
+            }],
+            recurrency_kind: None,
+            valid_from: None,
+            valid_to: None,
+            transaction_id: None,
+            custom_data: None,
+        }
+    }
+
+    /// A two-EVSE store: EVSE 1 holds profile id 10 (TxProfile, stack 0), EVSE 2
+    /// holds profile id 20 (TxProfile, stack 3).
+    fn clear_test_store() -> Vec<(i32, ChargingProfileType)> {
+        vec![
+            (
+                1,
+                clear_test_profile(10, 0, ChargingProfilePurposeEnumType::TxProfile),
+            ),
+            (
+                2,
+                clear_test_profile(20, 3, ChargingProfilePurposeEnumType::TxProfile),
+            ),
+        ]
+    }
+
+    #[test]
+    fn clear_by_profile_id_matches_only_that_slot() {
+        let store = clear_test_store();
+        // The id names the profile installed on EVSE 2.
+        assert_eq!(
+            v201_clear_charging_profile_matches(Some(20), None, &store),
+            vec![2]
+        );
+        // A profile id nothing holds matches nothing.
+        assert!(v201_clear_charging_profile_matches(Some(999), None, &store).is_empty());
+    }
+
+    #[test]
+    fn clear_by_profile_id_ignores_the_criteria() {
+        let store = clear_test_store();
+        // Spec J01: with a `chargingProfileId` present, the criteria are ignored —
+        // even a criteria block that would exclude EVSE 2 (wrong evseId + wrong
+        // stackLevel) does not stop the id from matching it.
+        let criteria = ClearChargingProfileType {
+            evse_id: Some(1),
+            charging_profile_purpose: Some(ChargingProfilePurposeEnumType::TxDefaultProfile),
+            stack_level: Some(99),
+            custom_data: None,
+        };
+        assert_eq!(
+            v201_clear_charging_profile_matches(Some(20), Some(&criteria), &store),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn clear_by_evse_id_criterion_selects_that_evse() {
+        let store = clear_test_store();
+        let criteria = ClearChargingProfileType {
+            evse_id: Some(1),
+            charging_profile_purpose: None,
+            stack_level: None,
+            custom_data: None,
+        };
+        assert_eq!(
+            v201_clear_charging_profile_matches(None, Some(&criteria), &store),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn clear_by_stack_level_criterion_selects_the_matching_profile() {
+        let store = clear_test_store();
+        let criteria = ClearChargingProfileType {
+            evse_id: None,
+            charging_profile_purpose: None,
+            stack_level: Some(3),
+            custom_data: None,
+        };
+        // Only EVSE 2's profile is at stack level 3.
+        assert_eq!(
+            v201_clear_charging_profile_matches(None, Some(&criteria), &store),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn clear_by_purpose_criterion_matches_txprofiles_and_excludes_others() {
+        let store = clear_test_store();
+        // The store holds only TxProfiles, so a TxProfile purpose filter matches
+        // every slot...
+        let tx = ClearChargingProfileType {
+            evse_id: None,
+            charging_profile_purpose: Some(ChargingProfilePurposeEnumType::TxProfile),
+            stack_level: None,
+            custom_data: None,
+        };
+        assert_eq!(
+            v201_clear_charging_profile_matches(None, Some(&tx), &store),
+            vec![1, 2]
+        );
+        // ...and a non-TxProfile purpose matches nothing installed.
+        let default = ClearChargingProfileType {
+            evse_id: None,
+            charging_profile_purpose: Some(ChargingProfilePurposeEnumType::TxDefaultProfile),
+            stack_level: None,
+            custom_data: None,
+        };
+        assert!(v201_clear_charging_profile_matches(None, Some(&default), &store).is_empty());
+    }
+
+    #[test]
+    fn clear_criteria_are_conjunctive() {
+        let store = clear_test_store();
+        // evseId 1 AND stackLevel 3 — EVSE 1's profile is at stack 0, so the two
+        // criteria together exclude it, matching nothing.
+        let criteria = ClearChargingProfileType {
+            evse_id: Some(1),
+            charging_profile_purpose: None,
+            stack_level: Some(3),
+            custom_data: None,
+        };
+        assert!(v201_clear_charging_profile_matches(None, Some(&criteria), &store).is_empty());
+    }
+
+    #[test]
+    fn clear_evse_id_zero_matches_nothing_in_the_txprofile_store() {
+        let store = clear_test_store();
+        // evseId 0 targets the station-wide profile the transaction-scoped store
+        // never holds (its keys are real EVSEs ≥ 1).
+        let criteria = ClearChargingProfileType {
+            evse_id: Some(0),
+            charging_profile_purpose: None,
+            stack_level: None,
+            custom_data: None,
+        };
+        assert!(v201_clear_charging_profile_matches(None, Some(&criteria), &store).is_empty());
+    }
+
+    #[test]
+    fn clear_empty_request_matches_every_installed_profile() {
+        let store = clear_test_store();
+        // Neither id nor criteria: the "clear all" wildcard.
+        assert_eq!(
+            v201_clear_charging_profile_matches(None, None, &store),
+            vec![1, 2]
+        );
+        // An empty request against an empty store matches nothing (→ Unknown).
+        assert!(v201_clear_charging_profile_matches(None, None, &[]).is_empty());
+    }
+
+    #[test]
+    fn clear_response_maps_matched_to_accepted_and_unmatched_to_unknown() {
+        assert_eq!(
+            v201_clear_charging_profile_response(true).status,
+            ClearChargingProfileStatusEnumType::Accepted
+        );
+        assert_eq!(
+            v201_clear_charging_profile_response(false).status,
+            ClearChargingProfileStatusEnumType::Unknown
+        );
+        // The builder carries no rejection detail on either arm.
+        assert!(v201_clear_charging_profile_response(true)
+            .status_info
+            .is_none());
+    }
+
+    /// Wire fidelity: both built `ClearChargingProfile.conf` values satisfy the
+    /// bundled OCPP 2.0.1 `ClearChargingProfileResponse` JSON Schema.
+    #[test]
+    fn built_clear_charging_profile_responses_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        for matched in [true, false] {
+            let resp = v201_clear_charging_profile_response(matched);
+            let payload = serde_json::to_value(&resp).unwrap();
+            assert!(
+                validator
+                    .validate_call_result("ClearChargingProfile", &payload)
+                    .is_ok(),
+                "built ClearChargingProfileResponse (matched={matched}) should be schema-valid, got: {payload}"
+            );
+        }
+    }
+
+    // ---- GetChargingProfiles → ReportChargingProfiles (#476) ----
+
+    /// The EVSE keys the matcher returned, in order — the readable projection the
+    /// `GetChargingProfiles` selector tests assert against.
+    fn matched_evses(matches: &[(i32, ChargingProfileType)]) -> Vec<i32> {
+        matches.iter().map(|(evse_id, _)| *evse_id).collect()
+    }
+
+    /// An all-`None` `ChargingProfileCriterionType` (the `{}` "any profile"
+    /// criterion), which individual tests then narrow one field at a time.
+    fn any_criterion() -> ChargingProfileCriterionType {
+        ChargingProfileCriterionType {
+            charging_profile_purpose: None,
+            stack_level: None,
+            charging_profile_id: None,
+            charging_limit_source: None,
+            custom_data: None,
+        }
+    }
+
+    #[test]
+    fn get_empty_criterion_without_evse_id_matches_every_installed_profile() {
+        // Reuses the two-EVSE store from the ClearChargingProfile tests: EVSE 1
+        // holds id 10 (stack 0), EVSE 2 holds id 20 (stack 3), both TxProfiles.
+        let store = clear_test_store();
+        assert_eq!(
+            matched_evses(&v201_get_charging_profiles_matches(
+                None,
+                &any_criterion(),
+                &store
+            )),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn get_evse_id_restricts_the_report_to_that_evse() {
+        let store = clear_test_store();
+        assert_eq!(
+            matched_evses(&v201_get_charging_profiles_matches(
+                Some(1),
+                &any_criterion(),
+                &store
+            )),
+            vec![1]
+        );
+        assert_eq!(
+            matched_evses(&v201_get_charging_profiles_matches(
+                Some(2),
+                &any_criterion(),
+                &store
+            )),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn get_evse_id_zero_or_out_of_range_matches_nothing() {
+        let store = clear_test_store();
+        // evseId 0 targets the station-wide profiles the transaction-scoped store
+        // never holds; a huge / negative id is simply absent from the snapshot.
+        // A malformed CSMS evseId is a trust boundary — it misses, never panics.
+        for evse_id in [0, -1, 999, i32::MIN] {
+            assert!(
+                v201_get_charging_profiles_matches(Some(evse_id), &any_criterion(), &store)
+                    .is_empty(),
+                "evseId {evse_id} must match nothing installed"
+            );
+        }
+    }
+
+    #[test]
+    fn get_by_purpose_criterion_matches_txprofiles_and_excludes_others() {
+        let store = clear_test_store();
+        let tx = ChargingProfileCriterionType {
+            charging_profile_purpose: Some(ChargingProfilePurposeEnumType::TxProfile),
+            ..any_criterion()
+        };
+        assert_eq!(
+            matched_evses(&v201_get_charging_profiles_matches(None, &tx, &store)),
+            vec![1, 2]
+        );
+        let default = ChargingProfileCriterionType {
+            charging_profile_purpose: Some(ChargingProfilePurposeEnumType::TxDefaultProfile),
+            ..any_criterion()
+        };
+        assert!(v201_get_charging_profiles_matches(None, &default, &store).is_empty());
+    }
+
+    #[test]
+    fn get_by_stack_level_criterion_selects_the_matching_profile() {
+        let store = clear_test_store();
+        let criterion = ChargingProfileCriterionType {
+            stack_level: Some(3),
+            ..any_criterion()
+        };
+        // Only EVSE 2's profile is at stack level 3.
+        assert_eq!(
+            matched_evses(&v201_get_charging_profiles_matches(
+                None, &criterion, &store
+            )),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn get_by_profile_id_list_criterion_filters_by_membership() {
+        let store = clear_test_store();
+        // A single id names EVSE 2's profile...
+        let one = ChargingProfileCriterionType {
+            charging_profile_id: Some(vec![20]),
+            ..any_criterion()
+        };
+        assert_eq!(
+            matched_evses(&v201_get_charging_profiles_matches(None, &one, &store)),
+            vec![2]
+        );
+        // ...both ids name both slots...
+        let both = ChargingProfileCriterionType {
+            charging_profile_id: Some(vec![10, 20]),
+            ..any_criterion()
+        };
+        assert_eq!(
+            matched_evses(&v201_get_charging_profiles_matches(None, &both, &store)),
+            vec![1, 2]
+        );
+        // ...and an id nothing holds matches nothing.
+        let none = ChargingProfileCriterionType {
+            charging_profile_id: Some(vec![999]),
+            ..any_criterion()
+        };
+        assert!(v201_get_charging_profiles_matches(None, &none, &store).is_empty());
+    }
+
+    #[test]
+    fn get_by_charging_limit_source_criterion_treats_stored_profiles_as_cso() {
+        let store = clear_test_store();
+        // Every simulator-installed profile is CSMS-sourced (CSO), so a source
+        // list that includes CSO does not exclude...
+        let cso = ChargingProfileCriterionType {
+            charging_limit_source: Some(vec![ChargingLimitSourceEnumType::Cso]),
+            ..any_criterion()
+        };
+        assert_eq!(
+            matched_evses(&v201_get_charging_profiles_matches(None, &cso, &store)),
+            vec![1, 2]
+        );
+        let with_cso = ChargingProfileCriterionType {
+            charging_limit_source: Some(vec![
+                ChargingLimitSourceEnumType::Ems,
+                ChargingLimitSourceEnumType::Cso,
+            ]),
+            ..any_criterion()
+        };
+        assert_eq!(
+            matched_evses(&v201_get_charging_profiles_matches(None, &with_cso, &store)),
+            vec![1, 2]
+        );
+        // ...but a source list that excludes CSO matches nothing installed.
+        let ems_only = ChargingProfileCriterionType {
+            charging_limit_source: Some(vec![ChargingLimitSourceEnumType::Ems]),
+            ..any_criterion()
+        };
+        assert!(v201_get_charging_profiles_matches(None, &ems_only, &store).is_empty());
+    }
+
+    #[test]
+    fn get_criteria_and_evse_id_are_conjunctive() {
+        let store = clear_test_store();
+        // evseId 1 AND stackLevel 3 — EVSE 1's profile is at stack 0, so the two
+        // together exclude it, matching nothing.
+        let criterion = ChargingProfileCriterionType {
+            stack_level: Some(3),
+            ..any_criterion()
+        };
+        assert!(v201_get_charging_profiles_matches(Some(1), &criterion, &store).is_empty());
+        // The same criterion on EVSE 2 (stack 3) does match.
+        assert_eq!(
+            matched_evses(&v201_get_charging_profiles_matches(
+                Some(2),
+                &criterion,
+                &store
+            )),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn get_empty_store_matches_nothing() {
+        assert!(v201_get_charging_profiles_matches(None, &any_criterion(), &[]).is_empty());
+    }
+
+    #[test]
+    fn get_response_maps_matched_to_accepted_and_unmatched_to_no_profiles() {
+        assert_eq!(
+            v201_get_charging_profiles_response(true).status,
+            GetChargingProfileStatusEnumType::Accepted
+        );
+        assert_eq!(
+            v201_get_charging_profiles_response(false).status,
+            GetChargingProfileStatusEnumType::NoProfiles
+        );
+        // The synchronous response carries no profile data or status detail.
+        let resp = v201_get_charging_profiles_response(true);
+        assert!(resp.status_info.is_none());
+    }
+
+    /// Wire fidelity: both built `GetChargingProfiles.conf` values satisfy the
+    /// bundled OCPP 2.0.1 `GetChargingProfilesResponse` JSON Schema.
+    #[test]
+    fn built_get_charging_profiles_responses_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        for matched in [true, false] {
+            let resp = v201_get_charging_profiles_response(matched);
+            let payload = serde_json::to_value(&resp).unwrap();
+            assert!(
+                validator
+                    .validate_call_result("GetChargingProfiles", &payload)
+                    .is_ok(),
+                "built GetChargingProfilesResponse (matched={matched}) should be schema-valid, got: {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn report_pages_single_evse_is_one_unpaged_cso_page() {
+        let matched = vec![(
+            1,
+            clear_test_profile(10, 0, ChargingProfilePurposeEnumType::TxProfile),
+        )];
+        let pages = v201_report_charging_profiles_pages(77, &matched);
+        assert_eq!(pages.len(), 1, "one matched EVSE → one page");
+        let page = &pages[0];
+        assert_eq!(
+            page.request_id, 77,
+            "the page echoes the GetChargingProfiles requestId"
+        );
+        assert_eq!(page.evse_id, 1);
+        assert_eq!(page.charging_limit_source, ChargingLimitSourceEnumType::Cso);
+        assert_eq!(
+            page.charging_profile.len(),
+            1,
+            "the page carries the EVSE's profile"
+        );
+        assert_eq!(page.charging_profile[0].id, 10);
+        assert!(
+            !page.tbc.unwrap_or(false),
+            "a single page is not 'to be continued'"
+        );
+    }
+
+    #[test]
+    fn report_pages_multi_evse_are_ordered_by_evse_and_tbc_paged() {
+        // Deliberately out of order to prove the builder sorts: EVSE 2 before 1.
+        let matched = vec![
+            (
+                2,
+                clear_test_profile(20, 3, ChargingProfilePurposeEnumType::TxProfile),
+            ),
+            (
+                1,
+                clear_test_profile(10, 0, ChargingProfilePurposeEnumType::TxProfile),
+            ),
+        ];
+        let pages = v201_report_charging_profiles_pages(5, &matched);
+        assert_eq!(pages.len(), 2);
+        // Sorted ascending by evseId regardless of snapshot order.
+        assert_eq!(pages[0].evse_id, 1);
+        assert_eq!(pages[1].evse_id, 2);
+        // Every page but the last is 'to be continued'; the last is not.
+        assert_eq!(pages[0].tbc, Some(true), "the first of two pages continues");
+        assert!(
+            !pages[1].tbc.unwrap_or(false),
+            "the last page is not 'to be continued'"
+        );
+        // Both echo the same requestId.
+        assert!(pages.iter().all(|p| p.request_id == 5));
+    }
+
+    #[test]
+    fn report_pages_empty_match_builds_no_pages() {
+        assert!(v201_report_charging_profiles_pages(1, &[]).is_empty());
+    }
+
+    /// Wire fidelity: every built `ReportChargingProfiles` CALL — single-page and
+    /// each page of a multi-page stream — satisfies the bundled OCPP 2.0.1
+    /// `ReportChargingProfiles` request JSON Schema.
+    #[test]
+    fn built_report_charging_profiles_pages_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        let matched = vec![
+            (
+                1,
+                clear_test_profile(10, 0, ChargingProfilePurposeEnumType::TxProfile),
+            ),
+            (
+                2,
+                clear_test_profile(20, 3, ChargingProfilePurposeEnumType::TxProfile),
+            ),
+        ];
+        let pages = v201_report_charging_profiles_pages(42, &matched);
+        assert_eq!(pages.len(), 2);
+        for page in &pages {
+            let payload = serde_json::to_value(page).unwrap();
+            assert!(
+                validator
+                    .validate_call("ReportChargingProfiles", &payload)
+                    .is_ok(),
+                "built ReportChargingProfiles page (evse={}) should be schema-valid, got: {payload}",
+                page.evse_id
+            );
         }
     }
 }
