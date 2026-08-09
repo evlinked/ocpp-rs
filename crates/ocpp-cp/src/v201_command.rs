@@ -696,7 +696,8 @@ pub fn v201_set_charging_profile_response(
 /// returns every EVSE key whose installed profile matches — the wiring layer
 /// then [`clear`](crate::v201_charging_profiles::V201TxProfileStore::clear)s each
 /// and reports [`Accepted`](ClearChargingProfileStatusEnumType::Accepted) when
-/// the returned slice is non-empty, [`Unknown`] otherwise.
+/// the returned slice is non-empty,
+/// [`Unknown`](ClearChargingProfileStatusEnumType::Unknown) otherwise.
 ///
 /// Matching is faithful to OCPP 2.0.1 (Part 2, `ClearChargingProfile`) over the
 /// simulator's one-`TxProfile`-per-EVSE store:
