@@ -80,6 +80,7 @@ use ocpp_messages::v201::{
     DataTransferRequest as V201DataTransferRequest,
     GetBaseReportRequest as V201GetBaseReportRequest,
     GetBaseReportResponse as V201GetBaseReportResponse,
+    GetChargingProfilesRequest as V201GetChargingProfilesRequest,
     GetVariablesRequest as V201GetVariablesRequest,
     GetVariablesResponse as V201GetVariablesResponse, MeterValuesRequest as V201MeterValuesRequest,
     NotifyReportRequest as V201NotifyReportRequest,
@@ -577,6 +578,21 @@ enum RemoteCommand {
     V201NotifyReport {
         request_id: i32,
         report_data: Vec<ReportDataType>,
+    },
+    /// Stream the installed charging profiles a CSMS asked for with an `Accepted`
+    /// OCPP 2.0.1 `GetChargingProfiles` (Part 2). The synchronous
+    /// `GetChargingProfiles.conf` only reports `Accepted` / `NoProfiles`; the
+    /// actual profiles follow as one or more `ReportChargingProfiles` CALLs,
+    /// correlated back by `request_id`. `profiles` is the already-resolved
+    /// `(evse_id, profile)` match set (snapshotted off the store lock on the CALL
+    /// path, so the send touches no shared state), paged into per-EVSE CALLs by
+    /// the consumer. Queued off the inbound-CALL path for the same reason as the
+    /// other side effects — the outbound `ReportChargingProfiles` CALLs must not
+    /// re-enter the receive loop mid-dispatch. Mirrors the `GetBaseReport →
+    /// NotifyReport` seam (#462).
+    V201ReportChargingProfiles {
+        request_id: i32,
+        profiles: Vec<(i32, ChargingProfileType)>,
     },
     /// Run the simulated diagnostics-upload state machine for an `Accepted`
     /// `GetDiagnostics` (OCPP 1.6J §4.x, firmware-management profile). Emits
@@ -1544,6 +1560,77 @@ impl ChargePoint {
                         status_info: None,
                         custom_data: None,
                     })
+                }
+            });
+        }
+
+        // GetChargingProfiles (OCPP 2.0.1 only) — the query half of the smart-
+        // charging report flow, alongside SetChargingProfile (#472) /
+        // ClearChargingProfile (#477). Like GetBaseReport, it is a two-part
+        // exchange: the station answers synchronously with `Accepted` /
+        // `NoProfiles`, then streams the matching installed profiles asynchronously
+        // as one or more `ReportChargingProfiles` CALL(s), correlated by
+        // `requestId`.
+        //
+        // The match set is resolved here off a snapshot of the `v201_tx_profiles`
+        // store (taken under its read lock on the CALL path), so the queued side
+        // effect carries owned data and touches no shared state when it runs.
+        // Status:
+        // - ≥1 matching profile → `Accepted`, and a `V201ReportChargingProfiles`
+        //   is queued on the command channel (sent after this CALLRESULT is
+        //   flushed, off the inbound-CALL path — same discipline as GetBaseReport);
+        // - no matching profile → `NoProfiles`, and nothing is queued.
+        //
+        // Unlike GetBaseReport, `GetChargingProfileStatusEnumType` has no
+        // `Rejected`: its only two values are `Accepted` / `NoProfiles`. So when
+        // the command consumer has gone away (CP shutting down) we still answer
+        // `Accepted` for a non-empty match — that is the honest status ("I do have
+        // matching profiles") — and log that the report could not be streamed,
+        // rather than misreport `NoProfiles`.
+        //
+        // Trust boundary: the request carries only a numeric `requestId`, an
+        // optional numeric `evseId`, and a schema-bounded criterion — nothing is
+        // parsed into an index or unwrapped, so a `0` / negative / out-of-range
+        // `evseId` simply misses the snapshot (→ `NoProfiles`) and never panics.
+        // Registered on the V201 arm only; "GetChargingProfiles" has no 1.6J twin.
+        // Ports `ocpp.v201.call.GetChargingProfiles` →
+        // `ocpp.v201.call.ReportChargingProfiles`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let v201_tx_profiles = v201_tx_profiles.clone();
+            let command_sender = command_sender.clone();
+            d.on(move |req: V201GetChargingProfilesRequest| {
+                let v201_tx_profiles = v201_tx_profiles.clone();
+                let command_sender = command_sender.clone();
+                async move {
+                    // Snapshot off the store lock, then resolve the match set with
+                    // the pure selector. In the simulator the CSMS's CALLs are
+                    // serialized through the single dispatcher, so the snapshot
+                    // cannot be raced by a concurrent install/clear.
+                    let installed = v201_tx_profiles.snapshot().await;
+                    let matches = v201_command::v201_get_charging_profiles_matches(
+                        req.evse_id,
+                        &req.charging_profile,
+                        &installed,
+                    );
+                    let matched = !matches.is_empty();
+                    if matched
+                        && command_sender
+                            .send(RemoteCommand::V201ReportChargingProfiles {
+                                request_id: req.request_id,
+                                profiles: matches,
+                            })
+                            .is_err()
+                    {
+                        // Consumer gone: we cannot stream the report, but the
+                        // status enum has no Rejected — Accepted is still the
+                        // honest answer for a non-empty match. Surface the drop.
+                        warn!(
+                            "v201 GetChargingProfiles: consumer gone, cannot stream \
+                             ReportChargingProfiles for request {}",
+                            req.request_id
+                        );
+                    }
+                    Ok(v201_command::v201_get_charging_profiles_response(matched))
                 }
             });
         }
@@ -2978,6 +3065,13 @@ impl ChargePoint {
                             report_data,
                         } => {
                             cp.send_v201_notify_report(request_id, report_data).await;
+                        }
+                        RemoteCommand::V201ReportChargingProfiles {
+                            request_id,
+                            profiles,
+                        } => {
+                            cp.send_v201_report_charging_profiles(request_id, profiles)
+                                .await;
                         }
                         RemoteCommand::V201ApplyAvailability {
                             connector_id,
@@ -4805,6 +4899,37 @@ impl ChargePoint {
         };
         if let Err(e) = self.call(request).await {
             warn!("v201 GetBaseReport: NotifyReport send failed for request {request_id}: {e}");
+        }
+    }
+
+    /// Stream the installed charging profiles an `Accepted` OCPP 2.0.1
+    /// `GetChargingProfiles` asked for, as one or more `ReportChargingProfiles`
+    /// CALLs (`ocpp.v201.call.ReportChargingProfiles`).
+    ///
+    /// Runs on the command-consumer task (off the inbound-CALL path), so the
+    /// outbound CALLs are sent only after the `GetChargingProfiles` CALLRESULT is
+    /// flushed and never re-enter the receive loop. `request_id` correlates the
+    /// report back to the triggering query; `profiles` is the `(evse_id, profile)`
+    /// match set the handler already resolved. The pure
+    /// [`v201_report_charging_profiles_pages`](crate::v201_command::v201_report_charging_profiles_pages)
+    /// builder pages it into one CSO-sourced CALL per EVSE (ascending `evseId`,
+    /// `tbc` set on every page but the last); each is sent in order so the CSMS
+    /// sees the paging flags in sequence. An empty match set builds no pages and
+    /// sends nothing (the handler only queues this for a non-empty match).
+    async fn send_v201_report_charging_profiles(
+        &self,
+        request_id: i32,
+        profiles: Vec<(i32, ChargingProfileType)>,
+    ) {
+        let pages = v201_command::v201_report_charging_profiles_pages(request_id, &profiles);
+        for page in pages {
+            let evse_id = page.evse_id;
+            if let Err(e) = self.call(page).await {
+                warn!(
+                    "v201 GetChargingProfiles: ReportChargingProfiles send failed for \
+                     request {request_id} (evse {evse_id}): {e}"
+                );
+            }
         }
     }
 
