@@ -24,6 +24,7 @@ use ocpp_messages::v201::{
     BootNotificationRequest as V201BootNotificationRequest,
     BootNotificationResponse as V201BootNotificationResponse,
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
+    DataTransferRequest as V201DataTransferRequest,
     GetBaseReportRequest as V201GetBaseReportRequest,
     GetBaseReportResponse as V201GetBaseReportResponse,
     GetVariablesRequest as V201GetVariablesRequest,
@@ -51,8 +52,8 @@ use ocpp_types::v201::{
     AttributeEnumType, BootReasonEnumType, ChangeAvailabilityStatusEnumType,
     ChargingProfileKindEnumType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
     ChargingProfileType, ChargingRateUnitEnumType, ChargingSchedulePeriodType,
-    ChargingScheduleType, ComponentType, ConnectorStatusEnumType, EvseType,
-    GenericDeviceModelStatusEnumType, GetVariableDataType, GetVariableStatusEnumType,
+    ChargingScheduleType, ComponentType, ConnectorStatusEnumType, DataTransferStatusEnumType,
+    EvseType, GenericDeviceModelStatusEnumType, GetVariableDataType, GetVariableStatusEnumType,
     IdTokenEnumType, IdTokenType, MeasurandEnumType, MessageTriggerEnumType, MutabilityEnumType,
     OperationalStatusEnumType, ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType,
     ReportBaseEnumType, RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType,
@@ -3021,6 +3022,112 @@ async fn v201_get_base_report_summary_inventory_is_empty_result_set_and_streams_
     assert_eq!(
         recorded[0].request_id, 79,
         "the one report is the FullInventory's (79), never the empty summary's (78)"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// ---------------------------------------------------------------------------
+// OCPP 2.0.1 CSMS -> CP `DataTransfer` (Issue #470): the vendor-extension escape
+// hatch on the V201 dispatcher arm. A `for_version(V201)` CP routes an inbound
+// 2.0.1 `DataTransfer` through the *same* shared registry the 1.6J CP uses
+// (`register_data_transfer_handler`), so a registered `(vendorId, messageId)`
+// handler runs and its free-form JSON `data` round-trips over the wire, while an
+// unregistered vendor resolves to the faithful `UnknownVendorId`. A green run
+// proves the version-gated registration and the `v201_data_transfer` adapter
+// carry the 2.0.1 frame end to end.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn v201_data_transfer_routes_through_the_shared_registry_over_the_wire() {
+    use ocpp_messages::v16j::{
+        DataTransferRequest as V16jDataTransferRequest,
+        DataTransferResponse as V16jDataTransferResponse,
+    };
+    use ocpp_types::v16j::DataTransferStatus as V16jDataTransferStatus;
+
+    let (mut server, addr) = start_v201_csms(|_| {}).await;
+
+    let cp = ChargePoint::new(v201_cp_config(addr, "CP201_DATATRANSFER"))
+        .expect("build v201 charge point");
+
+    // Register an echo handler for one (vendorId, messageId) on the shared
+    // registry — exactly the 1.6J registration API, observed by the V201 arm.
+    // The handler sees the request's `data` as the JSON *text* of the 2.0.1
+    // `Value`, so echoing it verbatim round-trips the structured payload.
+    cp.register_data_transfer_handler(
+        "com.evlinked",
+        Some("Echo".to_string()),
+        |req: &V16jDataTransferRequest| V16jDataTransferResponse {
+            status: V16jDataTransferStatus::Accepted,
+            data: req.data.clone(),
+        },
+    );
+
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // (1) A registered (vendorId, messageId) with a structured JSON payload →
+    // Accepted, and the object round-trips over the wire unchanged.
+    let payload = serde_json::json!({ "soc": 80, "phases": [1, 2, 3] });
+    let resp = server
+        .call::<V201DataTransferRequest>(
+            "CP201_DATATRANSFER",
+            V201DataTransferRequest {
+                vendor_id: "com.evlinked".to_string(),
+                message_id: Some("Echo".to_string()),
+                data: Some(payload.clone()),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS DataTransfer call round-trips");
+    assert_eq!(
+        resp.status,
+        DataTransferStatusEnumType::Accepted,
+        "a registered (vendorId, messageId) is Accepted"
+    );
+    assert_eq!(
+        resp.data,
+        Some(payload),
+        "the free-form JSON data round-trips over the wire without loss"
+    );
+
+    // (2) An unregistered vendor → the faithful UnknownVendorId, no handler run.
+    let resp = server
+        .call::<V201DataTransferRequest>(
+            "CP201_DATATRANSFER",
+            V201DataTransferRequest {
+                vendor_id: "com.stranger".to_string(),
+                message_id: Some("Echo".to_string()),
+                data: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS DataTransfer call round-trips");
+    assert_eq!(
+        resp.status,
+        DataTransferStatusEnumType::UnknownVendorId,
+        "an unimplemented vendor resolves to UnknownVendorId"
+    );
+
+    // (3) A known vendor but an unregistered messageId → UnknownMessageId.
+    let resp = server
+        .call::<V201DataTransferRequest>(
+            "CP201_DATATRANSFER",
+            V201DataTransferRequest {
+                vendor_id: "com.evlinked".to_string(),
+                message_id: Some("Nope".to_string()),
+                data: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS DataTransfer call round-trips");
+    assert_eq!(
+        resp.status,
+        DataTransferStatusEnumType::UnknownMessageId,
+        "a known vendor with an unregistered messageId is UnknownMessageId"
     );
 
     cp.disconnect().await.expect("disconnect");
