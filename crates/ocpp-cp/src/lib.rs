@@ -20,6 +20,7 @@ pub mod state_machine;
 pub mod transaction;
 pub mod v201_charging_profiles;
 pub mod v201_command;
+pub mod v201_data_transfer;
 pub mod v201_device_model;
 pub mod v201_transaction;
 
@@ -75,6 +76,7 @@ use v201_device_model::V201DeviceModel;
 // above (`StatusNotificationRequest`, `RegistrationStatus`).
 use ocpp_messages::v201::{
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
+    DataTransferRequest as V201DataTransferRequest,
     GetBaseReportRequest as V201GetBaseReportRequest,
     GetBaseReportResponse as V201GetBaseReportResponse,
     GetVariablesRequest as V201GetVariablesRequest,
@@ -2624,17 +2626,40 @@ impl ChargePoint {
             });
         }
 
-        // DataTransfer — route by (vendorId, messageId) through the registry
-        // (OCPP 1.6J §6.x, Issue #101). An unimplemented vendor/message yields
-        // the faithful UnknownVendorId / UnknownMessageId; a registered handler
-        // decides Accepted/Rejected (+ optional data). With no handlers
-        // registered the registry answers UnknownVendorId for every request.
-        {
-            let data_transfer = data_transfer.clone();
-            d.on(move |req: DataTransferRequest| {
+        // DataTransfer — route by (vendorId, messageId) through the registry.
+        // An unimplemented vendor/message yields the faithful UnknownVendorId /
+        // UnknownMessageId; a registered handler decides Accepted/Rejected (+
+        // optional data). With no handlers registered the registry answers
+        // UnknownVendorId for every request. Both dialects name the action
+        // `"DataTransfer"` but carry different request shapes (1.6J's `data` is
+        // an opaque string, 2.0.1's is free-form JSON), so — like
+        // SetChargingProfile above — exactly one handler is registered per
+        // `protocol_version`; the negotiated subprotocol and version-aware
+        // inbound validator keep the wire on a single dialect. Both arms consult
+        // the *same* shared registry (Issue #101), so `register_data_transfer_handler`
+        // is the single registration API for either version.
+        match protocol_version {
+            // OCPP 1.6J §6.x — the original vendor-extension escape hatch.
+            OcppVersion::V16J => {
                 let data_transfer = data_transfer.clone();
-                async move { Ok(data_transfer.dispatch(&req)) }
-            });
+                d.on(move |req: DataTransferRequest| {
+                    let data_transfer = data_transfer.clone();
+                    async move { Ok(data_transfer.dispatch(&req)) }
+                });
+            }
+            // OCPP 2.0.1 (Part 2, `DataTransfer`) — the same escape hatch with a
+            // free-form JSON `data` field. The `v201_data_transfer` adapter routes
+            // through the shared 1.6J registry and maps the request/response at the
+            // boundary (Issue #470), so the routing table stays the single source
+            // of truth. Ports `ocpp.v201.call.DataTransfer` and the
+            // `@on(Action.data_transfer)` dispatch shape from `ocpp/charge_point.py`.
+            OcppVersion::V201 => {
+                let data_transfer = data_transfer.clone();
+                d.on(move |req: V201DataTransferRequest| {
+                    let data_transfer = data_transfer.clone();
+                    async move { Ok(v201_data_transfer::dispatch(&data_transfer, &req)) }
+                });
+            }
         }
 
         // GetLocalListVersion — report the version of the Local Authorization
