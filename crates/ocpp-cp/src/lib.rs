@@ -75,6 +75,7 @@ use v201_device_model::V201DeviceModel;
 // (slice 2). Aliased to avoid clashing with the unqualified 1.6J names imported
 // above (`StatusNotificationRequest`, `RegistrationStatus`).
 use ocpp_messages::v201::{
+    CancelReservationRequest as V201CancelReservationRequest,
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
     ClearChargingProfileRequest as V201ClearChargingProfileRequest,
     DataTransferRequest as V201DataTransferRequest,
@@ -2420,37 +2421,125 @@ impl ChargePoint {
             });
         }
 
-        // CancelReservation — clear a reservation by reservationId (OCPP 1.6J
-        // §5.4). `Accepted` if the id is held (the connector is freed,
-        // `Reserved` → `Available`), `Rejected` if it is unknown. Freeing the
-        // connector is a local state change; on `Accepted` we also queue a
-        // `StatusNotification` (`Available`) off the inbound-CALL path so the
-        // CSMS sees the connector free up immediately (Issue #80). A
-        // `cancel_reservation()` that did not actually flip `Reserved` →
-        // `Available` (the connector moved on, e.g. a faulted/occupied edge)
-        // emits nothing — we only announce the transition we made. Ports
-        // `CancelReservation` from the Python reference's `call.py`/`enums.py`.
-        {
-            let connectors = connectors.clone();
-            let reservations = reservations.clone();
-            let command_sender = command_sender.clone();
-            let expiry_timers = expiry_timers.clone();
-            d.on(move |req: CancelReservationRequest| {
+        // CancelReservation — the teardown counterpart to ReserveNow: the CSMS
+        // drops a previously-made reservation by its integer `reservationId`.
+        // Both dialects key on the same id and share the same reservation store,
+        // but carry different response shapes (1.6J `CancelReservationStatus` vs
+        // 2.0.1 `CancelReservationStatusEnumType` + optional `statusInfo`), so —
+        // like SetChargingProfile / ClearChargingProfile below — exactly one
+        // handler is registered per `protocol_version`; the negotiated
+        // subprotocol and the version-aware inbound validator keep the wire on a
+        // single dialect, so the other version's request shape never reaches this
+        // dispatcher.
+        match protocol_version {
+            // OCPP 1.6J §5.4 — `Accepted` if the id is held (the connector is
+            // freed, `Reserved` → `Available`), `Rejected` if it is unknown.
+            // Freeing the connector is a local state change; on `Accepted` we also
+            // queue a `StatusNotification` (`Available`) off the inbound-CALL path
+            // so the CSMS sees the connector free up immediately (Issue #80). A
+            // `cancel_reservation()` that did not actually flip `Reserved` →
+            // `Available` (the connector moved on, e.g. a faulted/occupied edge)
+            // emits nothing — we only announce the transition we made. Unchanged
+            // from the pre-version-gate behavior. Ports `CancelReservation` from
+            // the Python reference's `call.py`/`enums.py`.
+            OcppVersion::V16J => {
                 let connectors = connectors.clone();
                 let reservations = reservations.clone();
                 let command_sender = command_sender.clone();
                 let expiry_timers = expiry_timers.clone();
-                async move {
-                    let held = reservations.write().await.remove(&req.reservation_id);
-                    let status = match held {
-                        Some(cid) => {
+                d.on(move |req: CancelReservationRequest| {
+                    let connectors = connectors.clone();
+                    let reservations = reservations.clone();
+                    let command_sender = command_sender.clone();
+                    let expiry_timers = expiry_timers.clone();
+                    async move {
+                        let held = reservations.write().await.remove(&req.reservation_id);
+                        let status = match held {
+                            Some(cid) => {
+                                // Disarm the pending auto-expiry timer (Issue #85) so
+                                // it can't later fire on a connector that has moved
+                                // on. Only done when *we* claimed the reservation
+                                // (`held` was Some): the claim above removed the map
+                                // entry, so any concurrent expiry task will now see
+                                // it gone and no-op — meaning the timer is still
+                                // sleeping and aborts cleanly, never mid-free.
+                                if let Some(timer) =
+                                    expiry_timers.write().await.remove(&req.reservation_id)
+                                {
+                                    timer.abort();
+                                }
+                                if let Some(mut connector) =
+                                    connectors.read().await.get(&cid).cloned()
+                                {
+                                    let was_reserved =
+                                        connector.status().await == ChargePointStatus::Reserved;
+                                    let _ = connector.cancel_reservation().await;
+                                    if was_reserved {
+                                        // Best-effort: cancellation is already
+                                        // Accepted; a dropped notification must not
+                                        // undo it.
+                                        let _ = command_sender.send(
+                                            RemoteCommand::EmitConnectorStatus {
+                                                connector_id: cid,
+                                                status: ChargePointStatus::Available,
+                                            },
+                                        );
+                                    }
+                                }
+                                CancelReservationStatus::Accepted
+                            }
+                            None => CancelReservationStatus::Rejected,
+                        };
+                        Ok(CancelReservationResponse { status })
+                    }
+                });
+            }
+            // OCPP 2.0.1 (Part 2, `CancelReservation`) — the inverse of the V201
+            // `ReserveNow` slice, answering in the 2.0.1 dialect
+            // (`CancelReservationStatusEnumType` + optional `statusInfo`). The pure
+            // Accepted/Rejected decision + response builder live in `v201_command`
+            // (#482); this is the runtime wiring, reusing the exact reservation
+            // store, expiry-timer machinery, and `EmitConnectorStatus` seam the
+            // 1.6J arm uses. Ports `ocpp.v201.call.CancelReservation` and the
+            // `@on(Action.cancel_reservation)` dispatch shape from
+            // `ocpp/charge_point.py`.
+            OcppVersion::V201 => {
+                let connectors = connectors.clone();
+                let reservations = reservations.clone();
+                let command_sender = command_sender.clone();
+                let expiry_timers = expiry_timers.clone();
+                d.on(move |req: V201CancelReservationRequest| {
+                    let connectors = connectors.clone();
+                    let reservations = reservations.clone();
+                    let command_sender = command_sender.clone();
+                    let expiry_timers = expiry_timers.clone();
+                    async move {
+                        // Decide the reported status and claim the reservation
+                        // under a single `reservations` write-lock section, so a
+                        // racing auto-expiry timer (Issue #85) can never make the
+                        // Accepted/Rejected verdict and the removal disagree: the
+                        // pure decision reads the held ids, and `remove` claims the
+                        // requested id, both before the lock is released. `freed`
+                        // carries the connector to release (the 1.6J arm's
+                        // atomic-`remove` discipline, re-expressed so the reported
+                        // status flows through the pure `v201_command` decision).
+                        let (status, freed) = {
+                            let mut map = reservations.write().await;
+                            let held_ids: Vec<i32> = map.keys().copied().collect();
+                            let status = v201_command::v201_cancel_reservation_status(
+                                req.reservation_id,
+                                &held_ids,
+                            );
+                            let freed = map.remove(&req.reservation_id);
+                            (status, freed)
+                        };
+                        if let Some(cid) = freed {
                             // Disarm the pending auto-expiry timer (Issue #85) so
-                            // it can't later fire on a connector that has moved
-                            // on. Only done when *we* claimed the reservation
-                            // (`held` was Some): the claim above removed the map
-                            // entry, so any concurrent expiry task will now see
-                            // it gone and no-op — meaning the timer is still
-                            // sleeping and aborts cleanly, never mid-free.
+                            // it can't later fire on a connector that has moved on.
+                            // The claim above already removed the map entry, so a
+                            // concurrent expiry task now sees it gone and no-ops —
+                            // the timer is still sleeping and aborts cleanly, never
+                            // mid-free.
                             if let Some(timer) =
                                 expiry_timers.write().await.remove(&req.reservation_id)
                             {
@@ -2472,13 +2561,11 @@ impl ChargePoint {
                                         });
                                 }
                             }
-                            CancelReservationStatus::Accepted
                         }
-                        None => CancelReservationStatus::Rejected,
-                    };
-                    Ok(CancelReservationResponse { status })
-                }
-            });
+                        Ok(v201_command::v201_cancel_reservation_response(status, None))
+                    }
+                });
+            }
         }
 
         // SetChargingProfile — install a Smart Charging profile on the station.
@@ -5508,6 +5595,43 @@ impl ChargePoint {
     async fn test_install_v201_tx_profile(&self, evse_id: i32, profile: ChargingProfileType) {
         self.v201_tx_profiles.install(evse_id, profile).await;
     }
+
+    /// Seed a live reservation exactly as an accepted `ReserveNow` would — reserve
+    /// the connector (`Available → Reserved`) and record `reservationId →
+    /// connector` in the shared store — so a `CancelReservation` wire test has a
+    /// reservation to cancel without depending on the (still-open) v201
+    /// `ReserveNow` slice. Connector clones share their state through `Arc`s, so
+    /// the reserve is visible to the live handler and to
+    /// [`test_connector_status`](Self::test_connector_status).
+    async fn test_reserve(&self, reservation_id: i32, connector_id: ConnectorId) {
+        let mut connector = self
+            .connectors
+            .read()
+            .await
+            .get(&connector_id)
+            .cloned()
+            .expect("test connector should exist");
+        connector
+            .reserve("test-token".to_string())
+            .await
+            .expect("a free connector should reserve");
+        self.reservations
+            .write()
+            .await
+            .insert(reservation_id, connector_id);
+    }
+
+    /// Read a connector's current status, so a wire test can assert a
+    /// `Reserved → Available` transition after a handler runs.
+    async fn test_connector_status(&self, connector_id: ConnectorId) -> ChargePointStatus {
+        self.connectors
+            .read()
+            .await
+            .get(&connector_id)
+            .expect("test connector should exist")
+            .status()
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -5965,6 +6089,75 @@ mod tests {
             }
             other => panic!("expected CallResult, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn v201_cancel_reservation_frees_a_held_reservation() {
+        // A V201 CP holding a reservation on EVSE 1 (seeded as an accepted
+        // ReserveNow would leave it) answers a 2.0.1 `CancelReservation` for that
+        // id with `Accepted` and frees the connector (`Reserved → Available`).
+        // Exercises the wired V201 arm end-to-end: a 2.0.1 CP now answers
+        // CancelReservation in its own dialect rather than the 1.6J one.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let cid = ConnectorId::new(1).unwrap();
+        cp.test_reserve(77, cid).await;
+        assert_eq!(
+            cp.test_connector_status(cid).await,
+            ChargePointStatus::Reserved,
+            "precondition: the seeded reservation holds the connector"
+        );
+
+        let call = make_call(V201CancelReservationRequest {
+            reservation_id: 77,
+            custom_data: None,
+        });
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::CancelReservationResponse = r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    ocpp_types::v201::CancelReservationStatusEnumType::Accepted
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.test_connector_status(cid).await,
+            ChargePointStatus::Available,
+            "an accepted cancel frees the connector"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_cancel_reservation_rejects_unknown_id_and_leaves_state() {
+        // Cancelling an id the station is not holding is `Rejected` and mutates
+        // nothing: the genuinely-held reservation on EVSE 1 keeps its connector
+        // `Reserved`.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let cid = ConnectorId::new(1).unwrap();
+        cp.test_reserve(77, cid).await;
+
+        let call = make_call(V201CancelReservationRequest {
+            reservation_id: 88, // not the held id
+            custom_data: None,
+        });
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::CancelReservationResponse = r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    ocpp_types::v201::CancelReservationStatusEnumType::Rejected
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.test_connector_status(cid).await,
+            ChargePointStatus::Reserved,
+            "a rejected cancel leaves the held reservation untouched"
+        );
     }
 
     #[tokio::test]

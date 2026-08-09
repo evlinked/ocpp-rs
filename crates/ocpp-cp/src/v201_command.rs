@@ -85,22 +85,41 @@
 //! cable — mirroring the 1.6J stop-then-unlock. Resolving the target against the
 //! live topology, reading authorization state, and driving the actuator off the
 //! CALL path is the wiring layer's job.
+//!
+//! ## `CancelReservation`
+//!
+//! Ports `ocpp.v201.call.CancelReservation` /
+//! `ocpp.v201.call_result.CancelReservation` — the 2.0.1 successor to the 1.6J
+//! `CancelReservation` the CP already answers on the `V16J` path, and the
+//! teardown counterpart to the v201 `ReserveNow` slice. A CSMS drops a
+//! previously-made reservation by its integer `reservationId`; the station
+//! reports [`Accepted`](CancelReservationStatusEnumType::Accepted) when that id
+//! names a reservation it currently holds (now freed, `Reserved → Available`) or
+//! [`Rejected`](CancelReservationStatusEnumType::Rejected) when the id is unknown
+//! — the reserve/cancel analogue of [`v201_request_stop_status`]'s
+//! member-of-the-live-set decision. Both versions key on the same integer id and
+//! share the same reservation store; only the response status enum differs
+//! (2.0.1's `CancelReservationStatusEnumType` is a clean `Accepted`/`Rejected`
+//! two-way split). Resolving the id against the live reservation store, freeing
+//! the connector, disarming the auto-expiry timer, and announcing `Available` off
+//! the CALL path is the wiring layer's job.
 
 use ocpp_types::common::Reason;
 use ocpp_types::v16j::ResetType;
 use ocpp_types::v201::{
-    ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType, ChargingProfileCriterionType,
-    ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
-    ClearChargingProfileStatusEnumType, ClearChargingProfileType, GetChargingProfileStatusEnumType,
-    MessageTriggerEnumType, OperationalStatusEnumType, RequestStartStopStatusEnumType,
-    ResetEnumType, ResetStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
-    UnlockStatusEnumType,
+    CancelReservationStatusEnumType, ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType,
+    ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
+    ChargingProfileType, ClearChargingProfileStatusEnumType, ClearChargingProfileType,
+    GetChargingProfileStatusEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
+    RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 
 use ocpp_messages::v201::{
-    ChangeAvailabilityResponse, ClearChargingProfileResponse, GetChargingProfilesResponse,
-    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
-    ResetResponse, SetChargingProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
+    CancelReservationResponse, ChangeAvailabilityResponse, ClearChargingProfileResponse,
+    GetChargingProfilesResponse, ReportChargingProfilesRequest, RequestStartTransactionResponse,
+    RequestStopTransactionResponse, ResetResponse, SetChargingProfileResponse,
+    TriggerMessageResponse, UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -912,6 +931,70 @@ pub fn v201_report_charging_profiles_pages(
             custom_data: None,
         })
         .collect()
+}
+
+/// Decide the [`CancelReservationStatusEnumType`] a `V201` station reports for an
+/// inbound `CancelReservation.req`, given the requested `reservationId` and the
+/// ids of every reservation the station currently holds.
+///
+/// Faithful to OCPP 2.0.1 (Part 2, `CancelReservation`) and a direct port of the
+/// 1.6J `CancelReservation` handler's decision in [`crate`]'s `ChargePoint`,
+/// re-expressed against the 2.0.1 [`CancelReservationStatusEnumType`]:
+///
+/// - [`Accepted`](CancelReservationStatusEnumType::Accepted) iff `requested`
+///   equals one of `held_reservation_ids` — the CSMS named a reservation this
+///   station is actually holding, so it can honor the cancel. This mirrors the
+///   1.6J handler's `reservations … remove(&reservationId)` returning `Some`.
+/// - [`Rejected`](CancelReservationStatusEnumType::Rejected) otherwise — an
+///   unknown id, *or* a station holding no reservations at all
+///   (`held_reservation_ids` empty), both fold to "no such reservation to
+///   cancel", exactly as the 1.6J handler folds them into one `None => Rejected`
+///   arm.
+///
+/// The comparison is a plain membership test over `i32` ids, so a negative,
+/// zero, or `i32::MIN` `reservationId` simply fails to match and is `Rejected`,
+/// never indexing or casting and never panicking — a trust boundary on the
+/// CSMS-supplied id. This is the reserve/cancel analogue of
+/// [`v201_request_stop_status`]'s member-of-the-live-set decision;
+/// `CancelReservationStatusEnumType` has exactly `Accepted` / `Rejected` (no
+/// deferred outcome), so — like it — this is a clean two-way split.
+///
+/// This is the *pure* decision, depending only on the requested id and the
+/// station's held-id read — no runtime handles, so it is unit-testable in
+/// isolation. Removing the reservation from the store (atomically, under the same
+/// write-lock the status is read on, so a racing auto-expiry timer cannot make
+/// the verdict and the removal disagree), freeing the connector, disarming the
+/// expiry timer, and announcing `Available` off the CALL path is the wiring
+/// layer's job.
+#[must_use]
+pub fn v201_cancel_reservation_status(
+    requested: i32,
+    held_reservation_ids: &[i32],
+) -> CancelReservationStatusEnumType {
+    if held_reservation_ids.contains(&requested) {
+        CancelReservationStatusEnumType::Accepted
+    } else {
+        // Unknown id or a station holding no reservations — nothing to cancel.
+        CancelReservationStatusEnumType::Rejected
+    }
+}
+
+/// Build a schema-valid `CancelReservation.conf` ([`CancelReservationResponse`]).
+///
+/// Pure constructor mirroring [`v201_request_stop_response`]: carries the decided
+/// [`status`](CancelReservationStatusEnumType) plus the optional 2.0.1
+/// `statusInfo` (a vendor-agnostic `reasonCode` and human-readable detail —
+/// useful, for example, to explain why a cancel was `Rejected`).
+#[must_use]
+pub fn v201_cancel_reservation_response(
+    status: CancelReservationStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> CancelReservationResponse {
+    CancelReservationResponse {
+        status,
+        status_info,
+        custom_data: None,
+    }
 }
 
 #[cfg(test)]
@@ -2353,6 +2436,113 @@ mod tests {
                 "built ReportChargingProfiles page (evse={}) should be schema-valid, got: {payload}",
                 page.evse_id
             );
+        }
+    }
+
+    // --- CancelReservation (v201) ------------------------------------------
+
+    /// A `reservationId` the station currently holds is `Accepted` — whether it
+    /// is the only reservation or one among several.
+    #[test]
+    fn cancel_reservation_accepts_a_held_id() {
+        assert_eq!(
+            v201_cancel_reservation_status(7, &[7]),
+            CancelReservationStatusEnumType::Accepted
+        );
+        assert_eq!(
+            v201_cancel_reservation_status(7, &[1, 7, 42]),
+            CancelReservationStatusEnumType::Accepted,
+            "a held id among several is still Accepted"
+        );
+    }
+
+    /// An id the station is not holding — and an idle station holding nothing —
+    /// both fold to `Rejected` (nothing to cancel), mirroring the 1.6J
+    /// `None => Rejected` arm.
+    #[test]
+    fn cancel_reservation_rejects_an_unknown_id() {
+        assert_eq!(
+            v201_cancel_reservation_status(99, &[1, 7, 42]),
+            CancelReservationStatusEnumType::Rejected,
+            "an id naming no held reservation is Rejected"
+        );
+        assert_eq!(
+            v201_cancel_reservation_status(7, &[]),
+            CancelReservationStatusEnumType::Rejected,
+            "a station holding no reservations Rejects any id"
+        );
+    }
+
+    /// Trust boundary on the CSMS-supplied id: a zero, negative, or `i32::MIN`
+    /// `reservationId` is a plain membership miss — `Rejected`, never a panic,
+    /// index, or cast.
+    #[test]
+    fn cancel_reservation_rejects_structurally_odd_ids_without_panicking() {
+        for requested in [0, -1, i32::MIN] {
+            assert_eq!(
+                v201_cancel_reservation_status(requested, &[1, 2, 3]),
+                CancelReservationStatusEnumType::Rejected,
+                "reservationId {requested} should miss and be Rejected"
+            );
+        }
+        // …and such a value is honored when it genuinely names a held reservation
+        // (the store keys on the raw i32, so no id is structurally excluded).
+        assert_eq!(
+            v201_cancel_reservation_status(i32::MIN, &[i32::MIN]),
+            CancelReservationStatusEnumType::Accepted
+        );
+    }
+
+    #[test]
+    fn cancel_reservation_response_carries_status_and_optional_status_info() {
+        let bare =
+            v201_cancel_reservation_response(CancelReservationStatusEnumType::Accepted, None);
+        assert_eq!(bare.status, CancelReservationStatusEnumType::Accepted);
+        assert!(bare.status_info.is_none());
+
+        let info = StatusInfoType {
+            reason_code: "NoReservation".to_string(),
+            additional_info: Some("no reservation with that id is held".to_string()),
+            custom_data: None,
+        };
+        let rejected =
+            v201_cancel_reservation_response(CancelReservationStatusEnumType::Rejected, Some(info));
+        assert_eq!(rejected.status, CancelReservationStatusEnumType::Rejected);
+        assert_eq!(
+            rejected
+                .status_info
+                .as_ref()
+                .map(|i| i.reason_code.as_str()),
+            Some("NoReservation")
+        );
+    }
+
+    /// Wire fidelity: every built `CancelReservation.conf` — with and without
+    /// `statusInfo`, across both status values — satisfies the bundled OCPP 2.0.1
+    /// `CancelReservationResponse` JSON Schema, the same guarantee the CP's
+    /// version-aware validator gives on the live path.
+    #[test]
+    fn built_cancel_reservation_responses_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        let info = StatusInfoType {
+            reason_code: "NoReservation".to_string(),
+            additional_info: Some("no reservation with that id is held".to_string()),
+            custom_data: None,
+        };
+        for status in [
+            CancelReservationStatusEnumType::Accepted,
+            CancelReservationStatusEnumType::Rejected,
+        ] {
+            for status_info in [None, Some(info.clone())] {
+                let resp = v201_cancel_reservation_response(status, status_info);
+                let payload = serde_json::to_value(&resp).unwrap();
+                assert!(
+                    validator
+                        .validate_call_result("CancelReservation", &payload)
+                        .is_ok(),
+                    "built {status:?} CancelReservationResponse should be schema-valid, got: {payload}"
+                );
+            }
         }
     }
 }
