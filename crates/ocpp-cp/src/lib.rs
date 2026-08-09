@@ -75,6 +75,7 @@ use v201_device_model::V201DeviceModel;
 // above (`StatusNotificationRequest`, `RegistrationStatus`).
 use ocpp_messages::v201::{
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
+    ClearChargingProfileRequest as V201ClearChargingProfileRequest,
     GetBaseReportRequest as V201GetBaseReportRequest,
     GetBaseReportResponse as V201GetBaseReportResponse,
     GetVariablesRequest as V201GetVariablesRequest,
@@ -2514,26 +2515,69 @@ impl ChargePoint {
             }
         }
 
-        // ClearChargingProfile — clear installed profiles matching the optional
-        // filters (`id`, `connectorId`, `chargingProfilePurpose`, `stackLevel`);
-        // a `None` filter matches anything, so an all-`None` request clears the
-        // whole store (§5.2). `Accepted` if at least one profile matched, else
-        // `Unknown`. Ports `ClearChargingProfile` from the Python reference's
+        // ClearChargingProfile — the teardown counterpart to SetChargingProfile:
+        // the CSMS removes installed charging profiles matching an optional
+        // selector, mid-session, without ending the transaction. `Accepted` if at
+        // least one profile matched, else `Unknown`. The two protocol versions
+        // carry different selector shapes and target different stores, so the
+        // registration is version-gated exactly like SetChargingProfile above.
+        // Ports `ClearChargingProfile` from the Python reference's
         // `call.py`/`enums.py`.
-        {
-            let charging_profiles = charging_profiles.clone();
-            d.on(move |req: ClearChargingProfileRequest| {
+        match protocol_version {
+            // OCPP 1.6J §5.3 — clear against the 1.6J `ChargingProfileStore` by
+            // the optional filters (`id`, `connectorId`, `chargingProfilePurpose`,
+            // `stackLevel`); a `None` filter matches anything, so an all-`None`
+            // request clears the whole store. Unchanged from the pre-version-gate
+            // behavior.
+            OcppVersion::V16J => {
                 let charging_profiles = charging_profiles.clone();
-                async move {
-                    let status = charging_profiles.clear(
-                        req.id,
-                        req.connector_id,
-                        req.charging_profile_purpose,
-                        req.stack_level,
-                    );
-                    Ok(ClearChargingProfileResponse { status })
-                }
-            });
+                d.on(move |req: ClearChargingProfileRequest| {
+                    let charging_profiles = charging_profiles.clone();
+                    async move {
+                        let status = charging_profiles.clear(
+                            req.id,
+                            req.connector_id,
+                            req.charging_profile_purpose,
+                            req.stack_level,
+                        );
+                        Ok(ClearChargingProfileResponse { status })
+                    }
+                });
+            }
+            // OCPP 2.0.1 (Part 2, `ClearChargingProfile`) — the inverse of the
+            // V201 `SetChargingProfile` arm above: resolve the request's selector
+            // against the `v201_tx_profiles` store and remove every matching
+            // slot, so the next periodic `TransactionEvent(Updated)` metering
+            // reading reports the unbounded power. The pure match decision +
+            // response builder live in `v201_command` (#474); this is the runtime
+            // wiring. `chargingProfileId` selects exclusively; otherwise the
+            // `evseId`/`chargingProfilePurpose`/`stackLevel` criteria filter, and
+            // an empty request clears every installed profile.
+            OcppVersion::V201 => {
+                let v201_tx_profiles = v201_tx_profiles.clone();
+                d.on(move |req: V201ClearChargingProfileRequest| {
+                    let v201_tx_profiles = v201_tx_profiles.clone();
+                    async move {
+                        // Snapshot off the store lock, decide, then remove the
+                        // matched EVSE slots. In the simulator the CSMS's CALLs
+                        // are serialized through the single dispatcher, so no
+                        // profile can be swapped underneath the snapshot→clear
+                        // gap.
+                        let installed = v201_tx_profiles.snapshot().await;
+                        let matches = v201_command::v201_clear_charging_profile_matches(
+                            req.charging_profile_id,
+                            req.charging_profile_criteria.as_ref(),
+                            &installed,
+                        );
+                        for evse_id in &matches {
+                            v201_tx_profiles.clear(*evse_id).await;
+                        }
+                        Ok(v201_command::v201_clear_charging_profile_response(
+                            !matches.is_empty(),
+                        ))
+                    }
+                });
+            }
         }
 
         // GetCompositeSchedule — report the effective charging schedule for a

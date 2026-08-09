@@ -76,6 +76,25 @@ impl V201TxProfileStore {
     pub async fn clear(&self, evse_id: i32) -> Option<ChargingProfileType> {
         self.by_evse.write().await.remove(&evse_id)
     }
+
+    /// A cloned `(evse_id, profile)` snapshot of every installed profile.
+    ///
+    /// The read a `ClearChargingProfile` needs: its selector is resolved against
+    /// the store's *current* contents by a pure decision that must see each
+    /// installed slot's EVSE key alongside the profile's `id` /
+    /// `chargingProfilePurpose` / `stackLevel`. Returning an owned snapshot lets
+    /// that matching run without holding the store lock, so the subsequent
+    /// per-EVSE [`clear`](Self::clear) removals take the write lock cleanly. The
+    /// order is unspecified (it is a `HashMap` walk); callers key off `evse_id`,
+    /// never position.
+    pub async fn snapshot(&self) -> Vec<(i32, ChargingProfileType)> {
+        self.by_evse
+            .read()
+            .await
+            .iter()
+            .map(|(evse_id, profile)| (*evse_id, profile.clone()))
+            .collect()
+    }
 }
 
 /// Parse an optional RFC 3339 timestamp field (`validFrom`, `validTo`,
@@ -405,6 +424,35 @@ mod tests {
             store.clear(3).await,
             None,
             "clearing an empty EVSE is a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_reflects_every_installed_profile_by_evse() {
+        let store = V201TxProfileStore::new();
+        assert!(
+            store.snapshot().await.is_empty(),
+            "an empty store snapshots to nothing"
+        );
+
+        let p1 = tx_profile(10, 11_000.0);
+        let p2 = tx_profile(20, 7_400.0);
+        store.install(1, p1.clone()).await;
+        store.install(2, p2.clone()).await;
+
+        // Order is a HashMap walk, so sort by EVSE key before comparing.
+        let mut snap = store.snapshot().await;
+        snap.sort_by_key(|(evse_id, _)| *evse_id);
+        assert_eq!(snap, vec![(1, p1), (2, p2)]);
+
+        // The snapshot is a detached clone: clearing the store afterward does not
+        // mutate an already-taken snapshot.
+        let taken = store.snapshot().await;
+        store.clear(1).await;
+        assert_eq!(
+            taken.len(),
+            2,
+            "a taken snapshot is independent of the store"
         );
     }
 
