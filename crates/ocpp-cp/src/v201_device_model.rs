@@ -413,7 +413,7 @@ impl V201DeviceModel {
     ///
     /// - **`component_variable`** narrows to specific component-variables. Each
     ///   entry matches case-insensitively on component/variable name + instance
-    ///   and exactly on EVSE id (the same [`ComponentKey`]/[`VariableKey`]
+    ///   and exactly on EVSE id (the same `ComponentKey`/`VariableKey`
     ///   normalization `GetVariables`/`SetVariables` use). An entry whose
     ///   `variable` is `None` matches the *whole component* (every variable
     ///   under it). A variable is kept if it matches **any** filter entry.
