@@ -36,9 +36,9 @@
 //! requires.
 
 use ocpp_types::v201::{
-    AttributeEnumType, ComponentType, GetVariableStatusEnumType, MutabilityEnumType,
-    ReportBaseEnumType, ReportDataType, SetVariableStatusEnumType, VariableAttributeType,
-    VariableType,
+    AttributeEnumType, ComponentCriterionEnumType, ComponentType, ComponentVariableType,
+    GetVariableStatusEnumType, MutabilityEnumType, ReportBaseEnumType, ReportDataType,
+    SetVariableStatusEnumType, VariableAttributeType, VariableType,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -394,34 +394,139 @@ impl V201DeviceModel {
                 // a new report base is a compile error to triage here.
                 ReportBaseEnumType::SummaryInventory => false,
             })
-            .map(|entry| {
-                let mutability = if entry.policy.read_only {
-                    MutabilityEnumType::ReadOnly
-                } else {
-                    MutabilityEnumType::ReadWrite
-                };
-                let variable_attribute = entry
-                    .attributes
-                    .iter()
-                    .map(|(kind, value)| VariableAttributeType {
-                        kind: Some(*kind),
-                        value: Some(value.clone()),
-                        mutability: Some(mutability),
-                        persistent: None,
-                        constant: None,
-                        custom_data: None,
-                    })
-                    .collect();
-                ReportDataType {
-                    component: entry.component.clone(),
-                    variable: entry.variable.clone(),
-                    variable_attribute,
-                    variable_characteristics: None,
-                    custom_data: None,
-                }
+            .map(Self::entry_to_report_data)
+            .collect();
+        Self::sort_report(&mut report);
+        report
+    }
+
+    /// Enumerate the device model as `NotifyReport` [`ReportDataType`] entries,
+    /// *filtered* by the `GetReport` selectors instead of a coarse
+    /// [`ReportBaseEnumType`].
+    ///
+    /// This is the pure data half of the `GetReport` → `NotifyReport` seam
+    /// (`ocpp.v201.call.GetReport`), the selection variant of
+    /// [`report`](Self::report): the handler acks `GetReport` and then streams
+    /// whatever this returns. Both filters are optional and AND together; an
+    /// absent or empty filter does not narrow on that axis (so both absent =
+    /// every reportable variable, matching `FullInventory`):
+    ///
+    /// - **`component_variable`** narrows to specific component-variables. Each
+    ///   entry matches case-insensitively on component/variable name + instance
+    ///   and exactly on EVSE id (the same [`ComponentKey`]/[`VariableKey`]
+    ///   normalization `GetVariables`/`SetVariables` use). An entry whose
+    ///   `variable` is `None` matches the *whole component* (every variable
+    ///   under it). A variable is kept if it matches **any** filter entry.
+    /// - **`component_criteria`** narrows by component state
+    ///   (`Active`/`Available`/`Enabled`/`Problem`). The seeded profile models a
+    ///   **healthy** station — every reportable variable is `Active`,
+    ///   `Available`, and `Enabled`, and none is in a `Problem` state — so a
+    ///   variable is reported iff it satisfies **all** requested criteria. That
+    ///   makes the criterion filter uniform across variables here: any list
+    ///   containing `Problem` matches nothing (→ `EmptyResultSet` at the
+    ///   handler), any other list admits every variable. Per-variable
+    ///   `Problem`/`Disabled`/`Unavailable` state is a later slice; the pure
+    ///   decision below is already shaped to grow into it.
+    ///
+    /// The result is deterministically ordered, exactly as
+    /// [`report`](Self::report) — see its ordering note.
+    pub fn report_filtered(
+        &self,
+        component_variable: Option<&[ComponentVariableType]>,
+        component_criteria: Option<&[ComponentCriterionEnumType]>,
+    ) -> Vec<ReportDataType> {
+        // Criteria gate first. On the healthy seed the criteria filter is
+        // uniform (see the doc comment), so a list the healthy state fails to
+        // satisfy (i.e. one requesting `Problem`) short-circuits to empty
+        // without scanning the store.
+        if let Some(criteria) = component_criteria {
+            if !criteria.is_empty() && !Self::healthy_state_matches_criteria(criteria) {
+                return Vec::new();
+            }
+        }
+        // An empty `component_variable` list is treated as "no such filter" —
+        // the schema requires at least one item when the field is present, so
+        // this is defensive, not a spec path.
+        let variable_filter = component_variable.filter(|filters| !filters.is_empty());
+        let mut report: Vec<ReportDataType> = self
+            .variables
+            .iter()
+            .filter(|(key, _)| match variable_filter {
+                None => true,
+                Some(filters) => Self::variable_matches_filter(key, filters),
+            })
+            .map(|(_, entry)| Self::entry_to_report_data(entry))
+            .collect();
+        Self::sort_report(&mut report);
+        report
+    }
+
+    /// Whether a stored variable (addressed by `key`) matches **any** entry of a
+    /// `GetReport` `componentVariable` filter. A filter entry with no `variable`
+    /// matches the whole component; one with a `variable` matches that exact
+    /// component-variable. Matching reuses the case-insensitive
+    /// [`ComponentKey`]/[`VariableKey`] normalization, so `EVSE`/`evse` and
+    /// `OCPPCommCtrlr`/`ocppcommctrlr` are the same identity as they are for
+    /// `GetVariables`.
+    fn variable_matches_filter(key: &VariableKey, filters: &[ComponentVariableType]) -> bool {
+        filters.iter().any(|cv| match &cv.variable {
+            None => key.component == ComponentKey::from_request(&cv.component),
+            Some(variable) => *key == VariableKey::from_request(&cv.component, variable),
+        })
+    }
+
+    /// Whether the seeded (healthy) component state satisfies **all** requested
+    /// `componentCriteria`. Every reportable variable in the standard profile is
+    /// `Active`, `Available`, and `Enabled`, and none is in a `Problem` state,
+    /// so those three criteria always hold and `Problem` never does. The match
+    /// is exhaustive without a wildcard, so a new criterion is a compile error
+    /// to triage here.
+    fn healthy_state_matches_criteria(criteria: &[ComponentCriterionEnumType]) -> bool {
+        criteria.iter().all(|c| match c {
+            ComponentCriterionEnumType::Active
+            | ComponentCriterionEnumType::Available
+            | ComponentCriterionEnumType::Enabled => true,
+            ComponentCriterionEnumType::Problem => false,
+        })
+    }
+
+    /// Render one stored variable entry as a `NotifyReport` [`ReportDataType`],
+    /// in its display (CSMS-visible) casing, with one [`VariableAttributeType`]
+    /// per stored attribute carrying the value and the mutability derived from
+    /// the write policy. Shared by [`report`](Self::report) and
+    /// [`report_filtered`](Self::report_filtered).
+    fn entry_to_report_data(entry: &VariableEntry) -> ReportDataType {
+        let mutability = if entry.policy.read_only {
+            MutabilityEnumType::ReadOnly
+        } else {
+            MutabilityEnumType::ReadWrite
+        };
+        let variable_attribute = entry
+            .attributes
+            .iter()
+            .map(|(kind, value)| VariableAttributeType {
+                kind: Some(*kind),
+                value: Some(value.clone()),
+                mutability: Some(mutability),
+                persistent: None,
+                constant: None,
+                custom_data: None,
             })
             .collect();
-        // Stable, reviewable order independent of HashMap iteration.
+        ReportDataType {
+            component: entry.component.clone(),
+            variable: entry.variable.clone(),
+            variable_attribute,
+            variable_characteristics: None,
+            custom_data: None,
+        }
+    }
+
+    /// Impose a stable, reviewable order on a report — sorted by component name
+    /// / instance / EVSE then variable name / instance — independent of the
+    /// backing `HashMap`'s iteration order, so callers and tests see a
+    /// deterministic result.
+    fn sort_report(report: &mut [ReportDataType]) {
         report.sort_by(|a, b| {
             (
                 &a.component.name,
@@ -438,7 +543,6 @@ impl V201DeviceModel {
                     &b.variable.instance,
                 ))
         });
-        report
     }
 }
 
@@ -790,6 +894,246 @@ mod tests {
         assert_eq!(
             heartbeat.variable_attribute[0].value.as_deref(),
             Some("600")
+        );
+    }
+
+    // --- report_filtered (GetReport selection) -----------------------------
+
+    /// A `componentVariable` filter entry: a component, optionally narrowed to a
+    /// single variable.
+    fn component_variable(component: &str, variable: Option<&str>) -> ComponentVariableType {
+        ComponentVariableType {
+            component: ComponentType {
+                name: component.to_string(),
+                instance: None,
+                evse: None,
+                custom_data: None,
+            },
+            variable: variable.map(|v| VariableType {
+                name: v.to_string(),
+                instance: None,
+                custom_data: None,
+            }),
+            custom_data: None,
+        }
+    }
+
+    /// How many `FullInventory` rows belong to a given component — the expected
+    /// size of a whole-component `componentVariable` narrowing.
+    fn full_inventory_component_count(model: &V201DeviceModel, component: &str) -> usize {
+        model
+            .report(ReportBaseEnumType::FullInventory)
+            .iter()
+            .filter(|d| d.component.name == component)
+            .count()
+    }
+
+    #[test]
+    fn report_filtered_no_filters_matches_full_inventory() {
+        // Both selectors absent = no narrowing on either axis = FullInventory.
+        let model = V201DeviceModel::with_standard_profile();
+        assert_eq!(
+            model.report_filtered(None, None),
+            model.report(ReportBaseEnumType::FullInventory),
+            "an unfiltered GetReport reports the whole inventory, in the same order"
+        );
+    }
+
+    #[test]
+    fn report_filtered_empty_lists_do_not_narrow() {
+        // Defensive: an empty (rather than absent) list is treated as "no such
+        // filter" — the schema requires ≥1 item when the field is present.
+        let model = V201DeviceModel::with_standard_profile();
+        let full = model.report(ReportBaseEnumType::FullInventory);
+        assert_eq!(model.report_filtered(Some(&[]), None), full);
+        assert_eq!(model.report_filtered(None, Some(&[])), full);
+    }
+
+    #[test]
+    fn report_filtered_narrows_to_a_named_component() {
+        // A whole-component filter (no `variable`) returns exactly that
+        // component's variables — every row, and only those.
+        let model = V201DeviceModel::with_standard_profile();
+        let filter = [component_variable("OCPPCommCtrlr", None)];
+        let report = model.report_filtered(Some(&filter), None);
+
+        assert!(!report.is_empty());
+        assert!(
+            report.iter().all(|d| d.component.name == "OCPPCommCtrlr"),
+            "a component filter admits only that component's variables"
+        );
+        assert_eq!(
+            report.len(),
+            full_inventory_component_count(&model, "OCPPCommCtrlr"),
+            "a whole-component filter returns every variable under it"
+        );
+        assert!(find(&report, "OCPPCommCtrlr", "HeartbeatInterval").is_some());
+    }
+
+    #[test]
+    fn report_filtered_narrows_to_a_single_variable() {
+        // A component+variable filter returns exactly that one row.
+        let model = V201DeviceModel::with_standard_profile();
+        let filter = [component_variable(
+            "OCPPCommCtrlr",
+            Some("HeartbeatInterval"),
+        )];
+        let report = model.report_filtered(Some(&filter), None);
+
+        assert_eq!(
+            report.len(),
+            1,
+            "a single component-variable selects one row"
+        );
+        assert_eq!(report[0].component.name, "OCPPCommCtrlr");
+        assert_eq!(report[0].variable.name, "HeartbeatInterval");
+    }
+
+    #[test]
+    fn report_filtered_matches_any_of_several_entries() {
+        // Filter entries OR together: two components → both components' rows.
+        let model = V201DeviceModel::with_standard_profile();
+        let filter = [
+            component_variable("OCPPCommCtrlr", Some("HeartbeatInterval")),
+            component_variable("SecurityCtrlr", Some("OrganizationName")),
+        ];
+        let report = model.report_filtered(Some(&filter), None);
+
+        assert_eq!(report.len(), 2);
+        assert!(find(&report, "OCPPCommCtrlr", "HeartbeatInterval").is_some());
+        assert!(find(&report, "SecurityCtrlr", "OrganizationName").is_some());
+    }
+
+    #[test]
+    fn report_filtered_unknown_component_is_empty() {
+        // A component the flat seed does not hold matches nothing → the handler
+        // maps this to EmptyResultSet. (Trust boundary: arbitrary wire text
+        // never panics, it simply misses.)
+        let model = V201DeviceModel::with_standard_profile();
+        let filter = [component_variable("NoSuchController", None)];
+        assert!(model.report_filtered(Some(&filter), None).is_empty());
+    }
+
+    #[test]
+    fn report_filtered_evse_scoped_component_misses_the_station_wide_seed() {
+        // The seed is station-wide (no EVSE); an EVSE-scoped filter matches
+        // nothing, because EVSE ids are compared exactly.
+        let model = V201DeviceModel::with_standard_profile();
+        let mut cv = component_variable("OCPPCommCtrlr", Some("HeartbeatInterval"));
+        cv.component.evse = Some(EvseType {
+            id: 1,
+            connector_id: None,
+            custom_data: None,
+        });
+        assert!(model.report_filtered(Some(&[cv]), None).is_empty());
+    }
+
+    #[test]
+    fn report_filtered_matches_case_insensitively() {
+        // Names/instances are case-insensitive (same normalization as
+        // GetVariables), so lowercased identities still resolve.
+        let model = V201DeviceModel::with_standard_profile();
+        let filter = [component_variable(
+            "ocppcommctrlr",
+            Some("heartbeatinterval"),
+        )];
+        let report = model.report_filtered(Some(&filter), None);
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].variable.name, "HeartbeatInterval");
+    }
+
+    #[test]
+    fn report_filtered_criteria_active_admits_all() {
+        // On the healthy seed every reportable variable is Active, so [Active]
+        // narrows nothing.
+        let model = V201DeviceModel::with_standard_profile();
+        assert_eq!(
+            model.report_filtered(None, Some(&[ComponentCriterionEnumType::Active])),
+            model.report(ReportBaseEnumType::FullInventory),
+        );
+    }
+
+    #[test]
+    fn report_filtered_criteria_problem_is_empty() {
+        // No seeded variable is in a Problem state → [Problem] matches nothing.
+        let model = V201DeviceModel::with_standard_profile();
+        assert!(model
+            .report_filtered(None, Some(&[ComponentCriterionEnumType::Problem]))
+            .is_empty());
+    }
+
+    #[test]
+    fn report_filtered_criteria_are_conjunctive() {
+        // Criteria AND together: a list containing Problem fails even though
+        // Active holds, so [Active, Problem] → empty on a healthy station.
+        let model = V201DeviceModel::with_standard_profile();
+        assert!(model
+            .report_filtered(
+                None,
+                Some(&[
+                    ComponentCriterionEnumType::Active,
+                    ComponentCriterionEnumType::Problem,
+                ]),
+            )
+            .is_empty());
+        // Available + Enabled both hold → admits everything.
+        assert_eq!(
+            model.report_filtered(
+                None,
+                Some(&[
+                    ComponentCriterionEnumType::Available,
+                    ComponentCriterionEnumType::Enabled,
+                ]),
+            ),
+            model.report(ReportBaseEnumType::FullInventory),
+        );
+    }
+
+    #[test]
+    fn report_filtered_combines_component_and_criteria() {
+        // The two selectors AND: a component narrowing that still satisfies the
+        // criteria returns that component's rows; the same narrowing with a
+        // Problem criterion returns nothing.
+        let model = V201DeviceModel::with_standard_profile();
+        let filter = [component_variable("OCPPCommCtrlr", None)];
+
+        let admitted =
+            model.report_filtered(Some(&filter), Some(&[ComponentCriterionEnumType::Active]));
+        assert_eq!(
+            admitted.len(),
+            full_inventory_component_count(&model, "OCPPCommCtrlr"),
+        );
+        assert!(admitted.iter().all(|d| d.component.name == "OCPPCommCtrlr"));
+
+        assert!(
+            model
+                .report_filtered(Some(&filter), Some(&[ComponentCriterionEnumType::Problem]))
+                .is_empty(),
+            "a Problem criterion empties even a matching component narrowing"
+        );
+    }
+
+    #[test]
+    fn report_filtered_is_deterministically_ordered() {
+        // A filtered report is stable and sorted, exactly like report().
+        let model = V201DeviceModel::with_standard_profile();
+        let filter = [
+            component_variable("SecurityCtrlr", None),
+            component_variable("OCPPCommCtrlr", None),
+        ];
+        let first = model.report_filtered(Some(&filter), None);
+        let second = model.report_filtered(Some(&filter), None);
+        assert_eq!(first, second, "filtered report ordering is stable");
+
+        let keys: Vec<(&str, &str)> = first
+            .iter()
+            .map(|d| (d.component.name.as_str(), d.variable.name.as_str()))
+            .collect();
+        let mut sorted = keys.clone();
+        sorted.sort_unstable();
+        assert_eq!(
+            keys, sorted,
+            "filtered report is sorted by component then variable"
         );
     }
 }

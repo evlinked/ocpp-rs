@@ -84,6 +84,7 @@ use ocpp_messages::v201::{
     GetChargingProfilesRequest as V201GetChargingProfilesRequest,
     GetCompositeScheduleRequest as V201GetCompositeScheduleRequest,
     GetCompositeScheduleResponse as V201GetCompositeScheduleResponse,
+    GetReportRequest as V201GetReportRequest, GetReportResponse as V201GetReportResponse,
     GetVariablesRequest as V201GetVariablesRequest,
     GetVariablesResponse as V201GetVariablesResponse, MeterValuesRequest as V201MeterValuesRequest,
     NotifyReportRequest as V201NotifyReportRequest,
@@ -1561,6 +1562,76 @@ impl ChargePoint {
                         GenericDeviceModelStatusEnumType::Rejected
                     };
                     Ok(V201GetBaseReportResponse {
+                        status,
+                        status_info: None,
+                        custom_data: None,
+                    })
+                }
+            });
+        }
+
+        // GetReport (OCPP 2.0.1 only) — the *filtered* sibling of GetBaseReport
+        // over the same `V201DeviceModel`, completing the device-model report
+        // family (#486). It shares GetBaseReport's two-part seam exactly: the
+        // station acknowledges here with a `GenericDeviceModelStatusEnumType`,
+        // then streams the actual inventory asynchronously as `NotifyReport`
+        // CALL(s) correlated by `requestId` — reusing the *same*
+        // `RemoteCommand::V201NotifyReport` command and off-CALL-path queueing.
+        // It differs from GetBaseReport only in *selection*: instead of a coarse
+        // `reportBase` enum, the station filters its device-model inventory by an
+        // optional `componentVariable[]` (specific component-variables) and/or an
+        // optional `componentCriteria[]` (`Active`/`Available`/`Enabled`/`Problem`).
+        //
+        // The filtered snapshot is computed here under the model's *read* lock —
+        // via the pure `report_filtered`, which owns the selection semantics — so
+        // the queued side effect carries owned data and touches no shared state
+        // when it runs. Status mirrors GetBaseReport:
+        // - a non-empty filtered report → `Accepted`, and a `V201NotifyReport` is
+        //   queued (sent after this CALLRESULT is flushed, off the inbound-CALL
+        //   path);
+        // - request understood but nothing matched the filter (e.g.
+        //   `componentCriteria = [Problem]` on a healthy simulator, or a
+        //   `componentVariable` naming an unknown/EVSE-scoped component the flat
+        //   seed does not hold) → `EmptyResultSet`, and nothing is queued;
+        // - the command consumer has gone away (CP shutting down) → `Rejected`
+        //   rather than promise a `NotifyReport` that will never arrive.
+        //
+        // Trust boundary: the request carries only a numeric `requestId`, an
+        // optional schema-bounded `componentCriteria[]` enum list, and a
+        // schema-bounded `componentVariable[]` — nothing is parsed into an index
+        // or unwrapped, so malformed/unknown criteria are rejected upstream by
+        // `SchemaValidator::v201()` and nothing here panics on wire input.
+        // Registered on the V201 arm only; "GetReport" has no 1.6J twin. Ports
+        // `ocpp.v201.call.GetReport` → `ocpp.v201.call.NotifyReport`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let device_model = v201_device_model.clone();
+            let command_sender = command_sender.clone();
+            d.on(move |req: V201GetReportRequest| {
+                let device_model = device_model.clone();
+                let command_sender = command_sender.clone();
+                async move {
+                    let report_data = device_model.read().await.report_filtered(
+                        req.component_variable.as_deref(),
+                        req.component_criteria.as_deref(),
+                    );
+                    let status = if report_data.is_empty() {
+                        // Understood, but nothing matched the filter — a
+                        // legitimate outcome. No NotifyReport follows.
+                        GenericDeviceModelStatusEnumType::EmptyResultSet
+                    } else if command_sender
+                        .send(RemoteCommand::V201NotifyReport {
+                            request_id: req.request_id,
+                            report_data,
+                        })
+                        .is_ok()
+                    {
+                        GenericDeviceModelStatusEnumType::Accepted
+                    } else {
+                        // Consumer gone: we cannot stream the report, so don't
+                        // claim we will.
+                        GenericDeviceModelStatusEnumType::Rejected
+                    };
+                    Ok(V201GetReportResponse {
                         status,
                         status_info: None,
                         custom_data: None,
@@ -6440,6 +6511,224 @@ mod tests {
             ChargePointStatus::Reserved,
             "a rejected cancel leaves the held reservation untouched"
         );
+    }
+
+    // --- GetReport (OCPP 2.0.1, #486) --------------------------------------
+
+    fn make_v201_get_report(
+        request_id: i32,
+        component_variable: Option<Vec<ocpp_types::v201::ComponentVariableType>>,
+        component_criteria: Option<Vec<ocpp_types::v201::ComponentCriterionEnumType>>,
+    ) -> CallMessage {
+        make_call(V201GetReportRequest {
+            component_variable,
+            request_id,
+            component_criteria,
+            custom_data: None,
+        })
+    }
+
+    /// A single-variable `componentVariable` filter entry.
+    fn v201_component_variable(
+        component: &str,
+        variable: &str,
+    ) -> ocpp_types::v201::ComponentVariableType {
+        ocpp_types::v201::ComponentVariableType {
+            component: ocpp_types::v201::ComponentType {
+                name: component.to_string(),
+                instance: None,
+                evse: None,
+                custom_data: None,
+            },
+            variable: Some(ocpp_types::v201::VariableType {
+                name: variable.to_string(),
+                instance: None,
+                custom_data: None,
+            }),
+            custom_data: None,
+        }
+    }
+
+    /// Drain whatever the inbound-CALL handlers queued on the command channel.
+    /// Takes the (single) receiver the way `connect()` would — fine in a test
+    /// that never connects — and non-blockingly pulls every ready command.
+    async fn v201_drain_commands(cp: &ChargePoint) -> Vec<RemoteCommand> {
+        let mut rx = cp
+            .command_receiver
+            .write()
+            .await
+            .take()
+            .expect("a freshly-built CP still owns its command receiver");
+        let mut commands = Vec::new();
+        while let Ok(command) = rx.try_recv() {
+            commands.push(command);
+        }
+        commands
+    }
+
+    #[tokio::test]
+    async fn v201_get_report_accepts_and_queues_a_notify_report() {
+        // An unfiltered GetReport on a V201 CP is Accepted and queues exactly one
+        // NotifyReport carrying the (non-empty) inventory, correlated by
+        // requestId — the same two-part seam as GetBaseReport.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_report(501, None, None)))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: V201GetReportResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, GenericDeviceModelStatusEnumType::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(
+            commands.len(),
+            1,
+            "an accepted GetReport queues one NotifyReport"
+        );
+        match &commands[0] {
+            RemoteCommand::V201NotifyReport {
+                request_id,
+                report_data,
+            } => {
+                assert_eq!(*request_id, 501, "the report is correlated by requestId");
+                assert!(
+                    !report_data.is_empty(),
+                    "the queued report carries the inventory"
+                );
+            }
+            other => panic!("expected a queued V201NotifyReport, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_get_report_empty_result_set_queues_nothing() {
+        // componentCriteria = [Problem] matches nothing on a healthy simulator →
+        // EmptyResultSet, and no NotifyReport is queued (nothing to stream).
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_report(
+                502,
+                None,
+                Some(vec![ocpp_types::v201::ComponentCriterionEnumType::Problem]),
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: V201GetReportResponse = r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    GenericDeviceModelStatusEnumType::EmptyResultSet
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert!(
+            v201_drain_commands(&cp).await.is_empty(),
+            "an EmptyResultSet GetReport queues no NotifyReport"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_get_report_narrows_to_the_requested_variable() {
+        // A componentVariable filter narrows the queued report to exactly the
+        // requested component-variable row.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let filter = vec![v201_component_variable(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+        )];
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_report(503, Some(filter), None)))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: V201GetReportResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, GenericDeviceModelStatusEnumType::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            RemoteCommand::V201NotifyReport { report_data, .. } => {
+                assert_eq!(report_data.len(), 1, "the filter selects a single row");
+                assert_eq!(report_data[0].component.name, "OCPPCommCtrlr");
+                assert_eq!(report_data[0].variable.name, "HeartbeatInterval");
+            }
+            other => panic!("expected a queued V201NotifyReport, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_get_report_rejects_when_the_consumer_is_gone() {
+        // If the command consumer has gone away (CP shutting down), an otherwise
+        // non-empty report cannot be streamed, so the station answers Rejected
+        // rather than promise a NotifyReport that never arrives.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // Drop the single receiver, closing the channel so every send() fails.
+        drop(cp.command_receiver.write().await.take());
+
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_report(504, None, None)))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: V201GetReportResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, GenericDeviceModelStatusEnumType::Rejected);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v201_get_report_payloads_are_schema_valid() {
+        // Draft-06 schema validity of the request (with both filters) and every
+        // response status, independent of the dispatcher's own validation.
+        let validator = SchemaValidator::v201();
+        let req = V201GetReportRequest {
+            component_variable: Some(vec![v201_component_variable(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+            )]),
+            request_id: 7,
+            component_criteria: Some(vec![
+                ocpp_types::v201::ComponentCriterionEnumType::Active,
+                ocpp_types::v201::ComponentCriterionEnumType::Available,
+            ]),
+            custom_data: None,
+        };
+        validator
+            .validate_call("GetReport", &serde_json::to_value(&req).unwrap())
+            .expect("GetReport request is schema-valid");
+
+        for status in [
+            GenericDeviceModelStatusEnumType::Accepted,
+            GenericDeviceModelStatusEnumType::Rejected,
+            GenericDeviceModelStatusEnumType::NotSupported,
+            GenericDeviceModelStatusEnumType::EmptyResultSet,
+        ] {
+            let resp = V201GetReportResponse {
+                status,
+                status_info: Some(StatusInfoType {
+                    reason_code: "NoData".to_string(),
+                    additional_info: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            validator
+                .validate_call_result("GetReport", &serde_json::to_value(&resp).unwrap())
+                .expect("GetReport response is schema-valid");
+        }
     }
 
     #[tokio::test]
