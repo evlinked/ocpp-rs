@@ -84,6 +84,8 @@ use ocpp_messages::v201::{
     GetChargingProfilesRequest as V201GetChargingProfilesRequest,
     GetCompositeScheduleRequest as V201GetCompositeScheduleRequest,
     GetCompositeScheduleResponse as V201GetCompositeScheduleResponse,
+    GetLocalListVersionRequest as V201GetLocalListVersionRequest,
+    GetLocalListVersionResponse as V201GetLocalListVersionResponse,
     GetReportRequest as V201GetReportRequest, GetReportResponse as V201GetReportResponse,
     GetVariablesRequest as V201GetVariablesRequest,
     GetVariablesResponse as V201GetVariablesResponse, MeterValuesRequest as V201MeterValuesRequest,
@@ -91,6 +93,8 @@ use ocpp_messages::v201::{
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     RequestStopTransactionRequest as V201RequestStopTransactionRequest,
     ReserveNowRequest as V201ReserveNowRequest, ResetRequest as V201ResetRequest,
+    SendLocalListRequest as V201SendLocalListRequest,
+    SendLocalListResponse as V201SendLocalListResponse,
     SetChargingProfileRequest as V201SetChargingProfileRequest,
     SetVariablesRequest as V201SetVariablesRequest,
     SetVariablesResponse as V201SetVariablesResponse,
@@ -3170,34 +3174,84 @@ impl ChargePoint {
         }
 
         // GetLocalListVersion — report the version of the Local Authorization
-        // List (OCPP 1.6J §5.x, Issue #93). `0` for an empty list; the CP never
-        // returns `-1` because it implements the profile.
-        {
-            let local_list = local_list.clone();
-            d.on(move |_req: GetLocalListVersionRequest| {
+        // List. Both dialects read the same shared version counter but carry
+        // different response shapes (1.6J `listVersion` vs 2.0.1 `versionNumber`
+        // + optional `customData`), so — like SendLocalList below and
+        // CancelReservation above — exactly one handler is registered per
+        // `protocol_version`. `0` for an empty list; the CP never returns `-1`
+        // because it implements the profile.
+        match protocol_version {
+            // OCPP 1.6J §5.x (Issue #93). Unchanged from the pre-version-gate
+            // behavior.
+            OcppVersion::V16J => {
                 let local_list = local_list.clone();
-                async move {
-                    Ok(GetLocalListVersionResponse {
-                        list_version: local_list.version(),
-                    })
-                }
-            });
+                d.on(move |_req: GetLocalListVersionRequest| {
+                    let local_list = local_list.clone();
+                    async move {
+                        Ok(GetLocalListVersionResponse {
+                            list_version: local_list.version(),
+                        })
+                    }
+                });
+            }
+            // OCPP 2.0.1 (Part 2, D02) — the same shared version reported in the
+            // 2.0.1 `versionNumber` shape. Ports `ocpp.v201.call.GetLocalListVersion`
+            // and the `@on(Action.get_local_list_version)` dispatch shape from
+            // `ocpp/charge_point.py`.
+            OcppVersion::V201 => {
+                let local_list = local_list.clone();
+                d.on(move |_req: V201GetLocalListVersionRequest| {
+                    let local_list = local_list.clone();
+                    async move {
+                        Ok(V201GetLocalListVersionResponse {
+                            version_number: local_list.version(),
+                            custom_data: None,
+                        })
+                    }
+                });
+            }
         }
 
         // SendLocalList — apply a Full or Differential update to the Local
-        // Authorization List (OCPP 1.6J §5.x, Issue #93). The list itself
-        // enforces version ordering, duplicate rejection, and Full/Differential
-        // semantics, returning the faithful UpdateStatus.
-        {
-            let local_list = local_list.clone();
-            d.on(move |req: SendLocalListRequest| {
+        // Authorization List. Both dialects share the one list store (version,
+        // capacity, Full/Differential semantics), but carry different request and
+        // response shapes and status enums (1.6J `UpdateStatus` vs 2.0.1
+        // `SendLocalListStatusEnumType` + optional `statusInfo`), so exactly one
+        // handler is registered per `protocol_version`. The list itself enforces
+        // version ordering, duplicate rejection, and the over-capacity guard,
+        // returning the faithful status.
+        match protocol_version {
+            // OCPP 1.6J §5.x (Issue #93). Unchanged from the pre-version-gate
+            // behavior.
+            OcppVersion::V16J => {
                 let local_list = local_list.clone();
-                async move {
-                    Ok(SendLocalListResponse {
-                        status: local_list.apply(&req),
-                    })
-                }
-            });
+                d.on(move |req: SendLocalListRequest| {
+                    let local_list = local_list.clone();
+                    async move {
+                        Ok(SendLocalListResponse {
+                            status: local_list.apply(&req),
+                        })
+                    }
+                });
+            }
+            // OCPP 2.0.1 (Part 2, D01) — the 2.0.1 request is applied against the
+            // same store via `apply_v201`, which reuses the 1.6J accept/reject
+            // decision and maps the outcome to `SendLocalListStatusEnumType`.
+            // Ports `ocpp.v201.call.SendLocalList` and the
+            // `@on(Action.send_local_list)` dispatch shape from `ocpp/charge_point.py`.
+            OcppVersion::V201 => {
+                let local_list = local_list.clone();
+                d.on(move |req: V201SendLocalListRequest| {
+                    let local_list = local_list.clone();
+                    async move {
+                        Ok(V201SendLocalListResponse {
+                            status: local_list.apply_v201(&req),
+                            status_info: None,
+                            custom_data: None,
+                        })
+                    }
+                });
+            }
         }
 
         d
@@ -6729,6 +6783,163 @@ mod tests {
                 .validate_call_result("GetReport", &serde_json::to_value(&resp).unwrap())
                 .expect("GetReport response is schema-valid");
         }
+    }
+
+    // --- OCPP 2.0.1 Local Authorization List (M7, issue #485) --------------
+    // A `for_version(V201)` CP answers `SendLocalList` / `GetLocalListVersion`
+    // in the 2.0.1 dialect against the one shared list store. These exercise the
+    // wired V201 arms end-to-end over `handle_message`.
+
+    fn v201_local_list_entry(
+        id: &str,
+        status: ocpp_types::v201::AuthorizationStatusEnumType,
+    ) -> ocpp_types::v201::AuthorizationData {
+        ocpp_types::v201::AuthorizationData {
+            id_token: ocpp_types::v201::IdTokenType {
+                id_token: id.to_string(),
+                kind: ocpp_types::v201::IdTokenEnumType::Iso14443,
+                additional_info: None,
+                custom_data: None,
+            },
+            id_token_info: Some(ocpp_types::v201::IdTokenInfoType {
+                status,
+                cache_expiry_date_time: None,
+                charging_priority: None,
+                language1: None,
+                evse_id: None,
+                language2: None,
+                group_id_token: None,
+                personal_message: None,
+                custom_data: None,
+            }),
+            custom_data: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_send_local_list_full_then_get_local_list_version() {
+        // A Full `SendLocalList` is `Accepted` and bumps the stored version; a
+        // following `GetLocalListVersion` reports that new version — both in the
+        // 2.0.1 dialect.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+
+        // Fresh station reports version 0.
+        let get0 = make_call(V201GetLocalListVersionRequest::default());
+        match cp
+            .handle_message(Message::Call(get0))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Message::CallResult(r) => {
+                let body: V201GetLocalListVersionResponse = r.payload_as().unwrap();
+                assert_eq!(body.version_number, 0, "a fresh list is at version 0");
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+
+        let send = make_call(V201SendLocalListRequest {
+            version_number: 42,
+            update_type: ocpp_types::v201::UpdateEnumType::Full,
+            local_authorization_list: Some(vec![
+                v201_local_list_entry(
+                    "TAG-A",
+                    ocpp_types::v201::AuthorizationStatusEnumType::Accepted,
+                ),
+                v201_local_list_entry(
+                    "TAG-B",
+                    ocpp_types::v201::AuthorizationStatusEnumType::Blocked,
+                ),
+            ]),
+            custom_data: None,
+        });
+        match cp
+            .handle_message(Message::Call(send))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Message::CallResult(r) => {
+                let body: V201SendLocalListResponse = r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    ocpp_types::v201::SendLocalListStatusEnumType::Accepted
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+
+        let get = make_call(V201GetLocalListVersionRequest::default());
+        match cp
+            .handle_message(Message::Call(get))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Message::CallResult(r) => {
+                let body: V201GetLocalListVersionResponse = r.payload_as().unwrap();
+                assert_eq!(
+                    body.version_number, 42,
+                    "GetLocalListVersion reports the version the accepted update set"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        // The shared store holds the two entries under their idToken keys.
+        assert_eq!(cp.local_list().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn v201_send_local_list_stale_differential_is_version_mismatch() {
+        // A Differential update that does not advance the version is
+        // `VersionMismatch` over the wire and leaves the stored version intact.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+
+        let seed = make_call(V201SendLocalListRequest {
+            version_number: 5,
+            update_type: ocpp_types::v201::UpdateEnumType::Full,
+            local_authorization_list: Some(vec![v201_local_list_entry(
+                "TAG-A",
+                ocpp_types::v201::AuthorizationStatusEnumType::Accepted,
+            )]),
+            custom_data: None,
+        });
+        cp.handle_message(Message::Call(seed)).await.unwrap();
+
+        let stale = make_call(V201SendLocalListRequest {
+            version_number: 5, // not strictly greater than the current version
+            update_type: ocpp_types::v201::UpdateEnumType::Differential,
+            local_authorization_list: Some(vec![v201_local_list_entry(
+                "TAG-Z",
+                ocpp_types::v201::AuthorizationStatusEnumType::Accepted,
+            )]),
+            custom_data: None,
+        });
+        match cp
+            .handle_message(Message::Call(stale))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Message::CallResult(r) => {
+                let body: V201SendLocalListResponse = r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    ocpp_types::v201::SendLocalListStatusEnumType::VersionMismatch
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.local_list().version(),
+            5,
+            "a rejected update does not bump the version"
+        );
+        assert_eq!(
+            cp.local_list().get("TAG-Z"),
+            None,
+            "nothing partially applied"
+        );
     }
 
     #[tokio::test]
