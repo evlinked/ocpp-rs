@@ -26,8 +26,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use ocpp_messages::v16j::SendLocalListRequest;
-use ocpp_types::common::IdTagInfo;
-use ocpp_types::v16j::{UpdateStatus, UpdateType};
+use ocpp_messages::v201::SendLocalListRequest as V201SendLocalListRequest;
+use ocpp_types::common::{AuthorizationStatus, IdTagInfo};
+use ocpp_types::v16j::{AuthorizationData, UpdateStatus, UpdateType};
+use ocpp_types::v201::{AuthorizationStatusEnumType, SendLocalListStatusEnumType, UpdateEnumType};
 
 /// Default capacity for the Local Authorization List — the value reported for
 /// the read-only `LocalAuthListMaxLength` standard configuration key (OCPP 1.6J
@@ -234,6 +236,108 @@ impl LocalAuthList {
     fn exceeds_capacity(&self, len: usize) -> bool {
         self.max_length.is_some_and(|max| len > max)
     }
+
+    /// Apply an **OCPP 2.0.1** `SendLocalList` request against this same store,
+    /// returning the resulting [`SendLocalListStatusEnumType`].
+    ///
+    /// The list is a single source of truth across dialects: a `for_version`
+    /// station shares one version counter, one capacity, and one set of entries
+    /// regardless of whether the CSMS speaks 1.6J or 2.0.1. So rather than a
+    /// parallel 2.0.1 store, the 2.0.1 request is translated onto the store's
+    /// entry model ([`v16j_request_from_v201`]) and run through the same
+    /// [`apply`](Self::apply) decision — Full replace, Differential version-gate,
+    /// duplicate rejection, and the over-capacity guard all behave identically —
+    /// and the resulting [`UpdateStatus`] is mapped back to the 2.0.1 status
+    /// ([`update_status_to_v201`]).
+    ///
+    /// Ports `ocpp.v201.call.SendLocalList` / `ocpp.v201.call_result.SendLocalList`.
+    /// A given [`ChargePoint`](crate::ChargePoint) only ever speaks one dialect,
+    /// so the shared entry map is never populated from both at once.
+    ///
+    /// **Trust boundary:** a malformed request — an empty or absent
+    /// `localAuthorizationList`, duplicate `idToken`s, a Differential update with
+    /// a stale `versionNumber`, or a bare `idToken` (delete) inside a Full update
+    /// — resolves to a faithful `Failed` / `VersionMismatch`, never a panic, and
+    /// leaves the stored list untouched.
+    pub fn apply_v201(&self, request: &V201SendLocalListRequest) -> SendLocalListStatusEnumType {
+        update_status_to_v201(self.apply(&v16j_request_from_v201(request)))
+    }
+}
+
+/// Translate an OCPP 2.0.1 `SendLocalList` request onto the store's entry model
+/// so it can run through the shared [`LocalAuthList::apply`] decision.
+///
+/// The mapping is faithful to what the store keys and tracks: the 2.0.1
+/// `idToken.idToken` string becomes the list key (as `idTag` does in 1.6J), a
+/// present `idTokenInfo` becomes an add/replace and an absent one a delete (the
+/// same `Some`/`None` discriminator `apply` already relies on), the
+/// `versionNumber` and `updateType` carry straight across, and an absent
+/// `localAuthorizationList` becomes the empty list (a Full "clear"). The
+/// `groupIdToken`, when present, is preserved as the 1.6J `parentIdTag`.
+///
+/// `cacheExpiryDateTime` (a 2.0.1 caching hint) is intentionally dropped: it is
+/// an RFC 3339 string with no bearing on list *management* (version/capacity),
+/// and no 2.0.1 read path consults the stored expiry yet.
+fn v16j_request_from_v201(request: &V201SendLocalListRequest) -> SendLocalListRequest {
+    SendLocalListRequest {
+        list_version: request.version_number,
+        update_type: match request.update_type {
+            UpdateEnumType::Full => UpdateType::Full,
+            UpdateEnumType::Differential => UpdateType::Differential,
+        },
+        local_authorization_list: request
+            .local_authorization_list
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|entry| AuthorizationData {
+                id_tag: entry.id_token.id_token.clone(),
+                id_tag_info: entry.id_token_info.as_ref().map(|info| IdTagInfo {
+                    status: v201_status_to_v16j(info.status),
+                    parent_id_tag: info.group_id_token.as_ref().map(|g| g.id_token.clone()),
+                    expiry_date: None,
+                }),
+            })
+            .collect(),
+    }
+}
+
+/// Map a 2.0.1 [`AuthorizationStatusEnumType`] onto the 1.6J
+/// [`AuthorizationStatus`] the store's entry model carries.
+///
+/// The five 1.6J statuses map 1:1. The 2.0.1-only refusals (`NoCredit`,
+/// `NotAllowedTypeEVSE`, `NotAtThisLocation`, `NotAtThisTime`, `Unknown`) have no
+/// 1.6J equivalent; they all mean "not a usable token", which 1.6J expresses as
+/// `Invalid`. This only affects the *stored* status a future offline-auth path
+/// would read; it has no bearing on the `SendLocalList` accept/reject decision,
+/// which turns solely on version, capacity, and structure.
+fn v201_status_to_v16j(status: AuthorizationStatusEnumType) -> AuthorizationStatus {
+    match status {
+        AuthorizationStatusEnumType::Accepted => AuthorizationStatus::Accepted,
+        AuthorizationStatusEnumType::Blocked => AuthorizationStatus::Blocked,
+        AuthorizationStatusEnumType::Expired => AuthorizationStatus::Expired,
+        AuthorizationStatusEnumType::ConcurrentTx => AuthorizationStatus::ConcurrentTx,
+        AuthorizationStatusEnumType::Invalid
+        | AuthorizationStatusEnumType::NoCredit
+        | AuthorizationStatusEnumType::NotAllowedTypeEvse
+        | AuthorizationStatusEnumType::NotAtThisLocation
+        | AuthorizationStatusEnumType::NotAtThisTime
+        | AuthorizationStatusEnumType::Unknown => AuthorizationStatus::Invalid,
+    }
+}
+
+/// Map the store's 1.6J [`UpdateStatus`] onto the 2.0.1
+/// [`SendLocalListStatusEnumType`].
+///
+/// `Accepted` and `VersionMismatch` are shared 1:1. The store never returns
+/// `NotSupported` (the CP implements the Local Authorization List profile), so it
+/// and `Failed` both fold to the faithful 2.0.1 `Failed`.
+fn update_status_to_v201(status: UpdateStatus) -> SendLocalListStatusEnumType {
+    match status {
+        UpdateStatus::Accepted => SendLocalListStatusEnumType::Accepted,
+        UpdateStatus::VersionMismatch => SendLocalListStatusEnumType::VersionMismatch,
+        UpdateStatus::Failed | UpdateStatus::NotSupported => SendLocalListStatusEnumType::Failed,
+    }
 }
 
 /// Whether the request lists the same `idTag` more than once.
@@ -248,8 +352,6 @@ fn has_duplicate_id_tags(request: &SendLocalListRequest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ocpp_types::common::AuthorizationStatus;
-    use ocpp_types::v16j::AuthorizationData;
 
     fn info(status: AuthorizationStatus) -> IdTagInfo {
         IdTagInfo {
@@ -613,5 +715,270 @@ mod tests {
         // An empty full update (a "clear") is still accepted.
         assert_eq!(list.apply(&full(2, vec![])), UpdateStatus::Accepted);
         assert_eq!(list.version(), 2);
+    }
+
+    /// OCPP 2.0.1 `SendLocalList` applied against the same shared store via
+    /// [`LocalAuthList::apply_v201`]. Mirrors the 1.6J cases above to prove the
+    /// 2.0.1 translation reuses the same accept/reject decision.
+    mod v201 {
+        use super::*;
+        use ocpp_types::v201::{
+            AuthorizationData as V201AuthorizationData, IdTokenEnumType, IdTokenInfoType,
+            IdTokenType,
+        };
+
+        fn token(id: &str) -> IdTokenType {
+            IdTokenType {
+                id_token: id.to_string(),
+                kind: IdTokenEnumType::Iso14443,
+                additional_info: None,
+                custom_data: None,
+            }
+        }
+
+        fn v201_info(status: AuthorizationStatusEnumType) -> IdTokenInfoType {
+            IdTokenInfoType {
+                status,
+                cache_expiry_date_time: None,
+                charging_priority: None,
+                language1: None,
+                evse_id: None,
+                language2: None,
+                group_id_token: None,
+                personal_message: None,
+                custom_data: None,
+            }
+        }
+
+        fn v201_entry(id: &str, status: AuthorizationStatusEnumType) -> V201AuthorizationData {
+            V201AuthorizationData {
+                id_token: token(id),
+                id_token_info: Some(v201_info(status)),
+                custom_data: None,
+            }
+        }
+
+        /// A bare `idToken` (no `idTokenInfo`) — a differential delete.
+        fn v201_delete(id: &str) -> V201AuthorizationData {
+            V201AuthorizationData {
+                id_token: token(id),
+                id_token_info: None,
+                custom_data: None,
+            }
+        }
+
+        fn v201_full(
+            version: i32,
+            entries: Vec<V201AuthorizationData>,
+        ) -> V201SendLocalListRequest {
+            V201SendLocalListRequest {
+                version_number: version,
+                update_type: UpdateEnumType::Full,
+                local_authorization_list: Some(entries),
+                custom_data: None,
+            }
+        }
+
+        fn v201_differential(
+            version: i32,
+            entries: Vec<V201AuthorizationData>,
+        ) -> V201SendLocalListRequest {
+            V201SendLocalListRequest {
+                version_number: version,
+                update_type: UpdateEnumType::Differential,
+                local_authorization_list: Some(entries),
+                custom_data: None,
+            }
+        }
+
+        #[test]
+        fn full_update_is_accepted_bumps_version_and_stores_entries() {
+            let list = LocalAuthList::new();
+            let status = list.apply_v201(&v201_full(
+                7,
+                vec![
+                    v201_entry("TAG-A", AuthorizationStatusEnumType::Accepted),
+                    v201_entry("TAG-B", AuthorizationStatusEnumType::Blocked),
+                ],
+            ));
+            assert_eq!(status, SendLocalListStatusEnumType::Accepted);
+            assert_eq!(list.version(), 7);
+            assert_eq!(list.len(), 2);
+            // Entries are stored under the `idToken` string key, with the 2.0.1
+            // status mapped onto the store's 1.6J model.
+            assert_eq!(
+                list.get("TAG-A").map(|i| i.status),
+                Some(AuthorizationStatus::Accepted)
+            );
+            assert_eq!(
+                list.get("TAG-B").map(|i| i.status),
+                Some(AuthorizationStatus::Blocked)
+            );
+        }
+
+        #[test]
+        fn full_update_with_absent_list_clears_and_sets_version() {
+            let list = LocalAuthList::new();
+            list.apply_v201(&v201_full(
+                3,
+                vec![v201_entry("TAG-A", AuthorizationStatusEnumType::Accepted)],
+            ));
+            assert_eq!(list.len(), 1);
+
+            // A Full update whose `localAuthorizationList` is omitted entirely is a
+            // clear — the translation maps `None` to the empty list.
+            let status = list.apply_v201(&V201SendLocalListRequest {
+                version_number: 4,
+                update_type: UpdateEnumType::Full,
+                local_authorization_list: None,
+                custom_data: None,
+            });
+            assert_eq!(status, SendLocalListStatusEnumType::Accepted);
+            assert_eq!(list.version(), 4);
+            assert!(list.is_empty());
+        }
+
+        #[test]
+        fn differential_adds_replaces_and_removes() {
+            let list = LocalAuthList::new();
+            list.apply_v201(&v201_full(
+                1,
+                vec![
+                    v201_entry("TAG-A", AuthorizationStatusEnumType::Accepted),
+                    v201_entry("TAG-B", AuthorizationStatusEnumType::Accepted),
+                ],
+            ));
+
+            let status = list.apply_v201(&v201_differential(
+                2,
+                vec![
+                    v201_entry("TAG-A", AuthorizationStatusEnumType::Blocked), // replace
+                    v201_entry("TAG-C", AuthorizationStatusEnumType::Accepted), // add
+                    v201_delete("TAG-B"),                                      // remove
+                ],
+            ));
+            assert_eq!(status, SendLocalListStatusEnumType::Accepted);
+            assert_eq!(list.version(), 2);
+            assert_eq!(list.len(), 2);
+            assert_eq!(
+                list.get("TAG-A").map(|i| i.status),
+                Some(AuthorizationStatus::Blocked)
+            );
+            assert_eq!(list.get("TAG-B"), None);
+            assert!(list.get("TAG-C").is_some());
+        }
+
+        #[test]
+        fn differential_with_stale_version_is_version_mismatch_without_mutation() {
+            let list = LocalAuthList::new();
+            list.apply_v201(&v201_full(
+                5,
+                vec![v201_entry("TAG-A", AuthorizationStatusEnumType::Accepted)],
+            ));
+
+            // Equal version is not strictly greater => mismatch, nothing changes.
+            let status = list.apply_v201(&v201_differential(
+                5,
+                vec![v201_entry("TAG-Z", AuthorizationStatusEnumType::Accepted)],
+            ));
+            assert_eq!(status, SendLocalListStatusEnumType::VersionMismatch);
+            assert_eq!(list.version(), 5);
+            assert_eq!(list.len(), 1);
+            assert_eq!(list.get("TAG-Z"), None);
+        }
+
+        #[test]
+        fn duplicate_id_tokens_fail_without_mutation() {
+            let list = LocalAuthList::new();
+            let status = list.apply_v201(&v201_full(
+                1,
+                vec![
+                    v201_entry("DUP", AuthorizationStatusEnumType::Accepted),
+                    v201_entry("DUP", AuthorizationStatusEnumType::Blocked),
+                ],
+            ));
+            assert_eq!(status, SendLocalListStatusEnumType::Failed);
+            assert_eq!(list.version(), 0);
+            assert!(list.is_empty());
+        }
+
+        #[test]
+        fn full_update_with_bare_id_token_delete_fails() {
+            // A delete (no `idTokenInfo`) is meaningless in a Full replace and is
+            // rejected, leaving the list untouched — the same rule the 1.6J path
+            // enforces.
+            let list = LocalAuthList::new();
+            list.apply_v201(&v201_full(
+                2,
+                vec![v201_entry("TAG-A", AuthorizationStatusEnumType::Accepted)],
+            ));
+            let status = list.apply_v201(&v201_full(
+                5,
+                vec![
+                    v201_entry("TAG-B", AuthorizationStatusEnumType::Accepted),
+                    v201_delete("TAG-C"),
+                ],
+            ));
+            assert_eq!(status, SendLocalListStatusEnumType::Failed);
+            assert_eq!(list.version(), 2);
+            assert_eq!(list.len(), 1);
+            assert!(list.get("TAG-A").is_some());
+        }
+
+        #[test]
+        fn over_capacity_full_update_is_rejected_without_mutation() {
+            let list = LocalAuthList::with_max_length(2);
+            list.apply_v201(&v201_full(
+                3,
+                vec![
+                    v201_entry("TAG-A", AuthorizationStatusEnumType::Accepted),
+                    v201_entry("TAG-B", AuthorizationStatusEnumType::Accepted),
+                ],
+            ));
+            let status = list.apply_v201(&v201_full(
+                4,
+                vec![
+                    v201_entry("TAG-X", AuthorizationStatusEnumType::Accepted),
+                    v201_entry("TAG-Y", AuthorizationStatusEnumType::Accepted),
+                    v201_entry("TAG-Z", AuthorizationStatusEnumType::Accepted),
+                ],
+            ));
+            assert_eq!(status, SendLocalListStatusEnumType::Failed);
+            assert_eq!(list.version(), 3);
+            assert_eq!(list.len(), 2);
+        }
+
+        #[test]
+        fn group_id_token_is_preserved_as_parent_id_tag() {
+            let list = LocalAuthList::new();
+            let mut info = v201_info(AuthorizationStatusEnumType::Accepted);
+            info.group_id_token = Some(token("PARENT"));
+            list.apply_v201(&v201_full(
+                1,
+                vec![V201AuthorizationData {
+                    id_token: token("TAG-A"),
+                    id_token_info: Some(info),
+                    custom_data: None,
+                }],
+            ));
+            assert_eq!(
+                list.get("TAG-A").and_then(|i| i.parent_id_tag),
+                Some("PARENT".to_string())
+            );
+        }
+
+        #[test]
+        fn v201_only_refusal_statuses_map_to_invalid() {
+            // The 2.0.1-only refusals collapse to the 1.6J `Invalid` in the store.
+            for s in [
+                AuthorizationStatusEnumType::NoCredit,
+                AuthorizationStatusEnumType::NotAllowedTypeEvse,
+                AuthorizationStatusEnumType::NotAtThisLocation,
+                AuthorizationStatusEnumType::NotAtThisTime,
+                AuthorizationStatusEnumType::Unknown,
+            ] {
+                assert_eq!(v201_status_to_v16j(s), AuthorizationStatus::Invalid);
+            }
+        }
     }
 }
