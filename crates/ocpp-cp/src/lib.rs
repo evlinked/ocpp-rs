@@ -89,7 +89,8 @@ use ocpp_messages::v201::{
     NotifyReportRequest as V201NotifyReportRequest,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     RequestStopTransactionRequest as V201RequestStopTransactionRequest,
-    ResetRequest as V201ResetRequest, SetChargingProfileRequest as V201SetChargingProfileRequest,
+    ReserveNowRequest as V201ReserveNowRequest, ResetRequest as V201ResetRequest,
+    SetChargingProfileRequest as V201SetChargingProfileRequest,
     SetVariablesRequest as V201SetVariablesRequest,
     SetVariablesResponse as V201SetVariablesResponse,
     StatusNotificationRequest as V201StatusNotificationRequest,
@@ -102,8 +103,8 @@ use ocpp_types::v201::{
     ConnectorStatusEnumType, GenericDeviceModelStatusEnumType, GenericStatusEnumType,
     GetVariableResultType, IdTokenType as V201IdTokenType, MessageTriggerEnumType,
     OperationalStatusEnumType, RegistrationStatusEnumType, ReportDataType,
-    RequestStartStopStatusEnumType, ResetStatusEnumType, SetVariableResultType, StatusInfoType,
-    TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
+    SetVariableResultType, StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -114,6 +115,7 @@ use std::time::Duration;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info, warn};
 use uuid::Uuid;
+use v201_command::ConnectorReservState;
 
 /// Opt-in outcome of the simulated firmware update (`UpdateFirmware`, OCPP
 /// 1.6J §4.x). Selects which branch of the firmware state machine the
@@ -2334,91 +2336,231 @@ impl ChargePoint {
             });
         }
 
-        // ReserveNow — reserve a connector for an idTag until expiryDate (OCPP
-        // 1.6J §5.14). Faithful status semantics keyed off the connector's live
-        // status: a free connector is reserved (→ `Reserved`) and the
-        // reservationId recorded; a busy connector → `Occupied`, a faulted one →
-        // `Faulted`, an unavailable one → `Unavailable`; an unknown/out-of-range
-        // connector id (incl. 0) → `Rejected`. The reserve itself is a local
-        // state change, but on `Accepted` we also queue a `StatusNotification`
-        // (`Reserved`) to the CSMS off the inbound-CALL path so a back office's
-        // live connector view flips immediately (Issue #80) without waiting for
-        // the next status event. Ports `ReserveNow` from the Python reference's
-        // `call.py`/`enums.py`.
-        {
-            let connectors = connectors.clone();
-            let reservations = reservations.clone();
-            let command_sender = command_sender.clone();
-            let expiry_timers = expiry_timers.clone();
-            d.on(move |req: ReserveNowRequest| {
+        // ReserveNow — the CSMS holds an EVSE/connector for a driver until an
+        // expiry time. Both dialects name the action `"ReserveNow"` but carry
+        // different request shapes (1.6J flat `connectorId` + `idTag` vs 2.0.1
+        // optional `evseId` + structured `idToken`/`connectorType`), so — like
+        // SetChargingProfile / ClearChargingProfile above — exactly one handler
+        // is registered per `protocol_version`; the negotiated subprotocol and
+        // the version-aware inbound validator keep the wire on a single dialect,
+        // so the other version's request shape never reaches this dispatcher.
+        match protocol_version {
+            // OCPP 1.6J §5.14 — faithful status semantics keyed off the
+            // connector's live status: a free connector is reserved (→ `Reserved`)
+            // and the reservationId recorded; a busy connector → `Occupied`, a
+            // faulted one → `Faulted`, an unavailable one → `Unavailable`; an
+            // unknown/out-of-range connector id (incl. 0) → `Rejected`. The
+            // reserve itself is a local state change, but on `Accepted` we also
+            // queue a `StatusNotification` (`Reserved`) to the CSMS off the
+            // inbound-CALL path so a back office's live connector view flips
+            // immediately (Issue #80) without waiting for the next status event.
+            // Unchanged from the pre-version-gate behavior. Ports `ReserveNow`
+            // from the Python reference's `call.py`/`enums.py`.
+            OcppVersion::V16J => {
                 let connectors = connectors.clone();
                 let reservations = reservations.clone();
                 let command_sender = command_sender.clone();
                 let expiry_timers = expiry_timers.clone();
-                async move {
-                    // A reservation whose `expiryDate` has already passed is
-                    // nonsensical — it would auto-free instantly — so reject it
-                    // outright rather than accept and immediately expire (Issue
-                    // #85), consistent with the liberal use of `Rejected` for
-                    // other non-reservable requests below.
-                    if req.expiry_date <= chrono::Utc::now() {
-                        return Ok(ReserveNowResponse {
-                            status: ReservationStatus::Rejected,
-                        });
-                    }
-                    let status = match ConnectorId::new(req.connector_id as u32) {
-                        Ok(cid) => match connectors.read().await.get(&cid).cloned() {
-                            Some(mut connector) => match connector.status().await {
-                                ChargePointStatus::Available => {
-                                    match connector.reserve(req.id_tag.clone()).await {
-                                        Ok(()) => {
-                                            reservations
-                                                .write()
-                                                .await
-                                                .insert(req.reservation_id, cid);
-                                            // Best-effort: the reservation is
-                                            // already Accepted; a dropped
-                                            // notification (consumer gone, CP
-                                            // shutting down) must not undo it.
-                                            let _ = command_sender.send(
-                                                RemoteCommand::EmitConnectorStatus {
-                                                    connector_id: cid,
-                                                    status: ChargePointStatus::Reserved,
-                                                },
-                                            );
-                                            // Arm the auto-expiry timer (Issue
-                                            // #85): when `expiryDate` passes,
-                                            // free the connector on our own.
-                                            Self::arm_reservation_expiry(
-                                                req.reservation_id,
-                                                cid,
-                                                req.expiry_date,
-                                                &connectors,
-                                                &reservations,
-                                                &expiry_timers,
-                                                &command_sender,
-                                            )
-                                            .await;
-                                            ReservationStatus::Accepted
+                d.on(move |req: ReserveNowRequest| {
+                    let connectors = connectors.clone();
+                    let reservations = reservations.clone();
+                    let command_sender = command_sender.clone();
+                    let expiry_timers = expiry_timers.clone();
+                    async move {
+                        // A reservation whose `expiryDate` has already passed is
+                        // nonsensical — it would auto-free instantly — so reject it
+                        // outright rather than accept and immediately expire (Issue
+                        // #85), consistent with the liberal use of `Rejected` for
+                        // other non-reservable requests below.
+                        if req.expiry_date <= chrono::Utc::now() {
+                            return Ok(ReserveNowResponse {
+                                status: ReservationStatus::Rejected,
+                            });
+                        }
+                        let status = match ConnectorId::new(req.connector_id as u32) {
+                            Ok(cid) => match connectors.read().await.get(&cid).cloned() {
+                                Some(mut connector) => match connector.status().await {
+                                    ChargePointStatus::Available => {
+                                        match connector.reserve(req.id_tag.clone()).await {
+                                            Ok(()) => {
+                                                reservations
+                                                    .write()
+                                                    .await
+                                                    .insert(req.reservation_id, cid);
+                                                // Best-effort: the reservation is
+                                                // already Accepted; a dropped
+                                                // notification (consumer gone, CP
+                                                // shutting down) must not undo it.
+                                                let _ = command_sender.send(
+                                                    RemoteCommand::EmitConnectorStatus {
+                                                        connector_id: cid,
+                                                        status: ChargePointStatus::Reserved,
+                                                    },
+                                                );
+                                                // Arm the auto-expiry timer (Issue
+                                                // #85): when `expiryDate` passes,
+                                                // free the connector on our own.
+                                                Self::arm_reservation_expiry(
+                                                    req.reservation_id,
+                                                    cid,
+                                                    req.expiry_date,
+                                                    &connectors,
+                                                    &reservations,
+                                                    &expiry_timers,
+                                                    &command_sender,
+                                                )
+                                                .await;
+                                                ReservationStatus::Accepted
+                                            }
+                                            Err(_) => ReservationStatus::Rejected,
                                         }
-                                        Err(_) => ReservationStatus::Rejected,
                                     }
-                                }
-                                ChargePointStatus::Faulted => ReservationStatus::Faulted,
-                                ChargePointStatus::Unavailable => ReservationStatus::Unavailable,
-                                // Reserved / Occupied / Preparing / Charging /
-                                // Suspended* / Finishing — connector is in use.
-                                _ => ReservationStatus::Occupied,
+                                    ChargePointStatus::Faulted => ReservationStatus::Faulted,
+                                    ChargePointStatus::Unavailable => {
+                                        ReservationStatus::Unavailable
+                                    }
+                                    // Reserved / Occupied / Preparing / Charging /
+                                    // Suspended* / Finishing — connector is in use.
+                                    _ => ReservationStatus::Occupied,
+                                },
+                                // Known protocol but no such connector on this CP.
+                                None => ReservationStatus::Rejected,
                             },
-                            // Known protocol but no such connector on this CP.
-                            None => ReservationStatus::Rejected,
-                        },
-                        // connectorId 0 / out of range → not a reservable connector.
-                        Err(_) => ReservationStatus::Rejected,
-                    };
-                    Ok(ReserveNowResponse { status })
-                }
-            });
+                            // connectorId 0 / out of range → not a reservable connector.
+                            Err(_) => ReservationStatus::Rejected,
+                        };
+                        Ok(ReserveNowResponse { status })
+                    }
+                });
+            }
+            // OCPP 2.0.1 (Part 2, `ReserveNow`) — the 2.0.1 successor. The request
+            // targets an optional `evseId` (whole-station when omitted) and carries
+            // a structured `idToken`/`connectorType` rather than a flat
+            // `connectorId`/`idTag`. The pure Accepted/Occupied/Faulted/Unavailable/
+            // Rejected decision + response builder live in `v201_command`
+            // (mirroring `SetChargingProfile`, #469); this is the runtime wiring:
+            // resolve `evseId` against the live connector topology into a distilled
+            // `ConnectorReservState`, decide, and on `Accepted` reserve the EVSE,
+            // record the reservation, queue the `Reserved` StatusNotification off
+            // the CALL path, and arm the auto-expiry timer — reusing the exact
+            // reservation/expiry machinery the 1.6J arm uses. Ports
+            // `ocpp.v201.call.ReserveNow` and the `@on(Action.reserve_now)` dispatch
+            // shape from `ocpp/charge_point.py`.
+            OcppVersion::V201 => {
+                let connectors = connectors.clone();
+                let reservations = reservations.clone();
+                let command_sender = command_sender.clone();
+                let expiry_timers = expiry_timers.clone();
+                d.on(move |req: V201ReserveNowRequest| {
+                    let connectors = connectors.clone();
+                    let reservations = reservations.clone();
+                    let command_sender = command_sender.clone();
+                    let expiry_timers = expiry_timers.clone();
+                    async move {
+                        // Parse the ISO-8601 expiry. A parseable timestamp already
+                        // in the past is rejected by the decision (it would auto-free
+                        // instantly, #85); a future one arms the auto-expiry timer on
+                        // Accept. An unparseable string is treated leniently as "no
+                        // schedulable expiry" — the reservation is held until an
+                        // explicit CancelReservation — never a panic on the
+                        // attacker-supplied text crossing the WebSocket boundary.
+                        let expiry = chrono::DateTime::parse_from_rfc3339(&req.expiry_date_time)
+                            .ok()
+                            .map(|t| t.with_timezone(&chrono::Utc));
+                        let already_expired = matches!(expiry, Some(t) if t <= chrono::Utc::now());
+
+                        // Resolve evseId → the targeted connector's distilled
+                        // reservability. A None / 0 / negative / out-of-range evseId
+                        // resolves to `Missing` (never indexes a connector), which
+                        // the pure decision maps to Rejected — never a panic.
+                        let cid = req
+                            .evse_id
+                            .filter(|id| *id >= 1)
+                            .and_then(|id| ConnectorId::new(id as u32).ok());
+                        let state = match &cid {
+                            Some(cid) => match connectors.read().await.get(cid).cloned() {
+                                Some(connector) => match connector.status().await {
+                                    ChargePointStatus::Available => ConnectorReservState::Free,
+                                    ChargePointStatus::Faulted => ConnectorReservState::Faulted,
+                                    ChargePointStatus::Unavailable => {
+                                        ConnectorReservState::Unavailable
+                                    }
+                                    // Reserved / Occupied / Preparing / Charging /
+                                    // Suspended* / Finishing — the connector is in use.
+                                    _ => ConnectorReservState::Busy,
+                                },
+                                None => ConnectorReservState::Missing,
+                            },
+                            None => ConnectorReservState::Missing,
+                        };
+
+                        let (mut status, mut status_info) = v201_command::v201_reserve_now_status(
+                            already_expired,
+                            req.evse_id,
+                            state,
+                        );
+
+                        // An Accepted decision performs the reservation side effect.
+                        // `reserve()` only succeeds from `Available`; a lost race
+                        // (the EVSE was taken between the status read and here)
+                        // downgrades to Rejected rather than reporting a reservation
+                        // that did not happen — mirroring the 1.6J `Err(_) =>
+                        // Rejected`.
+                        if status == ReserveNowStatusEnumType::Accepted {
+                            // An Accepted decision guarantees `cid` resolved to a
+                            // free connector; the `if let` is a total guard, never
+                            // an `unwrap`.
+                            if let Some(cid) = cid {
+                                let reserved = match connectors.read().await.get(&cid).cloned() {
+                                    Some(mut connector) => connector
+                                        .reserve(req.id_token.id_token.clone())
+                                        .await
+                                        .is_ok(),
+                                    None => false,
+                                };
+                                if reserved {
+                                    reservations.write().await.insert(req.id, cid);
+                                    // Best-effort: the reservation is already
+                                    // Accepted; a dropped notification (consumer
+                                    // gone) must not undo it.
+                                    let _ =
+                                        command_sender.send(RemoteCommand::EmitConnectorStatus {
+                                            connector_id: cid,
+                                            status: ChargePointStatus::Reserved,
+                                        });
+                                    // Arm auto-expiry only for a parseable *future*
+                                    // expiry (Issue #85), reusing the 1.6J machinery.
+                                    if let Some(expiry) = expiry {
+                                        Self::arm_reservation_expiry(
+                                            req.id,
+                                            cid,
+                                            expiry,
+                                            &connectors,
+                                            &reservations,
+                                            &expiry_timers,
+                                            &command_sender,
+                                        )
+                                        .await;
+                                    }
+                                } else {
+                                    status = ReserveNowStatusEnumType::Rejected;
+                                    status_info = Some(StatusInfoType {
+                                        reason_code: "ReserveFailed".to_string(),
+                                        additional_info: Some(
+                                            "the targeted EVSE could not be reserved \
+                                             (it was taken concurrently)"
+                                                .to_string(),
+                                        ),
+                                        custom_data: None,
+                                    });
+                                }
+                            }
+                        }
+
+                        Ok(v201_command::v201_reserve_now_response(status, status_info))
+                    }
+                });
+            }
         }
 
         // CancelReservation — the teardown counterpart to ReserveNow: the CSMS
@@ -6089,6 +6231,146 @@ mod tests {
             }
             other => panic!("expected CallResult, got: {other:?}"),
         }
+    }
+
+    // --- ReserveNow (v201) over the wire -----------------------------------
+
+    // Build a v201 `ReserveNow` CALL for `evse_id` (None = whole-station) whose
+    // expiry is one hour out, so the reservation is valid and arms a future timer.
+    fn make_v201_reserve_now(id: i32, evse_id: Option<i32>) -> CallMessage {
+        make_call(V201ReserveNowRequest {
+            id,
+            expiry_date_time: (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339(),
+            id_token: V201IdTokenType {
+                id_token: "DEADBEEF".to_string(),
+                kind: ocpp_types::v201::IdTokenEnumType::Iso14443,
+                additional_info: None,
+                custom_data: None,
+            },
+            connector_type: None,
+            evse_id,
+            group_id_token: None,
+            custom_data: None,
+        })
+    }
+
+    async fn v201_connector_status(cp: &ChargePoint, evse_id: u32) -> ChargePointStatus {
+        cp.get_connectors()
+            .await
+            .get(&ConnectorId::new(evse_id).unwrap())
+            .expect("connector exists")
+            .status()
+            .await
+    }
+
+    #[tokio::test]
+    async fn v201_reserve_now_accepts_a_free_evse_and_reports_reserved() {
+        // A V201 CP now answers `ReserveNow` in its own dialect: a free EVSE is
+        // reserved (→ Accepted) and the connector flips to `Reserved`, the state a
+        // queued `StatusNotification(Reserved)` announces to the CSMS.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        assert_eq!(
+            v201_connector_status(&cp, 1).await,
+            ChargePointStatus::Available
+        );
+
+        let resp = cp
+            .handle_message(Message::Call(make_v201_reserve_now(7, Some(1))))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::ReserveNowResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, ReserveNowStatusEnumType::Accepted);
+                assert!(body.status_info.is_none());
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            v201_connector_status(&cp, 1).await,
+            ChargePointStatus::Reserved,
+            "an accepted v201 reservation flips the connector to Reserved"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_reserve_now_reports_occupied_for_a_busy_evse() {
+        // A connector mid-cycle (plugged in → Preparing) cannot be reserved →
+        // Occupied, and its status is left untouched (not flipped to Reserved).
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.plug_in(ConnectorId::new(1).unwrap()).await.unwrap();
+        let busy = v201_connector_status(&cp, 1).await;
+        assert_ne!(busy, ChargePointStatus::Available);
+
+        let resp = cp
+            .handle_message(Message::Call(make_v201_reserve_now(8, Some(1))))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::ReserveNowResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, ReserveNowStatusEnumType::Occupied);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            v201_connector_status(&cp, 1).await,
+            busy,
+            "an Occupied reservation must not mutate the connector"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_reserve_now_rejects_an_unknown_evse() {
+        // A structurally-valid but out-of-range evseId names no EVSE → Rejected,
+        // never a panic (trust boundary on the inbound evseId).
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_reserve_now(9, Some(99))))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::ReserveNowResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, ReserveNowStatusEnumType::Rejected);
+                assert_eq!(
+                    body.status_info
+                        .expect("a refusal carries a reason")
+                        .reason_code,
+                    "UnknownEvse"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_reserve_now_rejects_a_station_level_reservation() {
+        // evseId omitted = reserve the whole station, which the flat simulator
+        // does not hold → Rejected, and no connector is reserved.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_reserve_now(10, None)))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::ReserveNowResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, ReserveNowStatusEnumType::Rejected);
+                assert_eq!(
+                    body.status_info
+                        .expect("a refusal carries a reason")
+                        .reason_code,
+                    "StationLevel"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            v201_connector_status(&cp, 1).await,
+            ChargePointStatus::Available,
+            "a rejected station-level reservation reserves nothing"
+        );
     }
 
     #[tokio::test]
