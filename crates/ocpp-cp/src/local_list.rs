@@ -244,11 +244,11 @@ impl LocalAuthList {
     /// station shares one version counter, one capacity, and one set of entries
     /// regardless of whether the CSMS speaks 1.6J or 2.0.1. So rather than a
     /// parallel 2.0.1 store, the 2.0.1 request is translated onto the store's
-    /// entry model ([`v16j_request_from_v201`]) and run through the same
+    /// entry model (`v16j_request_from_v201`) and run through the same
     /// [`apply`](Self::apply) decision — Full replace, Differential version-gate,
     /// duplicate rejection, and the over-capacity guard all behave identically —
     /// and the resulting [`UpdateStatus`] is mapped back to the 2.0.1 status
-    /// ([`update_status_to_v201`]).
+    /// (`update_status_to_v201`).
     ///
     /// Ports `ocpp.v201.call.SendLocalList` / `ocpp.v201.call_result.SendLocalList`.
     /// A given [`ChargePoint`](crate::ChargePoint) only ever speaks one dialect,
