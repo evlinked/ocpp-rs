@@ -103,24 +103,41 @@
 //! two-way split). Resolving the id against the live reservation store, freeing
 //! the connector, disarming the auto-expiry timer, and announcing `Available` off
 //! the CALL path is the wiring layer's job.
+//!
+//! ## `ClearCache`
+//!
+//! Ports `ocpp.v201.call.ClearCache` / `ocpp.v201.call_result.ClearCache` — the
+//! 2.0.1 successor to the 1.6J `ClearCache` the CP already answers on the `V16J`
+//! path. The CSMS asks the station to wipe its local Authorization Cache; the
+//! request carries no fields beyond the optional `customData`. Because the
+//! simulator implements a cache ([`crate::auth_cache::AuthCache`]), a clear is
+//! [`Accepted`](ClearCacheStatusEnumType::Accepted);
+//! [`Rejected`](ClearCacheStatusEnumType::Rejected) is the modeled outcome for a
+//! station that does not support caching at all — a future opt-in knob, kept as a
+//! seam here so the decision needn't change shape to grow one. Both dialects
+//! empty the same shared cache; only the response status enum differs (2.0.1's
+//! `ClearCacheStatusEnumType` is a clean `Accepted`/`Rejected` two-way split,
+//! plus an optional `statusInfo`). Emptying the shared cache off the CALL path is
+//! the wiring layer's job.
 
 use ocpp_types::common::Reason;
 use ocpp_types::v16j::ResetType;
 use ocpp_types::v201::{
     CancelReservationStatusEnumType, ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType,
     ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
-    ChargingProfileType, ClearChargingProfileStatusEnumType, ClearChargingProfileType,
-    GenericDeviceModelStatusEnumType, GetChargingProfileStatusEnumType, MessageTriggerEnumType,
-    OperationalStatusEnumType, RequestStartStopStatusEnumType, ReserveNowStatusEnumType,
-    ResetEnumType, ResetStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
-    UnlockStatusEnumType,
+    ChargingProfileType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
+    ClearChargingProfileType, GenericDeviceModelStatusEnumType, GetChargingProfileStatusEnumType,
+    MessageTriggerEnumType, OperationalStatusEnumType, RequestStartStopStatusEnumType,
+    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 
 use ocpp_messages::v201::{
-    CancelReservationResponse, ChangeAvailabilityResponse, ClearChargingProfileResponse,
-    GetChargingProfilesResponse, GetMonitoringReportResponse, ReportChargingProfilesRequest,
-    RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
-    ResetResponse, SetChargingProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
+    CancelReservationResponse, ChangeAvailabilityResponse, ClearCacheResponse,
+    ClearChargingProfileResponse, GetChargingProfilesResponse, GetMonitoringReportResponse,
+    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
+    ReserveNowResponse, ResetResponse, SetChargingProfileResponse, TriggerMessageResponse,
+    UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1155,6 +1172,51 @@ pub fn v201_cancel_reservation_response(
     status_info: Option<StatusInfoType>,
 ) -> CancelReservationResponse {
     CancelReservationResponse {
+        status,
+        status_info,
+        custom_data: None,
+    }
+}
+
+/// Decide the [`ClearCacheStatusEnumType`] a `V201` station reports for an
+/// inbound `ClearCache.req`, given whether the station implements an
+/// Authorization Cache at all.
+///
+/// - [`Accepted`](ClearCacheStatusEnumType::Accepted) when `supports_caching` —
+///   the station has a cache and will empty it. This is the simulator's live
+///   answer: it owns an [`AuthCache`](crate::auth_cache::AuthCache), so the clear
+///   always executes.
+/// - [`Rejected`](ClearCacheStatusEnumType::Rejected) otherwise — a station that
+///   does not support caching has nothing to clear, so per OCPP 2.0.1 (Part 2,
+///   D03) it refuses rather than silently no-op with an `Accepted`.
+///
+/// `ClearCache.req` carries no fields beyond the optional `customData`, so there
+/// is no CSMS-supplied value to parse and no malformed-input branch — the
+/// decision turns solely on this station capability. Modeling the `Rejected`
+/// arm keeps the seam for a future opt-in "no caching" knob without reshaping the
+/// decision. This is the *pure* decision; emptying the shared cache off the CALL
+/// path is the wiring layer's job.
+#[must_use]
+pub fn v201_clear_cache_status(supports_caching: bool) -> ClearCacheStatusEnumType {
+    if supports_caching {
+        ClearCacheStatusEnumType::Accepted
+    } else {
+        ClearCacheStatusEnumType::Rejected
+    }
+}
+
+/// Build a schema-valid `ClearCache.conf` ([`ClearCacheResponse`]).
+///
+/// Pure constructor mirroring [`v201_cancel_reservation_response`]: carries the
+/// decided [`status`](ClearCacheStatusEnumType) plus the optional 2.0.1
+/// `statusInfo` (a vendor-agnostic `reasonCode` and human-readable detail — for
+/// example, to explain a `Rejected` on a station without a cache).
+#[must_use]
+pub fn v201_clear_cache_response(
+    status: ClearCacheStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> ClearCacheResponse {
+    ClearCacheResponse {
         status,
         status_info,
         custom_data: None,
@@ -2872,6 +2934,76 @@ mod tests {
                         .validate_call_result("CancelReservation", &payload)
                         .is_ok(),
                     "built {status:?} CancelReservationResponse should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clear_cache_accepts_when_the_station_supports_caching() {
+        // The simulator owns an AuthCache, so the live answer is always Accepted.
+        assert_eq!(
+            v201_clear_cache_status(true),
+            ClearCacheStatusEnumType::Accepted
+        );
+    }
+
+    #[test]
+    fn clear_cache_rejects_when_the_station_has_no_cache() {
+        // The modeled seam for a future opt-in "no caching" station: nothing to
+        // clear => Rejected.
+        assert_eq!(
+            v201_clear_cache_status(false),
+            ClearCacheStatusEnumType::Rejected
+        );
+    }
+
+    #[test]
+    fn clear_cache_response_carries_status_and_optional_status_info() {
+        let bare = v201_clear_cache_response(ClearCacheStatusEnumType::Accepted, None);
+        assert_eq!(bare.status, ClearCacheStatusEnumType::Accepted);
+        assert!(bare.status_info.is_none());
+
+        let info = StatusInfoType {
+            reason_code: "NoCache".to_string(),
+            additional_info: Some("station has no authorization cache".to_string()),
+            custom_data: None,
+        };
+        let rejected = v201_clear_cache_response(ClearCacheStatusEnumType::Rejected, Some(info));
+        assert_eq!(rejected.status, ClearCacheStatusEnumType::Rejected);
+        assert_eq!(
+            rejected
+                .status_info
+                .as_ref()
+                .map(|i| i.reason_code.as_str()),
+            Some("NoCache")
+        );
+    }
+
+    /// Wire fidelity: every built `ClearCache.conf` — with and without
+    /// `statusInfo`, across both status values — satisfies the bundled OCPP 2.0.1
+    /// `ClearCacheResponse` JSON Schema, the same guarantee the CP's version-aware
+    /// validator gives on the live path.
+    #[test]
+    fn built_clear_cache_responses_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        let info = StatusInfoType {
+            reason_code: "NoCache".to_string(),
+            additional_info: Some("station has no authorization cache".to_string()),
+            custom_data: None,
+        };
+        for status in [
+            ClearCacheStatusEnumType::Accepted,
+            ClearCacheStatusEnumType::Rejected,
+        ] {
+            for status_info in [None, Some(info.clone())] {
+                let resp = v201_clear_cache_response(status, status_info);
+                let payload = serde_json::to_value(&resp).unwrap();
+                assert!(
+                    validator
+                        .validate_call_result("ClearCache", &payload)
+                        .is_ok(),
+                    "built {status:?} ClearCacheResponse should be schema-valid, got: {payload}"
                 );
             }
         }

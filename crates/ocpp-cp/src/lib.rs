@@ -77,6 +77,7 @@ use v201_device_model::V201DeviceModel;
 use ocpp_messages::v201::{
     CancelReservationRequest as V201CancelReservationRequest,
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
+    ClearCacheRequest as V201ClearCacheRequest, ClearCacheResponse as V201ClearCacheResponse,
     ClearChargingProfileRequest as V201ClearChargingProfileRequest,
     DataTransferRequest as V201DataTransferRequest,
     GetBaseReportRequest as V201GetBaseReportRequest,
@@ -3210,19 +3211,47 @@ impl ChargePoint {
         }
 
         // ClearCache — empty the authorization cache, then accept (Issue #23).
-        // Ports the OCPP 1.6J ClearCache use case (§5.2): the CSMS asks the CP to
-        // discard its Authorization Cache.
-        {
-            let auth_cache = auth_cache.clone();
-            d.on(move |_req: ClearCacheRequest| {
+        // The CSMS asks the CP to discard its Authorization Cache. Both dialects
+        // clear the same shared, dialect-independent `AuthCache`, but carry
+        // different response shapes (1.6J's bare `ClearCacheStatus` vs 2.0.1's
+        // `ClearCacheStatusEnumType` + optional `statusInfo`/`customData`), so —
+        // like SendLocalList / CancelReservation above — exactly one handler is
+        // registered per `protocol_version`. The clear is idempotent (a no-op on
+        // an already-empty cache) and the request carries no CSMS-supplied fields,
+        // so neither arm has a malformed-input branch.
+        match protocol_version {
+            // OCPP 1.6J §5.2 (Issue #23). Unchanged from the pre-version-gate
+            // behavior.
+            OcppVersion::V16J => {
                 let auth_cache = auth_cache.clone();
-                async move {
-                    auth_cache.clear();
-                    Ok(ClearCacheResponse {
-                        status: ClearCacheStatus::Accepted,
-                    })
-                }
-            });
+                d.on(move |_req: ClearCacheRequest| {
+                    let auth_cache = auth_cache.clone();
+                    async move {
+                        auth_cache.clear();
+                        Ok(ClearCacheResponse {
+                            status: ClearCacheStatus::Accepted,
+                        })
+                    }
+                });
+            }
+            // OCPP 2.0.1 (Part 2, D03) — the same shared cache is emptied and the
+            // clear reported in the 2.0.1 dialect. The station implements a cache,
+            // so the pure decision is `Accepted`. Ports `ocpp.v201.call.ClearCache`
+            // and the `@on(Action.clear_cache)` dispatch shape from
+            // `ocpp/charge_point.py`.
+            OcppVersion::V201 => {
+                let auth_cache = auth_cache.clone();
+                d.on(move |_req: V201ClearCacheRequest| {
+                    let auth_cache = auth_cache.clone();
+                    async move {
+                        auth_cache.clear();
+                        let status = v201_command::v201_clear_cache_status(true);
+                        Ok::<V201ClearCacheResponse, _>(v201_command::v201_clear_cache_response(
+                            status, None,
+                        ))
+                    }
+                });
+            }
         }
 
         // DataTransfer — route by (vendorId, messageId) through the registry.
@@ -7186,6 +7215,65 @@ mod tests {
             None,
             "nothing partially applied"
         );
+    }
+
+    #[tokio::test]
+    async fn v201_clear_cache_empties_the_shared_cache() {
+        // A 2.0.1 `ClearCache` empties the same shared Authorization Cache the
+        // 1.6J path clears, and answers `Accepted` in the 2.0.1 dialect.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.auth_cache.insert("TAG001", accepted_info());
+        cp.auth_cache.insert("TAG002", accepted_info());
+        assert_eq!(cp.auth_cache.len(), 2);
+
+        let call = make_call(V201ClearCacheRequest::default());
+        match cp
+            .handle_message(Message::Call(call))
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Message::CallResult(r) => {
+                let body: V201ClearCacheResponse = r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    ocpp_types::v201::ClearCacheStatusEnumType::Accepted
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert!(
+            cp.auth_cache.is_empty(),
+            "ClearCache should empty the shared cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_clear_cache_on_empty_cache_is_idempotent() {
+        // Clearing an already-empty cache is a no-op that still reports
+        // `Accepted` — never a panic. Two clears in a row prove idempotency.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        assert!(cp.auth_cache.is_empty());
+
+        for _ in 0..2 {
+            let call = make_call(V201ClearCacheRequest::default());
+            match cp
+                .handle_message(Message::Call(call))
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                Message::CallResult(r) => {
+                    let body: V201ClearCacheResponse = r.payload_as().unwrap();
+                    assert_eq!(
+                        body.status,
+                        ocpp_types::v201::ClearCacheStatusEnumType::Accepted
+                    );
+                }
+                other => panic!("expected CallResult, got: {other:?}"),
+            }
+            assert!(cp.auth_cache.is_empty());
+        }
     }
 
     #[tokio::test]
