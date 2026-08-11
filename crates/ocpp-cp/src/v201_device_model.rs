@@ -37,8 +37,9 @@
 
 use ocpp_types::v201::{
     AttributeEnumType, ComponentCriterionEnumType, ComponentType, ComponentVariableType,
-    GetVariableStatusEnumType, MutabilityEnumType, ReportBaseEnumType, ReportDataType,
-    SetVariableStatusEnumType, VariableAttributeType, VariableType,
+    GetVariableStatusEnumType, MonitoringCriterionEnumType, MonitoringDataType, MutabilityEnumType,
+    ReportBaseEnumType, ReportDataType, SetVariableStatusEnumType, VariableAttributeType,
+    VariableType,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -543,6 +544,32 @@ impl V201DeviceModel {
                     &b.variable.instance,
                 ))
         });
+    }
+
+    /// The filtered snapshot of the station's *variable monitors* a
+    /// `GetMonitoringReport` asks for — the monitoring counterpart of
+    /// [`report_filtered`](Self::report_filtered) (which returns the device-model
+    /// *inventory*). Where `report_filtered` reports component/variable rows, this
+    /// reports the [`SetVariableMonitoring`] monitors installed *on* those
+    /// variables (thresholds, deltas, periodics), narrowed by an optional
+    /// `component_variable[]` and/or `monitoring_criteria[]`.
+    ///
+    /// **Modeled answer (issue #493, option b).** The simulator does not model
+    /// per-variable monitors yet — no `SetVariableMonitoring` handler installs
+    /// them, so the store is empty and this snapshot is always empty today. That
+    /// is a deliberate, documented outcome (the CSMS gets `EmptyResultSet`), not
+    /// an accident. The two filter arguments are accepted now for signature parity
+    /// with `report_filtered` and the follow-up that adds the monitor store; once
+    /// monitors exist this method will filter them by component-variable and
+    /// criteria exactly as `report_filtered` narrows the inventory.
+    ///
+    /// [`SetVariableMonitoring`]: https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py
+    pub fn monitoring_snapshot(
+        &self,
+        _component_variable: Option<&[ComponentVariableType]>,
+        _monitoring_criteria: Option<&[MonitoringCriterionEnumType]>,
+    ) -> Vec<MonitoringDataType> {
+        Vec::new()
     }
 }
 
@@ -1135,5 +1162,26 @@ mod tests {
             keys, sorted,
             "filtered report is sorted by component then variable"
         );
+    }
+
+    // --- monitoring_snapshot (GetMonitoringReport selection) ---------------
+
+    #[test]
+    fn monitoring_snapshot_is_empty_until_a_monitor_store_exists() {
+        // Modeled answer (issue #493, option b): the simulator installs no
+        // per-variable monitors yet, so the snapshot is empty regardless of the
+        // filters — no filter, a component-variable filter, and a criteria filter
+        // all report nothing. The empty snapshot drives the `EmptyResultSet`
+        // status on the wire.
+        let model = V201DeviceModel::with_standard_profile();
+        assert!(model.monitoring_snapshot(None, None).is_empty());
+        let cv = [component_variable("OCPPCommCtrlr", None)];
+        assert!(model.monitoring_snapshot(Some(&cv), None).is_empty());
+        assert!(model
+            .monitoring_snapshot(
+                None,
+                Some(&[MonitoringCriterionEnumType::ThresholdMonitoring])
+            )
+            .is_empty());
     }
 }

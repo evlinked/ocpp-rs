@@ -86,9 +86,11 @@ use ocpp_messages::v201::{
     GetCompositeScheduleResponse as V201GetCompositeScheduleResponse,
     GetLocalListVersionRequest as V201GetLocalListVersionRequest,
     GetLocalListVersionResponse as V201GetLocalListVersionResponse,
+    GetMonitoringReportRequest as V201GetMonitoringReportRequest,
     GetReportRequest as V201GetReportRequest, GetReportResponse as V201GetReportResponse,
     GetVariablesRequest as V201GetVariablesRequest,
     GetVariablesResponse as V201GetVariablesResponse, MeterValuesRequest as V201MeterValuesRequest,
+    NotifyMonitoringReportRequest as V201NotifyMonitoringReportRequest,
     NotifyReportRequest as V201NotifyReportRequest,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     RequestStopTransactionRequest as V201RequestStopTransactionRequest,
@@ -107,7 +109,7 @@ use ocpp_types::v201::{
     ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
     ConnectorStatusEnumType, GenericDeviceModelStatusEnumType, GenericStatusEnumType,
     GetVariableResultType, IdTokenType as V201IdTokenType, MessageTriggerEnumType,
-    OperationalStatusEnumType, RegistrationStatusEnumType, ReportDataType,
+    MonitoringDataType, OperationalStatusEnumType, RegistrationStatusEnumType, ReportDataType,
     RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
     SetVariableResultType, StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
@@ -588,6 +590,20 @@ enum RemoteCommand {
     V201NotifyReport {
         request_id: i32,
         report_data: Vec<ReportDataType>,
+    },
+    /// Stream the *variable-monitoring* snapshot a CSMS asked for with an
+    /// `Accepted` OCPP 2.0.1 `GetMonitoringReport` (Part 2, D07). The monitoring
+    /// twin of [`V201NotifyReport`](Self::V201NotifyReport): the synchronous
+    /// `GetMonitoringReport.conf` only acknowledges; the installed monitors follow
+    /// as a `NotifyMonitoringReport` CALL, correlated back by `request_id`.
+    /// `monitor_data` is the already-computed snapshot (taken under the
+    /// device-model read lock on the CALL path, so the send touches no shared
+    /// state). Queued off the inbound-CALL path for the same reason as the other
+    /// side effects — the outbound `NotifyMonitoringReport` CALL must not re-enter
+    /// the receive loop mid-dispatch.
+    V201NotifyMonitoringReport {
+        request_id: i32,
+        monitor_data: Vec<MonitoringDataType>,
     },
     /// Stream the installed charging profiles a CSMS asked for with an `Accepted`
     /// OCPP 2.0.1 `GetChargingProfiles` (Part 2). The synchronous
@@ -1640,6 +1656,78 @@ impl ChargePoint {
                         status_info: None,
                         custom_data: None,
                     })
+                }
+            });
+        }
+
+        // GetMonitoringReport (OCPP 2.0.1 only) — the *monitoring* counterpart of
+        // GetReport, completing the device-model report family (#493). Where
+        // GetReport streams the device-model *inventory* (component/variable rows)
+        // via NotifyReport, GetMonitoringReport streams the `SetVariableMonitoring`
+        // *monitors installed on* those variables (thresholds, deltas, periodics)
+        // via NotifyMonitoringReport, filtered by an optional `componentVariable[]`
+        // and/or `monitoringCriteria[]`. It shares GetReport's two-part seam
+        // exactly: the station acknowledges here with a
+        // `GenericDeviceModelStatusEnumType`, then streams the monitors
+        // asynchronously as a `NotifyMonitoringReport` CALL correlated by
+        // `requestId` — via its own `RemoteCommand::V201NotifyMonitoringReport`
+        // command and the same off-CALL-path queueing discipline.
+        //
+        // The filtered snapshot is computed here under the model's *read* lock so
+        // the queued side effect carries owned data and touches no shared state
+        // when it runs. Status mirrors GetReport (the pure
+        // `v201_get_monitoring_report_status` owns the mapping):
+        // - a non-empty snapshot → `Accepted`, and a `V201NotifyMonitoringReport`
+        //   is queued (sent after this CALLRESULT is flushed, off the inbound-CALL
+        //   path);
+        // - request understood but nothing matched → `EmptyResultSet`, nothing
+        //   queued;
+        // - the command consumer has gone away (CP shutting down) → `Rejected`
+        //   rather than promise a `NotifyMonitoringReport` that will never arrive.
+        //
+        // Modeled answer (issue #493, option b): the simulator installs no
+        // per-variable monitors yet, so `monitoring_snapshot` is always empty
+        // today and the live outcome is `EmptyResultSet`. The `Accepted` /
+        // `Rejected` branches are wired and covered by the pure unit tests; a
+        // follow-up adds the monitor store + `SetVariableMonitoring` that
+        // populates it.
+        //
+        // Trust boundary: the request carries only a numeric `requestId`, an
+        // optional schema-bounded `monitoringCriteria[]` enum list, and a
+        // schema-bounded `componentVariable[]` — nothing is parsed into an index
+        // or unwrapped, so malformed/unknown criteria are rejected upstream by
+        // `SchemaValidator::v201()` and nothing here panics on wire input.
+        // Registered on the V201 arm only; "GetMonitoringReport" has no 1.6J twin.
+        // Ports `ocpp.v201.call.GetMonitoringReport` →
+        // `ocpp.v201.call.NotifyMonitoringReport`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let device_model = v201_device_model.clone();
+            let command_sender = command_sender.clone();
+            d.on(move |req: V201GetMonitoringReportRequest| {
+                let device_model = device_model.clone();
+                let command_sender = command_sender.clone();
+                async move {
+                    let monitor_data = device_model.read().await.monitoring_snapshot(
+                        req.component_variable.as_deref(),
+                        req.monitoring_criteria.as_deref(),
+                    );
+                    // Compute `has_monitors` before `monitor_data` is moved into the
+                    // queued command. `queued` short-circuits: an empty snapshot
+                    // never attempts the send (nothing to stream). A non-empty
+                    // snapshot is queued unless the consumer has gone away.
+                    let has_monitors = !monitor_data.is_empty();
+                    let queued = has_monitors
+                        && command_sender
+                            .send(RemoteCommand::V201NotifyMonitoringReport {
+                                request_id: req.request_id,
+                                monitor_data,
+                            })
+                            .is_ok();
+                    let status =
+                        v201_command::v201_get_monitoring_report_status(has_monitors, queued);
+                    Ok(v201_command::v201_get_monitoring_report_response(
+                        status, None,
+                    ))
                 }
             });
         }
@@ -3496,6 +3584,13 @@ impl ChargePoint {
                         } => {
                             cp.send_v201_notify_report(request_id, report_data).await;
                         }
+                        RemoteCommand::V201NotifyMonitoringReport {
+                            request_id,
+                            monitor_data,
+                        } => {
+                            cp.send_v201_notify_monitoring_report(request_id, monitor_data)
+                                .await;
+                        }
                         RemoteCommand::V201ReportChargingProfiles {
                             request_id,
                             profiles,
@@ -5332,6 +5427,42 @@ impl ChargePoint {
         }
     }
 
+    /// Stream the variable-monitoring snapshot an `Accepted` OCPP 2.0.1
+    /// `GetMonitoringReport` asked for, as a `NotifyMonitoringReport` CALL
+    /// (`ocpp.v201.call.NotifyMonitoringReport`).
+    ///
+    /// The monitoring twin of [`send_v201_notify_report`](Self::send_v201_notify_report):
+    /// runs on the command-consumer task (off the inbound-CALL path), so the
+    /// outbound `NotifyMonitoringReport` is sent only after the
+    /// `GetMonitoringReport` CALLRESULT is flushed and never re-enters the receive
+    /// loop. `request_id` correlates the report back to the triggering
+    /// `GetMonitoringReport`; `monitor_data` is the snapshot the handler already
+    /// computed.
+    ///
+    /// A single page carries the whole snapshot (`seqNo` 0, `tbc` omitted =
+    /// `false`) — correct for the simulator's small monitor set. Multi-page
+    /// chunking (`tbc` paging) is a later slice once the monitor set grows beyond
+    /// one frame.
+    async fn send_v201_notify_monitoring_report(
+        &self,
+        request_id: i32,
+        monitor_data: Vec<MonitoringDataType>,
+    ) {
+        let request = V201NotifyMonitoringReportRequest {
+            monitor: Some(monitor_data),
+            request_id,
+            tbc: None,
+            seq_no: 0,
+            generated_at: v201_now(),
+            custom_data: None,
+        };
+        if let Err(e) = self.call(request).await {
+            warn!(
+                "v201 GetMonitoringReport: NotifyMonitoringReport send failed for request {request_id}: {e}"
+            );
+        }
+    }
+
     /// Stream the installed charging profiles an `Accepted` OCPP 2.0.1
     /// `GetChargingProfiles` asked for, as one or more `ReportChargingProfiles`
     /// CALLs (`ocpp.v201.call.ReportChargingProfiles`).
@@ -6782,6 +6913,121 @@ mod tests {
             validator
                 .validate_call_result("GetReport", &serde_json::to_value(&resp).unwrap())
                 .expect("GetReport response is schema-valid");
+        }
+    }
+
+    // --- GetMonitoringReport (OCPP 2.0.1, #493) ----------------------------
+
+    fn make_v201_get_monitoring_report(
+        request_id: i32,
+        component_variable: Option<Vec<ocpp_types::v201::ComponentVariableType>>,
+        monitoring_criteria: Option<Vec<ocpp_types::v201::MonitoringCriterionEnumType>>,
+    ) -> CallMessage {
+        make_call(V201GetMonitoringReportRequest {
+            component_variable,
+            request_id,
+            monitoring_criteria,
+            custom_data: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn v201_get_monitoring_report_registered_and_empty_result_set_queues_nothing() {
+        // A V201 CP registers a GetMonitoringReport handler (the response parses,
+        // it is not an unrecognized action). The simulator installs no monitors
+        // yet (issue #493, option b), so an unfiltered request → EmptyResultSet
+        // and no NotifyMonitoringReport is queued — nothing to stream.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_monitoring_report(
+                601, None, None,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::GetMonitoringReportResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    GenericDeviceModelStatusEnumType::EmptyResultSet
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert!(
+            v201_drain_commands(&cp).await.is_empty(),
+            "an EmptyResultSet GetMonitoringReport queues no NotifyMonitoringReport"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_get_monitoring_report_filters_do_not_panic_and_stay_empty() {
+        // Trust boundary: a request narrowed by both a componentVariable filter
+        // and a monitoringCriteria filter is handled without panic and still
+        // resolves to EmptyResultSet on the monitor-less simulator.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_monitoring_report(
+                602,
+                Some(vec![v201_component_variable("EVSE", "Temperature")]),
+                Some(vec![
+                    ocpp_types::v201::MonitoringCriterionEnumType::ThresholdMonitoring,
+                    ocpp_types::v201::MonitoringCriterionEnumType::PeriodicMonitoring,
+                ]),
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::GetMonitoringReportResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    GenericDeviceModelStatusEnumType::EmptyResultSet
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[test]
+    fn v201_get_monitoring_report_payloads_are_schema_valid() {
+        // Draft-06 schema validity of the request (with both filters) and every
+        // response status, independent of the dispatcher's own validation.
+        let validator = SchemaValidator::v201();
+        let req = V201GetMonitoringReportRequest {
+            component_variable: Some(vec![v201_component_variable("EVSE", "Temperature")]),
+            request_id: 7,
+            monitoring_criteria: Some(vec![
+                ocpp_types::v201::MonitoringCriterionEnumType::ThresholdMonitoring,
+                ocpp_types::v201::MonitoringCriterionEnumType::DeltaMonitoring,
+            ]),
+            custom_data: None,
+        };
+        validator
+            .validate_call("GetMonitoringReport", &serde_json::to_value(&req).unwrap())
+            .expect("GetMonitoringReport request is schema-valid");
+
+        for status in [
+            GenericDeviceModelStatusEnumType::Accepted,
+            GenericDeviceModelStatusEnumType::Rejected,
+            GenericDeviceModelStatusEnumType::NotSupported,
+            GenericDeviceModelStatusEnumType::EmptyResultSet,
+        ] {
+            let resp = ocpp_messages::v201::GetMonitoringReportResponse {
+                status,
+                status_info: Some(StatusInfoType {
+                    reason_code: "NoMonitors".to_string(),
+                    additional_info: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            };
+            validator
+                .validate_call_result("GetMonitoringReport", &serde_json::to_value(&resp).unwrap())
+                .expect("GetMonitoringReport response is schema-valid");
         }
     }
 
