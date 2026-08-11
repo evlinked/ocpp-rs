@@ -126,18 +126,18 @@ use ocpp_types::v201::{
     CancelReservationStatusEnumType, ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType,
     ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
     ChargingProfileType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
-    ClearChargingProfileType, GenericDeviceModelStatusEnumType, GetChargingProfileStatusEnumType,
-    MessageTriggerEnumType, OperationalStatusEnumType, RequestStartStopStatusEnumType,
-    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
-    TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    ClearChargingProfileType, GenericDeviceModelStatusEnumType, GenericStatusEnumType,
+    GetChargingProfileStatusEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
+    RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType,
+    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 
 use ocpp_messages::v201::{
     CancelReservationResponse, ChangeAvailabilityResponse, ClearCacheResponse,
     ClearChargingProfileResponse, GetChargingProfilesResponse, GetMonitoringReportResponse,
     ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
-    ReserveNowResponse, ResetResponse, SetChargingProfileResponse, TriggerMessageResponse,
-    UnlockConnectorResponse,
+    ReserveNowResponse, ResetResponse, SetChargingProfileResponse, SetMonitoringLevelResponse,
+    TriggerMessageResponse, UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1270,6 +1270,27 @@ pub fn v201_get_monitoring_report_response(
     status_info: Option<StatusInfoType>,
 ) -> GetMonitoringReportResponse {
     GetMonitoringReportResponse {
+        status,
+        status_info,
+        custom_data: None,
+    }
+}
+
+/// Build a schema-valid `SetMonitoringLevel.conf` ([`SetMonitoringLevelResponse`]).
+///
+/// Pure constructor mirroring [`v201_get_monitoring_report_response`]: carries
+/// the station's accept/reject decision on the requested reporting level plus
+/// the optional 2.0.1 `statusInfo`. `status_info` is `None` on
+/// [`Accepted`](GenericStatusEnumType::Accepted) and carries the machine-readable
+/// reason (an out-of-range `severity`) on [`Rejected`](GenericStatusEnumType::Rejected).
+///
+/// Ports `ocpp.v201.call_result.SetMonitoringLevel`.
+#[must_use]
+pub fn v201_set_monitoring_level_response(
+    status: GenericStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> SetMonitoringLevelResponse {
+    SetMonitoringLevelResponse {
         status,
         status_info,
         custom_data: None,
@@ -3071,6 +3092,37 @@ mod tests {
                         .validate_call_result("GetMonitoringReport", &payload)
                         .is_ok(),
                     "built {status:?} GetMonitoringReportResponse should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    // --- SetMonitoringLevel: the reporting-level response builder (#500) ----
+
+    #[test]
+    fn built_set_monitoring_level_responses_are_schema_valid() {
+        // Every built response — both statuses, with and without a statusInfo —
+        // satisfies the bundled OCPP 2.0.1 SetMonitoringLevel response JSON
+        // Schema. The Rejected/OutOfRange shape is the exact one the handler
+        // emits for an out-of-range severity.
+        let validator = SchemaValidator::v201();
+        let info = StatusInfoType {
+            reason_code: "OutOfRange".to_string(),
+            additional_info: Some("severity must be in 0..=9 (0 Danger … 9 Debug)".to_string()),
+            custom_data: None,
+        };
+        for status in [
+            GenericStatusEnumType::Accepted,
+            GenericStatusEnumType::Rejected,
+        ] {
+            for status_info in [None, Some(info.clone())] {
+                let resp = v201_set_monitoring_level_response(status, status_info);
+                let payload = serde_json::to_value(&resp).unwrap();
+                assert!(
+                    validator
+                        .validate_call_result("SetMonitoringLevel", &payload)
+                        .is_ok(),
+                    "built {status:?} SetMonitoringLevelResponse should be schema-valid, got: {payload}"
                 );
             }
         }

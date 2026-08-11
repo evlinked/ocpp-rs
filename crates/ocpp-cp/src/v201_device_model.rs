@@ -44,6 +44,7 @@ use ocpp_types::v201::{
     VariableMonitoringType, VariableType,
 };
 use std::collections::{HashMap, HashSet};
+use std::ops::RangeInclusive;
 
 /// Normalized identity of a component: lowercased name + instance, plus the
 /// (numeric) EVSE id / connector id it is scoped to. A station-wide component
@@ -134,6 +135,17 @@ struct MonitorEntry {
     monitor: VariableMonitoringType,
 }
 
+/// The most permissive monitoring reporting level (`9`, Debug). Every installed
+/// monitor's severity is in `0..=9`, so at this level nothing is suppressed. The
+/// device model's default until a CSMS narrows it via `SetMonitoringLevel`.
+pub const DEFAULT_MONITORING_LEVEL: i32 = 9;
+
+/// The inclusive severity range a `SetMonitoringLevel` may set: `0` (Danger) …
+/// `9` (Debug); a lower number is more severe. This range is **not** pinned by
+/// the payload schema (which only constrains `severity` to `integer`), so the
+/// station enforces it here — an out-of-range value is a modeled rejection.
+const MONITORING_LEVEL_RANGE: RangeInclusive<i32> = 0..=9;
+
 /// The Charge Point simulator's OCPP 2.0.1 device model: the attribute values a
 /// CSMS can read via `GetVariables` and write via `SetVariables`, plus the
 /// variable monitors it installs via `SetVariableMonitoring` and streams via
@@ -142,7 +154,12 @@ struct MonitorEntry {
 /// `components` is tracked separately from `variables` so a read/write can tell
 /// an *unknown component* apart from a *known component with an unknown
 /// variable* — the two map to distinct status outcomes.
-#[derive(Debug, Default, Clone)]
+///
+/// `Default` is hand-written (not derived) so `active_monitoring_level` starts at
+/// [`DEFAULT_MONITORING_LEVEL`] (`9`) rather than the numeric zero a derive would
+/// give — `0` is the *most* severe level, which would silently suppress all but
+/// `Danger` monitors on a fresh station.
+#[derive(Debug, Clone)]
 pub struct V201DeviceModel {
     /// Every component identity the model knows about (even those whose
     /// requested variable is absent), for the `UnknownComponent` distinction.
@@ -157,6 +174,32 @@ pub struct V201DeviceModel {
     /// is never handed to a later monitor. Starts at 0 (`Default`), so the first
     /// assigned id is 1.
     last_monitor_id: i32,
+    /// The active monitoring **reporting level** (severity threshold) set by
+    /// `SetMonitoringLevel`: the station reports monitors whose `severity` is at
+    /// or below this number (lower = more severe; `0` Danger … `9` Debug).
+    /// Defaults to [`DEFAULT_MONITORING_LEVEL`] (`9`, report everything) until a
+    /// CSMS narrows it.
+    ///
+    /// Recorded but not yet **enforced**: there is no live `NotifyEvent` emitter
+    /// on the simulator to gate, so no installed monitor's reporting changes
+    /// today. The level is stored and readable ([`active_monitoring_level`]) so a
+    /// future emitter can honor it — mirroring how the monitor store landed
+    /// before the report seam that reads it.
+    ///
+    /// [`active_monitoring_level`]: V201DeviceModel::active_monitoring_level
+    active_monitoring_level: i32,
+}
+
+impl Default for V201DeviceModel {
+    fn default() -> Self {
+        Self {
+            components: HashSet::new(),
+            variables: HashMap::new(),
+            monitors: HashMap::new(),
+            last_monitor_id: 0,
+            active_monitoring_level: DEFAULT_MONITORING_LEVEL,
+        }
+    }
 }
 
 impl V201DeviceModel {
@@ -873,6 +916,35 @@ impl V201DeviceModel {
                 }
             })
             .collect()
+    }
+
+    /// Set the active monitoring **reporting level** (the state half of
+    /// `ocpp.v201.call.SetMonitoringLevel`). `severity` must be in
+    /// `MONITORING_LEVEL_RANGE` (`0..=9`; `0` Danger … `9` Debug):
+    ///
+    /// - in range → the level is stored and this returns `true` (the handler
+    ///   answers `Accepted`);
+    /// - out of range → the stored level is left **unchanged** and this returns
+    ///   `false` (the handler answers `Rejected`).
+    ///
+    /// `severity` is only range-compared, never parsed or used as an index, so
+    /// any `i32` — negative, `> 9`, `i32::MIN` / `i32::MAX` — is handled without
+    /// panicking or overflowing.
+    pub fn set_monitoring_level(&mut self, severity: i32) -> bool {
+        if MONITORING_LEVEL_RANGE.contains(&severity) {
+            self.active_monitoring_level = severity;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The active monitoring reporting level (severity threshold). Every
+    /// installed monitor whose `severity` is at or below this number is reported;
+    /// the rest are suppressed. Defaults to [`DEFAULT_MONITORING_LEVEL`] (`9`,
+    /// nothing suppressed) until a `SetMonitoringLevel` narrows it.
+    pub fn active_monitoring_level(&self) -> i32 {
+        self.active_monitoring_level
     }
 }
 
@@ -1887,5 +1959,62 @@ mod tests {
             .unwrap();
         assert_ne!(second, first, "the cleared id is never handed out again");
         assert!(second > first);
+    }
+
+    // --- SetMonitoringLevel: the reporting-level setter (#500) --------------
+
+    #[test]
+    fn monitoring_level_defaults_to_most_permissive() {
+        // A fresh station suppresses nothing: the default is the most permissive
+        // level (9, Debug), not the numeric zero a derived Default would give
+        // (0 = Danger, which would hide every less-severe monitor).
+        let model = V201DeviceModel::new();
+        assert_eq!(model.active_monitoring_level(), DEFAULT_MONITORING_LEVEL);
+        assert_eq!(model.active_monitoring_level(), 9);
+        // The standard profile inherits the same default.
+        assert_eq!(
+            V201DeviceModel::with_standard_profile().active_monitoring_level(),
+            9
+        );
+    }
+
+    #[test]
+    fn set_monitoring_level_accepts_in_range_and_stores_it() {
+        let mut model = V201DeviceModel::new();
+        // A representative mid-range level.
+        assert!(model.set_monitoring_level(5));
+        assert_eq!(model.active_monitoring_level(), 5);
+        // Both inclusive bounds are accepted.
+        assert!(model.set_monitoring_level(0));
+        assert_eq!(model.active_monitoring_level(), 0);
+        assert!(model.set_monitoring_level(9));
+        assert_eq!(model.active_monitoring_level(), 9);
+    }
+
+    #[test]
+    fn set_monitoring_level_replaces_the_previous_level() {
+        let mut model = V201DeviceModel::new();
+        assert!(model.set_monitoring_level(7));
+        assert!(model.set_monitoring_level(2));
+        assert_eq!(model.active_monitoring_level(), 2, "the last set wins");
+    }
+
+    #[test]
+    fn set_monitoring_level_rejects_out_of_range_and_leaves_state_unchanged() {
+        let mut model = V201DeviceModel::new();
+        // Seed a known-good level so we can prove a rejected set does not clobber
+        // it.
+        assert!(model.set_monitoring_level(4));
+        for bad in [-1, 10, 100, i32::MIN, i32::MAX] {
+            assert!(
+                !model.set_monitoring_level(bad),
+                "severity {bad} is out of 0..=9 and must be rejected",
+            );
+            assert_eq!(
+                model.active_monitoring_level(),
+                4,
+                "a rejected set leaves the stored level unchanged",
+            );
+        }
     }
 }
