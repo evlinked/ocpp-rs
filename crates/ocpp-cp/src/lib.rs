@@ -99,6 +99,8 @@ use ocpp_messages::v201::{
     SendLocalListRequest as V201SendLocalListRequest,
     SendLocalListResponse as V201SendLocalListResponse,
     SetChargingProfileRequest as V201SetChargingProfileRequest,
+    SetVariableMonitoringRequest as V201SetVariableMonitoringRequest,
+    SetVariableMonitoringResponse as V201SetVariableMonitoringResponse,
     SetVariablesRequest as V201SetVariablesRequest,
     SetVariablesResponse as V201SetVariablesResponse,
     StatusNotificationRequest as V201StatusNotificationRequest,
@@ -1525,6 +1527,41 @@ impl ChargePoint {
                         .collect();
                     Ok(V201SetVariablesResponse {
                         set_variable_result,
+                        custom_data: None,
+                    })
+                }
+            });
+        }
+
+        // SetVariableMonitoring (OCPP 2.0.1 only) — install (or replace) variable
+        // monitors (threshold / delta / periodic) on the device model, the write
+        // counterpart to the `GetMonitoringReport` read seam below and the monitor
+        // sibling of `SetVariables` above. It shares the same `V201DeviceModel`
+        // store (behind the write lock here); each accepted monitor becomes
+        // visible to a subsequent `GetMonitoringReport` via `monitoring_snapshot`,
+        // which streams it as a `NotifyMonitoringReport`. Registered only on the
+        // V201 arm — "SetVariableMonitoring" has no 1.6J twin.
+        //
+        // Trust boundary: each `SetMonitoringData` entry is schema-bounded and
+        // stored verbatim (no parse/exec, no indexing into it); an install against
+        // an unknown component/variable is a modeled rejection status, never a
+        // panic, and repeat installs are idempotent (an identical monitor is
+        // reported `Duplicate`, not double-installed). The write is applied on the
+        // CALL path (cheap, and must be visible to the CALLRESULT and any
+        // subsequent `GetMonitoringReport`), serialized by the model's write lock.
+        // Ports `ocpp.v201.call.SetVariableMonitoring` →
+        // `ocpp.v201.call_result.SetVariableMonitoring`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let device_model = v201_device_model.clone();
+            d.on(move |req: V201SetVariableMonitoringRequest| {
+                let device_model = device_model.clone();
+                async move {
+                    let set_monitoring_result = device_model
+                        .write()
+                        .await
+                        .install_monitors(&req.set_monitoring_data);
+                    Ok(V201SetVariableMonitoringResponse {
+                        set_monitoring_result,
                         custom_data: None,
                     })
                 }
@@ -7058,6 +7095,266 @@ mod tests {
                 .validate_call_result("GetMonitoringReport", &serde_json::to_value(&resp).unwrap())
                 .expect("GetMonitoringReport response is schema-valid");
         }
+    }
+
+    // --- SetVariableMonitoring (OCPP 2.0.1, #494) --------------------------
+    // A `for_version(V201)` CP installs variable monitors into the same
+    // `V201DeviceModel` the read/report seams share; a subsequent
+    // GetMonitoringReport then streams them. These exercise the wired V201 arm
+    // end-to-end over `handle_message`.
+
+    fn make_v201_set_variable_monitoring(
+        data: Vec<ocpp_types::v201::SetMonitoringDataType>,
+    ) -> CallMessage {
+        make_call(V201SetVariableMonitoringRequest {
+            set_monitoring_data: data,
+            custom_data: None,
+        })
+    }
+
+    fn v201_monitor_data(
+        component: &str,
+        variable: &str,
+        kind: ocpp_types::v201::MonitorEnumType,
+        value: f64,
+        severity: i32,
+    ) -> ocpp_types::v201::SetMonitoringDataType {
+        ocpp_types::v201::SetMonitoringDataType {
+            id: None,
+            transaction: None,
+            value,
+            kind,
+            severity,
+            component: ocpp_types::v201::ComponentType {
+                name: component.to_string(),
+                instance: None,
+                evse: None,
+                custom_data: None,
+            },
+            variable: ocpp_types::v201::VariableType {
+                name: variable.to_string(),
+                instance: None,
+                custom_data: None,
+            },
+            custom_data: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_set_variable_monitoring_installs_and_is_accepted() {
+        use ocpp_types::v201::{MonitorEnumType, SetMonitoringStatusEnumType};
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_variable_monitoring(vec![
+                v201_monitor_data(
+                    "OCPPCommCtrlr",
+                    "HeartbeatInterval",
+                    MonitorEnumType::UpperThreshold,
+                    600.0,
+                    5,
+                ),
+            ])))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetVariableMonitoringResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(body.set_monitoring_result.len(), 1);
+                assert_eq!(
+                    body.set_monitoring_result[0].status,
+                    SetMonitoringStatusEnumType::Accepted
+                );
+                assert_eq!(body.set_monitoring_result[0].id, Some(1));
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        // A pure install queues no side-effect command.
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_set_variable_monitoring_then_get_monitoring_report_streams_the_monitor() {
+        use ocpp_types::v201::MonitorEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // Install a monitor.
+        cp.handle_message(Message::Call(make_v201_set_variable_monitoring(vec![
+            v201_monitor_data(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                MonitorEnumType::UpperThreshold,
+                600.0,
+                5,
+            ),
+        ])))
+        .await
+        .unwrap();
+        // Now GetMonitoringReport finds it → Accepted, and queues one
+        // NotifyMonitoringReport carrying the installed monitor.
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_monitoring_report(
+                701, None, None,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::GetMonitoringReportResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(body.status, GenericDeviceModelStatusEnumType::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(commands.len(), 1, "one NotifyMonitoringReport is queued");
+        match &commands[0] {
+            RemoteCommand::V201NotifyMonitoringReport {
+                request_id,
+                monitor_data,
+            } => {
+                assert_eq!(*request_id, 701);
+                assert_eq!(monitor_data.len(), 1);
+                assert_eq!(monitor_data[0].component.name, "OCPPCommCtrlr");
+                assert_eq!(monitor_data[0].variable.name, "HeartbeatInterval");
+                assert_eq!(monitor_data[0].variable_monitoring.len(), 1);
+                assert_eq!(monitor_data[0].variable_monitoring[0].id, 1);
+            }
+            other => panic!("expected V201NotifyMonitoringReport, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_set_variable_monitoring_rejects_unknown_variable() {
+        use ocpp_types::v201::{MonitorEnumType, SetMonitoringStatusEnumType};
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_variable_monitoring(vec![
+                v201_monitor_data(
+                    "OCPPCommCtrlr",
+                    "NoSuchVariable",
+                    MonitorEnumType::Delta,
+                    1.0,
+                    3,
+                ),
+            ])))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetVariableMonitoringResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(
+                    body.set_monitoring_result[0].status,
+                    SetMonitoringStatusEnumType::UnknownVariable
+                );
+                assert_eq!(body.set_monitoring_result[0].id, None);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v201_set_variable_monitoring_response_is_schema_valid() {
+        use ocpp_types::v201::{
+            ComponentType, MonitorEnumType, SetMonitoringResultType, SetMonitoringStatusEnumType,
+            StatusInfoType, VariableType,
+        };
+        let validator = SchemaValidator::v201();
+        // A request with one monitor is schema-valid.
+        let req = V201SetVariableMonitoringRequest {
+            set_monitoring_data: vec![v201_monitor_data(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                MonitorEnumType::Periodic,
+                900.0,
+                5,
+            )],
+            custom_data: None,
+        };
+        validator
+            .validate_call(
+                "SetVariableMonitoring",
+                &serde_json::to_value(&req).unwrap(),
+            )
+            .expect("SetVariableMonitoring request is schema-valid");
+
+        // Both an accepted (with id) and a rejected (with statusInfo, no id)
+        // per-monitor result serialize to schema-valid responses.
+        for (status, id, status_info) in [
+            (SetMonitoringStatusEnumType::Accepted, Some(1), None),
+            (
+                SetMonitoringStatusEnumType::UnknownVariable,
+                None,
+                Some(StatusInfoType {
+                    reason_code: "UnknownVariable".to_string(),
+                    additional_info: None,
+                    custom_data: None,
+                }),
+            ),
+        ] {
+            let resp = ocpp_messages::v201::SetVariableMonitoringResponse {
+                set_monitoring_result: vec![SetMonitoringResultType {
+                    id,
+                    status,
+                    kind: MonitorEnumType::Periodic,
+                    component: ComponentType {
+                        name: "OCPPCommCtrlr".to_string(),
+                        instance: None,
+                        evse: None,
+                        custom_data: None,
+                    },
+                    variable: VariableType {
+                        name: "HeartbeatInterval".to_string(),
+                        instance: None,
+                        custom_data: None,
+                    },
+                    severity: 5,
+                    status_info,
+                    custom_data: None,
+                }],
+                custom_data: None,
+            };
+            validator
+                .validate_call_result(
+                    "SetVariableMonitoring",
+                    &serde_json::to_value(&resp).unwrap(),
+                )
+                .expect("SetVariableMonitoring response is schema-valid");
+        }
+    }
+
+    #[test]
+    fn v201_notify_monitoring_report_with_installed_monitors_is_schema_valid() {
+        // The snapshot produced by install → GetMonitoringReport is streamed as a
+        // NotifyMonitoringReport; a populated monitor list (built exactly as the
+        // send path builds it) must be OCPP 2.0.1 schema-valid, not just the empty
+        // case #493 covered.
+        use ocpp_types::v201::MonitorEnumType;
+        let mut model = V201DeviceModel::with_standard_profile();
+        model.install_monitors(&[v201_monitor_data(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            600.0,
+            5,
+        )]);
+        let monitor_data = model.monitoring_snapshot(None, None);
+        assert_eq!(monitor_data.len(), 1);
+
+        let request = V201NotifyMonitoringReportRequest {
+            monitor: Some(monitor_data),
+            request_id: 701,
+            tbc: None,
+            seq_no: 0,
+            generated_at: "2026-08-11T00:00:00Z".to_string(),
+            custom_data: None,
+        };
+        SchemaValidator::v201()
+            .validate_call(
+                "NotifyMonitoringReport",
+                &serde_json::to_value(&request).unwrap(),
+            )
+            .expect("NotifyMonitoringReport with installed monitors is schema-valid");
     }
 
     // --- OCPP 2.0.1 Local Authorization List (M7, issue #485) --------------
