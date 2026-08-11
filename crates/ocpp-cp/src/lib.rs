@@ -101,6 +101,7 @@ use ocpp_messages::v201::{
     SendLocalListRequest as V201SendLocalListRequest,
     SendLocalListResponse as V201SendLocalListResponse,
     SetChargingProfileRequest as V201SetChargingProfileRequest,
+    SetMonitoringLevelRequest as V201SetMonitoringLevelRequest,
     SetVariableMonitoringRequest as V201SetVariableMonitoringRequest,
     SetVariableMonitoringResponse as V201SetVariableMonitoringResponse,
     SetVariablesRequest as V201SetVariablesRequest,
@@ -1596,6 +1597,66 @@ impl ChargePoint {
                         clear_monitoring_result,
                         custom_data: None,
                     })
+                }
+            });
+        }
+
+        // SetMonitoringLevel (OCPP 2.0.1 only) — set the **reporting severity
+        // threshold** for the device-model monitoring family (#494/#495/#499).
+        // Where `SetVariableMonitoring` installs monitors and
+        // `ClearVariableMonitoring` removes them, this setter governs *at what
+        // severity* installed monitors report events: the station reports monitors
+        // whose `severity` is at or below the active level (lower = more severe;
+        // `0` Danger … `9` Debug). The level is stored on the shared
+        // `V201DeviceModel` (behind the write lock) and readable via
+        // `active_monitoring_level()`. Registered only on the V201 arm —
+        // "SetMonitoringLevel" has no 1.6J twin.
+        //
+        // Trust boundary: `req.severity` is a schema-bounded `i32`, but the `0..=9`
+        // range is **not** schema-constrained (the payload only pins `integer`),
+        // so the station validates it here. An in-range value is stored and
+        // answered `Accepted`; any out-of-range `i32` (negative, `> 9`,
+        // `i32::MIN` / `i32::MAX`) leaves the stored level unchanged and is
+        // answered `Rejected` with a `StatusInfoType` reason — it is only
+        // range-compared, never parsed or indexed, so it cannot panic or overflow
+        // on wire input. The write is applied on the CALL path (cheap, and must be
+        // visible to the CALLRESULT), serialized by the model's write lock;
+        // nothing is queued.
+        //
+        // Threshold is recorded, not yet **enforced**: there is no live
+        // `NotifyEvent` emitter on the simulator to gate, so no installed monitor's
+        // reporting changes today. The active level is stored and readable so a
+        // future emitter can honor it (follow-up on #500) — mirroring how the
+        // monitor store landed before the report seam that reads it. Ports
+        // `ocpp.v201.call.SetMonitoringLevel` →
+        // `ocpp.v201.call_result.SetMonitoringLevel`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let device_model = v201_device_model.clone();
+            d.on(move |req: V201SetMonitoringLevelRequest| {
+                let device_model = device_model.clone();
+                async move {
+                    let accepted = device_model
+                        .write()
+                        .await
+                        .set_monitoring_level(req.severity);
+                    let (status, status_info) = if accepted {
+                        (GenericStatusEnumType::Accepted, None)
+                    } else {
+                        (
+                            GenericStatusEnumType::Rejected,
+                            Some(StatusInfoType {
+                                reason_code: "OutOfRange".to_string(),
+                                additional_info: Some(
+                                    "severity must be in 0..=9 (0 Danger … 9 Debug)".to_string(),
+                                ),
+                                custom_data: None,
+                            }),
+                        )
+                    };
+                    Ok(v201_command::v201_set_monitoring_level_response(
+                        status,
+                        status_info,
+                    ))
                 }
             });
         }
@@ -7536,6 +7597,133 @@ mod tests {
                     &serde_json::to_value(&resp).unwrap(),
                 )
                 .expect("ClearVariableMonitoring response is schema-valid");
+        }
+    }
+
+    // --- OCPP 2.0.1 SetMonitoringLevel (M7, issue #500) --------------------
+    // A `for_version(V201)` CP sets its reporting severity threshold on the same
+    // shared `V201DeviceModel` the monitoring family uses. These exercise the
+    // wired V201 arm end-to-end over `handle_message`.
+
+    fn make_v201_set_monitoring_level(severity: i32) -> CallMessage {
+        make_call(V201SetMonitoringLevelRequest {
+            severity,
+            custom_data: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn v201_set_monitoring_level_in_range_is_accepted() {
+        use ocpp_types::v201::GenericStatusEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_monitoring_level(5)))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetMonitoringLevelResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, GenericStatusEnumType::Accepted);
+                // Accepted carries no statusInfo.
+                assert!(body.status_info.is_none());
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        // A pure set queues no side-effect command.
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_set_monitoring_level_boundaries_are_accepted() {
+        use ocpp_types::v201::GenericStatusEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // Both inclusive bounds (0 = Danger, 9 = Debug) are accepted.
+        for severity in [0, 9] {
+            let resp = cp
+                .handle_message(Message::Call(make_v201_set_monitoring_level(severity)))
+                .await
+                .unwrap();
+            match resp.unwrap() {
+                Message::CallResult(r) => {
+                    let body: ocpp_messages::v201::SetMonitoringLevelResponse =
+                        r.payload_as().unwrap();
+                    assert_eq!(
+                        body.status,
+                        GenericStatusEnumType::Accepted,
+                        "severity {severity} is in range and must be Accepted",
+                    );
+                }
+                other => panic!("expected CallResult, got: {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_set_monitoring_level_out_of_range_is_rejected() {
+        use ocpp_types::v201::GenericStatusEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // Out-of-range severities (below 0, above 9, and the i32 extremes) are
+        // Rejected with a populated statusInfo — never a panic on wire input.
+        for severity in [-1, 10, i32::MIN, i32::MAX] {
+            let resp = cp
+                .handle_message(Message::Call(make_v201_set_monitoring_level(severity)))
+                .await
+                .unwrap();
+            match resp.unwrap() {
+                Message::CallResult(r) => {
+                    let body: ocpp_messages::v201::SetMonitoringLevelResponse =
+                        r.payload_as().unwrap();
+                    assert_eq!(
+                        body.status,
+                        GenericStatusEnumType::Rejected,
+                        "severity {severity} is out of range and must be Rejected",
+                    );
+                    let info = body
+                        .status_info
+                        .expect("a rejection carries a statusInfo reason");
+                    assert_eq!(info.reason_code, "OutOfRange");
+                }
+                other => panic!("expected CallResult, got: {other:?}"),
+            }
+        }
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[test]
+    fn v201_set_monitoring_level_request_and_response_are_schema_valid() {
+        use ocpp_types::v201::{GenericStatusEnumType, StatusInfoType};
+        let validator = SchemaValidator::v201();
+        // A request carrying a severity is schema-valid.
+        let req = V201SetMonitoringLevelRequest {
+            severity: 3,
+            custom_data: None,
+        };
+        validator
+            .validate_call("SetMonitoringLevel", &serde_json::to_value(&req).unwrap())
+            .expect("SetMonitoringLevel request is schema-valid");
+
+        // Both answer shapes — Accepted (no statusInfo) and Rejected (with the
+        // OutOfRange statusInfo the handler emits) — serialize to a schema-valid
+        // response.
+        for (status, status_info) in [
+            (GenericStatusEnumType::Accepted, None),
+            (
+                GenericStatusEnumType::Rejected,
+                Some(StatusInfoType {
+                    reason_code: "OutOfRange".to_string(),
+                    additional_info: Some("severity must be in 0..=9".to_string()),
+                    custom_data: None,
+                }),
+            ),
+        ] {
+            let resp = ocpp_messages::v201::SetMonitoringLevelResponse {
+                status,
+                status_info,
+                custom_data: None,
+            };
+            validator
+                .validate_call_result("SetMonitoringLevel", &serde_json::to_value(&resp).unwrap())
+                .expect("SetMonitoringLevel response is schema-valid");
         }
     }
 
