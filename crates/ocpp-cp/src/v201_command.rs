@@ -126,17 +126,18 @@ use ocpp_types::v201::{
     CancelReservationStatusEnumType, ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType,
     ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
     ChargingProfileType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
-    ClearChargingProfileType, GetChargingProfileStatusEnumType, MessageTriggerEnumType,
-    OperationalStatusEnumType, RequestStartStopStatusEnumType, ReserveNowStatusEnumType,
-    ResetEnumType, ResetStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
-    UnlockStatusEnumType,
+    ClearChargingProfileType, GenericDeviceModelStatusEnumType, GetChargingProfileStatusEnumType,
+    MessageTriggerEnumType, OperationalStatusEnumType, RequestStartStopStatusEnumType,
+    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 
 use ocpp_messages::v201::{
     CancelReservationResponse, ChangeAvailabilityResponse, ClearCacheResponse,
-    ClearChargingProfileResponse, GetChargingProfilesResponse, ReportChargingProfilesRequest,
-    RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
-    ResetResponse, SetChargingProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
+    ClearChargingProfileResponse, GetChargingProfilesResponse, GetMonitoringReportResponse,
+    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
+    ReserveNowResponse, ResetResponse, SetChargingProfileResponse, TriggerMessageResponse,
+    UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1216,6 +1217,59 @@ pub fn v201_clear_cache_response(
     status_info: Option<StatusInfoType>,
 ) -> ClearCacheResponse {
     ClearCacheResponse {
+        status,
+        status_info,
+        custom_data: None,
+    }
+}
+
+/// Decide the [`GenericDeviceModelStatusEnumType`] a `V201` station reports for
+/// an inbound `GetMonitoringReport.req`, from whether any installed monitor
+/// matched the request's filters and whether the asynchronous
+/// `NotifyMonitoringReport` could be queued.
+///
+/// Ports `ocpp.v201.call.GetMonitoringReport` → `NotifyMonitoringReport`. It is
+/// the pure twin of the `GetReport` status mapping (#487): the station answers
+/// synchronously here, then streams the matched monitors asynchronously as a
+/// `NotifyMonitoringReport` CALL correlated by `requestId`. Three outcomes,
+/// mirroring `GetReport`:
+///
+/// - `has_monitors == false` — the request was understood but nothing matched
+///   (on today's simulator, always: no monitors are installed yet, issue #493
+///   option b) → [`EmptyResultSet`](GenericDeviceModelStatusEnumType::EmptyResultSet),
+///   and nothing is queued.
+/// - `has_monitors && queued` — a non-empty snapshot was handed to the command
+///   channel → [`Accepted`](GenericDeviceModelStatusEnumType::Accepted); the
+///   `NotifyMonitoringReport` follows once this CALLRESULT is flushed.
+/// - `has_monitors && !queued` — the command consumer has gone away (CP shutting
+///   down), so the station cannot stream the report it would otherwise promise →
+///   [`Rejected`](GenericDeviceModelStatusEnumType::Rejected).
+#[must_use]
+pub fn v201_get_monitoring_report_status(
+    has_monitors: bool,
+    queued: bool,
+) -> GenericDeviceModelStatusEnumType {
+    if !has_monitors {
+        GenericDeviceModelStatusEnumType::EmptyResultSet
+    } else if queued {
+        GenericDeviceModelStatusEnumType::Accepted
+    } else {
+        GenericDeviceModelStatusEnumType::Rejected
+    }
+}
+
+/// Build a schema-valid `GetMonitoringReport.conf`
+/// ([`GetMonitoringReportResponse`]).
+///
+/// Pure constructor mirroring [`v201_cancel_reservation_response`]: carries the
+/// decided [`status`](GenericDeviceModelStatusEnumType) plus the optional 2.0.1
+/// `statusInfo` (a vendor-agnostic `reasonCode` and human-readable detail).
+#[must_use]
+pub fn v201_get_monitoring_report_response(
+    status: GenericDeviceModelStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> GetMonitoringReportResponse {
+    GetMonitoringReportResponse {
         status,
         status_info,
         custom_data: None,
@@ -2950,6 +3004,73 @@ mod tests {
                         .validate_call_result("ClearCache", &payload)
                         .is_ok(),
                     "built {status:?} ClearCacheResponse should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    // --- GetMonitoringReport (v201, #493) ----------------------------------
+
+    #[test]
+    fn get_monitoring_report_empty_snapshot_is_empty_result_set() {
+        // No monitor matched (the simulator's standing state, option b): the
+        // request was understood but there is nothing to stream. `queued` is
+        // irrelevant when there are no monitors.
+        assert_eq!(
+            v201_get_monitoring_report_status(false, false),
+            GenericDeviceModelStatusEnumType::EmptyResultSet
+        );
+        assert_eq!(
+            v201_get_monitoring_report_status(false, true),
+            GenericDeviceModelStatusEnumType::EmptyResultSet
+        );
+    }
+
+    #[test]
+    fn get_monitoring_report_queued_snapshot_is_accepted() {
+        // A non-empty snapshot handed to the command channel → Accepted; the
+        // NotifyMonitoringReport follows off the CALL path.
+        assert_eq!(
+            v201_get_monitoring_report_status(true, true),
+            GenericDeviceModelStatusEnumType::Accepted
+        );
+    }
+
+    #[test]
+    fn get_monitoring_report_consumer_gone_is_rejected() {
+        // Monitors matched but the command consumer is gone (CP shutting down):
+        // we cannot stream the report, so we do not promise it.
+        assert_eq!(
+            v201_get_monitoring_report_status(true, false),
+            GenericDeviceModelStatusEnumType::Rejected
+        );
+    }
+
+    #[test]
+    fn built_get_monitoring_report_responses_are_schema_valid() {
+        // Every built response — across all three statuses, with and without a
+        // statusInfo — satisfies the bundled OCPP 2.0.1 GetMonitoringReport
+        // response JSON Schema.
+        let validator = SchemaValidator::v201();
+        let info = StatusInfoType {
+            reason_code: "NoMonitors".to_string(),
+            additional_info: Some("no variable monitors are installed".to_string()),
+            custom_data: None,
+        };
+        for status in [
+            GenericDeviceModelStatusEnumType::Accepted,
+            GenericDeviceModelStatusEnumType::Rejected,
+            GenericDeviceModelStatusEnumType::EmptyResultSet,
+            GenericDeviceModelStatusEnumType::NotSupported,
+        ] {
+            for status_info in [None, Some(info.clone())] {
+                let resp = v201_get_monitoring_report_response(status, status_info);
+                let payload = serde_json::to_value(&resp).unwrap();
+                assert!(
+                    validator
+                        .validate_call_result("GetMonitoringReport", &payload)
+                        .is_ok(),
+                    "built {status:?} GetMonitoringReportResponse should be schema-valid, got: {payload}"
                 );
             }
         }
