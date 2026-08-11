@@ -79,6 +79,8 @@ use ocpp_messages::v201::{
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
     ClearCacheRequest as V201ClearCacheRequest, ClearCacheResponse as V201ClearCacheResponse,
     ClearChargingProfileRequest as V201ClearChargingProfileRequest,
+    ClearVariableMonitoringRequest as V201ClearVariableMonitoringRequest,
+    ClearVariableMonitoringResponse as V201ClearVariableMonitoringResponse,
     DataTransferRequest as V201DataTransferRequest,
     GetBaseReportRequest as V201GetBaseReportRequest,
     GetBaseReportResponse as V201GetBaseReportResponse,
@@ -1562,6 +1564,36 @@ impl ChargePoint {
                         .install_monitors(&req.set_monitoring_data);
                     Ok(V201SetVariableMonitoringResponse {
                         set_monitoring_result,
+                        custom_data: None,
+                    })
+                }
+            });
+        }
+
+        // ClearVariableMonitoring (OCPP 2.0.1 only) — remove previously-installed
+        // variable monitors by id, the teardown counterpart to
+        // `SetVariableMonitoring` above over the same `V201DeviceModel` store. A
+        // cleared monitor stops appearing in `monitoring_snapshot`, so a
+        // subsequent `GetMonitoringReport` no longer streams it. Registered only
+        // on the V201 arm — "ClearVariableMonitoring" has no 1.6J twin.
+        //
+        // Trust boundary: `req.id` is a schema-bounded `Vec<i32>`; each id is used
+        // only as a `HashMap` key (no parse, no indexing), so an unknown or
+        // out-of-range id is a modeled `NotFound`, never a panic. Like the install
+        // handler this is a pure read-and-remove with **no queued side effect** —
+        // the write is applied on the CALL path (must be visible to the CALLRESULT
+        // and any later `GetMonitoringReport`), serialized by the model's write
+        // lock. Ports `ocpp.v201.call.ClearVariableMonitoring` →
+        // `ocpp.v201.call_result.ClearVariableMonitoring`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let device_model = v201_device_model.clone();
+            d.on(move |req: V201ClearVariableMonitoringRequest| {
+                let device_model = device_model.clone();
+                async move {
+                    let clear_monitoring_result =
+                        device_model.write().await.clear_monitors(&req.id);
+                    Ok(V201ClearVariableMonitoringResponse {
+                        clear_monitoring_result,
                         custom_data: None,
                     })
                 }
@@ -7355,6 +7387,156 @@ mod tests {
                 &serde_json::to_value(&request).unwrap(),
             )
             .expect("NotifyMonitoringReport with installed monitors is schema-valid");
+    }
+
+    // --- ClearVariableMonitoring (OCPP 2.0.1, #497) ------------------------
+    // The teardown counterpart to SetVariableMonitoring: a `for_version(V201)`
+    // CP removes monitors by id from the same shared `V201DeviceModel`, so a
+    // subsequent GetMonitoringReport no longer streams them. These exercise the
+    // wired V201 arm end-to-end over `handle_message`.
+
+    fn make_v201_clear_variable_monitoring(ids: Vec<i32>) -> CallMessage {
+        make_call(V201ClearVariableMonitoringRequest {
+            id: ids,
+            custom_data: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn v201_clear_variable_monitoring_removes_an_installed_monitor() {
+        use ocpp_types::v201::{
+            ClearMonitoringStatusEnumType, GenericDeviceModelStatusEnumType, MonitorEnumType,
+        };
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // Install a monitor (assigned id 1).
+        cp.handle_message(Message::Call(make_v201_set_variable_monitoring(vec![
+            v201_monitor_data(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                MonitorEnumType::UpperThreshold,
+                600.0,
+                5,
+            ),
+        ])))
+        .await
+        .unwrap();
+
+        // Clear it by id → Accepted, and nothing is queued (pure read-and-remove).
+        let resp = cp
+            .handle_message(Message::Call(make_v201_clear_variable_monitoring(vec![1])))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::ClearVariableMonitoringResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(body.clear_monitoring_result.len(), 1);
+                assert_eq!(
+                    body.clear_monitoring_result[0].status,
+                    ClearMonitoringStatusEnumType::Accepted
+                );
+                assert_eq!(body.clear_monitoring_result[0].id, 1);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+
+        // The cleared monitor is gone: GetMonitoringReport is now EmptyResultSet
+        // and streams no NotifyMonitoringReport.
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_monitoring_report(
+                702, None, None,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::GetMonitoringReportResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    GenericDeviceModelStatusEnumType::EmptyResultSet
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        // A single drain (the receiver is take-once) proves neither the clear nor
+        // the empty GetMonitoringReport queued any side-effect command.
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_clear_variable_monitoring_unknown_id_is_not_found() {
+        use ocpp_types::v201::ClearMonitoringStatusEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // No monitors installed — an unknown id is NotFound, never a panic.
+        let resp = cp
+            .handle_message(Message::Call(make_v201_clear_variable_monitoring(vec![
+                999,
+            ])))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::ClearVariableMonitoringResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(
+                    body.clear_monitoring_result[0].status,
+                    ClearMonitoringStatusEnumType::NotFound
+                );
+                assert_eq!(body.clear_monitoring_result[0].id, 999);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn v201_clear_variable_monitoring_response_is_schema_valid() {
+        use ocpp_types::v201::{
+            ClearMonitoringResultType, ClearMonitoringStatusEnumType, StatusInfoType,
+        };
+        let validator = SchemaValidator::v201();
+        // A request carrying one id is schema-valid.
+        let req = V201ClearVariableMonitoringRequest {
+            id: vec![1, 2],
+            custom_data: None,
+        };
+        validator
+            .validate_call(
+                "ClearVariableMonitoring",
+                &serde_json::to_value(&req).unwrap(),
+            )
+            .expect("ClearVariableMonitoring request is schema-valid");
+
+        // Each per-id result status (incl. a Rejected with statusInfo) serializes
+        // to a schema-valid response.
+        for (status, status_info) in [
+            (ClearMonitoringStatusEnumType::Accepted, None),
+            (ClearMonitoringStatusEnumType::NotFound, None),
+            (
+                ClearMonitoringStatusEnumType::Rejected,
+                Some(StatusInfoType {
+                    reason_code: "InUse".to_string(),
+                    additional_info: None,
+                    custom_data: None,
+                }),
+            ),
+        ] {
+            let resp = ocpp_messages::v201::ClearVariableMonitoringResponse {
+                clear_monitoring_result: vec![ClearMonitoringResultType {
+                    status,
+                    id: 1,
+                    status_info,
+                    custom_data: None,
+                }],
+                custom_data: None,
+            };
+            validator
+                .validate_call_result(
+                    "ClearVariableMonitoring",
+                    &serde_json::to_value(&resp).unwrap(),
+                )
+                .expect("ClearVariableMonitoring response is schema-valid");
+        }
     }
 
     // --- OCPP 2.0.1 Local Authorization List (M7, issue #485) --------------

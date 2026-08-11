@@ -36,11 +36,12 @@
 //! requires.
 
 use ocpp_types::v201::{
-    AttributeEnumType, ComponentCriterionEnumType, ComponentType, ComponentVariableType,
-    GetVariableStatusEnumType, MonitorEnumType, MonitoringCriterionEnumType, MonitoringDataType,
-    MutabilityEnumType, ReportBaseEnumType, ReportDataType, SetMonitoringDataType,
-    SetMonitoringResultType, SetMonitoringStatusEnumType, SetVariableStatusEnumType,
-    VariableAttributeType, VariableMonitoringType, VariableType,
+    AttributeEnumType, ClearMonitoringResultType, ClearMonitoringStatusEnumType,
+    ComponentCriterionEnumType, ComponentType, ComponentVariableType, GetVariableStatusEnumType,
+    MonitorEnumType, MonitoringCriterionEnumType, MonitoringDataType, MutabilityEnumType,
+    ReportBaseEnumType, ReportDataType, SetMonitoringDataType, SetMonitoringResultType,
+    SetMonitoringStatusEnumType, SetVariableStatusEnumType, VariableAttributeType,
+    VariableMonitoringType, VariableType,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -820,6 +821,58 @@ impl V201DeviceModel {
             },
         );
         result(SetMonitoringStatusEnumType::Accepted, Some(id))
+    }
+
+    /// Clear a batch of previously-installed variable monitors by id, returning
+    /// one [`ClearMonitoringResultType`] per requested id, **in request order**.
+    ///
+    /// This is the teardown half of the monitoring seam — the inverse of
+    /// [`install_monitors`](Self::install_monitors) — and the source the
+    /// `ClearVariableMonitoring` handler drains under the model's write lock. A
+    /// cleared monitor no longer appears in
+    /// [`monitoring_snapshot`](Self::monitoring_snapshot), so a subsequent
+    /// `GetMonitoringReport` stops reporting it.
+    ///
+    /// Per-id outcome:
+    /// - [`Accepted`](ClearMonitoringStatusEnumType::Accepted) — a monitor with
+    ///   this id existed and was removed.
+    /// - [`NotFound`](ClearMonitoringStatusEnumType::NotFound) — no monitor with
+    ///   this id: never installed, or already cleared — including the second
+    ///   occurrence of a duplicate id within one batch, whose first occurrence
+    ///   already removed it.
+    ///
+    /// [`Rejected`](ClearMonitoringStatusEnumType::Rejected) is not produced: the
+    /// store holds only CSMS-installed monitors, so there is no station-refused /
+    /// preconfigured monitor to refuse yet. It stays in the ported status enum
+    /// for the wire (a future hard-wired-monitor seam maps to it) — mirroring how
+    /// the install path documents the unproduced `UnsupportedMonitorType`.
+    ///
+    /// The assigned-id counter (`last_monitor_id`) is monotonic and is **not**
+    /// rewound on clear, so a later install never reuses a cleared id.
+    ///
+    /// Ports `ocpp.v201.call.ClearVariableMonitoring` /
+    /// `ocpp.v201.call_result.ClearVariableMonitoring`.
+    pub fn clear_monitors(&mut self, ids: &[i32]) -> Vec<ClearMonitoringResultType> {
+        ids.iter()
+            .map(|&id| {
+                // `HashMap::remove` returning the entry *is* the existence probe:
+                // present → removed (`Accepted`), absent → `NotFound`. A repeated
+                // id in one batch clears on its first occurrence and reports
+                // `NotFound` thereafter — idempotent, and it cannot panic on any
+                // wire input (an unknown or huge id simply fails to match).
+                let status = if self.monitors.remove(&id).is_some() {
+                    ClearMonitoringStatusEnumType::Accepted
+                } else {
+                    ClearMonitoringStatusEnumType::NotFound
+                };
+                ClearMonitoringResultType {
+                    status,
+                    id,
+                    status_info: None,
+                    custom_data: None,
+                }
+            })
+            .collect()
     }
 }
 
@@ -1725,5 +1778,114 @@ mod tests {
             vec!["AlignedDataCtrlr", "SampledDataCtrlr"],
             "sorted by component name"
         );
+    }
+
+    // --- clear_monitors (ClearVariableMonitoring, issue #497) --------------
+
+    #[test]
+    fn clear_removes_the_monitor_and_it_vanishes_from_the_snapshot() {
+        let mut model = V201DeviceModel::with_standard_profile();
+        let id = model.install_monitors(&[monitor_data(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            600.0,
+            5,
+        )])[0]
+            .id
+            .unwrap();
+        assert_eq!(model.monitoring_snapshot(None, None).len(), 1);
+
+        let results = model.clear_monitors(&[id]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, ClearMonitoringStatusEnumType::Accepted);
+        assert_eq!(results[0].id, id);
+        // The cleared monitor no longer shows up in a subsequent report.
+        assert!(model.monitoring_snapshot(None, None).is_empty());
+    }
+
+    #[test]
+    fn clear_unknown_id_is_not_found() {
+        let mut model = V201DeviceModel::with_standard_profile();
+        let results = model.clear_monitors(&[999]);
+        assert_eq!(results[0].status, ClearMonitoringStatusEnumType::NotFound);
+        assert_eq!(results[0].id, 999);
+    }
+
+    #[test]
+    fn clear_mixed_batch_preserves_request_order() {
+        let mut model = V201DeviceModel::with_standard_profile();
+        let live = model.install_monitors(&[monitor_data(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            600.0,
+            5,
+        )])[0]
+            .id
+            .unwrap();
+
+        // Unknown, then live, then unknown — the results echo each requested id
+        // in the order asked, so the CSMS can correlate row-by-row.
+        let results = model.clear_monitors(&[404, live, 405]);
+        assert_eq!(
+            results.iter().map(|r| (r.id, r.status)).collect::<Vec<_>>(),
+            vec![
+                (404, ClearMonitoringStatusEnumType::NotFound),
+                (live, ClearMonitoringStatusEnumType::Accepted),
+                (405, ClearMonitoringStatusEnumType::NotFound),
+            ]
+        );
+        assert!(model.monitoring_snapshot(None, None).is_empty());
+    }
+
+    #[test]
+    fn clear_duplicate_id_in_one_batch_is_accepted_then_not_found() {
+        // The same id twice in one request: the first occurrence removes it,
+        // the second finds nothing — idempotent, never a panic.
+        let mut model = V201DeviceModel::with_standard_profile();
+        let id = model.install_monitors(&[monitor_data(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            600.0,
+            5,
+        )])[0]
+            .id
+            .unwrap();
+        let results = model.clear_monitors(&[id, id]);
+        assert_eq!(results[0].status, ClearMonitoringStatusEnumType::Accepted);
+        assert_eq!(results[1].status, ClearMonitoringStatusEnumType::NotFound);
+    }
+
+    #[test]
+    fn cleared_id_is_not_reused_by_a_later_install() {
+        // Clearing a monitor does not rewind the monotonic id counter, so the
+        // next install gets a fresh id rather than reusing the cleared one.
+        let mut model = V201DeviceModel::with_standard_profile();
+        let first = model.install_monitors(&[monitor_data(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            600.0,
+            5,
+        )])[0]
+            .id
+            .unwrap();
+        assert_eq!(
+            model.clear_monitors(&[first])[0].status,
+            ClearMonitoringStatusEnumType::Accepted
+        );
+        let second = model.install_monitors(&[monitor_data(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            MonitorEnumType::Delta,
+            10.0,
+            3,
+        )])[0]
+            .id
+            .unwrap();
+        assert_ne!(second, first, "the cleared id is never handed out again");
+        assert!(second > first);
     }
 }
