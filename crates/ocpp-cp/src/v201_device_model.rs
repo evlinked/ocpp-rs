@@ -37,9 +37,10 @@
 
 use ocpp_types::v201::{
     AttributeEnumType, ComponentCriterionEnumType, ComponentType, ComponentVariableType,
-    GetVariableStatusEnumType, MonitoringCriterionEnumType, MonitoringDataType, MutabilityEnumType,
-    ReportBaseEnumType, ReportDataType, SetVariableStatusEnumType, VariableAttributeType,
-    VariableType,
+    GetVariableStatusEnumType, MonitorEnumType, MonitoringCriterionEnumType, MonitoringDataType,
+    MutabilityEnumType, ReportBaseEnumType, ReportDataType, SetMonitoringDataType,
+    SetMonitoringResultType, SetMonitoringStatusEnumType, SetVariableStatusEnumType,
+    VariableAttributeType, VariableMonitoringType, VariableType,
 };
 use std::collections::{HashMap, HashSet};
 
@@ -115,8 +116,27 @@ struct VariableEntry {
     variable: VariableType,
 }
 
+/// One installed variable monitor: the normalized identity of the
+/// component-variable it watches, that variable's display (CSMS-visible) casing,
+/// and the monitor definition itself.
+///
+/// The [`key`](Self::key) drives filtering and grouping in
+/// [`monitoring_snapshot`](V201DeviceModel::monitoring_snapshot) (case-insensitive,
+/// exactly like the `GetVariables`/`GetReport` seams); `component`/`variable`
+/// keep the original casing so the streamed `NotifyMonitoringReport` reproduces
+/// the real names rather than the lowercased keys.
+#[derive(Debug, Clone)]
+struct MonitorEntry {
+    key: VariableKey,
+    component: ComponentType,
+    variable: VariableType,
+    monitor: VariableMonitoringType,
+}
+
 /// The Charge Point simulator's OCPP 2.0.1 device model: the attribute values a
-/// CSMS can read via `GetVariables` and write via `SetVariables`.
+/// CSMS can read via `GetVariables` and write via `SetVariables`, plus the
+/// variable monitors it installs via `SetVariableMonitoring` and streams via
+/// `GetMonitoringReport` → `NotifyMonitoringReport`.
 ///
 /// `components` is tracked separately from `variables` so a read/write can tell
 /// an *unknown component* apart from a *known component with an unknown
@@ -128,6 +148,14 @@ pub struct V201DeviceModel {
     components: HashSet<ComponentKey>,
     /// Per-variable stored attribute values and write policy.
     variables: HashMap<VariableKey, VariableEntry>,
+    /// Installed variable monitors, keyed by their station-assigned id — the
+    /// primary index, so `ClearVariableMonitoring` (a follow-up) can clear by id
+    /// and `SetVariableMonitoring` can replace an existing monitor by id.
+    monitors: HashMap<i32, MonitorEntry>,
+    /// The last monitor id assigned. Monotonic (never reused), so a cleared id
+    /// is never handed to a later monitor. Starts at 0 (`Default`), so the first
+    /// assigned id is 1.
+    last_monitor_id: i32,
 }
 
 impl V201DeviceModel {
@@ -554,22 +582,244 @@ impl V201DeviceModel {
     /// variables (thresholds, deltas, periodics), narrowed by an optional
     /// `component_variable[]` and/or `monitoring_criteria[]`.
     ///
-    /// **Modeled answer (issue #493, option b).** The simulator does not model
-    /// per-variable monitors yet — no `SetVariableMonitoring` handler installs
-    /// them, so the store is empty and this snapshot is always empty today. That
-    /// is a deliberate, documented outcome (the CSMS gets `EmptyResultSet`), not
-    /// an accident. The two filter arguments are accepted now for signature parity
-    /// with `report_filtered` and the follow-up that adds the monitor store; once
-    /// monitors exist this method will filter them by component-variable and
-    /// criteria exactly as `report_filtered` narrows the inventory.
+    /// Monitors are installed by [`install_monitors`](Self::install_monitors)
+    /// (the `SetVariableMonitoring` handler, issue #494) and grouped here into one
+    /// [`MonitoringDataType`] row per component-variable, its `variableMonitoring`
+    /// list id-sorted. Both filters narrow the result and AND together:
+    /// `component_variable[]` matches case-insensitively exactly as
+    /// [`report_filtered`](Self::report_filtered) does, and `monitoring_criteria[]`
+    /// keeps a monitor whose kind falls under **any** requested criterion (the
+    /// criteria OR together). An absent or empty filter does not narrow on that
+    /// axis, so both absent = every installed monitor. On a station with no
+    /// monitors installed the snapshot is empty and the handler answers
+    /// `EmptyResultSet`.
     ///
     /// [`SetVariableMonitoring`]: https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py
     pub fn monitoring_snapshot(
         &self,
-        _component_variable: Option<&[ComponentVariableType]>,
-        _monitoring_criteria: Option<&[MonitoringCriterionEnumType]>,
+        component_variable: Option<&[ComponentVariableType]>,
+        monitoring_criteria: Option<&[MonitoringCriterionEnumType]>,
     ) -> Vec<MonitoringDataType> {
-        Vec::new()
+        // Both filters are optional and AND together; an absent or empty list
+        // does not narrow on that axis (the schema requires ≥1 item when a
+        // filter is present, so the empty case is defensive, not a spec path) —
+        // matching how `report_filtered` treats its filters.
+        let variable_filter = component_variable.filter(|filters| !filters.is_empty());
+        let criteria_filter = monitoring_criteria.filter(|criteria| !criteria.is_empty());
+
+        // Collect matching monitors grouped by their component-variable identity.
+        // The group value carries the display-form component/variable (from the
+        // first monitor seen for that identity) plus its monitors; the output is
+        // sorted at the end, so `HashMap` iteration order does not leak.
+        let mut groups: HashMap<
+            VariableKey,
+            (ComponentType, VariableType, Vec<VariableMonitoringType>),
+        > = HashMap::new();
+        for entry in self.monitors.values() {
+            if let Some(filters) = variable_filter {
+                if !Self::variable_matches_filter(&entry.key, filters) {
+                    continue;
+                }
+            }
+            if let Some(criteria) = criteria_filter {
+                if !criteria
+                    .iter()
+                    .any(|c| Self::monitor_matches_criterion(entry.monitor.kind, *c))
+                {
+                    continue;
+                }
+            }
+            groups
+                .entry(entry.key.clone())
+                .or_insert_with(|| (entry.component.clone(), entry.variable.clone(), Vec::new()))
+                .2
+                .push(entry.monitor.clone());
+        }
+
+        let mut snapshot: Vec<MonitoringDataType> = groups
+            .into_values()
+            .map(|(component, variable, mut variable_monitoring)| {
+                // Stable order within a component-variable row: by monitor id.
+                variable_monitoring.sort_by_key(|m| m.id);
+                MonitoringDataType {
+                    component,
+                    variable,
+                    variable_monitoring,
+                    custom_data: None,
+                }
+            })
+            .collect();
+        Self::sort_monitoring(&mut snapshot);
+        snapshot
+    }
+
+    /// Whether a monitor of the given [`MonitorEnumType`] falls under a requested
+    /// `GetMonitoringReport` [`MonitoringCriterionEnumType`]. The three criteria
+    /// partition the five monitor kinds: `ThresholdMonitoring` covers
+    /// `Upper`/`LowerThreshold`, `DeltaMonitoring` covers `Delta`, and
+    /// `PeriodicMonitoring` covers `Periodic`/`PeriodicClockAligned`. The match is
+    /// exhaustive without a wildcard so a new monitor kind is a compile error to
+    /// triage here.
+    fn monitor_matches_criterion(
+        kind: MonitorEnumType,
+        criterion: MonitoringCriterionEnumType,
+    ) -> bool {
+        match criterion {
+            MonitoringCriterionEnumType::ThresholdMonitoring => matches!(
+                kind,
+                MonitorEnumType::UpperThreshold | MonitorEnumType::LowerThreshold
+            ),
+            MonitoringCriterionEnumType::DeltaMonitoring => matches!(kind, MonitorEnumType::Delta),
+            MonitoringCriterionEnumType::PeriodicMonitoring => matches!(
+                kind,
+                MonitorEnumType::Periodic | MonitorEnumType::PeriodicClockAligned
+            ),
+        }
+    }
+
+    /// Impose a stable, reviewable order on a monitoring snapshot — sorted by
+    /// component name / instance / EVSE then variable name / instance — so callers
+    /// and tests see a deterministic result independent of `HashMap` iteration.
+    /// The monitors within each row are already id-sorted by
+    /// [`monitoring_snapshot`](Self::monitoring_snapshot).
+    fn sort_monitoring(snapshot: &mut [MonitoringDataType]) {
+        snapshot.sort_by(|a, b| {
+            (
+                &a.component.name,
+                &a.component.instance,
+                a.component.evse.as_ref().map(|e| e.id),
+                &a.variable.name,
+                &a.variable.instance,
+            )
+                .cmp(&(
+                    &b.component.name,
+                    &b.component.instance,
+                    b.component.evse.as_ref().map(|e| e.id),
+                    &b.variable.name,
+                    &b.variable.instance,
+                ))
+        });
+    }
+
+    /// Install (or replace) a batch of variable monitors requested by a
+    /// `SetVariableMonitoring`, returning one [`SetMonitoringResultType`] per
+    /// requested monitor, in request order.
+    ///
+    /// This is the write half of the monitoring seam — the install counterpart to
+    /// [`set`](Self::set) for the device-model inventory — and the source the
+    /// `SetVariableMonitoring` handler drains under the model's write lock. Each
+    /// installed monitor becomes visible to a subsequent `GetMonitoringReport` via
+    /// [`monitoring_snapshot`](Self::monitoring_snapshot).
+    ///
+    /// Ports `ocpp.v201.call.SetVariableMonitoring` /
+    /// `ocpp.v201.call_result.SetVariableMonitoring`.
+    pub fn install_monitors(
+        &mut self,
+        data: &[SetMonitoringDataType],
+    ) -> Vec<SetMonitoringResultType> {
+        data.iter().map(|d| self.install_monitor(d)).collect()
+    }
+
+    /// Install (or replace) a single monitor, returning its per-monitor result.
+    ///
+    /// Decision precedence — the same identity checks as [`set`](Self::set), then
+    /// the monitoring-specific outcomes:
+    /// - [`UnknownComponent`](SetMonitoringStatusEnumType::UnknownComponent) — no
+    ///   component with this (normalized) identity exists.
+    /// - [`UnknownVariable`](SetMonitoringStatusEnumType::UnknownVariable) — the
+    ///   component exists but carries no such variable.
+    /// - **Replace** (`id` present) — a request carrying an `id` targets an
+    ///   existing monitor *on the same variable*: the monitor is updated in place,
+    ///   keeping its id ([`Accepted`](SetMonitoringStatusEnumType::Accepted)). An
+    ///   `id` that names no monitor (or one on a different variable) is
+    ///   [`Rejected`](SetMonitoringStatusEnumType::Rejected).
+    /// - [`Duplicate`](SetMonitoringStatusEnumType::Duplicate) — an identical
+    ///   monitor (same variable + `type` + `severity` + `value`) already exists.
+    /// - [`Accepted`](SetMonitoringStatusEnumType::Accepted) — installed with a
+    ///   freshly-assigned id.
+    ///
+    /// The result echoes the requested `type` / `severity` / `component` /
+    /// `variable` so the CSMS can correlate each outcome to its request entry; the
+    /// assigned `id` is returned only on `Accepted`.
+    ///
+    /// `UnsupportedMonitorType` is not produced: the simulator supports every
+    /// monitor kind on any known variable (it does not model per-variable monitor
+    /// capabilities). It stays in the ported status enum for the wire.
+    fn install_monitor(&mut self, data: &SetMonitoringDataType) -> SetMonitoringResultType {
+        let result = |status, id| SetMonitoringResultType {
+            id,
+            status,
+            kind: data.kind,
+            component: data.component.clone(),
+            variable: data.variable.clone(),
+            severity: data.severity,
+            status_info: None,
+            custom_data: None,
+        };
+
+        let component_key = ComponentKey::from_request(&data.component);
+        if !self.components.contains(&component_key) {
+            return result(SetMonitoringStatusEnumType::UnknownComponent, None);
+        }
+        let variable_key = VariableKey::from_request(&data.component, &data.variable);
+        if !self.variables.contains_key(&variable_key) {
+            return result(SetMonitoringStatusEnumType::UnknownVariable, None);
+        }
+
+        let transaction = data.transaction.unwrap_or(false);
+
+        // Replace path: an `id` in the request replaces that existing monitor,
+        // but only when it names a monitor on this same variable.
+        if let Some(id) = data.id {
+            return match self.monitors.get_mut(&id) {
+                Some(entry) if entry.key == variable_key => {
+                    entry.monitor = VariableMonitoringType {
+                        id,
+                        transaction,
+                        value: data.value,
+                        kind: data.kind,
+                        severity: data.severity,
+                        custom_data: None,
+                    };
+                    result(SetMonitoringStatusEnumType::Accepted, Some(id))
+                }
+                _ => result(SetMonitoringStatusEnumType::Rejected, None),
+            };
+        }
+
+        // Duplicate: an identical monitor already exists on this variable. `value`
+        // is compared by `to_bits()` — exact bit-for-bit identity, never
+        // arithmetic — so this is `clippy::float_cmp`-clean and treats an
+        // identical resend as a duplicate rather than a second monitor.
+        let is_duplicate = self.monitors.values().any(|e| {
+            e.key == variable_key
+                && e.monitor.kind == data.kind
+                && e.monitor.severity == data.severity
+                && e.monitor.value.to_bits() == data.value.to_bits()
+        });
+        if is_duplicate {
+            return result(SetMonitoringStatusEnumType::Duplicate, None);
+        }
+
+        self.last_monitor_id += 1;
+        let id = self.last_monitor_id;
+        self.monitors.insert(
+            id,
+            MonitorEntry {
+                key: variable_key,
+                component: data.component.clone(),
+                variable: data.variable.clone(),
+                monitor: VariableMonitoringType {
+                    id,
+                    transaction,
+                    value: data.value,
+                    kind: data.kind,
+                    severity: data.severity,
+                    custom_data: None,
+                },
+            },
+        );
+        result(SetMonitoringStatusEnumType::Accepted, Some(id))
     }
 }
 
@@ -1164,15 +1414,34 @@ mod tests {
         );
     }
 
-    // --- monitoring_snapshot (GetMonitoringReport selection) ---------------
+    // --- install_monitors + monitoring_snapshot (SetVariableMonitoring /  ---
+    // --- GetMonitoringReport, issue #494) ----------------------------------
+
+    fn monitor_data(
+        component_name: &str,
+        variable_name: &str,
+        kind: MonitorEnumType,
+        value: f64,
+        severity: i32,
+    ) -> SetMonitoringDataType {
+        SetMonitoringDataType {
+            id: None,
+            transaction: None,
+            value,
+            kind,
+            severity,
+            component: component(component_name),
+            variable: variable(variable_name),
+            custom_data: None,
+        }
+    }
 
     #[test]
-    fn monitoring_snapshot_is_empty_until_a_monitor_store_exists() {
-        // Modeled answer (issue #493, option b): the simulator installs no
-        // per-variable monitors yet, so the snapshot is empty regardless of the
-        // filters — no filter, a component-variable filter, and a criteria filter
-        // all report nothing. The empty snapshot drives the `EmptyResultSet`
-        // status on the wire.
+    fn empty_snapshot_when_no_monitor_installed() {
+        // A freshly-seeded model has no monitors, so the snapshot is empty
+        // regardless of the filters — no filter, a component-variable filter, and
+        // a criteria filter all report nothing. The empty snapshot drives the
+        // `EmptyResultSet` status on the wire (no regression to #493's path).
         let model = V201DeviceModel::with_standard_profile();
         assert!(model.monitoring_snapshot(None, None).is_empty());
         let cv = [component_variable("OCPPCommCtrlr", None)];
@@ -1183,5 +1452,278 @@ mod tests {
                 Some(&[MonitoringCriterionEnumType::ThresholdMonitoring])
             )
             .is_empty());
+    }
+
+    #[test]
+    fn install_accepts_and_snapshot_reports_the_monitor() {
+        let mut model = V201DeviceModel::with_standard_profile();
+        let results = model.install_monitors(&[monitor_data(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            600.0,
+            5,
+        )]);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, SetMonitoringStatusEnumType::Accepted);
+        // A new monitor gets a station-assigned id (the first is 1).
+        assert_eq!(results[0].id, Some(1));
+
+        let snapshot = model.monitoring_snapshot(None, None);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].component.name, "OCPPCommCtrlr");
+        assert_eq!(snapshot[0].variable.name, "HeartbeatInterval");
+        assert_eq!(snapshot[0].variable_monitoring.len(), 1);
+        let m = &snapshot[0].variable_monitoring[0];
+        assert_eq!(m.id, 1);
+        assert_eq!(m.kind, MonitorEnumType::UpperThreshold);
+        assert_eq!(m.value, 600.0);
+        assert_eq!(m.severity, 5);
+        assert!(!m.transaction);
+    }
+
+    #[test]
+    fn install_rejects_unknown_component_and_variable() {
+        let mut model = V201DeviceModel::with_standard_profile();
+        let results = model.install_monitors(&[
+            monitor_data(
+                "NoSuchCtrlr",
+                "HeartbeatInterval",
+                MonitorEnumType::Delta,
+                1.0,
+                3,
+            ),
+            monitor_data(
+                "OCPPCommCtrlr",
+                "NoSuchVariable",
+                MonitorEnumType::Delta,
+                1.0,
+                3,
+            ),
+        ]);
+        assert_eq!(
+            results[0].status,
+            SetMonitoringStatusEnumType::UnknownComponent
+        );
+        assert_eq!(results[0].id, None);
+        assert_eq!(
+            results[1].status,
+            SetMonitoringStatusEnumType::UnknownVariable
+        );
+        assert_eq!(results[1].id, None);
+        // Nothing was installed.
+        assert!(model.monitoring_snapshot(None, None).is_empty());
+    }
+
+    #[test]
+    fn identical_reinstall_is_a_duplicate() {
+        let mut model = V201DeviceModel::with_standard_profile();
+        let data = monitor_data(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            600.0,
+            5,
+        );
+        assert_eq!(
+            model.install_monitors(std::slice::from_ref(&data))[0].status,
+            SetMonitoringStatusEnumType::Accepted
+        );
+        let again = model.install_monitors(&[data]);
+        assert_eq!(again[0].status, SetMonitoringStatusEnumType::Duplicate);
+        assert_eq!(again[0].id, None);
+        // Only the first monitor exists.
+        assert_eq!(
+            model.monitoring_snapshot(None, None)[0]
+                .variable_monitoring
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn different_severity_on_same_variable_is_not_a_duplicate() {
+        // Two threshold monitors on one variable at different severities (e.g. a
+        // warning and a critical alarm) coexist — not a duplicate.
+        let mut model = V201DeviceModel::with_standard_profile();
+        model.install_monitors(&[monitor_data(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            600.0,
+            5,
+        )]);
+        let second = model.install_monitors(&[monitor_data(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            600.0,
+            1,
+        )]);
+        assert_eq!(second[0].status, SetMonitoringStatusEnumType::Accepted);
+        assert_eq!(second[0].id, Some(2));
+        let snapshot = model.monitoring_snapshot(None, None);
+        // Both monitors group under the one component-variable, id-sorted.
+        assert_eq!(snapshot.len(), 1);
+        let ids: Vec<i32> = snapshot[0]
+            .variable_monitoring
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn replace_by_id_updates_in_place_and_keeps_the_id() {
+        let mut model = V201DeviceModel::with_standard_profile();
+        let id = model.install_monitors(&[monitor_data(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            600.0,
+            5,
+        )])[0]
+            .id
+            .unwrap();
+
+        let mut replacement = monitor_data(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            900.0,
+            2,
+        );
+        replacement.id = Some(id);
+        let result = model.install_monitors(&[replacement]);
+        assert_eq!(result[0].status, SetMonitoringStatusEnumType::Accepted);
+        assert_eq!(result[0].id, Some(id));
+
+        let snapshot = model.monitoring_snapshot(None, None);
+        assert_eq!(
+            snapshot[0].variable_monitoring.len(),
+            1,
+            "replaced, not added"
+        );
+        let m = &snapshot[0].variable_monitoring[0];
+        assert_eq!(m.id, id);
+        assert_eq!(m.value, 900.0);
+        assert_eq!(m.severity, 2);
+    }
+
+    #[test]
+    fn replace_of_unknown_id_is_rejected() {
+        let mut model = V201DeviceModel::with_standard_profile();
+        let mut data = monitor_data(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            MonitorEnumType::Delta,
+            1.0,
+            3,
+        );
+        data.id = Some(999);
+        let result = model.install_monitors(&[data]);
+        assert_eq!(result[0].status, SetMonitoringStatusEnumType::Rejected);
+        assert_eq!(result[0].id, None);
+        assert!(model.monitoring_snapshot(None, None).is_empty());
+    }
+
+    #[test]
+    fn snapshot_filters_by_component_variable() {
+        let mut model = V201DeviceModel::with_standard_profile();
+        model.install_monitors(&[
+            monitor_data(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                MonitorEnumType::UpperThreshold,
+                600.0,
+                5,
+            ),
+            monitor_data(
+                "AlignedDataCtrlr",
+                "Interval",
+                MonitorEnumType::Delta,
+                10.0,
+                5,
+            ),
+        ]);
+        let filter = [component_variable("AlignedDataCtrlr", Some("Interval"))];
+        let snapshot = model.monitoring_snapshot(Some(&filter), None);
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].component.name, "AlignedDataCtrlr");
+        assert_eq!(snapshot[0].variable.name, "Interval");
+    }
+
+    #[test]
+    fn snapshot_filters_by_monitoring_criteria() {
+        let mut model = V201DeviceModel::with_standard_profile();
+        model.install_monitors(&[
+            monitor_data(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                MonitorEnumType::UpperThreshold,
+                600.0,
+                5,
+            ),
+            monitor_data(
+                "AlignedDataCtrlr",
+                "Interval",
+                MonitorEnumType::Delta,
+                10.0,
+                5,
+            ),
+            monitor_data(
+                "SampledDataCtrlr",
+                "TxUpdatedInterval",
+                MonitorEnumType::Periodic,
+                30.0,
+                5,
+            ),
+        ]);
+        // ThresholdMonitoring keeps only the UpperThreshold monitor.
+        let threshold = model.monitoring_snapshot(
+            None,
+            Some(&[MonitoringCriterionEnumType::ThresholdMonitoring]),
+        );
+        assert_eq!(threshold.len(), 1);
+        assert_eq!(threshold[0].variable.name, "HeartbeatInterval");
+        // DeltaMonitoring OR PeriodicMonitoring keeps the other two.
+        let delta_or_periodic = model.monitoring_snapshot(
+            None,
+            Some(&[
+                MonitoringCriterionEnumType::DeltaMonitoring,
+                MonitoringCriterionEnumType::PeriodicMonitoring,
+            ]),
+        );
+        assert_eq!(delta_or_periodic.len(), 2);
+    }
+
+    #[test]
+    fn snapshot_is_deterministically_ordered() {
+        let mut model = V201DeviceModel::with_standard_profile();
+        model.install_monitors(&[
+            monitor_data(
+                "SampledDataCtrlr",
+                "TxUpdatedInterval",
+                MonitorEnumType::Periodic,
+                30.0,
+                5,
+            ),
+            monitor_data(
+                "AlignedDataCtrlr",
+                "Interval",
+                MonitorEnumType::Delta,
+                10.0,
+                5,
+            ),
+        ]);
+        let first = model.monitoring_snapshot(None, None);
+        let second = model.monitoring_snapshot(None, None);
+        assert_eq!(first, second, "snapshot ordering is stable");
+        let names: Vec<&str> = first.iter().map(|d| d.component.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["AlignedDataCtrlr", "SampledDataCtrlr"],
+            "sorted by component name"
+        );
     }
 }
