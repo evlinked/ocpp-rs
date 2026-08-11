@@ -118,9 +118,10 @@ use ocpp_types::v201::{
 
 use ocpp_messages::v201::{
     CancelReservationResponse, ChangeAvailabilityResponse, ClearChargingProfileResponse,
-    GetChargingProfilesResponse, GetMonitoringReportResponse, ReportChargingProfilesRequest,
-    RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
-    ResetResponse, SetChargingProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
+    GetChargingProfilesResponse, GetMonitoringReportResponse, GetTransactionStatusResponse,
+    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
+    ReserveNowResponse, ResetResponse, SetChargingProfileResponse, TriggerMessageResponse,
+    UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1210,6 +1211,75 @@ pub fn v201_get_monitoring_report_response(
     GetMonitoringReportResponse {
         status,
         status_info,
+        custom_data: None,
+    }
+}
+
+/// Decide the `(messagesInQueue, ongoingIndicator)` pair a `V201` station reports
+/// for an inbound `GetTransactionStatus.req`, from the request's optional
+/// `transactionId`, the ids of every transaction the station currently has live,
+/// and whether the station still has messages queued for delivery.
+///
+/// Ports `ocpp.v201.call.GetTransactionStatus` /
+/// `ocpp.v201.call_result.GetTransactionStatus` (OCPP 2.0.1 Part 2, E13). There
+/// is no 1.6J equivalent — this is a 2.0.1-only message the CSMS uses (e.g. after
+/// a reconnect) to learn whether a transaction is still ongoing and/or whether
+/// the station still has undelivered messages for it before deciding to clean up.
+///
+/// The `ongoingIndicator` mirrors [`v201_request_stop_status`]'s
+/// member-of-the-live-set test, but reported rather than acted on:
+///
+/// - **`transactionId` present** — `ongoingIndicator = Some(true)` iff `requested`
+///   equals one of `live_transaction_ids` (the station is actually running it);
+///   otherwise `Some(false)` — an unknown id, an id whose transaction has already
+///   ended, or an idle station all fold to the modeled "not ongoing" answer, the
+///   same fold the stop decision applies. Matching is exact string equality over
+///   the station-minted decimal id, never a numeric parse: a malformed or
+///   non-canonical id (`"07"`, whitespace, a huge value) simply fails to match and
+///   reports `Some(false)`, never panicking — a trust boundary on the
+///   CSMS-supplied id.
+/// - **`transactionId` omitted (station-wide query)** — `ongoingIndicator = None`:
+///   the query concerns only the station's queued-message state, so the response
+///   field is left absent (it is optional for exactly this case) rather than
+///   fabricating a per-transaction verdict.
+///
+/// `messages_in_queue` is reported through unchanged. The simulator does not yet
+/// buffer offline messages, so the wiring layer passes `false` today (a modeled
+/// answer, documented at the call site); accepting it as an input keeps this pure
+/// and lets a future outbound queue flip it without reshaping the decision.
+///
+/// This is the *pure* decision, depending only on the request and two plain reads
+/// — no runtime handles, so it is unit-testable in isolation. Resolving the live
+/// ids from the transaction table off the CALL path is the wiring layer's job.
+#[must_use]
+pub fn v201_get_transaction_status(
+    requested: Option<&str>,
+    live_transaction_ids: &[&str],
+    messages_in_queue: bool,
+) -> (bool, Option<bool>) {
+    // A present id maps to a membership verdict; an omitted id (station-wide
+    // query) leaves the optional indicator absent.
+    let ongoing_indicator = requested.map(|id| live_transaction_ids.contains(&id));
+    (messages_in_queue, ongoing_indicator)
+}
+
+/// Build a schema-valid `GetTransactionStatus.conf`
+/// ([`GetTransactionStatusResponse`]).
+///
+/// Pure constructor mirroring [`v201_request_stop_response`]: carries the required
+/// [`messages_in_queue`](GetTransactionStatusResponse::messages_in_queue) flag and
+/// the optional [`ongoing_indicator`](GetTransactionStatusResponse::ongoing_indicator)
+/// — both decided by [`v201_get_transaction_status`]. Unlike the command builders
+/// this response carries no `statusInfo` (the message defines none), only the two
+/// status fields plus the vendor `customData` extension.
+#[must_use]
+pub fn v201_get_transaction_status_response(
+    messages_in_queue: bool,
+    ongoing_indicator: Option<bool>,
+) -> GetTransactionStatusResponse {
+    GetTransactionStatusResponse {
+        messages_in_queue,
+        ongoing_indicator,
         custom_data: None,
     }
 }
@@ -2939,6 +3009,96 @@ mod tests {
                         .validate_call_result("GetMonitoringReport", &payload)
                         .is_ok(),
                     "built {status:?} GetMonitoringReportResponse should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    // --- GetTransactionStatus (v201, #490) ---------------------------------
+
+    #[test]
+    fn get_transaction_status_station_wide_query_omits_ongoing_indicator() {
+        // No transactionId → a station-wide query about queued messages only; the
+        // ongoingIndicator is left absent rather than fabricating a verdict, and
+        // messagesInQueue passes through.
+        assert_eq!(
+            v201_get_transaction_status(None, &["1", "2"], false),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn get_transaction_status_live_id_is_ongoing() {
+        // A transactionId the station is actually running → Some(true).
+        assert_eq!(
+            v201_get_transaction_status(Some("2"), &["1", "2"], false),
+            (false, Some(true))
+        );
+    }
+
+    #[test]
+    fn get_transaction_status_unknown_or_ended_id_is_not_ongoing() {
+        // An id not in the live set — unknown, already ended, or an idle station
+        // (empty set) — all fold to the modeled "not ongoing" answer, Some(false).
+        assert_eq!(
+            v201_get_transaction_status(Some("9"), &["1", "2"], false),
+            (false, Some(false))
+        );
+        assert_eq!(
+            v201_get_transaction_status(Some("1"), &[], false),
+            (false, Some(false))
+        );
+    }
+
+    #[test]
+    fn get_transaction_status_matches_on_exact_string_never_parses() {
+        // Trust boundary: matching is exact string equality over the station-minted
+        // decimal id, not a numeric parse. A non-canonical spelling of a live id
+        // fails to match and reports Some(false) — never panics, never coerces.
+        assert_eq!(
+            v201_get_transaction_status(Some("07"), &["7"], false),
+            (false, Some(false)),
+            "a non-canonical spelling of a live id must not match"
+        );
+        assert_eq!(
+            v201_get_transaction_status(Some(" 7 "), &["7"], false),
+            (false, Some(false))
+        );
+    }
+
+    #[test]
+    fn get_transaction_status_reports_messages_in_queue_unchanged() {
+        // The queued-message flag is reported through verbatim, independent of the
+        // transactionId branch.
+        assert_eq!(
+            v201_get_transaction_status(None, &[], true),
+            (true, None),
+            "messagesInQueue passes through on a station-wide query"
+        );
+        assert_eq!(
+            v201_get_transaction_status(Some("1"), &["1"], true),
+            (true, Some(true)),
+            "messagesInQueue passes through alongside a per-transaction verdict"
+        );
+    }
+
+    #[test]
+    fn built_get_transaction_status_responses_are_schema_valid() {
+        // Every built response — messagesInQueue true/false crossed with the three
+        // ongoingIndicator shapes (absent / Some(true) / Some(false)) — satisfies
+        // the bundled OCPP 2.0.1 GetTransactionStatus response JSON Schema.
+        let validator = SchemaValidator::v201();
+        for messages_in_queue in [false, true] {
+            for ongoing_indicator in [None, Some(true), Some(false)] {
+                let resp =
+                    v201_get_transaction_status_response(messages_in_queue, ongoing_indicator);
+                let payload = serde_json::to_value(&resp).unwrap();
+                assert!(
+                    validator
+                        .validate_call_result("GetTransactionStatus", &payload)
+                        .is_ok(),
+                    "built GetTransactionStatusResponse (messagesInQueue={messages_in_queue}, \
+                     ongoingIndicator={ongoing_indicator:?}) should be schema-valid, got: {payload}"
                 );
             }
         }
