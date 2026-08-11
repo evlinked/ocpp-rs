@@ -101,6 +101,7 @@ use ocpp_messages::v201::{
     SendLocalListRequest as V201SendLocalListRequest,
     SendLocalListResponse as V201SendLocalListResponse,
     SetChargingProfileRequest as V201SetChargingProfileRequest,
+    SetMonitoringBaseRequest as V201SetMonitoringBaseRequest,
     SetMonitoringLevelRequest as V201SetMonitoringLevelRequest,
     SetVariableMonitoringRequest as V201SetVariableMonitoringRequest,
     SetVariableMonitoringResponse as V201SetVariableMonitoringResponse,
@@ -1654,6 +1655,63 @@ impl ChargePoint {
                         )
                     };
                     Ok(v201_command::v201_set_monitoring_level_response(
+                        status,
+                        status_info,
+                    ))
+                }
+            });
+        }
+
+        // SetMonitoringBase (OCPP 2.0.1 only) — select which **set** of
+        // pre-configured monitors is active for the device-model monitoring family
+        // (#494/#495/#499/#503). Where `SetMonitoringLevel` sets the reporting
+        // severity threshold, this selects the monitoring *base*: `All` (every
+        // monitor), `FactoryDefault` (the station's pre-configured set), or
+        // `HardWiredOnly` (only physically hard-wired monitors). The selected base
+        // is stored on the shared `V201DeviceModel` (behind the write lock) and
+        // readable via `active_monitoring_base()`. Registered only on the V201 arm
+        // — "SetMonitoringBase" has no 1.6J twin.
+        //
+        // Decision / modeled seam: `All` and `FactoryDefault` are recorded and
+        // answered `Accepted`. `HardWiredOnly` is a modeled seam — the monitor
+        // store models only CSMS-installed monitors and has no hard-wired-monitor
+        // seam yet, so the station has no hard-wired set to activate. Rather than
+        // silently record a base it cannot honor, it answers `NotSupported` with a
+        // `StatusInfoType` reason and leaves the stored base unchanged (the same
+        // "a non-accept leaves state unchanged" shape as `SetMonitoringLevel`'s
+        // out-of-range rejection). The decision is a pure match on the typed
+        // `monitoringBase`, so no wire value can panic. The write is applied on the
+        // CALL path (cheap, and must be visible to the CALLRESULT), serialized by
+        // the model's write lock; nothing is queued.
+        //
+        // Base is recorded, not yet **enforced**: selecting a base changes no
+        // monitor's activation today (there is no pre-configured / hard-wired
+        // monitor seam to gate). It is stored and readable so that seam can honor
+        // it later — mirroring how the reporting level (#503) and the monitor store
+        // (#494) landed before the emitters that read them. Ports
+        // `ocpp.v201.call.SetMonitoringBase` →
+        // `ocpp.v201.call_result.SetMonitoringBase`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let device_model = v201_device_model.clone();
+            d.on(move |req: V201SetMonitoringBaseRequest| {
+                let device_model = device_model.clone();
+                async move {
+                    let status = device_model
+                        .write()
+                        .await
+                        .set_monitoring_base(req.monitoring_base);
+                    let status_info = match status {
+                        GenericDeviceModelStatusEnumType::Accepted => None,
+                        _ => Some(StatusInfoType {
+                            reason_code: "NotSupported".to_string(),
+                            additional_info: Some(
+                                "HardWiredOnly base is not modeled: no hard-wired monitors exist"
+                                    .to_string(),
+                            ),
+                            custom_data: None,
+                        }),
+                    };
+                    Ok(v201_command::v201_set_monitoring_base_response(
                         status,
                         status_info,
                     ))
@@ -7724,6 +7782,127 @@ mod tests {
             validator
                 .validate_call_result("SetMonitoringLevel", &serde_json::to_value(&resp).unwrap())
                 .expect("SetMonitoringLevel response is schema-valid");
+        }
+    }
+
+    // --- OCPP 2.0.1 SetMonitoringBase (M7, issue #501) --------------------
+    // A `for_version(V201)` CP selects its active monitoring base on the same
+    // shared `V201DeviceModel` the monitoring family uses. These exercise the
+    // wired V201 arm end-to-end over `handle_message`.
+
+    fn make_v201_set_monitoring_base(base: ocpp_types::v201::MonitorBaseEnumType) -> CallMessage {
+        make_call(V201SetMonitoringBaseRequest {
+            monitoring_base: base,
+            custom_data: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn v201_set_monitoring_base_all_and_factory_default_are_accepted() {
+        use ocpp_types::v201::{GenericDeviceModelStatusEnumType, MonitorBaseEnumType};
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        for base in [
+            MonitorBaseEnumType::All,
+            MonitorBaseEnumType::FactoryDefault,
+        ] {
+            let resp = cp
+                .handle_message(Message::Call(make_v201_set_monitoring_base(base)))
+                .await
+                .unwrap();
+            match resp.unwrap() {
+                Message::CallResult(r) => {
+                    let body: ocpp_messages::v201::SetMonitoringBaseResponse =
+                        r.payload_as().unwrap();
+                    assert_eq!(
+                        body.status,
+                        GenericDeviceModelStatusEnumType::Accepted,
+                        "base {base:?} is modeled and must be Accepted",
+                    );
+                    // Accepted carries no statusInfo.
+                    assert!(body.status_info.is_none());
+                }
+                other => panic!("expected CallResult, got: {other:?}"),
+            }
+        }
+        // A pure set queues no side-effect command.
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_set_monitoring_base_hard_wired_only_is_not_supported() {
+        use ocpp_types::v201::{GenericDeviceModelStatusEnumType, MonitorBaseEnumType};
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_monitoring_base(
+                MonitorBaseEnumType::HardWiredOnly,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetMonitoringBaseResponse = r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    GenericDeviceModelStatusEnumType::NotSupported,
+                    "no hard-wired monitors are modeled: HardWiredOnly is NotSupported",
+                );
+                let info = body
+                    .status_info
+                    .expect("a NotSupported answer carries a statusInfo reason");
+                assert_eq!(info.reason_code, "NotSupported");
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        // No side-effect command is queued even on the modeled-seam path.
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[test]
+    fn v201_set_monitoring_base_request_and_response_are_schema_valid() {
+        use ocpp_types::v201::{
+            GenericDeviceModelStatusEnumType, MonitorBaseEnumType, StatusInfoType,
+        };
+        let validator = SchemaValidator::v201();
+        // A request for each base is schema-valid.
+        for base in [
+            MonitorBaseEnumType::All,
+            MonitorBaseEnumType::FactoryDefault,
+            MonitorBaseEnumType::HardWiredOnly,
+        ] {
+            let req = V201SetMonitoringBaseRequest {
+                monitoring_base: base,
+                custom_data: None,
+            };
+            validator
+                .validate_call("SetMonitoringBase", &serde_json::to_value(&req).unwrap())
+                .expect("SetMonitoringBase request is schema-valid");
+        }
+
+        // Both answer shapes the handler emits — Accepted (no statusInfo) and
+        // NotSupported (with the reason it emits for HardWiredOnly) — serialize to
+        // a schema-valid response.
+        for (status, status_info) in [
+            (GenericDeviceModelStatusEnumType::Accepted, None),
+            (
+                GenericDeviceModelStatusEnumType::NotSupported,
+                Some(StatusInfoType {
+                    reason_code: "NotSupported".to_string(),
+                    additional_info: Some(
+                        "HardWiredOnly base is not modeled: no hard-wired monitors exist"
+                            .to_string(),
+                    ),
+                    custom_data: None,
+                }),
+            ),
+        ] {
+            let resp = ocpp_messages::v201::SetMonitoringBaseResponse {
+                status,
+                status_info,
+                custom_data: None,
+            };
+            validator
+                .validate_call_result("SetMonitoringBase", &serde_json::to_value(&resp).unwrap())
+                .expect("SetMonitoringBase response is schema-valid");
         }
     }
 

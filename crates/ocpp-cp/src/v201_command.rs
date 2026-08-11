@@ -136,8 +136,8 @@ use ocpp_messages::v201::{
     CancelReservationResponse, ChangeAvailabilityResponse, ClearCacheResponse,
     ClearChargingProfileResponse, GetChargingProfilesResponse, GetMonitoringReportResponse,
     ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
-    ReserveNowResponse, ResetResponse, SetChargingProfileResponse, SetMonitoringLevelResponse,
-    TriggerMessageResponse, UnlockConnectorResponse,
+    ReserveNowResponse, ResetResponse, SetChargingProfileResponse, SetMonitoringBaseResponse,
+    SetMonitoringLevelResponse, TriggerMessageResponse, UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1291,6 +1291,28 @@ pub fn v201_set_monitoring_level_response(
     status_info: Option<StatusInfoType>,
 ) -> SetMonitoringLevelResponse {
     SetMonitoringLevelResponse {
+        status,
+        status_info,
+        custom_data: None,
+    }
+}
+
+/// Build a schema-valid `SetMonitoringBase.conf` ([`SetMonitoringBaseResponse`]).
+///
+/// Pure constructor mirroring [`v201_set_monitoring_level_response`]: carries the
+/// station's decision on the requested monitoring base as a
+/// [`GenericDeviceModelStatusEnumType`] plus the optional 2.0.1 `statusInfo`.
+/// `status_info` is `None` on [`Accepted`](GenericDeviceModelStatusEnumType::Accepted)
+/// and carries the machine-readable reason (an unmodeled `HardWiredOnly` base) on
+/// [`NotSupported`](GenericDeviceModelStatusEnumType::NotSupported).
+///
+/// Ports `ocpp.v201.call_result.SetMonitoringBase`.
+#[must_use]
+pub fn v201_set_monitoring_base_response(
+    status: GenericDeviceModelStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> SetMonitoringBaseResponse {
+    SetMonitoringBaseResponse {
         status,
         status_info,
         custom_data: None,
@@ -3123,6 +3145,42 @@ mod tests {
                         .validate_call_result("SetMonitoringLevel", &payload)
                         .is_ok(),
                     "built {status:?} SetMonitoringLevelResponse should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    // --- SetMonitoringBase: the active-base response builder (#501) ---------
+
+    #[test]
+    fn built_set_monitoring_base_responses_are_schema_valid() {
+        // Every built response — each device-model status, with and without a
+        // statusInfo — satisfies the bundled OCPP 2.0.1 SetMonitoringBase response
+        // JSON Schema. `Accepted` (no statusInfo) and `NotSupported` (the
+        // HardWiredOnly seam, with statusInfo) are the exact shapes the handler
+        // emits; the remaining statuses round-trip for completeness.
+        let validator = SchemaValidator::v201();
+        let info = StatusInfoType {
+            reason_code: "NotSupported".to_string(),
+            additional_info: Some(
+                "HardWiredOnly base is not modeled: no hard-wired monitors exist".to_string(),
+            ),
+            custom_data: None,
+        };
+        for status in [
+            GenericDeviceModelStatusEnumType::Accepted,
+            GenericDeviceModelStatusEnumType::Rejected,
+            GenericDeviceModelStatusEnumType::NotSupported,
+            GenericDeviceModelStatusEnumType::EmptyResultSet,
+        ] {
+            for status_info in [None, Some(info.clone())] {
+                let resp = v201_set_monitoring_base_response(status, status_info);
+                let payload = serde_json::to_value(&resp).unwrap();
+                assert!(
+                    validator
+                        .validate_call_result("SetMonitoringBase", &payload)
+                        .is_ok(),
+                    "built {status:?} SetMonitoringBaseResponse should be schema-valid, got: {payload}"
                 );
             }
         }
