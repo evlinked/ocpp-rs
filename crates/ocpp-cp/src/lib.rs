@@ -25,6 +25,7 @@ pub mod v201_data_transfer;
 pub mod v201_device_model;
 pub mod v201_display_message;
 pub mod v201_transaction;
+pub mod v201_tx_default_profile;
 
 use anyhow::Result;
 use auth_cache::AuthCache;
@@ -75,6 +76,7 @@ use v201_charging_profiles::V201TxProfileStore;
 use v201_cost::V201CostStore;
 use v201_device_model::V201DeviceModel;
 use v201_display_message::V201DisplayMessageStore;
+use v201_tx_default_profile::V201TxDefaultProfileStore;
 // 2.0.1 provisioning message + enum types used by the version-aware runtime
 // (slice 2). Aliased to avoid clashing with the unqualified 1.6J names imported
 // above (`StatusNotificationRequest`, `RegistrationStatus`).
@@ -979,6 +981,16 @@ pub struct ChargePoint {
     /// `v16j::ChargingProfile`). Read back via
     /// [`installed_tx_profile`](Self::installed_tx_profile). Empty on the 1.6J path.
     v201_tx_profiles: Arc<V201TxProfileStore>,
+    /// v201 `TxDefaultProfile` store (Issue #471): the default charging schedule
+    /// applied to an EVSE whenever no [`v201_tx_profiles`](Self::v201_tx_profiles)
+    /// entry is in force. Installed out-of-band by a `SetChargingProfile` and, as
+    /// station configuration rather than a transaction-scoped profile,
+    /// **persists across transactions** — so it is *not* touched by
+    /// `close_transaction`. Keyed by EVSE id, with key `0` the station-wide
+    /// default (the schema's `evseId = 0` "applies to each individual evse" rule);
+    /// read back via [`installed_tx_default_profile`](Self::installed_tx_default_profile).
+    /// Consulted as the fallback by the metering resolver and `GetCompositeSchedule`.
+    v201_tx_default_profiles: Arc<V201TxDefaultProfileStore>,
     /// v201 display messages installed by `SetDisplayMessage` (OCPP 2.0.1 Part 2,
     /// E05–E08, Issue #505), keyed by `MessageInfoType.id`. The foundational store
     /// of the display-message family: a same-id re-install upserts, a future
@@ -1165,6 +1177,14 @@ impl ChargePoint {
         // install straight from the CALL path.
         let v201_display_messages = Arc::new(V201DisplayMessageStore::new());
 
+        // Issue #471: v201 `TxDefaultProfile` store, shared into the default
+        // dispatcher (the `SetChargingProfile` command installs a default into it)
+        // and kept on the CP (the metering sampler and `GetCompositeSchedule` read
+        // it as the fallback when no `TxProfile` is in force; `installed_tx_default_profile`
+        // reads it back). Persists across transactions — station configuration,
+        // not a transaction-scoped profile — so nothing clears it on close.
+        let v201_tx_default_profiles = Arc::new(V201TxDefaultProfileStore::new());
+
         // Running-cost store the 2.0.1 `CostUpdated` handler upserts into
         // (Issue #502). Shared into the default dispatcher so the V201 arm can
         // record an inbound cost; read back via `recorded_transaction_cost`.
@@ -1206,6 +1226,7 @@ impl ChargePoint {
             reservations.clone(),
             charging_profiles.clone(),
             v201_tx_profiles.clone(),
+            v201_tx_default_profiles.clone(),
             v201_display_messages.clone(),
             v201_costs.clone(),
             expiry_timers.clone(),
@@ -1238,6 +1259,7 @@ impl ChargePoint {
             next_v201_transaction_id: Arc::new(AtomicI32::new(1)),
             v201_sessions,
             v201_tx_profiles,
+            v201_tx_default_profiles,
             v201_display_messages,
             v201_costs,
             reservations,
@@ -1278,6 +1300,7 @@ impl ChargePoint {
         reservations: Arc<RwLock<HashMap<i32, ConnectorId>>>,
         charging_profiles: Arc<ChargingProfileStore>,
         v201_tx_profiles: Arc<V201TxProfileStore>,
+        v201_tx_default_profiles: Arc<V201TxDefaultProfileStore>,
         v201_display_messages: Arc<V201DisplayMessageStore>,
         v201_costs: Arc<V201CostStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
@@ -3403,9 +3426,11 @@ impl ChargePoint {
             OcppVersion::V201 => {
                 let active_transactions = active_transactions.clone();
                 let v201_tx_profiles = v201_tx_profiles.clone();
+                let v201_tx_default_profiles = v201_tx_default_profiles.clone();
                 d.on(move |req: V201SetChargingProfileRequest| {
                     let active_transactions = active_transactions.clone();
                     let v201_tx_profiles = v201_tx_profiles.clone();
+                    let v201_tx_default_profiles = v201_tx_default_profiles.clone();
                     async move {
                         let evse_id = req.evse_id;
                         // An ongoing transaction on the target EVSE. The v201 store
@@ -3422,22 +3447,44 @@ impl ChargePoint {
                                 .values()
                                 .any(|cid| i64::from(cid.value()) == i64::from(evse_id));
 
+                        let purpose = req.charging_profile.charging_profile_purpose;
                         let (status, status_info) = v201_command::v201_set_charging_profile_status(
-                            req.charging_profile.charging_profile_purpose,
+                            purpose,
                             has_active_transaction,
                         );
 
-                        // Only an accepted install mutates the store; a rejection
-                        // leaves any profile already bound to the EVSE untouched. The
-                        // install replaces (does not stack) — the store holds one
-                        // TxProfile per EVSE, so a SetChargingProfile supersedes a
-                        // RequestStartTransaction-installed one on the same EVSE, and
-                        // `close_transaction` still clears it when the transaction
-                        // ends.
+                        // Only an accepted install mutates a store; a rejection
+                        // leaves state untouched. The *purpose* selects the store,
+                        // each an upsert per EVSE key (last accepted install wins):
+                        //
+                        // - `TxProfile` → the transaction-scoped `v201_tx_profiles`
+                        //   (supersedes a RequestStartTransaction-installed one on
+                        //   the same EVSE; `close_transaction` clears it when the
+                        //   transaction ends).
+                        // - `TxDefaultProfile` → `v201_tx_default_profiles`, station
+                        //   configuration that persists across transactions and is
+                        //   applied as the fallback when no `TxProfile` is in force
+                        //   (`evseId = 0` installs the station-wide default). Nothing
+                        //   clears it on transaction end (Issue #471).
+                        //
+                        // The station-ceiling purposes never reach here — the
+                        // decision above rejects them — so an accept is only ever one
+                        // of these two.
                         if status == ChargingProfileStatusEnumType::Accepted {
-                            v201_tx_profiles
-                                .install(evse_id, req.charging_profile)
-                                .await;
+                            match purpose {
+                                ChargingProfilePurposeEnumType::TxProfile => {
+                                    v201_tx_profiles
+                                        .install(evse_id, req.charging_profile)
+                                        .await;
+                                }
+                                ChargingProfilePurposeEnumType::TxDefaultProfile => {
+                                    v201_tx_default_profiles
+                                        .install(evse_id, req.charging_profile)
+                                        .await;
+                                }
+                                ChargingProfilePurposeEnumType::ChargingStationMaxProfile
+                                | ChargingProfilePurposeEnumType::ChargingStationExternalConstraints => {}
+                            }
                         }
 
                         Ok(v201_command::v201_set_charging_profile_response(
@@ -3608,9 +3655,11 @@ impl ChargePoint {
             OcppVersion::V201 => {
                 let connectors = connectors.clone();
                 let v201_tx_profiles = v201_tx_profiles.clone();
+                let v201_tx_default_profiles = v201_tx_default_profiles.clone();
                 d.on(move |req: V201GetCompositeScheduleRequest| {
                     let connectors = connectors.clone();
                     let v201_tx_profiles = v201_tx_profiles.clone();
+                    let v201_tx_default_profiles = v201_tx_default_profiles.clone();
                     async move {
                         let rejected = V201GetCompositeScheduleResponse {
                             status: GenericStatusEnumType::Rejected,
@@ -3618,12 +3667,21 @@ impl ChargePoint {
                             status_info: None,
                             custom_data: None,
                         };
-                        // No profile installed on the EVSE → nothing to compose. An
-                        // out-of-range / 0 / negative `evseId` simply misses the
-                        // store (never panics) and falls here.
+                        // The profile in force on the EVSE: the `TxProfile` if one
+                        // is installed, else the EVSE's `TxDefaultProfile` fallback
+                        // (specific-EVSE default, else the `evseId = 0` station-wide
+                        // default), matching the metering resolver's precedence
+                        // (Issue #471). An out-of-range / 0 / negative `evseId`
+                        // simply misses both stores (never panics). No profile at all
+                        // → nothing to compose → Rejected.
                         let profile = match v201_tx_profiles.get(req.evse_id).await {
                             Some(profile) => profile,
-                            None => return Ok(rejected),
+                            None => {
+                                match v201_tx_default_profiles.effective_for(req.evse_id).await {
+                                    Some(profile) => profile,
+                                    None => return Ok(rejected),
+                                }
+                            }
                         };
                         // Nominal voltage for any A↔W conversion, read from the
                         // EVSE's connector config (the value the metering resolver
@@ -4658,6 +4716,9 @@ impl ChargePoint {
         // this transaction (slice 7e, Issue #455), so the periodic reading
         // reflects an installed limit rather than ignoring it.
         let tx_profiles = self.v201_tx_profiles.clone();
+        // The `TxDefaultProfile` store, consulted as the fallback each tick when
+        // no `TxProfile` bounds this transaction (Issue #471).
+        let tx_default_profiles = self.v201_tx_default_profiles.clone();
         let evse_id = connector_id.value() as i32;
         let txid_str = transaction_id.to_string();
 
@@ -4711,10 +4772,17 @@ impl ChargePoint {
                     }
                 };
 
-                // If a `TxProfile` bounds this EVSE and its active limit is
-                // tighter than the connector's natural rate, surface the bounded
-                // power on the reading; otherwise the sample is unchanged.
-                let bounded_power_w = match tx_profiles.get(evse_id).await {
+                // The profile bounding this reading, by the Issue #471 precedence:
+                // the `TxProfile` in force on the EVSE, else its `TxDefaultProfile`
+                // fallback (specific-EVSE default, else the `evseId = 0` station-wide
+                // default). If that profile's active limit is tighter than the
+                // connector's natural rate, surface the bounded power on the reading;
+                // otherwise (no profile in force, or a looser limit) it is unchanged.
+                let effective_profile = match tx_profiles.get(evse_id).await {
+                    Some(profile) => Some(profile),
+                    None => tx_default_profiles.effective_for(evse_id).await,
+                };
+                let bounded_power_w = match effective_profile {
                     Some(profile) => crate::v201_charging_profiles::bounded_power_w(
                         &profile,
                         now_elapsed,
@@ -5103,6 +5171,21 @@ impl ChargePoint {
     /// `chargingProfile`.
     pub async fn installed_tx_profile(&self, evse_id: i32) -> Option<ChargingProfileType> {
         self.v201_tx_profiles.get(evse_id).await
+    }
+
+    /// The 2.0.1 `TxDefaultProfile` installed under the exact key `evse_id` by a
+    /// `SetChargingProfile`, if any (Issue #471) — the read path making an
+    /// installed default observable.
+    ///
+    /// Returns the default stored under `evse_id` verbatim (key `0` is the
+    /// station-wide default). It does **not** apply the `evseId = 0` wildcard
+    /// fallback — a query for a specific EVSE with only a station-wide default
+    /// returns `None` here; the metering resolver and `GetCompositeSchedule` apply
+    /// that fallback themselves. Unlike a `TxProfile`, a default persists across
+    /// transactions, so a `Some` here does not imply a live transaction. Always
+    /// `None` on the 1.6J path (which has no v201 profile store).
+    pub async fn installed_tx_default_profile(&self, evse_id: i32) -> Option<ChargingProfileType> {
+        self.v201_tx_default_profiles.get(evse_id).await
     }
 
     /// The display message currently installed under `id` by `SetDisplayMessage`,
@@ -6543,6 +6626,20 @@ impl ChargePoint {
         self.v201_tx_profiles.install(evse_id, profile).await;
     }
 
+    /// Install a v201 `TxDefaultProfile` directly into the fallback store the
+    /// `GetCompositeSchedule` and periodic-metering handlers consult, bypassing
+    /// the `SetChargingProfile` wire path (Issue #471). `evse_id = 0` seeds the
+    /// station-wide default.
+    async fn test_install_v201_tx_default_profile(
+        &self,
+        evse_id: i32,
+        profile: ChargingProfileType,
+    ) {
+        self.v201_tx_default_profiles
+            .install(evse_id, profile)
+            .await;
+    }
+
     /// Seed a live reservation exactly as an accepted `ReserveNow` would — reserve
     /// the connector (`Available → Reserved`) and record `reservationId →
     /// connector` in the shared store — so a `CancelReservation` wire test has a
@@ -7045,6 +7142,221 @@ mod tests {
                 assert_eq!(schedule.charging_schedule_period.len(), 1);
                 assert_eq!(schedule.charging_schedule_period[0].start_period, 0);
                 assert_eq!(schedule.charging_schedule_period[0].limit, 11_000.0);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    // --- SetChargingProfile / TxDefaultProfile (v201) over the wire --------
+    // (Issue #471)
+
+    // Build a v201 `SetChargingProfile` CALL installing `profile` on `evse_id`.
+    fn make_v201_set_charging_profile(evse_id: i32, profile: ChargingProfileType) -> CallMessage {
+        make_call(V201SetChargingProfileRequest {
+            evse_id,
+            charging_profile: profile,
+            custom_data: None,
+        })
+    }
+
+    // A single flat-`limit` W schedule of the given `purpose`, tagged with `id`.
+    fn v201_flat_profile(
+        id: i32,
+        purpose: ChargingProfilePurposeEnumType,
+        limit: f64,
+    ) -> ChargingProfileType {
+        use ocpp_types::v201::{
+            ChargingProfileKindEnumType, ChargingRateUnitEnumType, ChargingSchedulePeriodType,
+            ChargingScheduleType,
+        };
+        ChargingProfileType {
+            id,
+            stack_level: 0,
+            charging_profile_purpose: purpose,
+            charging_profile_kind: ChargingProfileKindEnumType::Relative,
+            charging_schedule: vec![ChargingScheduleType {
+                id: 1,
+                charging_rate_unit: ChargingRateUnitEnumType::W,
+                charging_schedule_period: vec![ChargingSchedulePeriodType {
+                    start_period: 0,
+                    limit,
+                    number_phases: None,
+                    phase_to_use: None,
+                    custom_data: None,
+                }],
+                start_schedule: None,
+                duration: None,
+                min_charging_rate: None,
+                sales_tariff: None,
+                custom_data: None,
+            }],
+            recurrency_kind: None,
+            valid_from: None,
+            valid_to: None,
+            transaction_id: None,
+            custom_data: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_set_charging_profile_accepts_and_installs_a_txdefaultprofile() {
+        // A TxDefaultProfile is station configuration, not transaction-scoped, so
+        // it is Accepted with no live transaction and lands in the *default* store
+        // (read via `installed_tx_default_profile`) — never the transaction-scoped
+        // one. Exercises the wired V201 handler's purpose-branched install.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let call = make_v201_set_charging_profile(
+            1,
+            v201_flat_profile(7, ChargingProfilePurposeEnumType::TxDefaultProfile, 6_000.0),
+        );
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetChargingProfileResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, ChargingProfileStatusEnumType::Accepted);
+                assert!(
+                    body.status_info.is_none(),
+                    "an accepted install has no detail"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.installed_tx_default_profile(1).await.expect("stored").id,
+            7,
+            "the default landed in the default store"
+        );
+        assert!(
+            cp.installed_tx_profile(1).await.is_none(),
+            "a default does not land in the transaction-scoped TxProfile store"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_set_charging_profile_rejects_a_station_ceiling_purpose() {
+        // The station-wide ceiling purposes are deferred: still Rejected with an
+        // UnsupportedPurpose statusInfo, and nothing is stored.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let call = make_v201_set_charging_profile(
+            0,
+            v201_flat_profile(
+                9,
+                ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
+                6_000.0,
+            ),
+        );
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetChargingProfileResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, ChargingProfileStatusEnumType::Rejected);
+                assert_eq!(
+                    body.status_info.as_ref().map(|i| i.reason_code.as_str()),
+                    Some("UnsupportedPurpose")
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert!(cp.installed_tx_default_profile(0).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn v201_get_composite_schedule_falls_back_to_a_txdefaultprofile() {
+        use ocpp_types::v201::ChargingRateUnitEnumType;
+        // With no TxProfile in force on EVSE 1 but a TxDefaultProfile installed on
+        // it, GetCompositeSchedule composes the *default* rather than rejecting —
+        // the TxProfile > TxDefaultProfile fallback of Issue #471.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.test_install_v201_tx_default_profile(
+            1,
+            v201_flat_profile(7, ChargingProfilePurposeEnumType::TxDefaultProfile, 6_000.0),
+        )
+        .await;
+        let call = make_call(V201GetCompositeScheduleRequest {
+            duration: 3_600,
+            charging_rate_unit: None,
+            evse_id: 1,
+            custom_data: None,
+        });
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: V201GetCompositeScheduleResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, GenericStatusEnumType::Accepted);
+                let schedule = body.schedule.expect("composed from the default");
+                assert_eq!(schedule.evse_id, 1);
+                assert_eq!(schedule.charging_rate_unit, ChargingRateUnitEnumType::W);
+                assert_eq!(schedule.charging_schedule_period[0].limit, 6_000.0);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_get_composite_schedule_txprofile_wins_over_a_default() {
+        // Both a TxProfile (11 kW) and a station-wide TxDefaultProfile (6 kW) apply
+        // to EVSE 1; the TxProfile takes precedence, so the composite reflects it.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.test_install_v201_tx_default_profile(
+            0,
+            v201_flat_profile(7, ChargingProfilePurposeEnumType::TxDefaultProfile, 6_000.0),
+        )
+        .await;
+        cp.test_install_v201_tx_profile(
+            1,
+            v201_flat_profile(1, ChargingProfilePurposeEnumType::TxProfile, 11_000.0),
+        )
+        .await;
+        let call = make_call(V201GetCompositeScheduleRequest {
+            duration: 3_600,
+            charging_rate_unit: None,
+            evse_id: 1,
+            custom_data: None,
+        });
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: V201GetCompositeScheduleResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, GenericStatusEnumType::Accepted);
+                let schedule = body.schedule.expect("composed schedule");
+                assert_eq!(
+                    schedule.charging_schedule_period[0].limit, 11_000.0,
+                    "the TxProfile limit wins over the default's"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_get_composite_schedule_uses_the_station_wide_default_wildcard() {
+        // Only a station-wide (evseId = 0) TxDefaultProfile is installed; a query
+        // for a concrete EVSE with no default of its own resolves the wildcard.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.test_install_v201_tx_default_profile(
+            0,
+            v201_flat_profile(7, ChargingProfilePurposeEnumType::TxDefaultProfile, 6_000.0),
+        )
+        .await;
+        let call = make_call(V201GetCompositeScheduleRequest {
+            duration: 3_600,
+            charging_rate_unit: None,
+            evse_id: 2,
+            custom_data: None,
+        });
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: V201GetCompositeScheduleResponse = r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    GenericStatusEnumType::Accepted,
+                    "EVSE 2 with no default of its own resolves the evseId=0 wildcard"
+                );
+                assert_eq!(
+                    body.schedule.expect("composed").charging_schedule_period[0].limit,
+                    6_000.0
+                );
             }
             other => panic!("expected CallResult, got: {other:?}"),
         }
