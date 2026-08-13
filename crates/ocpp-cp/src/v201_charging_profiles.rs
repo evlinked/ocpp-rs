@@ -291,6 +291,36 @@ fn effective_phases(period: &ChargingSchedulePeriodType) -> i32 {
     period.number_phases.unwrap_or(3).clamp(1, 3)
 }
 
+/// The charging power (in watts) `profile` resolves to `elapsed_s` into the
+/// transaction — its active `chargingSchedulePeriod` limit converted to watts —
+/// or `None` when the profile imposes no limit at this instant (outside its
+/// validity window, past its schedule `duration`, or with no period yet in
+/// force).
+///
+/// Unlike [`bounded_power_w`] this applies **no** natural-rate gate: it returns
+/// the profile's own resolved watt limit whether or not it is tighter than the
+/// connector's draw. The shared conversion core of [`bounded_power_w`] (which
+/// adds the gate) and [`bounded_power_w_capped`] (which composes several resolved
+/// limits by `min`). The resolved limit is floored at the schedule's
+/// `minChargingRate` (Issue #467) before an ampere limit's A→W conversion at
+/// `nominal_voltage_v` across the period's clamped phase count (Issue #465).
+#[must_use]
+pub fn active_limit_w(
+    profile: &ChargingProfileType,
+    elapsed_s: i32,
+    tx_start: DateTime<Utc>,
+    nominal_voltage_v: f64,
+) -> Option<f64> {
+    let (schedule, period) = resolve_active(profile, elapsed_s, tx_start)?;
+    let limit = floored_limit(schedule, period);
+    Some(match schedule.charging_rate_unit {
+        ChargingRateUnitEnumType::W => limit,
+        ChargingRateUnitEnumType::A => {
+            limit * nominal_voltage_v * f64::from(effective_phases(period))
+        }
+    })
+}
+
 /// The charging power (in watts) `profile` binds the connector to `elapsed_s`
 /// into the transaction, given the connector's unbounded `natural_power_w` and
 /// its `nominal_voltage_v` (for an ampere limit's A→W conversion) — or `None`
@@ -323,14 +353,56 @@ pub fn bounded_power_w(
     natural_power_w: f64,
     nominal_voltage_v: f64,
 ) -> Option<f64> {
-    let (schedule, period) = resolve_active(profile, elapsed_s, tx_start)?;
-    let limit = floored_limit(schedule, period);
-    let limit_w = match schedule.charging_rate_unit {
-        ChargingRateUnitEnumType::W => limit,
-        ChargingRateUnitEnumType::A => {
-            limit * nominal_voltage_v * f64::from(effective_phases(period))
+    let limit_w = active_limit_w(profile, elapsed_s, tx_start, nominal_voltage_v)?;
+    (limit_w < natural_power_w).then_some(limit_w)
+}
+
+/// The charging power (in watts) the connector is bound to `elapsed_s` into the
+/// transaction once the resolved `TxProfile`/`TxDefaultProfile` limit is **capped
+/// by the applicable station ceilings** (OCPP 2.0.1 Part 2, §K01; Issue #511) —
+/// or `None` when nothing binds below the connector's natural rate at this offset.
+///
+/// The effective limit is the minimum of every constraint in force:
+///
+/// * `effective_profile` — the resolved `TxProfile`/`TxDefaultProfile` in force on
+///   the EVSE, with its `TxProfile > TxDefaultProfile` precedence already applied
+///   by the caller (so this is the substitutive limit, or `None` if no such
+///   profile is in force);
+/// * each ceiling in `ceilings` — the applicable `ChargingStationMaxProfile` /
+///   `ChargingStationExternalConstraints`, each of which *caps* rather than
+///   substitutes.
+///
+/// Composition is `min(natural, effective_profile?, ceilings…)`, so a ceiling
+/// binds even with **no** `TxProfile`/`TxDefaultProfile` present (a station-wide
+/// limit still caps the natural rate), and a profile below every ceiling is left
+/// untouched. Because every term enters a `min`, stacking is order-independent —
+/// the tightest ceiling wins regardless of the `ceilings` order, so no precedence
+/// between `ChargingStationMaxProfile` and `ChargingStationExternalConstraints`
+/// need be threaded here (the latter is the semantic outermost cap; a `min`
+/// honors it either way).
+///
+/// As with [`bounded_power_w`], `None` is returned when the composed limit is at
+/// or above `natural_power_w`: a bound no tighter than the connector's own draw
+/// does not bend the reading. A profile or ceiling that constrains nothing at
+/// this instant simply drops out of the `min` (its `active_limit_w` is `None`).
+#[must_use]
+pub fn bounded_power_w_capped(
+    effective_profile: Option<&ChargingProfileType>,
+    ceilings: &[&ChargingProfileType],
+    elapsed_s: i32,
+    tx_start: DateTime<Utc>,
+    natural_power_w: f64,
+    nominal_voltage_v: f64,
+) -> Option<f64> {
+    let mut limit_w = natural_power_w;
+    for profile in effective_profile
+        .into_iter()
+        .chain(ceilings.iter().copied())
+    {
+        if let Some(w) = active_limit_w(profile, elapsed_s, tx_start, nominal_voltage_v) {
+            limit_w = limit_w.min(w);
         }
-    };
+    }
     (limit_w < natural_power_w).then_some(limit_w)
 }
 
@@ -504,6 +576,46 @@ pub fn compose_composite_schedule(
     requested_unit: Option<ChargingRateUnitEnumType>,
     nominal_voltage_v: f64,
 ) -> Option<CompositeScheduleType> {
+    compose_composite_schedule_capped(
+        evse_id,
+        profile,
+        &[],
+        window_start,
+        duration,
+        requested_unit,
+        nominal_voltage_v,
+    )
+}
+
+/// The station-ceiling-capped counterpart of [`compose_composite_schedule`]
+/// (OCPP 2.0.1 Part 2, §K01; Issue #511): the composite of the base
+/// `TxProfile`/`TxDefaultProfile` `profile`, with every reported period **capped**
+/// by the applicable station ceilings (`ChargingStationMaxProfile` /
+/// `ChargingStationExternalConstraints`) in force at that instant.
+///
+/// Walks the union of the base profile's and every ceiling's candidate breakpoints
+/// (so a ceiling change mid-window opens a new reported period), reads the base
+/// limit at each via `composite_contribution_at`, and caps it by the `min` of the
+/// ceilings active there — all converted into the reported `out_unit`. The base
+/// period's `numberPhases` is preserved (a ceiling caps the magnitude, not the
+/// phase count), and a ceiling that constrains nothing at an offset simply drops
+/// out of the `min`. As in the uncapped composite, an offset where the base
+/// profile itself imposes no limit is a gap (no period emitted) — a ceiling alone,
+/// with no base profile in force, contributes no schedule (matching the handler,
+/// which reports `Rejected` when no base profile is installed).
+///
+/// With an empty `ceilings` slice this is exactly [`compose_composite_schedule`],
+/// which delegates here.
+#[must_use]
+pub fn compose_composite_schedule_capped(
+    evse_id: i32,
+    profile: &ChargingProfileType,
+    ceilings: &[&ChargingProfileType],
+    window_start: DateTime<Utc>,
+    duration: i32,
+    requested_unit: Option<ChargingRateUnitEnumType>,
+    nominal_voltage_v: f64,
+) -> Option<CompositeScheduleType> {
     if duration <= 0 {
         return None;
     }
@@ -514,6 +626,17 @@ pub fn compose_composite_schedule(
             .map_or(ChargingRateUnitEnumType::W, |s| s.charging_rate_unit)
     });
 
+    // Candidate breakpoints: the base profile's, plus every ceiling's — a ceiling
+    // stepping to a new limit mid-window must open a new reported period even if
+    // the base profile is flat across it. A superset is fine; adjacent equal
+    // periods coalesce below.
+    let mut offsets = composite_boundary_offsets(profile, window_start, duration);
+    for ceiling in ceilings {
+        offsets.extend(composite_boundary_offsets(ceiling, window_start, duration));
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+
     let mut periods: Vec<ChargingSchedulePeriodType> = Vec::new();
     // The (limit, phases) at the previous boundary, or `None` if that boundary was
     // a gap. Coalescing compares against this rather than the last emitted period,
@@ -521,9 +644,27 @@ pub fn compose_composite_schedule(
     // re-emitted (the gap between carried a different, unconstrained limit) —
     // matters for a recurring profile whose `duration` leaves a daily/weekly gap.
     let mut prev: Option<(f64, Option<i32>)> = None;
-    for offset in composite_boundary_offsets(profile, window_start, duration) {
+    for offset in offsets {
+        // The base contribution — a gap here means the EVSE has no limit at this
+        // instant, so nothing to cap or report (a ceiling never manufactures a
+        // limit where the base profile imposes none).
         let current =
-            composite_contribution_at(profile, offset, window_start, out_unit, nominal_voltage_v);
+            composite_contribution_at(profile, offset, window_start, out_unit, nominal_voltage_v)
+                .map(|(base_limit, phases)| {
+                    let capped = ceilings.iter().filter_map(|ceiling| {
+                        composite_contribution_at(
+                            ceiling,
+                            offset,
+                            window_start,
+                            out_unit,
+                            nominal_voltage_v,
+                        )
+                        .map(|(ceiling_limit, _)| ceiling_limit)
+                    });
+                    // min(base, ceilings…) in `out_unit`; the base phase count is
+                    // preserved (a ceiling caps magnitude, not phases).
+                    (capped.fold(base_limit, f64::min), phases)
+                });
         if let Some((limit, phases)) = current {
             let unchanged = matches!(
                 prev,
@@ -1399,5 +1540,165 @@ mod tests {
                 resp.status
             );
         }
+    }
+
+    // ---- Station-ceiling composition (Issue #511) ----
+
+    #[test]
+    fn active_limit_w_returns_the_resolved_limit_without_a_natural_gate() {
+        // Unlike `bounded_power_w`, `active_limit_w` reports the profile's own watt
+        // limit whether or not it is below any connector rate.
+        let profile = tx_profile(1, 6_000.0);
+        assert_eq!(active_limit_w(&profile, 0, t0(), 230.0), Some(6_000.0));
+        // An ampere limit is converted at nominal voltage across its phases.
+        let amps = ampere_profile(Some(3), 16.0);
+        assert_eq!(
+            active_limit_w(&amps, 0, t0(), 230.0),
+            Some(16.0 * 230.0 * 3.0)
+        );
+        // No period in force yet → None.
+        let deferred = stepped_profile(ChargingRateUnitEnumType::W, &[(600, 7_400.0)]);
+        assert_eq!(active_limit_w(&deferred, 0, t0(), 230.0), None);
+    }
+
+    #[test]
+    fn capped_binds_the_ceiling_below_the_tx_limit() {
+        // TxProfile at 11 kW, a 6 kW station ceiling, natural rate 22 kW → the
+        // metering bound is min(22k, 11k, 6k) = 6 kW.
+        let tx = tx_profile(1, 11_000.0);
+        let ceiling = stepped_profile(ChargingRateUnitEnumType::W, &[(0, 6_000.0)]);
+        assert_eq!(
+            bounded_power_w_capped(Some(&tx), &[&ceiling], 0, t0(), 22_000.0, 230.0),
+            Some(6_000.0)
+        );
+    }
+
+    #[test]
+    fn capped_leaves_a_ceiling_above_the_tx_limit_untouched() {
+        // A ceiling looser than the TxProfile does not bend the result: min is the
+        // 7.4 kW TxProfile, still below the 22 kW natural rate.
+        let tx = tx_profile(1, 7_400.0);
+        let ceiling = stepped_profile(ChargingRateUnitEnumType::W, &[(0, 20_000.0)]);
+        assert_eq!(
+            bounded_power_w_capped(Some(&tx), &[&ceiling], 0, t0(), 22_000.0, 230.0),
+            Some(7_400.0)
+        );
+    }
+
+    #[test]
+    fn capped_ceiling_binds_with_no_tx_profile_in_force() {
+        // A station ceiling caps the natural rate even when no TxProfile /
+        // TxDefaultProfile is in force: min(22k, 8k) = 8 kW.
+        let ceiling = stepped_profile(ChargingRateUnitEnumType::W, &[(0, 8_000.0)]);
+        assert_eq!(
+            bounded_power_w_capped(None, &[&ceiling], 0, t0(), 22_000.0, 230.0),
+            Some(8_000.0)
+        );
+        // …but a ceiling at or above the natural rate leaves the reading unbounded.
+        let loose = stepped_profile(ChargingRateUnitEnumType::W, &[(0, 30_000.0)]);
+        assert_eq!(
+            bounded_power_w_capped(None, &[&loose], 0, t0(), 22_000.0, 230.0),
+            None
+        );
+    }
+
+    #[test]
+    fn capped_stacks_two_ceilings_taking_the_tightest() {
+        // TxProfile 11 kW, ChargingStationMaxProfile 9 kW, external constraint
+        // 5 kW → the outermost (tightest) wins: min(22k, 11k, 9k, 5k) = 5 kW.
+        // Order-independent (both enter a `min`).
+        let tx = tx_profile(1, 11_000.0);
+        let max = stepped_profile(ChargingRateUnitEnumType::W, &[(0, 9_000.0)]);
+        let external = stepped_profile(ChargingRateUnitEnumType::W, &[(0, 5_000.0)]);
+        assert_eq!(
+            bounded_power_w_capped(Some(&tx), &[&max, &external], 0, t0(), 22_000.0, 230.0),
+            Some(5_000.0)
+        );
+        assert_eq!(
+            bounded_power_w_capped(Some(&tx), &[&external, &max], 0, t0(), 22_000.0, 230.0),
+            Some(5_000.0),
+            "min is order-independent"
+        );
+    }
+
+    #[test]
+    fn capped_with_no_ceilings_matches_bounded_power_w() {
+        // The empty-ceilings composition is exactly the pre-#511 single-profile
+        // bound (no regression to the metering path).
+        let tx = tx_profile(1, 6_000.0);
+        for natural in [22_000.0, 5_000.0, 6_000.0] {
+            assert_eq!(
+                bounded_power_w_capped(Some(&tx), &[], 0, t0(), natural, 230.0),
+                bounded_power_w(&tx, 0, t0(), natural, 230.0),
+                "natural={natural}"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_capped_caps_each_period_by_a_flat_ceiling() {
+        // Base steps 11 kW → 7.4 kW; a flat 8 kW ceiling clips only the first
+        // period, so the composite reads 8 kW then 7.4 kW.
+        let base = stepped_profile(
+            ChargingRateUnitEnumType::W,
+            &[(0, 11_000.0), (1_800, 7_400.0)],
+        );
+        let ceiling = stepped_profile(ChargingRateUnitEnumType::W, &[(0, 8_000.0)]);
+        let sched =
+            compose_composite_schedule_capped(1, &base, &[&ceiling], t0(), 3_600, None, 230.0)
+                .expect("the base profile constrains the window");
+        let periods = &sched.charging_schedule_period;
+        assert_eq!(periods.len(), 2);
+        assert_eq!((periods[0].start_period, periods[0].limit), (0, 8_000.0));
+        assert_eq!(
+            (periods[1].start_period, periods[1].limit),
+            (1_800, 7_400.0)
+        );
+    }
+
+    #[test]
+    fn compose_capped_opens_a_new_period_at_a_ceiling_step() {
+        // A flat 11 kW base, but a ceiling that steps 9 kW → 4 kW at 1 800 s: the
+        // composite must break at the ceiling's step even though the base is flat.
+        let base = tx_profile(1, 11_000.0);
+        let ceiling = stepped_profile(
+            ChargingRateUnitEnumType::W,
+            &[(0, 9_000.0), (1_800, 4_000.0)],
+        );
+        let sched =
+            compose_composite_schedule_capped(1, &base, &[&ceiling], t0(), 3_600, None, 230.0)
+                .expect("the base profile constrains the whole window");
+        let periods = &sched.charging_schedule_period;
+        assert_eq!(periods.len(), 2, "the ceiling step opens a new period");
+        assert_eq!((periods[0].start_period, periods[0].limit), (0, 9_000.0));
+        assert_eq!(
+            (periods[1].start_period, periods[1].limit),
+            (1_800, 4_000.0)
+        );
+    }
+
+    #[test]
+    fn compose_capped_with_no_ceilings_equals_the_uncapped_composite() {
+        // No regression: capped with an empty ceiling slice is the uncapped result.
+        let base = stepped_profile(
+            ChargingRateUnitEnumType::W,
+            &[(0, 11_000.0), (1_800, 7_400.0)],
+        );
+        assert_eq!(
+            compose_composite_schedule_capped(1, &base, &[], t0(), 3_600, None, 230.0),
+            compose_composite_schedule(1, &base, t0(), 3_600, None, 230.0)
+        );
+    }
+
+    #[test]
+    fn compose_capped_ceiling_alone_never_manufactures_a_schedule() {
+        // A base profile with no period in force over the window yields None even
+        // with a ceiling installed — a ceiling caps, it does not create a schedule.
+        let deferred = stepped_profile(ChargingRateUnitEnumType::W, &[(600, 7_400.0)]);
+        let ceiling = stepped_profile(ChargingRateUnitEnumType::W, &[(0, 5_000.0)]);
+        assert_eq!(
+            compose_composite_schedule_capped(1, &deferred, &[&ceiling], t0(), 300, None, 230.0),
+            None
+        );
     }
 }

@@ -673,10 +673,13 @@ pub fn v201_unlock_response(
 ///   (an `evseId = 0` install becomes the station-wide default).
 /// - **`ChargingStationMaxProfile` / `ChargingStationExternalConstraints`** —
 ///   station-wide *ceilings* that cap a resolved limit rather than substitute for
-///   it. They compose differently from a `TxProfile`/`TxDefaultProfile` fallback
-///   and are deferred to a follow-up slice, so they remain
-///   [`Rejected`](ChargingProfileStatusEnumType::Rejected) with an
-///   `UnsupportedPurpose` `statusInfo` for now.
+///   it (`min(resolved, ceiling)`, Issue #511). Like a `TxDefaultProfile` they are
+///   station configuration, not transaction-scoped, so they are
+///   [`Accepted`](ChargingProfileStatusEnumType::Accepted) regardless of whether a
+///   session is live; the wiring layer installs them into the
+///   [`V201StationCeilingStore`](crate::v201_station_ceiling::V201StationCeilingStore)
+///   (an `evseId = 0` install becomes the whole-station ceiling) and the metering
+///   resolver / `GetCompositeSchedule` cap by them.
 /// - **`TxProfile` with no ongoing transaction on the target EVSE** — a
 ///   `TxProfile` is transaction-scoped, so with nothing to bind it to it is
 ///   [`Rejected`](ChargingProfileStatusEnumType::Rejected) with a `NoTransaction`
@@ -728,24 +731,16 @@ pub fn v201_set_charging_profile_status(
             (ChargingProfileStatusEnumType::Accepted, None)
         }
         // The station-ceiling purposes cap a resolved limit rather than substitute
-        // for it, so they compose differently from a TxProfile/TxDefaultProfile
-        // fallback and are deferred to a follow-up slice — Rejected with an
-        // explanatory `statusInfo` in the meantime (Issue #471).
+        // for it (`min(resolved, ceiling)`); like a TxDefaultProfile they are
+        // station configuration, not transaction-scoped, so they are Accepted
+        // regardless of whether a session is live. `evseId = 0` installs the
+        // whole-station ceiling. The wiring layer routes them into the
+        // `V201StationCeilingStore`, which the metering resolver and
+        // `GetCompositeSchedule` cap by (Issue #511).
         ChargingProfilePurposeEnumType::ChargingStationMaxProfile
-        | ChargingProfilePurposeEnumType::ChargingStationExternalConstraints => (
-            ChargingProfileStatusEnumType::Rejected,
-            Some(StatusInfoType {
-                reason_code: "UnsupportedPurpose".to_string(),
-                additional_info: Some(
-                    "SetChargingProfile.chargingProfile.chargingProfilePurpose \
-                     ChargingStationMaxProfile / ChargingStationExternalConstraints are \
-                     not yet handled by the simulator (station-wide ceilings); \
-                     TxProfile and TxDefaultProfile are supported"
-                        .to_string(),
-                ),
-                custom_data: None,
-            }),
-        ),
+        | ChargingProfilePurposeEnumType::ChargingStationExternalConstraints => {
+            (ChargingProfileStatusEnumType::Accepted, None)
+        }
     }
 }
 
@@ -2496,10 +2491,11 @@ mod tests {
     }
 
     #[test]
-    fn set_charging_profile_rejects_the_station_ceiling_purposes() {
-        // The station-wide ceilings cap a resolved limit rather than substitute for
-        // it, so they are deferred to a follow-up and rejected for now, regardless
-        // of whether a session is live.
+    fn set_charging_profile_accepts_the_station_ceiling_purposes() {
+        // The station-wide ceilings are station configuration, not
+        // transaction-scoped, so they are Accepted regardless of whether a session
+        // is live; the wiring layer installs them into the ceiling store and the
+        // metering resolver caps by them (Issue #511).
         for purpose in [
             ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
             ChargingProfilePurposeEnumType::ChargingStationExternalConstraints,
@@ -2508,13 +2504,12 @@ mod tests {
                 let (status, info) = v201_set_charging_profile_status(purpose, has_tx);
                 assert_eq!(
                     status,
-                    ChargingProfileStatusEnumType::Rejected,
-                    "{purpose:?} is not honored by the simulator yet (has_tx={has_tx})"
+                    ChargingProfileStatusEnumType::Accepted,
+                    "{purpose:?} is honored as a station ceiling (has_tx={has_tx})"
                 );
-                assert_eq!(
-                    info.as_ref().map(|i| i.reason_code.as_str()),
-                    Some("UnsupportedPurpose"),
-                    "{purpose:?} is rejected with UnsupportedPurpose (has_tx={has_tx})"
+                assert!(
+                    info.is_none(),
+                    "an accepted ceiling carries no rejection detail (has_tx={has_tx})"
                 );
             }
         }
@@ -2554,8 +2549,10 @@ mod tests {
     fn built_set_charging_profile_responses_are_schema_valid() {
         let validator = SchemaValidator::v201();
         let info = StatusInfoType {
-            reason_code: "UnsupportedPurpose".to_string(),
-            additional_info: Some("only TxProfile is handled by the simulator".to_string()),
+            reason_code: "NoTransaction".to_string(),
+            additional_info: Some(
+                "a TxProfile requires an ongoing transaction on the targeted EVSE".to_string(),
+            ),
             custom_data: None,
         };
         for status in [
