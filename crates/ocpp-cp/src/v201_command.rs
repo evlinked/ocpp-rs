@@ -146,22 +146,23 @@ use ocpp_types::v201::{
     CancelReservationStatusEnumType, ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType,
     ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
     ChargingProfileType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
-    ClearChargingProfileType, DisplayMessageStatusEnumType, GenericDeviceModelStatusEnumType,
-    GenericStatusEnumType, GetChargingProfileStatusEnumType, GetDisplayMessagesStatusEnumType,
-    MessageInfoType, MessagePriorityEnumType, MessageStateEnumType, MessageTriggerEnumType,
-    OperationalStatusEnumType, RequestStartStopStatusEnumType, ReserveNowStatusEnumType,
-    ResetEnumType, ResetStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
-    UnlockStatusEnumType,
+    ClearChargingProfileType, ClearMessageStatusEnumType, DisplayMessageStatusEnumType,
+    GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetChargingProfileStatusEnumType,
+    GetDisplayMessagesStatusEnumType, MessageInfoType, MessagePriorityEnumType,
+    MessageStateEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
+    RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType,
+    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 
 use ocpp_messages::v201::{
     CancelReservationResponse, ChangeAvailabilityResponse, ClearCacheResponse,
-    ClearChargingProfileResponse, CostUpdatedResponse, GetChargingProfilesResponse,
-    GetDisplayMessagesResponse, GetMonitoringReportResponse, GetTransactionStatusResponse,
-    NotifyDisplayMessagesRequest, ReportChargingProfilesRequest, RequestStartTransactionResponse,
-    RequestStopTransactionResponse, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
-    SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
-    TriggerMessageResponse, UnlockConnectorResponse,
+    ClearChargingProfileResponse, ClearDisplayMessageResponse, CostUpdatedResponse,
+    GetChargingProfilesResponse, GetDisplayMessagesResponse, GetMonitoringReportResponse,
+    GetTransactionStatusResponse, NotifyDisplayMessagesRequest, ReportChargingProfilesRequest,
+    RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
+    ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
+    SetMonitoringBaseResponse, SetMonitoringLevelResponse, TriggerMessageResponse,
+    UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1628,6 +1629,31 @@ pub fn v201_notify_display_messages_pages(
             custom_data: None,
         })
         .collect()
+}
+
+/// Build a schema-valid `ClearDisplayMessage.conf` ([`ClearDisplayMessageResponse`]).
+///
+/// Pure constructor mirroring [`v201_clear_charging_profile_response`]: the
+/// teardown half of the display-message family (ports
+/// [`ocpp.v201.call_result.ClearDisplayMessage`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call_result.py)).
+/// The station reports [`Accepted`](ClearMessageStatusEnumType::Accepted) when a
+/// message with the requested id existed and was removed (`removed == true`), or
+/// [`Unknown`](ClearMessageStatusEnumType::Unknown) when the id named nothing
+/// installed — exactly the two-value contract
+/// `ocpp.v201.enums.ClearMessageStatusEnumType` defines. No detail rides on
+/// either arm; `remove` is a single side effect the wiring layer applies before
+/// calling this.
+#[must_use]
+pub fn v201_clear_display_message_response(removed: bool) -> ClearDisplayMessageResponse {
+    ClearDisplayMessageResponse {
+        status: if removed {
+            ClearMessageStatusEnumType::Accepted
+        } else {
+            ClearMessageStatusEnumType::Unknown
+        },
+        status_info: None,
+        custom_data: None,
+    }
 }
 
 /// Build the (empty) `CostUpdated` acknowledgement.
@@ -3970,6 +3996,40 @@ mod tests {
                     &serde_json::to_value(&page).unwrap(),
                 )
                 .expect("NotifyDisplayMessages CALL is schema-valid");
+        }
+    }
+
+    // --- ClearDisplayMessage (v201, #509) ----------------------------------
+
+    #[test]
+    fn clear_display_message_response_maps_removed_to_accepted_and_missing_to_unknown() {
+        assert_eq!(
+            v201_clear_display_message_response(true).status,
+            ClearMessageStatusEnumType::Accepted
+        );
+        assert_eq!(
+            v201_clear_display_message_response(false).status,
+            ClearMessageStatusEnumType::Unknown
+        );
+        // The builder carries no detail on either arm.
+        let resp = v201_clear_display_message_response(true);
+        assert!(resp.status_info.is_none());
+        assert!(resp.custom_data.is_none());
+    }
+
+    /// Wire fidelity: both built `ClearDisplayMessage.conf` values satisfy the
+    /// bundled OCPP 2.0.1 `ClearDisplayMessageResponse` JSON Schema.
+    #[test]
+    fn built_clear_display_message_responses_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        for removed in [true, false] {
+            let resp = v201_clear_display_message_response(removed);
+            let payload = serde_json::to_value(&resp).unwrap();
+            validator
+                .validate_call_result("ClearDisplayMessage", &payload)
+                .unwrap_or_else(|e| {
+                    panic!("built ClearDisplayMessageResponse (removed={removed}) should be schema-valid: {e}")
+                });
         }
     }
 
