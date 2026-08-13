@@ -119,6 +119,26 @@
 //! `ClearCacheStatusEnumType` is a clean `Accepted`/`Rejected` two-way split,
 //! plus an optional `statusInfo`). Emptying the shared cache off the CALL path is
 //! the wiring layer's job.
+//!
+//! ## `SetDisplayMessage`
+//!
+//! Ports `ocpp.v201.call.SetDisplayMessage` /
+//! `ocpp.v201.call_result.SetDisplayMessage` (OCPP 2.0.1 Part 2, E05–E08). The
+//! CSMS installs one [`MessageInfoType`] for the station to show on its display;
+//! the station answers synchronously with a [`DisplayMessageStatusEnumType`]. It
+//! has no 1.6J twin. The *pure decision*
+//! ([`v201_set_display_message_status`]) is the accept/reject half —
+//! `Accepted` for a message the simulator can model, or `UnknownTransaction` when
+//! the message binds a `transactionId` the station is not running — and the wiring
+//! layer upserts the accepted message into the display-message store
+//! ([`V201DisplayMessageStore`](crate::v201_display_message::V201DisplayMessageStore)),
+//! keyed by `MessageInfoType.id` so a same-id re-install replaces rather than
+//! duplicates. The remaining reserved statuses
+//! (`NotSupportedMessageFormat` / `NotSupportedPriority` / `NotSupportedState` /
+//! `Rejected`) are documented modeled seams the simulator does not produce — a
+//! simulated display can render any schema-valid format/priority/state — kept for
+//! the wire and a future capability knob, the way the monitor store (#494)
+//! documents its unproduced statuses.
 
 use ocpp_types::common::Reason;
 use ocpp_types::v16j::ResetType;
@@ -126,10 +146,11 @@ use ocpp_types::v201::{
     CancelReservationStatusEnumType, ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType,
     ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
     ChargingProfileType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
-    ClearChargingProfileType, GenericDeviceModelStatusEnumType, GenericStatusEnumType,
-    GetChargingProfileStatusEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
-    RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType,
-    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    ClearChargingProfileType, DisplayMessageStatusEnumType, GenericDeviceModelStatusEnumType,
+    GenericStatusEnumType, GetChargingProfileStatusEnumType, MessageInfoType,
+    MessageTriggerEnumType, OperationalStatusEnumType, RequestStartStopStatusEnumType,
+    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 
 use ocpp_messages::v201::{
@@ -137,8 +158,9 @@ use ocpp_messages::v201::{
     ClearChargingProfileResponse, CostUpdatedResponse, GetChargingProfilesResponse,
     GetMonitoringReportResponse, GetTransactionStatusResponse, ReportChargingProfilesRequest,
     RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
-    ResetResponse, SetChargingProfileResponse, SetMonitoringBaseResponse,
-    SetMonitoringLevelResponse, TriggerMessageResponse, UnlockConnectorResponse,
+    ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
+    SetMonitoringBaseResponse, SetMonitoringLevelResponse, TriggerMessageResponse,
+    UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1385,6 +1407,93 @@ pub fn v201_get_transaction_status_response(
     GetTransactionStatusResponse {
         messages_in_queue,
         ongoing_indicator,
+        custom_data: None,
+    }
+}
+
+/// Decide the [`DisplayMessageStatusEnumType`] a `V201` station reports for an
+/// inbound `SetDisplayMessage.req`, given the [`message`](MessageInfoType) to
+/// install and the ids of every transaction the station currently has live —
+/// returning the decided status together with the optional `statusInfo`
+/// explaining a refusal.
+///
+/// Faithful to OCPP 2.0.1 (Part 2, E05–E08, `SetDisplayMessage`):
+///
+/// - **Transaction-bound message referencing an unknown transaction** — when the
+///   message carries a `transactionId` (`MessageInfoType.transaction_id`) that is
+///   **not** one of `live_transaction_ids`, the station cannot scope the message
+///   to a session it is not running, so it is
+///   [`UnknownTransaction`](DisplayMessageStatusEnumType::UnknownTransaction) with
+///   a `NoTransaction` `statusInfo`, checked *first* — the message is **not**
+///   installed. Matching is exact string equality over the station-minted decimal
+///   id, the same member-of-the-live-set test
+///   [`v201_request_stop_status`] / [`v201_get_transaction_status`] use, so a
+///   non-canonical spelling, whitespace, or a huge value simply misses and is
+///   `UnknownTransaction`, never parsed and never panicking — a trust boundary on
+///   the CSMS-supplied id.
+/// - **Otherwise** — a schema-valid message the simulator can model (a
+///   station-wide message, or one bound to a live transaction) →
+///   [`Accepted`](DisplayMessageStatusEnumType::Accepted), no `statusInfo`. The
+///   wiring layer then upserts it into the display-message store by
+///   `MessageInfoType.id`.
+///
+/// The remaining `DisplayMessageStatusEnumType` variants
+/// (`NotSupportedMessageFormat`, `NotSupportedPriority`, `NotSupportedState`,
+/// `Rejected`) are **documented modeled seams** the simulator does not produce: a
+/// simulated display can render any schema-valid `MessageFormatEnumType`,
+/// `MessagePriorityEnumType`, and `MessageStateEnumType`, so it accepts every
+/// well-formed `MessageInfoType`. They stay in the ported status enum for the wire
+/// — a real station with a fixed-format display, or a future opt-in capability
+/// knob, maps to them — mirroring how the monitor store (#494) documents its
+/// unproduced statuses. The three enum fields are typed, so an unknown wire value
+/// fails deserialization (rejected as a CALLERROR) before reaching this decision.
+///
+/// This is the *pure* decision, depending only on the message and the station's
+/// live-id read — no runtime handles, so it is unit-testable in isolation.
+/// Resolving the live ids from the transaction table and performing the upsert off
+/// the CALL path is the wiring layer's job.
+#[must_use]
+pub fn v201_set_display_message_status(
+    message: &MessageInfoType,
+    live_transaction_ids: &[&str],
+) -> (DisplayMessageStatusEnumType, Option<StatusInfoType>) {
+    // A message may bind itself to a transaction; if it names one the station is
+    // not running, there is nothing to scope it to — refuse before installing.
+    if let Some(transaction_id) = message.transaction_id.as_deref() {
+        if !live_transaction_ids.contains(&transaction_id) {
+            return (
+                DisplayMessageStatusEnumType::UnknownTransaction,
+                Some(StatusInfoType {
+                    reason_code: "NoTransaction".to_string(),
+                    additional_info: Some(
+                        "SetDisplayMessage.message.transactionId does not name a \
+                         transaction the station is currently running"
+                            .to_string(),
+                    ),
+                    custom_data: None,
+                }),
+            );
+        }
+    }
+    (DisplayMessageStatusEnumType::Accepted, None)
+}
+
+/// Build a schema-valid `SetDisplayMessage.conf` ([`SetDisplayMessageResponse`]).
+///
+/// Pure constructor mirroring [`v201_set_charging_profile_response`]: carries the
+/// decided [`status`](DisplayMessageStatusEnumType) plus the optional 2.0.1
+/// `statusInfo` (a vendor-agnostic `reasonCode` and human-readable detail —
+/// useful, for example, to explain why an install was `UnknownTransaction`).
+///
+/// Ports `ocpp.v201.call_result.SetDisplayMessage`.
+#[must_use]
+pub fn v201_set_display_message_response(
+    status: DisplayMessageStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> SetDisplayMessageResponse {
+    SetDisplayMessageResponse {
+        status,
+        status_info,
         custom_data: None,
     }
 }
@@ -3355,6 +3464,126 @@ mod tests {
                         .is_ok(),
                     "built GetTransactionStatusResponse (messagesInQueue={messages_in_queue}, \
                      ongoingIndicator={ongoing_indicator:?}) should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    // --- SetDisplayMessage (v201, #505) ------------------------------------
+
+    /// A minimal schema-shaped `MessageInfoType` with the given `id`, optionally
+    /// bound to a `transactionId`, for the decision tests.
+    fn display_message(id: i32, transaction_id: Option<&str>) -> MessageInfoType {
+        use ocpp_types::v201::{
+            MessageContentType, MessageFormatEnumType, MessagePriorityEnumType,
+        };
+        MessageInfoType {
+            id,
+            priority: MessagePriorityEnumType::NormalCycle,
+            message: MessageContentType {
+                format: MessageFormatEnumType::Utf8,
+                content: "Welcome".to_string(),
+                language: None,
+                custom_data: None,
+            },
+            state: None,
+            start_date_time: None,
+            end_date_time: None,
+            transaction_id: transaction_id.map(str::to_owned),
+            display: None,
+            custom_data: None,
+        }
+    }
+
+    #[test]
+    fn set_display_message_station_wide_message_is_accepted() {
+        // A message that binds no transaction is a plain station-wide install →
+        // Accepted, no statusInfo, independent of what the station is running.
+        let msg = display_message(1, None);
+        assert_eq!(
+            v201_set_display_message_status(&msg, &["7"]),
+            (DisplayMessageStatusEnumType::Accepted, None)
+        );
+        assert_eq!(
+            v201_set_display_message_status(&msg, &[]),
+            (DisplayMessageStatusEnumType::Accepted, None),
+            "a station-wide message is accepted even on an idle station"
+        );
+    }
+
+    #[test]
+    fn set_display_message_bound_to_a_live_transaction_is_accepted() {
+        // A message scoped to a transaction the station IS running → Accepted.
+        let msg = display_message(2, Some("7"));
+        let (status, status_info) = v201_set_display_message_status(&msg, &["7", "8"]);
+        assert_eq!(status, DisplayMessageStatusEnumType::Accepted);
+        assert!(status_info.is_none());
+    }
+
+    #[test]
+    fn set_display_message_bound_to_an_unknown_transaction_is_unknown_transaction() {
+        // A message scoped to a transaction the station is NOT running — an unknown
+        // id, or an idle station (empty set) — is UnknownTransaction with a
+        // populated statusInfo, and is not installed.
+        let msg = display_message(3, Some("9"));
+        let (status, status_info) = v201_set_display_message_status(&msg, &["7", "8"]);
+        assert_eq!(status, DisplayMessageStatusEnumType::UnknownTransaction);
+        assert_eq!(status_info.unwrap().reason_code, "NoTransaction");
+
+        let (idle_status, _) = v201_set_display_message_status(&msg, &[]);
+        assert_eq!(
+            idle_status,
+            DisplayMessageStatusEnumType::UnknownTransaction,
+            "an idle station cannot scope a transaction-bound message"
+        );
+    }
+
+    #[test]
+    fn set_display_message_matches_transaction_id_on_exact_string_never_parses() {
+        // Trust boundary: the bound transactionId is matched by exact string
+        // equality over the station-minted decimal id, not a numeric parse. A
+        // non-canonical spelling of a live id misses → UnknownTransaction, never a
+        // panic or a coercion.
+        let padded = display_message(4, Some("07"));
+        assert_eq!(
+            v201_set_display_message_status(&padded, &["7"]).0,
+            DisplayMessageStatusEnumType::UnknownTransaction,
+            "a non-canonical spelling of a live id must not match"
+        );
+        let spaced = display_message(5, Some(" 7 "));
+        assert_eq!(
+            v201_set_display_message_status(&spaced, &["7"]).0,
+            DisplayMessageStatusEnumType::UnknownTransaction
+        );
+    }
+
+    #[test]
+    fn built_set_display_message_responses_are_schema_valid() {
+        // Every built response — each DisplayMessageStatusEnumType crossed with
+        // with/without a statusInfo — satisfies the bundled OCPP 2.0.1
+        // SetDisplayMessage response JSON Schema.
+        let validator = SchemaValidator::v201();
+        let info = StatusInfoType {
+            reason_code: "NoTransaction".to_string(),
+            additional_info: Some("bound to a transaction the station is not running".to_string()),
+            custom_data: None,
+        };
+        for status in [
+            DisplayMessageStatusEnumType::Accepted,
+            DisplayMessageStatusEnumType::NotSupportedMessageFormat,
+            DisplayMessageStatusEnumType::Rejected,
+            DisplayMessageStatusEnumType::NotSupportedPriority,
+            DisplayMessageStatusEnumType::NotSupportedState,
+            DisplayMessageStatusEnumType::UnknownTransaction,
+        ] {
+            for status_info in [None, Some(info.clone())] {
+                let resp = v201_set_display_message_response(status, status_info);
+                let payload = serde_json::to_value(&resp).unwrap();
+                assert!(
+                    validator
+                        .validate_call_result("SetDisplayMessage", &payload)
+                        .is_ok(),
+                    "built {status:?} SetDisplayMessageResponse should be schema-valid, got: {payload}"
                 );
             }
         }
