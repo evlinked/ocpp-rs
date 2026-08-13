@@ -91,6 +91,7 @@ use ocpp_messages::v201::{
     GetLocalListVersionResponse as V201GetLocalListVersionResponse,
     GetMonitoringReportRequest as V201GetMonitoringReportRequest,
     GetReportRequest as V201GetReportRequest, GetReportResponse as V201GetReportResponse,
+    GetTransactionStatusRequest as V201GetTransactionStatusRequest,
     GetVariablesRequest as V201GetVariablesRequest,
     GetVariablesResponse as V201GetVariablesResponse, MeterValuesRequest as V201MeterValuesRequest,
     NotifyMonitoringReportRequest as V201NotifyMonitoringReportRequest,
@@ -2272,6 +2273,51 @@ impl ChargePoint {
                     }
 
                     Ok(v201_command::v201_request_stop_response(status, None))
+                }
+            });
+        }
+
+        // GetTransactionStatus (OCPP 2.0.1 Part 2, E13) — a 2.0.1-only query: the
+        // CSMS asks whether a specific transaction is still ongoing and/or whether
+        // the station still has messages queued for it (e.g. after a reconnect,
+        // before deciding to clean up). There is no 1.6J equivalent, so this is
+        // registered on the `V201` arm only (Issue #490). Unlike the command
+        // handlers this is a pure read-and-answer with no side effect: it reads the
+        // live `active_transactions` set and reports directly — nothing is queued.
+        if protocol_version == OcppVersion::V201 {
+            let active_transactions = active_transactions.clone();
+            d.on(move |req: V201GetTransactionStatusRequest| {
+                let active_transactions = active_transactions.clone();
+                async move {
+                    // Resolve the live ids to their decimal spellings, exactly as
+                    // the RequestStopTransaction handler does, so an inbound opaque
+                    // `transactionId` is matched by exact string equality (never a
+                    // numeric parse — a malformed / non-canonical id just misses and
+                    // reports `ongoingIndicator = Some(false)`, never panicking).
+                    let live_ids: Vec<String> = active_transactions
+                        .read()
+                        .await
+                        .keys()
+                        .map(ToString::to_string)
+                        .collect();
+                    let live_id_strs: Vec<&str> = live_ids.iter().map(String::as_str).collect();
+
+                    // `messagesInQueue` is a modeled `false`: the simulator does not
+                    // yet buffer offline messages, so it never has undelivered
+                    // messages queued for a transaction. Wiring it as an input (see
+                    // `v201_get_transaction_status`) lets a future outbound queue
+                    // flip this without reshaping the decision.
+                    let (messages_in_queue, ongoing_indicator) =
+                        v201_command::v201_get_transaction_status(
+                            req.transaction_id.as_deref(),
+                            &live_id_strs,
+                            false,
+                        );
+
+                    Ok(v201_command::v201_get_transaction_status_response(
+                        messages_in_queue,
+                        ongoing_indicator,
+                    ))
                 }
             });
         }
@@ -6236,6 +6282,18 @@ impl ChargePoint {
             .insert(reservation_id, connector_id);
     }
 
+    /// Record a live transaction (`transactionId → connector`) directly in the
+    /// shared `active_transactions` store, exactly as an accepted
+    /// `RequestStartTransaction` / local start would, so a `GetTransactionStatus`
+    /// wire test has an ongoing transaction to query without a live client. The V201
+    /// path renders the `i32` key as its decimal string on the wire.
+    async fn test_insert_active_transaction(&self, transaction_id: i32, connector_id: ConnectorId) {
+        self.active_transactions
+            .write()
+            .await
+            .insert(transaction_id, connector_id);
+    }
+
     /// Read a connector's current status, so a wire test can assert a
     /// `Reserved → Available` transition after a handler runs.
     async fn test_connector_status(&self, connector_id: ConnectorId) -> ChargePointStatus {
@@ -7903,6 +7961,102 @@ mod tests {
             validator
                 .validate_call_result("SetMonitoringBase", &serde_json::to_value(&resp).unwrap())
                 .expect("SetMonitoringBase response is schema-valid");
+        }
+    }
+
+    // --- GetTransactionStatus (M7, issue #490) -----------------------------
+    // A `for_version(V201)` CP answers the 2.0.1-only GetTransactionStatus query
+    // against the live `active_transactions` set. These exercise the wired V201
+    // arm end-to-end over `handle_message`.
+
+    fn make_v201_get_transaction_status(transaction_id: Option<&str>) -> CallMessage {
+        make_call(V201GetTransactionStatusRequest {
+            transaction_id: transaction_id.map(ToString::to_string),
+            custom_data: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn v201_get_transaction_status_station_wide_omits_ongoing_indicator() {
+        // A station-wide query (no transactionId) is registered (the response
+        // parses, it is not an unrecognized action), reports messagesInQueue =
+        // false (modeled: no offline queue yet), omits ongoingIndicator, and
+        // queues nothing.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_transaction_status(None)))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::GetTransactionStatusResponse =
+                    r.payload_as().unwrap();
+                assert!(!body.messages_in_queue);
+                assert_eq!(
+                    body.ongoing_indicator, None,
+                    "a station-wide query omits ongoingIndicator"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert!(
+            v201_drain_commands(&cp).await.is_empty(),
+            "GetTransactionStatus is a pure read — it queues nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_get_transaction_status_reports_ongoing_for_a_live_transaction() {
+        // With transaction 7 live on the station, a query for "7" reports
+        // ongoingIndicator = Some(true).
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.test_insert_active_transaction(7, ConnectorId::new(1).unwrap())
+            .await;
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_transaction_status(Some("7"))))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::GetTransactionStatusResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(
+                    body.ongoing_indicator,
+                    Some(true),
+                    "a live transaction is reported ongoing"
+                );
+                assert!(!body.messages_in_queue);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_get_transaction_status_unknown_or_noncanonical_id_is_not_ongoing() {
+        // An id the station is not running — an unknown id, or a non-canonical
+        // spelling of a live one ("07" ≠ "7") — reports ongoingIndicator =
+        // Some(false) and never panics (trust boundary: exact string match, no
+        // numeric parse).
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.test_insert_active_transaction(7, ConnectorId::new(1).unwrap())
+            .await;
+        for probe in ["999", "07"] {
+            let resp = cp
+                .handle_message(Message::Call(make_v201_get_transaction_status(Some(probe))))
+                .await
+                .unwrap();
+            match resp.unwrap() {
+                Message::CallResult(r) => {
+                    let body: ocpp_messages::v201::GetTransactionStatusResponse =
+                        r.payload_as().unwrap();
+                    assert_eq!(
+                        body.ongoing_indicator,
+                        Some(false),
+                        "id {probe:?} is not live → Some(false)"
+                    );
+                }
+                other => panic!("expected CallResult, got: {other:?}"),
+            }
         }
     }
 
