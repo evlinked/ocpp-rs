@@ -147,20 +147,21 @@ use ocpp_types::v201::{
     ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
     ChargingProfileType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
     ClearChargingProfileType, DisplayMessageStatusEnumType, GenericDeviceModelStatusEnumType,
-    GenericStatusEnumType, GetChargingProfileStatusEnumType, MessageInfoType,
-    MessageTriggerEnumType, OperationalStatusEnumType, RequestStartStopStatusEnumType,
-    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
-    TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    GenericStatusEnumType, GetChargingProfileStatusEnumType, GetDisplayMessagesStatusEnumType,
+    MessageInfoType, MessagePriorityEnumType, MessageStateEnumType, MessageTriggerEnumType,
+    OperationalStatusEnumType, RequestStartStopStatusEnumType, ReserveNowStatusEnumType,
+    ResetEnumType, ResetStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
+    UnlockStatusEnumType,
 };
 
 use ocpp_messages::v201::{
     CancelReservationResponse, ChangeAvailabilityResponse, ClearCacheResponse,
     ClearChargingProfileResponse, CostUpdatedResponse, GetChargingProfilesResponse,
-    GetMonitoringReportResponse, GetTransactionStatusResponse, ReportChargingProfilesRequest,
-    RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
-    ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
-    SetMonitoringBaseResponse, SetMonitoringLevelResponse, TriggerMessageResponse,
-    UnlockConnectorResponse,
+    GetDisplayMessagesResponse, GetMonitoringReportResponse, GetTransactionStatusResponse,
+    NotifyDisplayMessagesRequest, ReportChargingProfilesRequest, RequestStartTransactionResponse,
+    RequestStopTransactionResponse, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
+    SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
+    TriggerMessageResponse, UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1496,6 +1497,119 @@ pub fn v201_set_display_message_response(
         status_info,
         custom_data: None,
     }
+}
+
+/// Resolve which installed display messages a `GetDisplayMessages` query matches,
+/// given its optional `id` / `priority` / `state` selectors and an owned
+/// `snapshot()` of the [`V201DisplayMessageStore`](crate::v201_display_message::V201DisplayMessageStore).
+///
+/// The query half of the display-message family (ports
+/// [`ocpp.v201.call.GetDisplayMessages`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py)),
+/// mirroring [`v201_get_charging_profiles_matches`]: each selector is an
+/// independent, **conjunctive** filter and an absent (`None`) selector is a
+/// wildcard that never excludes. An empty query `{}` (all selectors absent) thus
+/// matches every installed message.
+///
+/// - **`id`** — absent = any; present = the message's [`id`](MessageInfoType::id)
+///   must be one of the listed ids (an id list naming nothing installed matches
+///   nothing). The schema guarantees a present list is non-empty (`minItems` 1).
+/// - **`priority`** — absent = any; present must equal the message's
+///   (required) [`priority`](MessageInfoType::priority).
+/// - **`state`** — absent = any; present matches a message whose
+///   [`state`](MessageInfoType::state) equals it **or** whose state is `None`. A
+///   stateless message is displayed in *every* station state (OCPP 2.0.1
+///   `MessageInfoType.state`: "When omitted this message should be shown in any
+///   state"), so a "which messages show in state X" query must include it —
+///   faithful to the spec rather than a literal field-equality.
+///
+/// Pure over its inputs (the request selectors plus an owned snapshot), so it is
+/// unit-testable without a runtime or the store lock; taking the snapshot and
+/// streaming the report is the wiring layer's job.
+#[must_use]
+pub fn v201_get_display_messages_matches(
+    id: Option<&[i32]>,
+    priority: Option<MessagePriorityEnumType>,
+    state: Option<MessageStateEnumType>,
+    installed: &[MessageInfoType],
+) -> Vec<MessageInfoType> {
+    installed
+        .iter()
+        .filter(|message| {
+            id.is_none_or(|ids| ids.contains(&message.id))
+                && priority.is_none_or(|p| p == message.priority)
+                // A stateless message shows in any state, so a state query includes it.
+                && state.is_none_or(|s| message.state.is_none_or(|ms| ms == s))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Build a schema-valid `GetDisplayMessages.conf` ([`GetDisplayMessagesResponse`]).
+///
+/// Pure constructor mirroring [`v201_get_charging_profiles_response`]: the station
+/// reports [`Accepted`](GetDisplayMessagesStatusEnumType::Accepted) when at least
+/// one installed message matched the query (`matched == true`) — those messages
+/// then stream asynchronously as `NotifyDisplayMessages` — or
+/// [`Unknown`](GetDisplayMessagesStatusEnumType::Unknown) when the selector
+/// matched nothing installed, exactly the two-value contract
+/// `ocpp.v201.enums.GetDisplayMessagesStatusEnumType` defines. No message data
+/// rides on this synchronous response.
+#[must_use]
+pub fn v201_get_display_messages_response(matched: bool) -> GetDisplayMessagesResponse {
+    GetDisplayMessagesResponse {
+        status: if matched {
+            GetDisplayMessagesStatusEnumType::Accepted
+        } else {
+            GetDisplayMessagesStatusEnumType::Unknown
+        },
+        status_info: None,
+        custom_data: None,
+    }
+}
+
+/// Page the messages a `GetDisplayMessages` query matched into the
+/// `NotifyDisplayMessages` CALL(s) the station streams back.
+///
+/// The asynchronous data half of the query flow (ports
+/// [`ocpp.v201.call.NotifyDisplayMessages`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py)):
+/// [`v201_get_display_messages_matches`] resolves which installed messages to
+/// report, and this builds one [`NotifyDisplayMessagesRequest`] per message —
+/// each echoing the triggering `request_id`. Pages are ordered by ascending
+/// [`id`](MessageInfoType::id) (the store snapshot is an unordered `HashMap` walk,
+/// so sorting makes the paging deterministic), and every page but the last is
+/// flagged `tbc` ("to be continued"); the final page leaves `tbc` absent
+/// (= `false`). An empty match set builds no pages — there is nothing to stream.
+///
+/// One message per page (mirroring [`v201_report_charging_profiles_pages`]'s
+/// one-profile-per-page shape) keeps each page's `messageInfo` at exactly one
+/// item — always satisfying the schema's `minItems: 1` — and makes the `tbc`
+/// paging observable. Multi-message-per-page batching is a later refinement if a
+/// station's installed set ever outgrows a single frame; the CSMS reassembles by
+/// `request_id` regardless of how the messages are split across pages.
+///
+/// Pure over its inputs, so it is unit-testable without a runtime; sending the
+/// pages over the wire is the wiring layer's job.
+#[must_use]
+pub fn v201_notify_display_messages_pages(
+    request_id: i32,
+    matched: &[MessageInfoType],
+) -> Vec<NotifyDisplayMessagesRequest> {
+    // Deterministic paging order: the store snapshot is a HashMap walk.
+    let mut ordered: Vec<&MessageInfoType> = matched.iter().collect();
+    ordered.sort_by_key(|message| message.id);
+
+    let last = ordered.len().saturating_sub(1);
+    ordered
+        .into_iter()
+        .enumerate()
+        .map(|(i, message)| NotifyDisplayMessagesRequest {
+            request_id,
+            message_info: Some(vec![message.clone()]),
+            // Every page but the last announces that more follow.
+            tbc: (i < last).then_some(true),
+            custom_data: None,
+        })
+        .collect()
 }
 
 /// Build the (empty) `CostUpdated` acknowledgement.
@@ -3586,6 +3700,237 @@ mod tests {
                     "built {status:?} SetDisplayMessageResponse should be schema-valid, got: {payload}"
                 );
             }
+        }
+    }
+
+    // --- GetDisplayMessages (v201, #508) -----------------------------------
+
+    /// A `MessageInfoType` with the given `id`, `priority`, and (optional)
+    /// `state`, so the selector tests can tell messages apart on every selector.
+    fn display_message_pss(
+        id: i32,
+        priority: MessagePriorityEnumType,
+        state: Option<MessageStateEnumType>,
+    ) -> MessageInfoType {
+        let mut msg = display_message(id, None);
+        msg.priority = priority;
+        msg.state = state;
+        msg
+    }
+
+    #[test]
+    fn get_display_messages_empty_selector_matches_every_installed_message() {
+        let installed = vec![
+            display_message_pss(1, MessagePriorityEnumType::NormalCycle, None),
+            display_message_pss(2, MessagePriorityEnumType::AlwaysFront, None),
+        ];
+        // No id/priority/state selector → every installed message matches.
+        let mut got = v201_get_display_messages_matches(None, None, None, &installed);
+        got.sort_by_key(|m| m.id);
+        assert_eq!(got, installed);
+        // An empty store matches nothing, whatever the selector.
+        assert!(v201_get_display_messages_matches(None, None, None, &[]).is_empty());
+    }
+
+    #[test]
+    fn get_display_messages_id_selector_filters_and_tolerates_unknown_ids() {
+        let installed = vec![
+            display_message_pss(1, MessagePriorityEnumType::NormalCycle, None),
+            display_message_pss(2, MessagePriorityEnumType::NormalCycle, None),
+            display_message_pss(3, MessagePriorityEnumType::NormalCycle, None),
+        ];
+        // Only the listed ids match; a present-but-unknown id (99) simply misses.
+        let ids = [2, 99];
+        let mut got = v201_get_display_messages_matches(Some(&ids), None, None, &installed);
+        got.sort_by_key(|m| m.id);
+        assert_eq!(got.iter().map(|m| m.id).collect::<Vec<_>>(), vec![2]);
+        // An id list naming nothing installed matches nothing — never a panic on a
+        // CSMS-supplied id (i32::MIN / MAX / negative all just miss).
+        assert!(v201_get_display_messages_matches(
+            Some(&[i32::MIN, i32::MAX, -1]),
+            None,
+            None,
+            &installed
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn get_display_messages_priority_selector_filters_on_exact_priority() {
+        let installed = vec![
+            display_message_pss(1, MessagePriorityEnumType::AlwaysFront, None),
+            display_message_pss(2, MessagePriorityEnumType::NormalCycle, None),
+            display_message_pss(3, MessagePriorityEnumType::AlwaysFront, None),
+        ];
+        let mut got = v201_get_display_messages_matches(
+            None,
+            Some(MessagePriorityEnumType::AlwaysFront),
+            None,
+            &installed,
+        );
+        got.sort_by_key(|m| m.id);
+        assert_eq!(got.iter().map(|m| m.id).collect::<Vec<_>>(), vec![1, 3]);
+        // A priority naming no installed message matches nothing.
+        assert!(v201_get_display_messages_matches(
+            None,
+            Some(MessagePriorityEnumType::InFront),
+            None,
+            &installed
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn get_display_messages_state_selector_includes_stateless_messages() {
+        // A stateless message shows in EVERY station state, so a state query must
+        // include it; a message with a different explicit state is excluded.
+        let installed = vec![
+            display_message_pss(1, MessagePriorityEnumType::NormalCycle, None), // any state
+            display_message_pss(
+                2,
+                MessagePriorityEnumType::NormalCycle,
+                Some(MessageStateEnumType::Charging),
+            ),
+            display_message_pss(
+                3,
+                MessagePriorityEnumType::NormalCycle,
+                Some(MessageStateEnumType::Idle),
+            ),
+        ];
+        // state=Charging → the stateless (1) and the Charging (2) match, not Idle (3).
+        let mut got = v201_get_display_messages_matches(
+            None,
+            None,
+            Some(MessageStateEnumType::Charging),
+            &installed,
+        );
+        got.sort_by_key(|m| m.id);
+        assert_eq!(got.iter().map(|m| m.id).collect::<Vec<_>>(), vec![1, 2]);
+        // state=Idle → the stateless (1) and the Idle (3) match, not Charging (2).
+        let mut got = v201_get_display_messages_matches(
+            None,
+            None,
+            Some(MessageStateEnumType::Idle),
+            &installed,
+        );
+        got.sort_by_key(|m| m.id);
+        assert_eq!(got.iter().map(|m| m.id).collect::<Vec<_>>(), vec![1, 3]);
+    }
+
+    #[test]
+    fn get_display_messages_selectors_and_conjunctively() {
+        let installed = vec![
+            display_message_pss(
+                1,
+                MessagePriorityEnumType::AlwaysFront,
+                Some(MessageStateEnumType::Charging),
+            ),
+            display_message_pss(
+                2,
+                MessagePriorityEnumType::AlwaysFront,
+                Some(MessageStateEnumType::Idle),
+            ),
+            display_message_pss(
+                3,
+                MessagePriorityEnumType::NormalCycle,
+                Some(MessageStateEnumType::Charging),
+            ),
+        ];
+        // id ∈ {1,2,3} AND priority=AlwaysFront AND state=Charging → only 1.
+        let got = v201_get_display_messages_matches(
+            Some(&[1, 2, 3]),
+            Some(MessagePriorityEnumType::AlwaysFront),
+            Some(MessageStateEnumType::Charging),
+            &installed,
+        );
+        assert_eq!(got.iter().map(|m| m.id).collect::<Vec<_>>(), vec![1]);
+        // Tighten the id filter to exclude 1 → the AND matches nothing.
+        assert!(v201_get_display_messages_matches(
+            Some(&[2, 3]),
+            Some(MessagePriorityEnumType::AlwaysFront),
+            Some(MessageStateEnumType::Charging),
+            &installed
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn get_display_messages_response_maps_matched_to_accepted_or_unknown() {
+        assert_eq!(
+            v201_get_display_messages_response(true).status,
+            GetDisplayMessagesStatusEnumType::Accepted
+        );
+        assert_eq!(
+            v201_get_display_messages_response(false).status,
+            GetDisplayMessagesStatusEnumType::Unknown
+        );
+        // No message data rides on the synchronous acknowledgement.
+        let resp = v201_get_display_messages_response(true);
+        assert!(resp.status_info.is_none());
+        assert!(resp.custom_data.is_none());
+    }
+
+    #[test]
+    fn notify_display_messages_pages_are_ordered_and_tbc_flagged() {
+        // Snapshot order is a HashMap walk; the pages must come out sorted by id
+        // with `tbc` set on every page but the last (which leaves it absent).
+        let matched = vec![
+            display_message_pss(30, MessagePriorityEnumType::NormalCycle, None),
+            display_message_pss(10, MessagePriorityEnumType::NormalCycle, None),
+            display_message_pss(20, MessagePriorityEnumType::NormalCycle, None),
+        ];
+        let pages = v201_notify_display_messages_pages(77, &matched);
+        assert_eq!(pages.len(), 3, "one page per matched message");
+        // Ascending id order, one message per page, requestId echoed on every page.
+        let ids: Vec<i32> = pages
+            .iter()
+            .map(|p| p.message_info.as_ref().unwrap()[0].id)
+            .collect();
+        assert_eq!(ids, vec![10, 20, 30]);
+        assert!(pages.iter().all(|p| p.request_id == 77));
+        assert!(pages
+            .iter()
+            .all(|p| p.message_info.as_ref().unwrap().len() == 1));
+        // tbc set on all but the last.
+        assert_eq!(pages[0].tbc, Some(true));
+        assert_eq!(pages[1].tbc, Some(true));
+        assert_eq!(
+            pages[2].tbc, None,
+            "the final page leaves tbc absent (= false)"
+        );
+    }
+
+    #[test]
+    fn notify_display_messages_pages_empty_match_builds_no_pages() {
+        assert!(v201_notify_display_messages_pages(1, &[]).is_empty());
+    }
+
+    #[test]
+    fn built_get_display_messages_payloads_are_schema_valid() {
+        // Both synchronous answers, and a streamed NotifyDisplayMessages page,
+        // satisfy the bundled OCPP 2.0.1 JSON Schemas.
+        let validator = SchemaValidator::v201();
+        for matched in [true, false] {
+            let resp = v201_get_display_messages_response(matched);
+            validator
+                .validate_call_result("GetDisplayMessages", &serde_json::to_value(&resp).unwrap())
+                .expect("GetDisplayMessages response is schema-valid");
+        }
+        let matched = vec![
+            display_message_pss(
+                1,
+                MessagePriorityEnumType::AlwaysFront,
+                Some(MessageStateEnumType::Charging),
+            ),
+            display_message_pss(2, MessagePriorityEnumType::NormalCycle, None),
+        ];
+        for page in v201_notify_display_messages_pages(9, &matched) {
+            validator
+                .validate_call(
+                    "NotifyDisplayMessages",
+                    &serde_json::to_value(&page).unwrap(),
+                )
+                .expect("NotifyDisplayMessages CALL is schema-valid");
         }
     }
 

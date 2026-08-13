@@ -91,6 +91,7 @@ use ocpp_messages::v201::{
     GetChargingProfilesRequest as V201GetChargingProfilesRequest,
     GetCompositeScheduleRequest as V201GetCompositeScheduleRequest,
     GetCompositeScheduleResponse as V201GetCompositeScheduleResponse,
+    GetDisplayMessagesRequest as V201GetDisplayMessagesRequest,
     GetLocalListVersionRequest as V201GetLocalListVersionRequest,
     GetLocalListVersionResponse as V201GetLocalListVersionResponse,
     GetMonitoringReportRequest as V201GetMonitoringReportRequest,
@@ -633,6 +634,21 @@ enum RemoteCommand {
     V201ReportChargingProfiles {
         request_id: i32,
         profiles: Vec<(i32, ChargingProfileType)>,
+    },
+    /// Stream the installed display messages a CSMS asked for with an `Accepted`
+    /// OCPP 2.0.1 `GetDisplayMessages` (Part 2, E05–E08). The synchronous
+    /// `GetDisplayMessages.conf` only reports `Accepted` / `Unknown`; the actual
+    /// messages follow as one or more `NotifyDisplayMessages` CALLs, correlated
+    /// back by `request_id`. `messages` is the already-resolved match set
+    /// (snapshotted off the display-message store lock on the CALL path, so the
+    /// send touches no shared state), paged into per-message CALLs by the
+    /// consumer. Queued off the inbound-CALL path for the same reason as the
+    /// other side effects — the outbound `NotifyDisplayMessages` CALLs must not
+    /// re-enter the receive loop mid-dispatch. The display-message twin of
+    /// [`V201ReportChargingProfiles`](Self::V201ReportChargingProfiles).
+    V201NotifyDisplayMessages {
+        request_id: i32,
+        messages: Vec<MessageInfoType>,
     },
     /// Run the simulated diagnostics-upload state machine for an `Accepted`
     /// `GetDiagnostics` (OCPP 1.6J §4.x, firmware-management profile). Emits
@@ -2091,6 +2107,79 @@ impl ChargePoint {
                         );
                     }
                     Ok(v201_command::v201_get_charging_profiles_response(matched))
+                }
+            });
+        }
+
+        // GetDisplayMessages (OCPP 2.0.1 only) — the query half of the display-
+        // message family (#508), alongside SetDisplayMessage (#505) and a future
+        // ClearDisplayMessage (#509). Like GetChargingProfiles, it is a two-part
+        // exchange: the station answers synchronously with `Accepted` / `Unknown`,
+        // then streams the matching installed messages asynchronously as one or
+        // more `NotifyDisplayMessages` CALL(s), correlated by `requestId`.
+        //
+        // The match set is resolved here off a snapshot of the
+        // `v201_display_messages` store (taken under its read lock on the CALL
+        // path), so the queued side effect carries owned data and touches no
+        // shared state when it runs. Status:
+        // - ≥1 matching message → `Accepted`, and a `V201NotifyDisplayMessages`
+        //   is queued on the command channel (sent after this CALLRESULT is
+        //   flushed, off the inbound-CALL path — same discipline as
+        //   GetChargingProfiles);
+        // - no matching message → `Unknown`, and nothing is queued.
+        //
+        // Like `GetChargingProfileStatusEnumType`, `GetDisplayMessagesStatusEnumType`
+        // has no `Rejected`: its only two values are `Accepted` / `Unknown`. So
+        // when the command consumer has gone away (CP shutting down) we still
+        // answer `Accepted` for a non-empty match — the honest status ("I do have
+        // matching messages") — and log that the report could not be streamed,
+        // rather than misreport `Unknown`.
+        //
+        // Trust boundary: the request carries only a numeric `requestId`, an
+        // optional numeric `id[]`, and schema-bounded `priority` / `state` enums —
+        // nothing is parsed into an index or unwrapped, so an unknown/negative id,
+        // or a priority/state naming no installed message, simply misses the
+        // snapshot (→ `Unknown`) and never panics.
+        // Registered on the V201 arm only; "GetDisplayMessages" has no 1.6J twin.
+        // Ports `ocpp.v201.call.GetDisplayMessages` →
+        // `ocpp.v201.call.NotifyDisplayMessages`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let v201_display_messages = v201_display_messages.clone();
+            let command_sender = command_sender.clone();
+            d.on(move |req: V201GetDisplayMessagesRequest| {
+                let v201_display_messages = v201_display_messages.clone();
+                let command_sender = command_sender.clone();
+                async move {
+                    // Snapshot off the store lock, then resolve the match set with
+                    // the pure selector. In the simulator the CSMS's CALLs are
+                    // serialized through the single dispatcher, so the snapshot
+                    // cannot be raced by a concurrent install/clear.
+                    let installed = v201_display_messages.snapshot().await;
+                    let matches = v201_command::v201_get_display_messages_matches(
+                        req.id.as_deref(),
+                        req.priority,
+                        req.state,
+                        &installed,
+                    );
+                    let matched = !matches.is_empty();
+                    if matched
+                        && command_sender
+                            .send(RemoteCommand::V201NotifyDisplayMessages {
+                                request_id: req.request_id,
+                                messages: matches,
+                            })
+                            .is_err()
+                    {
+                        // Consumer gone: we cannot stream the report, but the
+                        // status enum has no Rejected — Accepted is still the
+                        // honest answer for a non-empty match. Surface the drop.
+                        warn!(
+                            "v201 GetDisplayMessages: consumer gone, cannot stream \
+                             NotifyDisplayMessages for request {}",
+                            req.request_id
+                        );
+                    }
+                    Ok(v201_command::v201_get_display_messages_response(matched))
                 }
             });
         }
@@ -3986,6 +4075,13 @@ impl ChargePoint {
                             profiles,
                         } => {
                             cp.send_v201_report_charging_profiles(request_id, profiles)
+                                .await;
+                        }
+                        RemoteCommand::V201NotifyDisplayMessages {
+                            request_id,
+                            messages,
+                        } => {
+                            cp.send_v201_notify_display_messages(request_id, messages)
                                 .await;
                         }
                         RemoteCommand::V201ApplyAvailability {
@@ -5912,6 +6008,36 @@ impl ChargePoint {
                 warn!(
                     "v201 GetChargingProfiles: ReportChargingProfiles send failed for \
                      request {request_id} (evse {evse_id}): {e}"
+                );
+            }
+        }
+    }
+
+    /// Stream the installed display messages an `Accepted` OCPP 2.0.1
+    /// `GetDisplayMessages` asked for, as one or more `NotifyDisplayMessages`
+    /// CALLs (`ocpp.v201.call.NotifyDisplayMessages`).
+    ///
+    /// Runs on the command-consumer task (off the inbound-CALL path), so the
+    /// outbound CALLs are sent only after the `GetDisplayMessages` CALLRESULT is
+    /// flushed and never re-enter the receive loop. `request_id` correlates the
+    /// report back to the triggering query; `messages` is the match set the
+    /// handler already resolved. The pure
+    /// [`v201_notify_display_messages_pages`](crate::v201_command::v201_notify_display_messages_pages)
+    /// builder pages it into one CALL per message (ascending `id`, `tbc` set on
+    /// every page but the last); each is sent in order so the CSMS sees the
+    /// paging flags in sequence. An empty match set builds no pages and sends
+    /// nothing (the handler only queues this for a non-empty match).
+    async fn send_v201_notify_display_messages(
+        &self,
+        request_id: i32,
+        messages: Vec<MessageInfoType>,
+    ) {
+        let pages = v201_command::v201_notify_display_messages_pages(request_id, &messages);
+        for page in pages {
+            if let Err(e) = self.call(page).await {
+                warn!(
+                    "v201 GetDisplayMessages: NotifyDisplayMessages send failed for \
+                     request {request_id}: {e}"
                 );
             }
         }
@@ -8170,6 +8296,192 @@ mod tests {
             validator
                 .validate_call_result("SetDisplayMessage", &serde_json::to_value(&resp).unwrap())
                 .expect("SetDisplayMessage response is schema-valid");
+        }
+    }
+
+    // --- OCPP 2.0.1 GetDisplayMessages (M7, issue #508) --------------------
+    // A `for_version(V201)` CP answers the query synchronously (Accepted /
+    // Unknown) off a snapshot of its `V201DisplayMessageStore`, and queues a
+    // `V201NotifyDisplayMessages` command carrying the match set on Accepted.
+    // These exercise the wired V201 arm end-to-end over `handle_message`.
+
+    fn make_v201_get_display_messages(
+        request_id: i32,
+        id: Option<Vec<i32>>,
+        priority: Option<ocpp_types::v201::MessagePriorityEnumType>,
+        state: Option<ocpp_types::v201::MessageStateEnumType>,
+    ) -> CallMessage {
+        make_call(V201GetDisplayMessagesRequest {
+            request_id,
+            id,
+            priority,
+            state,
+            custom_data: None,
+        })
+    }
+
+    /// Install a display message on the CP via the wired `SetDisplayMessage`
+    /// handler, so the `GetDisplayMessages` tests query a store populated exactly
+    /// the way a CSMS would populate it.
+    async fn install_v201_display_message(cp: &ChargePoint, message: MessageInfoType) {
+        cp.handle_message(Message::Call(make_v201_set_display_message(message)))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn v201_get_display_messages_on_empty_store_is_unknown_and_queues_nothing() {
+        use ocpp_types::v201::GetDisplayMessagesStatusEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // No messages installed → the station has nothing to report.
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_display_messages(
+                1, None, None, None,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::GetDisplayMessagesResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, GetDisplayMessagesStatusEnumType::Unknown);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert!(
+            v201_drain_commands(&cp).await.is_empty(),
+            "an Unknown query queues no NotifyDisplayMessages"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_get_display_messages_streams_the_installed_messages() {
+        use ocpp_types::v201::GetDisplayMessagesStatusEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        install_v201_display_message(&cp, make_v201_display_message(10, None)).await;
+        install_v201_display_message(&cp, make_v201_display_message(20, None)).await;
+
+        // An unfiltered query matches both → Accepted, one V201NotifyDisplayMessages
+        // command carrying the match set, correlated by requestId.
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_display_messages(
+                701, None, None, None,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::GetDisplayMessagesResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, GetDisplayMessagesStatusEnumType::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(
+            commands.len(),
+            1,
+            "one NotifyDisplayMessages stream is queued"
+        );
+        match &commands[0] {
+            RemoteCommand::V201NotifyDisplayMessages {
+                request_id,
+                messages,
+            } => {
+                assert_eq!(*request_id, 701);
+                let mut ids: Vec<i32> = messages.iter().map(|m| m.id).collect();
+                ids.sort_unstable();
+                assert_eq!(ids, vec![10, 20]);
+            }
+            other => panic!("expected V201NotifyDisplayMessages, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_get_display_messages_id_filter_narrows_the_stream() {
+        use ocpp_types::v201::GetDisplayMessagesStatusEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        for id in [1, 2, 3] {
+            install_v201_display_message(&cp, make_v201_display_message(id, None)).await;
+        }
+        // Filter to id ∈ {2, 99}: 2 is installed, 99 is not → only 2 streams.
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_display_messages(
+                5,
+                Some(vec![2, 99]),
+                None,
+                None,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::GetDisplayMessagesResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, GetDisplayMessagesStatusEnumType::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(commands.len(), 1);
+        match &commands[0] {
+            RemoteCommand::V201NotifyDisplayMessages { messages, .. } => {
+                assert_eq!(messages.iter().map(|m| m.id).collect::<Vec<_>>(), vec![2]);
+            }
+            other => panic!("expected V201NotifyDisplayMessages, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_get_display_messages_unknown_id_filter_is_unknown_and_queues_nothing() {
+        use ocpp_types::v201::GetDisplayMessagesStatusEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        for id in [1, 2, 3] {
+            install_v201_display_message(&cp, make_v201_display_message(id, None)).await;
+        }
+        // A filter naming nothing installed → Unknown, nothing queued (never a
+        // panic on the CSMS-supplied id).
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_display_messages(
+                6,
+                Some(vec![404]),
+                None,
+                None,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::GetDisplayMessagesResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, GetDisplayMessagesStatusEnumType::Unknown);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[test]
+    fn v201_get_display_messages_request_is_schema_valid() {
+        use ocpp_types::v201::{MessagePriorityEnumType, MessageStateEnumType};
+        let validator = SchemaValidator::v201();
+        // Both the minimal (requestId only) and fully-filtered request shapes the
+        // CSMS can send are schema-valid.
+        for req in [
+            V201GetDisplayMessagesRequest {
+                request_id: 1,
+                id: None,
+                priority: None,
+                state: None,
+                custom_data: None,
+            },
+            V201GetDisplayMessagesRequest {
+                request_id: 2,
+                id: Some(vec![1, 2, 3]),
+                priority: Some(MessagePriorityEnumType::AlwaysFront),
+                state: Some(MessageStateEnumType::Charging),
+                custom_data: None,
+            },
+        ] {
+            validator
+                .validate_call("GetDisplayMessages", &serde_json::to_value(&req).unwrap())
+                .expect("GetDisplayMessages request is schema-valid");
         }
     }
 
