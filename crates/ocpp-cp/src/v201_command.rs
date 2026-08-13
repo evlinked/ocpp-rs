@@ -134,11 +134,11 @@ use ocpp_types::v201::{
 
 use ocpp_messages::v201::{
     CancelReservationResponse, ChangeAvailabilityResponse, ClearCacheResponse,
-    ClearChargingProfileResponse, GetChargingProfilesResponse, GetMonitoringReportResponse,
-    GetTransactionStatusResponse, ReportChargingProfilesRequest, RequestStartTransactionResponse,
-    RequestStopTransactionResponse, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
-    SetMonitoringBaseResponse, SetMonitoringLevelResponse, TriggerMessageResponse,
-    UnlockConnectorResponse,
+    ClearChargingProfileResponse, CostUpdatedResponse, GetChargingProfilesResponse,
+    GetMonitoringReportResponse, GetTransactionStatusResponse, ReportChargingProfilesRequest,
+    RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
+    ResetResponse, SetChargingProfileResponse, SetMonitoringBaseResponse,
+    SetMonitoringLevelResponse, TriggerMessageResponse, UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1387,6 +1387,20 @@ pub fn v201_get_transaction_status_response(
         ongoing_indicator,
         custom_data: None,
     }
+}
+
+/// Build the (empty) `CostUpdated` acknowledgement.
+///
+/// Ports [`ocpp.v201.call_result.CostUpdated`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call_result.py):
+/// OCPP 2.0.1 Part 2, K (Tariff & Cost) defines no fields and no rejection
+/// status for the response, so the station always acknowledges with an empty
+/// body (`{}` on the wire, only the optional vendor extension). A builder is
+/// kept — rather than inlining the struct literal at the call site — for
+/// symmetry with the family's other response builders and to give the
+/// schema-validity test a single named target.
+#[must_use]
+pub fn v201_cost_updated_response() -> CostUpdatedResponse {
+    CostUpdatedResponse { custom_data: None }
 }
 
 #[cfg(test)]
@@ -3344,5 +3358,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn built_cost_updated_response_is_empty_and_schema_valid() {
+        // The acknowledgement carries no fields, so it serializes to `{}` and
+        // satisfies the bundled OCPP 2.0.1 CostUpdated response JSON Schema.
+        let payload = serde_json::to_value(v201_cost_updated_response()).unwrap();
+        assert_eq!(payload, serde_json::json!({}));
+        assert!(
+            SchemaValidator::v201()
+                .validate_call_result("CostUpdated", &payload)
+                .is_ok(),
+            "built CostUpdatedResponse should be schema-valid, got: {payload}"
+        );
     }
 }
