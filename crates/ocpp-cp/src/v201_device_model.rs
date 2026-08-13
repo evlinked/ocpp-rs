@@ -37,7 +37,8 @@
 
 use ocpp_types::v201::{
     AttributeEnumType, ClearMonitoringResultType, ClearMonitoringStatusEnumType,
-    ComponentCriterionEnumType, ComponentType, ComponentVariableType, GetVariableStatusEnumType,
+    ComponentCriterionEnumType, ComponentType, ComponentVariableType,
+    GenericDeviceModelStatusEnumType, GetVariableStatusEnumType, MonitorBaseEnumType,
     MonitorEnumType, MonitoringCriterionEnumType, MonitoringDataType, MutabilityEnumType,
     ReportBaseEnumType, ReportDataType, SetMonitoringDataType, SetMonitoringResultType,
     SetMonitoringStatusEnumType, SetVariableStatusEnumType, VariableAttributeType,
@@ -146,6 +147,11 @@ pub const DEFAULT_MONITORING_LEVEL: i32 = 9;
 /// station enforces it here — an out-of-range value is a modeled rejection.
 const MONITORING_LEVEL_RANGE: RangeInclusive<i32> = 0..=9;
 
+/// The default active monitoring base (`All`): every monitor — pre-configured
+/// plus CSMS-installed — is in scope. The device model's default until a CSMS
+/// narrows it via `SetMonitoringBase`.
+pub const DEFAULT_MONITORING_BASE: MonitorBaseEnumType = MonitorBaseEnumType::All;
+
 /// The Charge Point simulator's OCPP 2.0.1 device model: the attribute values a
 /// CSMS can read via `GetVariables` and write via `SetVariables`, plus the
 /// variable monitors it installs via `SetVariableMonitoring` and streams via
@@ -158,7 +164,8 @@ const MONITORING_LEVEL_RANGE: RangeInclusive<i32> = 0..=9;
 /// `Default` is hand-written (not derived) so `active_monitoring_level` starts at
 /// [`DEFAULT_MONITORING_LEVEL`] (`9`) rather than the numeric zero a derive would
 /// give — `0` is the *most* severe level, which would silently suppress all but
-/// `Danger` monitors on a fresh station.
+/// `Danger` monitors on a fresh station. `active_monitoring_base` starts at
+/// [`DEFAULT_MONITORING_BASE`] (`All`) for the same reason.
 #[derive(Debug, Clone)]
 pub struct V201DeviceModel {
     /// Every component identity the model knows about (even those whose
@@ -188,6 +195,27 @@ pub struct V201DeviceModel {
     ///
     /// [`active_monitoring_level`]: V201DeviceModel::active_monitoring_level
     active_monitoring_level: i32,
+    /// The active monitoring **base** selected by `SetMonitoringBase`: which set
+    /// of pre-configured variable monitors is active — [`All`], the
+    /// [`FactoryDefault`] set, or [`HardWiredOnly`]. Defaults to
+    /// [`DEFAULT_MONITORING_BASE`] ([`All`]) until a CSMS narrows it.
+    ///
+    /// Recorded but not (fully) **enforced**: the monitor store models only the
+    /// CSMS-installed monitors and has no pre-configured / hard-wired seam yet, so
+    /// selecting a base changes no monitor's activation today. The selected base
+    /// is stored and readable ([`active_monitoring_base`]) so a future
+    /// pre-configured-monitor seam can honor it — mirroring how the reporting
+    /// level ([`active_monitoring_level`]) landed before the emitter that reads
+    /// it. Because the store has no hard-wired monitors, [`HardWiredOnly`] is a
+    /// modeled seam — see [`set_monitoring_base`].
+    ///
+    /// [`All`]: MonitorBaseEnumType::All
+    /// [`FactoryDefault`]: MonitorBaseEnumType::FactoryDefault
+    /// [`HardWiredOnly`]: MonitorBaseEnumType::HardWiredOnly
+    /// [`active_monitoring_base`]: V201DeviceModel::active_monitoring_base
+    /// [`active_monitoring_level`]: V201DeviceModel::active_monitoring_level
+    /// [`set_monitoring_base`]: V201DeviceModel::set_monitoring_base
+    active_monitoring_base: MonitorBaseEnumType,
 }
 
 impl Default for V201DeviceModel {
@@ -198,6 +226,7 @@ impl Default for V201DeviceModel {
             monitors: HashMap::new(),
             last_monitor_id: 0,
             active_monitoring_level: DEFAULT_MONITORING_LEVEL,
+            active_monitoring_base: DEFAULT_MONITORING_BASE,
         }
     }
 }
@@ -945,6 +974,61 @@ impl V201DeviceModel {
     /// nothing suppressed) until a `SetMonitoringLevel` narrows it.
     pub fn active_monitoring_level(&self) -> i32 {
         self.active_monitoring_level
+    }
+
+    /// Select the active monitoring **base** (the state half of
+    /// `ocpp.v201.call.SetMonitoringBase`) and report the station's decision as a
+    /// [`GenericDeviceModelStatusEnumType`]:
+    ///
+    /// - [`All`] / [`FactoryDefault`] → the base is recorded and this returns
+    ///   [`Accepted`]. Both name a coherent selection over the monitors the model
+    ///   tracks (the CSMS-installed set is a subset of `All`; `FactoryDefault`
+    ///   selects the pre-configured subset — currently empty, but a well-defined
+    ///   choice), so the station records the selection.
+    /// - [`HardWiredOnly`] → this is a **modeled seam**. The monitor store models
+    ///   only CSMS-installed monitors and has no hard-wired-monitor seam, so the
+    ///   station has no hard-wired set to activate. Rather than silently record a
+    ///   base it cannot honor (which would make [`active_monitoring_base`] claim
+    ///   `HardWiredOnly` is active while no hard-wired monitor exists), the
+    ///   station answers [`NotSupported`] and leaves the stored base
+    ///   **unchanged** — the same "a non-accept leaves state unchanged" shape as
+    ///   [`set_monitoring_level`]'s out-of-range rejection. When a real hard-wired
+    ///   seam lands, this arm records the base and returns `Accepted`.
+    ///
+    /// `base` is matched, never parsed or indexed, so no wire value can panic.
+    ///
+    /// [`All`]: MonitorBaseEnumType::All
+    /// [`FactoryDefault`]: MonitorBaseEnumType::FactoryDefault
+    /// [`HardWiredOnly`]: MonitorBaseEnumType::HardWiredOnly
+    /// [`Accepted`]: GenericDeviceModelStatusEnumType::Accepted
+    /// [`NotSupported`]: GenericDeviceModelStatusEnumType::NotSupported
+    /// [`active_monitoring_base`]: V201DeviceModel::active_monitoring_base
+    /// [`set_monitoring_level`]: V201DeviceModel::set_monitoring_level
+    pub fn set_monitoring_base(
+        &mut self,
+        base: MonitorBaseEnumType,
+    ) -> GenericDeviceModelStatusEnumType {
+        match base {
+            MonitorBaseEnumType::All | MonitorBaseEnumType::FactoryDefault => {
+                self.active_monitoring_base = base;
+                GenericDeviceModelStatusEnumType::Accepted
+            }
+            // Modeled seam: no hard-wired monitors are modeled, so there is
+            // nothing to activate. Report `NotSupported` and leave the stored
+            // base unchanged rather than claim a base the station cannot honor.
+            MonitorBaseEnumType::HardWiredOnly => GenericDeviceModelStatusEnumType::NotSupported,
+        }
+    }
+
+    /// The active monitoring base — which set of pre-configured monitors is
+    /// selected. Defaults to [`DEFAULT_MONITORING_BASE`] ([`All`]) until a
+    /// `SetMonitoringBase` narrows it; a [`NotSupported`] request leaves it
+    /// unchanged.
+    ///
+    /// [`All`]: MonitorBaseEnumType::All
+    /// [`NotSupported`]: GenericDeviceModelStatusEnumType::NotSupported
+    pub fn active_monitoring_base(&self) -> MonitorBaseEnumType {
+        self.active_monitoring_base
     }
 }
 
@@ -2016,5 +2100,62 @@ mod tests {
                 "a rejected set leaves the stored level unchanged",
             );
         }
+    }
+
+    // --- SetMonitoringBase: the active-base selector (#501) -----------------
+
+    #[test]
+    fn monitoring_base_defaults_to_all() {
+        // A fresh station has every monitor in scope: the default base is `All`,
+        // not the first-declared variant a derive might imply.
+        let model = V201DeviceModel::new();
+        assert_eq!(model.active_monitoring_base(), DEFAULT_MONITORING_BASE);
+        assert_eq!(model.active_monitoring_base(), MonitorBaseEnumType::All);
+        // The standard profile inherits the same default.
+        assert_eq!(
+            V201DeviceModel::with_standard_profile().active_monitoring_base(),
+            MonitorBaseEnumType::All,
+        );
+    }
+
+    #[test]
+    fn set_monitoring_base_all_and_factory_default_are_accepted_and_recorded() {
+        let mut model = V201DeviceModel::new();
+        // `FactoryDefault` is recorded and accepted.
+        assert_eq!(
+            model.set_monitoring_base(MonitorBaseEnumType::FactoryDefault),
+            GenericDeviceModelStatusEnumType::Accepted,
+        );
+        assert_eq!(
+            model.active_monitoring_base(),
+            MonitorBaseEnumType::FactoryDefault,
+        );
+        // `All` is recorded and accepted, replacing the previous selection.
+        assert_eq!(
+            model.set_monitoring_base(MonitorBaseEnumType::All),
+            GenericDeviceModelStatusEnumType::Accepted,
+        );
+        assert_eq!(model.active_monitoring_base(), MonitorBaseEnumType::All);
+    }
+
+    #[test]
+    fn set_monitoring_base_hard_wired_only_is_not_supported_and_leaves_state_unchanged() {
+        let mut model = V201DeviceModel::new();
+        // Seed a known-good base so we can prove the modeled `HardWiredOnly` seam
+        // does not clobber it.
+        assert_eq!(
+            model.set_monitoring_base(MonitorBaseEnumType::FactoryDefault),
+            GenericDeviceModelStatusEnumType::Accepted,
+        );
+        assert_eq!(
+            model.set_monitoring_base(MonitorBaseEnumType::HardWiredOnly),
+            GenericDeviceModelStatusEnumType::NotSupported,
+            "no hard-wired monitors are modeled, so HardWiredOnly is NotSupported",
+        );
+        assert_eq!(
+            model.active_monitoring_base(),
+            MonitorBaseEnumType::FactoryDefault,
+            "a NotSupported base leaves the stored selection unchanged",
+        );
     }
 }
