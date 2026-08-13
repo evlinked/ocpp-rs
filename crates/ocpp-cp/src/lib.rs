@@ -23,6 +23,7 @@ pub mod v201_command;
 pub mod v201_cost;
 pub mod v201_data_transfer;
 pub mod v201_device_model;
+pub mod v201_display_message;
 pub mod v201_transaction;
 pub mod v201_tx_default_profile;
 
@@ -74,6 +75,7 @@ use ocpp_types::{
 use v201_charging_profiles::V201TxProfileStore;
 use v201_cost::V201CostStore;
 use v201_device_model::V201DeviceModel;
+use v201_display_message::V201DisplayMessageStore;
 use v201_tx_default_profile::V201TxDefaultProfileStore;
 // 2.0.1 provisioning message + enum types used by the version-aware runtime
 // (slice 2). Aliased to avoid clashing with the unqualified 1.6J names imported
@@ -106,6 +108,7 @@ use ocpp_messages::v201::{
     SendLocalListRequest as V201SendLocalListRequest,
     SendLocalListResponse as V201SendLocalListResponse,
     SetChargingProfileRequest as V201SetChargingProfileRequest,
+    SetDisplayMessageRequest as V201SetDisplayMessageRequest,
     SetMonitoringBaseRequest as V201SetMonitoringBaseRequest,
     SetMonitoringLevelRequest as V201SetMonitoringLevelRequest,
     SetVariableMonitoringRequest as V201SetVariableMonitoringRequest,
@@ -119,11 +122,12 @@ use ocpp_messages::v201::{
 use ocpp_types::v201::{
     AttributeEnumType, AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType,
     ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
-    ConnectorStatusEnumType, GenericDeviceModelStatusEnumType, GenericStatusEnumType,
-    GetVariableResultType, IdTokenType as V201IdTokenType, MessageTriggerEnumType,
-    MonitoringDataType, OperationalStatusEnumType, RegistrationStatusEnumType, ReportDataType,
-    RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
-    SetVariableResultType, StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    ConnectorStatusEnumType, DisplayMessageStatusEnumType, GenericDeviceModelStatusEnumType,
+    GenericStatusEnumType, GetVariableResultType, IdTokenType as V201IdTokenType, MessageInfoType,
+    MessageTriggerEnumType, MonitoringDataType, OperationalStatusEnumType,
+    RegistrationStatusEnumType, ReportDataType, RequestStartStopStatusEnumType,
+    ReserveNowStatusEnumType, ResetStatusEnumType, SetVariableResultType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -971,6 +975,14 @@ pub struct ChargePoint {
     /// read back via [`installed_tx_default_profile`](Self::installed_tx_default_profile).
     /// Consulted as the fallback by the metering resolver and `GetCompositeSchedule`.
     v201_tx_default_profiles: Arc<V201TxDefaultProfileStore>,
+    /// v201 display messages installed by `SetDisplayMessage` (OCPP 2.0.1 Part 2,
+    /// E05–E08, Issue #505), keyed by `MessageInfoType.id`. The foundational store
+    /// of the display-message family: a same-id re-install upserts, a future
+    /// `ClearDisplayMessage` removes by id, and a future `GetDisplayMessages`
+    /// enumerates it — one source of truth for all three. Populated by the
+    /// `SetDisplayMessage` handler (only once its pure decision returns `Accepted`).
+    /// Empty on the 1.6J path (the handler is V201-only).
+    v201_display_messages: Arc<V201DisplayMessageStore>,
     /// Latest running total cost the CSMS has pushed per transaction id via the
     /// 2.0.1 `CostUpdated` message (Issue #502), keyed by the wire
     /// `transactionId` string. Upserted by the V201-only `CostUpdated` handler
@@ -1144,6 +1156,10 @@ impl ChargePoint {
         // `SetChargingProfile` command (#469) installs straight into this store
         // from the dispatcher, so it is shared into the default dispatcher too.
         let v201_tx_profiles = Arc::new(V201TxProfileStore::new());
+        // The display-message store the V201 `SetDisplayMessage` handler upserts
+        // into (Issue #505). Shared into the default dispatcher so the handler can
+        // install straight from the CALL path.
+        let v201_display_messages = Arc::new(V201DisplayMessageStore::new());
 
         // Issue #471: v201 `TxDefaultProfile` store, shared into the default
         // dispatcher (the `SetChargingProfile` command installs a default into it)
@@ -1195,6 +1211,7 @@ impl ChargePoint {
             charging_profiles.clone(),
             v201_tx_profiles.clone(),
             v201_tx_default_profiles.clone(),
+            v201_display_messages.clone(),
             v201_costs.clone(),
             expiry_timers.clone(),
             config.unlock_connector_outcome,
@@ -1227,6 +1244,7 @@ impl ChargePoint {
             v201_sessions,
             v201_tx_profiles,
             v201_tx_default_profiles,
+            v201_display_messages,
             v201_costs,
             reservations,
             expiry_timers,
@@ -1267,6 +1285,7 @@ impl ChargePoint {
         charging_profiles: Arc<ChargingProfileStore>,
         v201_tx_profiles: Arc<V201TxProfileStore>,
         v201_tx_default_profiles: Arc<V201TxDefaultProfileStore>,
+        v201_display_messages: Arc<V201DisplayMessageStore>,
         v201_costs: Arc<V201CostStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
         unlock_outcome: UnlockConnectorOutcome,
@@ -1698,6 +1717,70 @@ impl ChargePoint {
                         )
                     };
                     Ok(v201_command::v201_set_monitoring_level_response(
+                        status,
+                        status_info,
+                    ))
+                }
+            });
+        }
+
+        // SetDisplayMessage (OCPP 2.0.1 only) — install (or replace) a message on
+        // the station's display (Issue #505, OCPP 2.0.1 Part 2 E05–E08). The
+        // foundational slice of the display-message family: the `V201DisplayMessageStore`
+        // it upserts into is the source of truth a future `GetDisplayMessages`
+        // (query) and `ClearDisplayMessage` (remove-by-id) will read/mutate.
+        // Registered only on the V201 arm — "SetDisplayMessage" has no 1.6J twin.
+        //
+        // A pure read-decide-answer with a single side effect (the upsert), no
+        // queued command. The decision
+        // (`v201_command::v201_set_display_message_status`) reads the live
+        // `active_transactions` set — resolving its ids to their decimal spellings
+        // exactly as the `GetTransactionStatus` / `RequestStopTransaction` handlers
+        // do — so a message bound to a `transactionId` the station is not running
+        // answers `UnknownTransaction` (with a `statusInfo`) and is **not** stored;
+        // any other schema-valid `MessageInfoType` answers `Accepted` and is
+        // upserted by `message.id` (a same-id re-install replaces, never
+        // duplicates). The other `DisplayMessageStatusEnumType` variants
+        // (NotSupported* / Rejected) are documented modeled seams the simulator
+        // does not produce (a simulated display renders any schema-valid
+        // format/priority/state).
+        //
+        // Trust boundary: `MessageInfoType`'s format / priority / state are typed
+        // enums (an unknown wire value fails deserialization → CALLERROR before the
+        // handler), and the bound `transactionId` is exact-string-matched, never
+        // parsed — no wire value can panic. The `active_transactions` read lock is
+        // released before the store write lock is taken (no lock held across the
+        // decision), so the two never interleave. Ports
+        // `ocpp.v201.call.SetDisplayMessage` →
+        // `ocpp.v201.call_result.SetDisplayMessage`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let active_transactions = active_transactions.clone();
+            let display_messages = v201_display_messages.clone();
+            d.on(move |req: V201SetDisplayMessageRequest| {
+                let active_transactions = active_transactions.clone();
+                let display_messages = display_messages.clone();
+                async move {
+                    // Resolve the live transaction ids to their decimal spellings,
+                    // then drop the read lock before touching the store.
+                    let live_ids: Vec<String> = active_transactions
+                        .read()
+                        .await
+                        .keys()
+                        .map(ToString::to_string)
+                        .collect();
+                    let live_id_strs: Vec<&str> = live_ids.iter().map(String::as_str).collect();
+
+                    let (status, status_info) =
+                        v201_command::v201_set_display_message_status(&req.message, &live_id_strs);
+
+                    // Install only an accepted message; a non-accept leaves the
+                    // store unchanged (the same shape as SetMonitoringLevel's
+                    // out-of-range rejection).
+                    if matches!(status, DisplayMessageStatusEnumType::Accepted) {
+                        display_messages.install(req.message).await;
+                    }
+
+                    Ok(v201_command::v201_set_display_message_response(
                         status,
                         status_info,
                     ))
@@ -5009,6 +5092,21 @@ impl ChargePoint {
         self.v201_tx_default_profiles.get(evse_id).await
     }
 
+    /// The display message currently installed under `id` by `SetDisplayMessage`,
+    /// if any (OCPP 2.0.1 Part 2 E05–E08, Issue #505).
+    ///
+    /// The read path making an installed display message observable: an operator
+    /// (or a test) can confirm a `SetDisplayMessage` the station answered
+    /// `Accepted` was actually taken up into the store — and a re-install with the
+    /// same `id` replaced rather than duplicated it — rather than parsed off the
+    /// wire and dropped. Always `None` on the 1.6J path (which has no v201
+    /// display-message store) and for an `id` the station never installed (or one a
+    /// later `ClearDisplayMessage` removed). The reader the follow-up
+    /// `GetDisplayMessages` / `ClearDisplayMessage` handlers build on.
+    pub async fn installed_display_message(&self, id: i32) -> Option<MessageInfoType> {
+        self.v201_display_messages.get(id).await
+    }
+
     /// The latest running total cost the CSMS has pushed for `transaction_id`
     /// via the 2.0.1 `CostUpdated` message, if any (Issue #502).
     ///
@@ -8214,6 +8312,176 @@ mod tests {
             validator
                 .validate_call_result("SetMonitoringLevel", &serde_json::to_value(&resp).unwrap())
                 .expect("SetMonitoringLevel response is schema-valid");
+        }
+    }
+
+    // --- OCPP 2.0.1 SetDisplayMessage (M7, issue #505) ---------------------
+    // A `for_version(V201)` CP installs a display message into its
+    // `V201DisplayMessageStore`. These exercise the wired V201 arm end-to-end
+    // over `handle_message`, including the upsert-by-id and the
+    // UnknownTransaction refusal against the live `active_transactions` set.
+
+    fn make_v201_display_message(id: i32, transaction_id: Option<&str>) -> MessageInfoType {
+        use ocpp_types::v201::{
+            MessageContentType, MessageFormatEnumType, MessagePriorityEnumType,
+        };
+        MessageInfoType {
+            id,
+            priority: MessagePriorityEnumType::NormalCycle,
+            message: MessageContentType {
+                format: MessageFormatEnumType::Utf8,
+                content: format!("message-{id}"),
+                language: None,
+                custom_data: None,
+            },
+            state: None,
+            start_date_time: None,
+            end_date_time: None,
+            transaction_id: transaction_id.map(ToString::to_string),
+            display: None,
+            custom_data: None,
+        }
+    }
+
+    fn make_v201_set_display_message(message: MessageInfoType) -> CallMessage {
+        make_call(V201SetDisplayMessageRequest {
+            message,
+            custom_data: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn v201_set_display_message_station_wide_is_accepted_and_stored() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_display_message(
+                make_v201_display_message(1, None),
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetDisplayMessageResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, DisplayMessageStatusEnumType::Accepted);
+                // Accepted carries no statusInfo.
+                assert!(body.status_info.is_none());
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        // The accepted message is observable in the store, read back by id.
+        assert_eq!(
+            cp.installed_display_message(1)
+                .await
+                .map(|m| m.message.content),
+            Some("message-1".to_string()),
+        );
+        // A pure install queues no side-effect command.
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_set_display_message_same_id_upserts() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.handle_message(Message::Call(make_v201_set_display_message(
+            make_v201_display_message(2, None),
+        )))
+        .await
+        .unwrap();
+
+        // Re-install a different message under the SAME id.
+        let mut replacement = make_v201_display_message(2, None);
+        replacement.message.content = "replaced".to_string();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_display_message(replacement)))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetDisplayMessageResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, DisplayMessageStatusEnumType::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.installed_display_message(2)
+                .await
+                .map(|m| m.message.content),
+            Some("replaced".to_string()),
+            "a same-id re-install replaces the stored message rather than duplicating it"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_set_display_message_bound_to_unknown_transaction_is_refused_and_not_stored() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // The idle station is running no transactions, so a message bound to any
+        // transactionId is UnknownTransaction with a populated statusInfo, and is
+        // not installed — never a panic on the CSMS-supplied id.
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_display_message(
+                make_v201_display_message(3, Some("999")),
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetDisplayMessageResponse = r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    DisplayMessageStatusEnumType::UnknownTransaction
+                );
+                assert_eq!(
+                    body.status_info
+                        .expect("a refusal carries a statusInfo reason")
+                        .reason_code,
+                    "NoTransaction"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.installed_display_message(3).await,
+            None,
+            "a refused message is not stored"
+        );
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[test]
+    fn v201_set_display_message_request_and_response_are_schema_valid() {
+        use ocpp_types::v201::StatusInfoType;
+        let validator = SchemaValidator::v201();
+        // A request carrying a MessageInfoType is schema-valid.
+        let req = V201SetDisplayMessageRequest {
+            message: make_v201_display_message(1, None),
+            custom_data: None,
+        };
+        validator
+            .validate_call("SetDisplayMessage", &serde_json::to_value(&req).unwrap())
+            .expect("SetDisplayMessage request is schema-valid");
+
+        // Both answer shapes the handler emits — Accepted (no statusInfo) and
+        // UnknownTransaction (with the NoTransaction statusInfo) — serialize to a
+        // schema-valid response.
+        for (status, status_info) in [
+            (DisplayMessageStatusEnumType::Accepted, None),
+            (
+                DisplayMessageStatusEnumType::UnknownTransaction,
+                Some(StatusInfoType {
+                    reason_code: "NoTransaction".to_string(),
+                    additional_info: None,
+                    custom_data: None,
+                }),
+            ),
+        ] {
+            let resp = ocpp_messages::v201::SetDisplayMessageResponse {
+                status,
+                status_info,
+                custom_data: None,
+            };
+            validator
+                .validate_call_result("SetDisplayMessage", &serde_json::to_value(&resp).unwrap())
+                .expect("SetDisplayMessage response is schema-valid");
         }
     }
 
