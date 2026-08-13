@@ -2098,9 +2098,11 @@ async fn v201_request_start_installs_the_txprofile_and_threads_group_id_token() 
 // resolver reads, out-of-band from a remote start. This exercises the full
 // handler contract end to end: rejected when there is no transaction to bind
 // to, accepted once a session is live (observable via `installed_tx_profile`),
-// a non-TxProfile purpose rejected without mutating the store, a second
+// a station-ceiling purpose rejected without mutating the store, a second
 // TxProfile *replacing* the first, and teardown clearing it when the
-// transaction ends.
+// transaction ends. (A `TxDefaultProfile` is now Accepted into a separate store
+// — Issue #471 — covered by the `ocpp-cp` unit/wire tests; this test keeps its
+// focus on the transaction-scoped `TxProfile` store's isolation.)
 #[tokio::test]
 async fn v201_set_charging_profile_installs_replaces_and_rejects_faithfully() {
     let (mut server, addr, log) = start_v201_csms_recording_txns().await;
@@ -2114,10 +2116,12 @@ async fn v201_set_charging_profile_installs_replaces_and_rejects_faithfully() {
     cp.connect().await.expect("v201 connect + boot sequence");
 
     // Two distinct TxProfiles (different limits) so a replace is observable, and a
-    // non-TxProfile profile the simulator does not honor.
+    // station-ceiling profile the simulator does not honor yet (Issue #471 defers
+    // ChargingStationMaxProfile / ChargingStationExternalConstraints).
     let profile_a = tx_profile_limited_w(6_000.0);
     let profile_b = tx_profile_limited_w(3_000.0);
-    let default_profile = charging_profile(ChargingProfilePurposeEnumType::TxDefaultProfile);
+    let ceiling_profile =
+        charging_profile(ChargingProfilePurposeEnumType::ChargingStationMaxProfile);
 
     // (1) Before any transaction: a TxProfile has nothing to bind to → Rejected
     // with `NoTransaction`, and the store stays empty.
@@ -2197,14 +2201,14 @@ async fn v201_set_charging_profile_installs_replaces_and_rejects_faithfully() {
         "an accepted SetChargingProfile installs its TxProfile against the EVSE"
     );
 
-    // (3) A non-TxProfile purpose → Rejected with `UnsupportedPurpose`, and the
+    // (3) A station-ceiling purpose → Rejected with `UnsupportedPurpose`, and the
     // store is left untouched (profile_a still installed).
     let resp = server
         .call::<V201SetChargingProfileRequest>(
             "CP201_SETPROFILE",
             V201SetChargingProfileRequest {
                 evse_id: 1,
-                charging_profile: default_profile,
+                charging_profile: ceiling_profile,
                 custom_data: None,
             },
         )
@@ -2214,12 +2218,12 @@ async fn v201_set_charging_profile_installs_replaces_and_rejects_faithfully() {
     assert_eq!(
         resp.status_info.as_ref().map(|i| i.reason_code.as_str()),
         Some("UnsupportedPurpose"),
-        "a non-TxProfile purpose is rejected as unsupported"
+        "a station-ceiling purpose is rejected as unsupported"
     );
     assert_eq!(
         cp.installed_tx_profile(1).await,
         Some(profile_a),
-        "a rejected non-TxProfile leaves the installed profile untouched"
+        "a rejected station-ceiling profile leaves the installed TxProfile untouched"
     );
 
     // (4) A second TxProfile *replaces* the first (the store holds one per EVSE).
@@ -2591,6 +2595,82 @@ async fn v201_periodic_update_is_unchanged_without_a_binding_profile() {
             Some(MeasurandEnumType::EnergyActiveImportRegister)
         );
     }
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// Issue #471: a station-wide `TxDefaultProfile` (installed by SetChargingProfile
+// with evseId=0) is *applied* in the metering path when no `TxProfile` is in
+// force — the profile-less session below is bounded by the default. This proves
+// acceptance criterion #1 ("a TxDefaultProfile install is Accepted and applied
+// when no TxProfile is in force on the EVSE") over the real sampler, not just the
+// composed-schedule readout.
+#[tokio::test]
+async fn v201_periodic_update_reflects_a_txdefaultprofile_when_no_txprofile_is_in_force() {
+    let (mut server, addr, log) = start_v201_csms_recording_txns().await;
+
+    let config = ChargePointConfig {
+        meter_values_interval: 1,
+        ..v201_cp_config(addr, "CP201_DEFAULT")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // CSMS -> CP: install a station-wide (evseId=0) TxDefaultProfile bounding to
+    // 3 680 W — tighter than the connector's 7 360 W natural rate — with no
+    // transaction live. A default is Accepted regardless of transaction state.
+    let mut default_profile = tx_profile_limited_w(3_680.0);
+    default_profile.charging_profile_purpose = ChargingProfilePurposeEnumType::TxDefaultProfile;
+    let resp = server
+        .call::<V201SetChargingProfileRequest>(
+            "CP201_DEFAULT",
+            V201SetChargingProfileRequest {
+                evse_id: 0,
+                charging_profile: default_profile,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS SetChargingProfile call round-trips");
+    assert_eq!(
+        resp.status,
+        ChargingProfileStatusEnumType::Accepted,
+        "a station-wide TxDefaultProfile is Accepted with no live transaction"
+    );
+
+    // CSMS -> CP: a *profile-less* remote start on EVSE 1 — nothing binds it but
+    // the station-wide default.
+    let start = server
+        .call::<V201RequestStartTransactionRequest>(
+            "CP201_DEFAULT",
+            V201RequestStartTransactionRequest {
+                id_token: central_id_token("RFID-CAFE"),
+                remote_start_id: 71,
+                evse_id: Some(1),
+                group_id_token: None,
+                charging_profile: None,
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS RequestStartTransaction call round-trips");
+    assert_eq!(start.status, RequestStartStopStatusEnumType::Accepted);
+    assert_eq!(
+        cp.installed_tx_profile(1).await,
+        None,
+        "the profile-less start installs no TxProfile — only the default is in force"
+    );
+
+    wait_for_event(&log, TransactionEventEnumType::Updated).await;
+
+    // The periodic reading is bounded by the station-wide default (3 680 W),
+    // exactly as a TxProfile of the same limit would bind it.
+    assert_eq!(
+        recorded_bounded_power(&log),
+        Some(3_680.0),
+        "the Updated reflects the station-wide TxDefaultProfile's binding limit"
+    );
 
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");

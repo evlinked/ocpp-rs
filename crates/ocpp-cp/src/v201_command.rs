@@ -641,13 +641,19 @@ pub fn v201_unlock_response(
 /// `ChargePoint` (`lib.rs`), which enforces the same "a `chargingProfile`
 /// attached to a transaction-scoped install SHALL be a `TxProfile`" contract:
 ///
-/// - **Non-`TxProfile` purpose** — `TxDefaultProfile`,
-///   `ChargingStationMaxProfile`, and `ChargingStationExternalConstraints` are
-///   station-scoped / default profiles the simulator does not yet install; they
-///   are
+/// - **`TxDefaultProfile` purpose** — the default schedule applied to an EVSE
+///   whenever no `TxProfile` is in force (Issue #471). Station configuration, not
+///   transaction-scoped, so it is
+///   [`Accepted`](ChargingProfileStatusEnumType::Accepted) regardless of whether
+///   a session is live; the wiring layer installs it into the
+///   [`V201TxDefaultProfileStore`](crate::v201_tx_default_profile::V201TxDefaultProfileStore)
+///   (an `evseId = 0` install becomes the station-wide default).
+/// - **`ChargingStationMaxProfile` / `ChargingStationExternalConstraints`** —
+///   station-wide *ceilings* that cap a resolved limit rather than substitute for
+///   it. They compose differently from a `TxProfile`/`TxDefaultProfile` fallback
+///   and are deferred to a follow-up slice, so they remain
 ///   [`Rejected`](ChargingProfileStatusEnumType::Rejected) with an
-///   `UnsupportedPurpose` `statusInfo`, checked *before* the transaction read so
-///   the reason never depends on whether a session happens to be live.
+///   `UnsupportedPurpose` `statusInfo` for now.
 /// - **`TxProfile` with no ongoing transaction on the target EVSE** — a
 ///   `TxProfile` is transaction-scoped, so with nothing to bind it to it is
 ///   [`Rejected`](ChargingProfileStatusEnumType::Rejected) with a `NoTransaction`
@@ -669,43 +675,55 @@ pub fn v201_set_charging_profile_status(
     purpose: ChargingProfilePurposeEnumType,
     has_active_transaction: bool,
 ) -> (ChargingProfileStatusEnumType, Option<StatusInfoType>) {
-    // Only a TxProfile is honored: it is the sole purpose the simulator installs
-    // and enforces today (the transaction-scoped store + metering resolver).
-    // Checked first so a station-scoped purpose is rejected for *being*
-    // unsupported, independent of the live-transaction state.
-    if purpose != ChargingProfilePurposeEnumType::TxProfile {
-        return (
+    match purpose {
+        // A TxProfile is transaction-scoped: with no ongoing transaction on the
+        // targeted EVSE there is nothing to bind it to.
+        ChargingProfilePurposeEnumType::TxProfile => {
+            if has_active_transaction {
+                (ChargingProfileStatusEnumType::Accepted, None)
+            } else {
+                (
+                    ChargingProfileStatusEnumType::Rejected,
+                    Some(StatusInfoType {
+                        reason_code: "NoTransaction".to_string(),
+                        additional_info: Some(
+                            "SetChargingProfile carrying a TxProfile requires an ongoing \
+                             transaction on the targeted EVSE"
+                                .to_string(),
+                        ),
+                        custom_data: None,
+                    }),
+                )
+            }
+        }
+        // A TxDefaultProfile is station configuration, not transaction-scoped: it
+        // is the default schedule applied to an EVSE whenever no TxProfile is in
+        // force, so it is Accepted regardless of whether a session is live
+        // (Issue #471). `evseId = 0` installs the station-wide default that
+        // applies to every EVSE; the install target is the wiring layer's job.
+        ChargingProfilePurposeEnumType::TxDefaultProfile => {
+            (ChargingProfileStatusEnumType::Accepted, None)
+        }
+        // The station-ceiling purposes cap a resolved limit rather than substitute
+        // for it, so they compose differently from a TxProfile/TxDefaultProfile
+        // fallback and are deferred to a follow-up slice — Rejected with an
+        // explanatory `statusInfo` in the meantime (Issue #471).
+        ChargingProfilePurposeEnumType::ChargingStationMaxProfile
+        | ChargingProfilePurposeEnumType::ChargingStationExternalConstraints => (
             ChargingProfileStatusEnumType::Rejected,
             Some(StatusInfoType {
                 reason_code: "UnsupportedPurpose".to_string(),
                 additional_info: Some(
-                    "SetChargingProfile.chargingProfile.chargingProfilePurpose must be \
-                     TxProfile; TxDefaultProfile / ChargingStationMaxProfile / \
-                     ChargingStationExternalConstraints are not yet handled by the \
-                     simulator"
+                    "SetChargingProfile.chargingProfile.chargingProfilePurpose \
+                     ChargingStationMaxProfile / ChargingStationExternalConstraints are \
+                     not yet handled by the simulator (station-wide ceilings); \
+                     TxProfile and TxDefaultProfile are supported"
                         .to_string(),
                 ),
                 custom_data: None,
             }),
-        );
+        ),
     }
-    // A TxProfile is transaction-scoped: with no ongoing transaction on the
-    // targeted EVSE there is nothing to bind it to.
-    if !has_active_transaction {
-        return (
-            ChargingProfileStatusEnumType::Rejected,
-            Some(StatusInfoType {
-                reason_code: "NoTransaction".to_string(),
-                additional_info: Some(
-                    "SetChargingProfile carrying a TxProfile requires an ongoing \
-                     transaction on the targeted EVSE"
-                        .to_string(),
-                ),
-                custom_data: None,
-            }),
-        );
-    }
-    (ChargingProfileStatusEnumType::Accepted, None)
 }
 
 /// Build a schema-valid `SetChargingProfile.conf` ([`SetChargingProfileResponse`]).
@@ -2234,11 +2252,32 @@ mod tests {
     }
 
     #[test]
-    fn set_charging_profile_rejects_every_non_txprofile_purpose_before_the_transaction_read() {
-        // The purpose guard is checked first: a station-scoped / default profile is
-        // rejected for being unsupported regardless of whether a session is live.
+    fn set_charging_profile_accepts_a_txdefaultprofile_regardless_of_transaction() {
+        // A TxDefaultProfile is station configuration, not transaction-scoped, so
+        // it is Accepted whether or not a session is live on the EVSE (Issue #471).
+        for has_tx in [false, true] {
+            let (status, info) = v201_set_charging_profile_status(
+                ChargingProfilePurposeEnumType::TxDefaultProfile,
+                has_tx,
+            );
+            assert_eq!(
+                status,
+                ChargingProfileStatusEnumType::Accepted,
+                "a TxDefaultProfile is accepted (has_tx={has_tx})"
+            );
+            assert!(
+                info.is_none(),
+                "an accepted default carries no rejection detail (has_tx={has_tx})"
+            );
+        }
+    }
+
+    #[test]
+    fn set_charging_profile_rejects_the_station_ceiling_purposes() {
+        // The station-wide ceilings cap a resolved limit rather than substitute for
+        // it, so they are deferred to a follow-up and rejected for now, regardless
+        // of whether a session is live.
         for purpose in [
-            ChargingProfilePurposeEnumType::TxDefaultProfile,
             ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
             ChargingProfilePurposeEnumType::ChargingStationExternalConstraints,
         ] {
@@ -2247,7 +2286,7 @@ mod tests {
                 assert_eq!(
                     status,
                     ChargingProfileStatusEnumType::Rejected,
-                    "{purpose:?} is not honored by the simulator (has_tx={has_tx})"
+                    "{purpose:?} is not honored by the simulator yet (has_tx={has_tx})"
                 );
                 assert_eq!(
                     info.as_ref().map(|i| i.reason_code.as_str()),
