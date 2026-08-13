@@ -20,6 +20,7 @@ pub mod state_machine;
 pub mod transaction;
 pub mod v201_charging_profiles;
 pub mod v201_command;
+pub mod v201_cost;
 pub mod v201_data_transfer;
 pub mod v201_device_model;
 pub mod v201_transaction;
@@ -70,6 +71,7 @@ use ocpp_types::{
     OcppVersion,
 };
 use v201_charging_profiles::V201TxProfileStore;
+use v201_cost::V201CostStore;
 use v201_device_model::V201DeviceModel;
 // 2.0.1 provisioning message + enum types used by the version-aware runtime
 // (slice 2). Aliased to avoid clashing with the unqualified 1.6J names imported
@@ -81,7 +83,7 @@ use ocpp_messages::v201::{
     ClearChargingProfileRequest as V201ClearChargingProfileRequest,
     ClearVariableMonitoringRequest as V201ClearVariableMonitoringRequest,
     ClearVariableMonitoringResponse as V201ClearVariableMonitoringResponse,
-    DataTransferRequest as V201DataTransferRequest,
+    CostUpdatedRequest as V201CostUpdatedRequest, DataTransferRequest as V201DataTransferRequest,
     GetBaseReportRequest as V201GetBaseReportRequest,
     GetBaseReportResponse as V201GetBaseReportResponse,
     GetChargingProfilesRequest as V201GetChargingProfilesRequest,
@@ -957,6 +959,15 @@ pub struct ChargePoint {
     /// `v16j::ChargingProfile`). Read back via
     /// [`installed_tx_profile`](Self::installed_tx_profile). Empty on the 1.6J path.
     v201_tx_profiles: Arc<V201TxProfileStore>,
+    /// Latest running total cost the CSMS has pushed per transaction id via the
+    /// 2.0.1 `CostUpdated` message (Issue #502), keyed by the wire
+    /// `transactionId` string. Upserted by the V201-only `CostUpdated` handler
+    /// and read back via [`recorded_transaction_cost`](Self::recorded_transaction_cost).
+    /// A cost is recorded unconditionally (OCPP defines no rejection for
+    /// `CostUpdated`), so an entry may exist for a `transactionId` not in
+    /// [`active_transactions`](Self::active_transactions). Empty on the 1.6J path
+    /// (which has no `CostUpdated` handler). See [`V201CostStore`].
+    v201_costs: Arc<V201CostStore>,
     /// Maps an active reservation ID → the connector it holds (OCPP 1.6J §5.14).
     /// Populated by the default `ReserveNow` handler, consulted/cleared by
     /// `CancelReservation`, and emptied for a connector when a transaction
@@ -1122,6 +1133,11 @@ impl ChargePoint {
         // from the dispatcher, so it is shared into the default dispatcher too.
         let v201_tx_profiles = Arc::new(V201TxProfileStore::new());
 
+        // Running-cost store the 2.0.1 `CostUpdated` handler upserts into
+        // (Issue #502). Shared into the default dispatcher so the V201 arm can
+        // record an inbound cost; read back via `recorded_transaction_cost`.
+        let v201_costs = Arc::new(V201CostStore::new());
+
         // Wrap the shared state the default handlers need *before* building the
         // dispatcher: RemoteStart/RemoteStop consult live connector status and
         // the active-transaction map to answer Accepted/Rejected faithfully.
@@ -1158,6 +1174,7 @@ impl ChargePoint {
             reservations.clone(),
             charging_profiles.clone(),
             v201_tx_profiles.clone(),
+            v201_costs.clone(),
             expiry_timers.clone(),
             config.unlock_connector_outcome,
             data_transfer.clone(),
@@ -1188,6 +1205,7 @@ impl ChargePoint {
             next_v201_transaction_id: Arc::new(AtomicI32::new(1)),
             v201_sessions,
             v201_tx_profiles,
+            v201_costs,
             reservations,
             expiry_timers,
             validator,
@@ -1226,6 +1244,7 @@ impl ChargePoint {
         reservations: Arc<RwLock<HashMap<i32, ConnectorId>>>,
         charging_profiles: Arc<ChargingProfileStore>,
         v201_tx_profiles: Arc<V201TxProfileStore>,
+        v201_costs: Arc<V201CostStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
         unlock_outcome: UnlockConnectorOutcome,
         data_transfer: Arc<DataTransferRegistry>,
@@ -2318,6 +2337,31 @@ impl ChargePoint {
                         messages_in_queue,
                         ongoing_indicator,
                     ))
+                }
+            });
+        }
+
+        // CostUpdated (OCPP 2.0.1 Part 2, K — Tariff & Cost) — a 2.0.1-only
+        // message: the CSMS pushes the running total cost of an ongoing
+        // transaction so the station can show the driver an up-to-date price.
+        // There is no 1.6J equivalent, so this is registered on the `V201` arm
+        // only (Issue #502). It records the latest cost against the wire
+        // `transactionId` and answers with an empty `CostUpdatedResponse` —
+        // OCPP defines no rejection status for CostUpdated, so the cost is taken
+        // up unconditionally (an id the station is not, or not yet, running is
+        // recorded pending rather than dropped: OCPP places no ordering
+        // guarantee between CostUpdated and the station's own liveness view). The
+        // only side effect is the in-memory upsert; nothing is queued, and the
+        // opaque `transactionId` is used as an exact string key, never parsed, so
+        // a malformed/edge id cannot panic. `totalCost` is stored verbatim (the
+        // decoded f64, no rounding — see the #411 float-fidelity direction).
+        if protocol_version == OcppVersion::V201 {
+            let v201_costs = v201_costs.clone();
+            d.on(move |req: V201CostUpdatedRequest| {
+                let v201_costs = v201_costs.clone();
+                async move {
+                    v201_costs.update(&req.transaction_id, req.total_cost).await;
+                    Ok(v201_command::v201_cost_updated_response())
                 }
             });
         }
@@ -4880,6 +4924,24 @@ impl ChargePoint {
     /// `chargingProfile`.
     pub async fn installed_tx_profile(&self, evse_id: i32) -> Option<ChargingProfileType> {
         self.v201_tx_profiles.get(evse_id).await
+    }
+
+    /// The latest running total cost the CSMS has pushed for `transaction_id`
+    /// via the 2.0.1 `CostUpdated` message, if any (Issue #502).
+    ///
+    /// The read path making a recorded cost observable: an operator (or a test)
+    /// can confirm a `CostUpdated` figure was taken up against its transaction
+    /// rather than parsed off the wire and dropped. Keyed by the wire
+    /// `transactionId` string (the simulator's live-transaction ids render as
+    /// their decimal spelling, so a cost for a live transaction is read back
+    /// under the same id the transaction is known by). `None` when the CSMS has
+    /// never pushed a cost for that id, and always `None` on the 1.6J path
+    /// (which has no `CostUpdated` handler). A `Some` here does not imply the
+    /// transaction is still live — a cost is recorded unconditionally — so a
+    /// caller wanting "live cost" joins this against the live
+    /// `active_transactions` set.
+    pub async fn recorded_transaction_cost(&self, transaction_id: &str) -> Option<f64> {
+        self.v201_costs.get(transaction_id).await
     }
 
     /// The `groupIdToken` threaded onto the live 2.0.1 transaction `transaction_id`
@@ -8058,6 +8120,115 @@ mod tests {
                 other => panic!("expected CallResult, got: {other:?}"),
             }
         }
+    }
+
+    // --- CostUpdated (M7, issue #502) --------------------------------------
+    // A `for_version(V201)` CP records the running total cost the CSMS pushes for
+    // an ongoing transaction and answers with an empty `CostUpdatedResponse`.
+    // These exercise the wired V201 arm end-to-end over `handle_message`.
+
+    fn make_v201_cost_updated(total_cost: f64, transaction_id: &str) -> CallMessage {
+        make_call(V201CostUpdatedRequest {
+            total_cost,
+            transaction_id: transaction_id.to_string(),
+            custom_data: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn v201_cost_updated_records_cost_for_a_live_transaction() {
+        // With transaction 7 live, a CostUpdated for "7" is acknowledged with an
+        // empty response, records the cost (read back exactly), and queues
+        // nothing (the only side effect is the in-memory upsert).
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.test_insert_active_transaction(7, ConnectorId::new(1).unwrap())
+            .await;
+        assert_eq!(cp.recorded_transaction_cost("7").await, None);
+
+        let resp = cp
+            .handle_message(Message::Call(make_v201_cost_updated(12.5, "7")))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                // The acknowledgement parses as a CostUpdatedResponse (the action
+                // is registered) and serializes to an empty body.
+                let body: ocpp_messages::v201::CostUpdatedResponse = r.payload_as().unwrap();
+                assert_eq!(serde_json::to_value(&body).unwrap(), serde_json::json!({}));
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.recorded_transaction_cost("7").await,
+            Some(12.5),
+            "the pushed cost is recorded against the live transaction"
+        );
+        assert!(
+            v201_drain_commands(&cp).await.is_empty(),
+            "CostUpdated only upserts in memory — it queues nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_cost_updated_same_id_overwrites_with_the_latest_figure() {
+        // The running total moves forward over a session: a later CostUpdated for
+        // the same transaction replaces the earlier figure rather than stacking.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.test_insert_active_transaction(7, ConnectorId::new(1).unwrap())
+            .await;
+        cp.handle_message(Message::Call(make_v201_cost_updated(12.0, "7")))
+            .await
+            .unwrap();
+        cp.handle_message(Message::Call(make_v201_cost_updated(18.25, "7")))
+            .await
+            .unwrap();
+        assert_eq!(
+            cp.recorded_transaction_cost("7").await,
+            Some(18.25),
+            "the latest figure wins"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_cost_updated_unknown_id_is_recorded_pending() {
+        // OCPP defines no rejection for CostUpdated, so a cost for a transaction
+        // the station is not running is still acknowledged (empty response) and
+        // recorded pending rather than dropped — never a panic on the opaque id.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_cost_updated(3.0, "not-live")))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let _body: ocpp_messages::v201::CostUpdatedResponse = r.payload_as().unwrap();
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.recorded_transaction_cost("not-live").await,
+            Some(3.0),
+            "an unknown id is recorded pending, not dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_cost_updated_request_and_response_are_schema_valid() {
+        // The request the CSMS sends and the response the station builds both
+        // satisfy the bundled OCPP 2.0.1 CostUpdated schemas.
+        let validator = SchemaValidator::v201();
+        let req = V201CostUpdatedRequest {
+            total_cost: 42.75,
+            transaction_id: "7".to_string(),
+            custom_data: None,
+        };
+        validator
+            .validate_call("CostUpdated", &serde_json::to_value(&req).unwrap())
+            .expect("CostUpdated request is schema-valid");
+        let resp = v201_command::v201_cost_updated_response();
+        validator
+            .validate_call_result("CostUpdated", &serde_json::to_value(&resp).unwrap())
+            .expect("CostUpdated response is schema-valid");
     }
 
     // --- OCPP 2.0.1 Local Authorization List (M7, issue #485) --------------
