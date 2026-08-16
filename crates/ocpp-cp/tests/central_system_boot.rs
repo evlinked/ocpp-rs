@@ -18,6 +18,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use ocpp_cp::v201_station_ceiling::CeilingKind;
 use ocpp_cp::{ChargePoint, ChargePointConfig, UnlockConnectorOutcome};
 use ocpp_messages::v16j::RegistrationStatus;
 use ocpp_messages::v201::{
@@ -2098,11 +2099,12 @@ async fn v201_request_start_installs_the_txprofile_and_threads_group_id_token() 
 // resolver reads, out-of-band from a remote start. This exercises the full
 // handler contract end to end: rejected when there is no transaction to bind
 // to, accepted once a session is live (observable via `installed_tx_profile`),
-// a station-ceiling purpose rejected without mutating the store, a second
-// TxProfile *replacing* the first, and teardown clearing it when the
-// transaction ends. (A `TxDefaultProfile` is now Accepted into a separate store
-// — Issue #471 — covered by the `ocpp-cp` unit/wire tests; this test keeps its
-// focus on the transaction-scoped `TxProfile` store's isolation.)
+// a station-ceiling purpose Accepted into a *separate* ceiling store without
+// disturbing the TxProfile store (Issue #511), a second TxProfile *replacing*
+// the first, and teardown clearing it when the transaction ends. (A
+// `TxDefaultProfile` is likewise Accepted into its own store — Issue #471 —
+// covered by the `ocpp-cp` unit/wire tests; this test keeps its focus on the
+// transaction-scoped `TxProfile` store's isolation from the other purposes.)
 #[tokio::test]
 async fn v201_set_charging_profile_installs_replaces_and_rejects_faithfully() {
     let (mut server, addr, log) = start_v201_csms_recording_txns().await;
@@ -2116,7 +2118,7 @@ async fn v201_set_charging_profile_installs_replaces_and_rejects_faithfully() {
     cp.connect().await.expect("v201 connect + boot sequence");
 
     // Two distinct TxProfiles (different limits) so a replace is observable, and a
-    // station-ceiling profile the simulator does not honor yet (Issue #471 defers
+    // station-ceiling profile the simulator now honors as a cap (Issue #511:
     // ChargingStationMaxProfile / ChargingStationExternalConstraints).
     let profile_a = tx_profile_limited_w(6_000.0);
     let profile_b = tx_profile_limited_w(3_000.0);
@@ -2201,29 +2203,34 @@ async fn v201_set_charging_profile_installs_replaces_and_rejects_faithfully() {
         "an accepted SetChargingProfile installs its TxProfile against the EVSE"
     );
 
-    // (3) A station-ceiling purpose → Rejected with `UnsupportedPurpose`, and the
-    // store is left untouched (profile_a still installed).
+    // (3) A station-ceiling purpose → Accepted, installed into the *ceiling* store
+    // (Issue #511), leaving the transaction-scoped TxProfile store untouched
+    // (profile_a still installed).
     let resp = server
         .call::<V201SetChargingProfileRequest>(
             "CP201_SETPROFILE",
             V201SetChargingProfileRequest {
                 evse_id: 1,
-                charging_profile: ceiling_profile,
+                charging_profile: ceiling_profile.clone(),
                 custom_data: None,
             },
         )
         .await
         .expect("CSMS SetChargingProfile call round-trips");
-    assert_eq!(resp.status, ChargingProfileStatusEnumType::Rejected);
+    assert_eq!(resp.status, ChargingProfileStatusEnumType::Accepted);
+    assert!(
+        resp.status_info.is_none(),
+        "an accepted station-ceiling install carries no reason"
+    );
     assert_eq!(
-        resp.status_info.as_ref().map(|i| i.reason_code.as_str()),
-        Some("UnsupportedPurpose"),
-        "a station-ceiling purpose is rejected as unsupported"
+        cp.installed_station_ceiling(CeilingKind::Max, 1).await,
+        Some(ceiling_profile),
+        "the station ceiling lands in the ceiling store against its EVSE"
     );
     assert_eq!(
         cp.installed_tx_profile(1).await,
         Some(profile_a),
-        "a rejected station-ceiling profile leaves the installed TxProfile untouched"
+        "installing a station ceiling leaves the transaction-scoped TxProfile untouched"
     );
 
     // (4) A second TxProfile *replaces* the first (the store holds one per EVSE).

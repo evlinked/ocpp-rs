@@ -24,6 +24,7 @@ pub mod v201_cost;
 pub mod v201_data_transfer;
 pub mod v201_device_model;
 pub mod v201_display_message;
+pub mod v201_station_ceiling;
 pub mod v201_transaction;
 pub mod v201_tx_default_profile;
 
@@ -76,6 +77,7 @@ use v201_charging_profiles::V201TxProfileStore;
 use v201_cost::V201CostStore;
 use v201_device_model::V201DeviceModel;
 use v201_display_message::V201DisplayMessageStore;
+use v201_station_ceiling::{CeilingKind, V201StationCeilingStore};
 use v201_tx_default_profile::V201TxDefaultProfileStore;
 // 2.0.1 provisioning message + enum types used by the version-aware runtime
 // (slice 2). Aliased to avoid clashing with the unqualified 1.6J names imported
@@ -991,6 +993,17 @@ pub struct ChargePoint {
     /// read back via [`installed_tx_default_profile`](Self::installed_tx_default_profile).
     /// Consulted as the fallback by the metering resolver and `GetCompositeSchedule`.
     v201_tx_default_profiles: Arc<V201TxDefaultProfileStore>,
+    /// v201 station-ceiling store (Issue #511): the `ChargingStationMaxProfile` /
+    /// `ChargingStationExternalConstraints` profiles that **cap** — rather than
+    /// substitute for — the resolved [`v201_tx_profiles`](Self::v201_tx_profiles) /
+    /// [`v201_tx_default_profiles`](Self::v201_tx_default_profiles) limit. Installed
+    /// out-of-band by a `SetChargingProfile`, keyed by `(kind, evseId)` with
+    /// `evseId = 0` the whole-station ceiling; station configuration that persists
+    /// across transactions (not touched by `close_transaction`). The metering
+    /// resolver and `GetCompositeSchedule` apply it as `min(resolved, ceiling…)`;
+    /// read back via [`installed_station_ceiling`](Self::installed_station_ceiling).
+    /// Empty on the 1.6J path.
+    v201_station_ceilings: Arc<V201StationCeilingStore>,
     /// v201 display messages installed by `SetDisplayMessage` (OCPP 2.0.1 Part 2,
     /// E05–E08, Issue #505), keyed by `MessageInfoType.id`. The foundational store
     /// of the display-message family: a same-id re-install upserts, a future
@@ -1185,6 +1198,15 @@ impl ChargePoint {
         // not a transaction-scoped profile — so nothing clears it on close.
         let v201_tx_default_profiles = Arc::new(V201TxDefaultProfileStore::new());
 
+        // Issue #511: v201 station-ceiling store (ChargingStationMaxProfile /
+        // ChargingStationExternalConstraints), shared into the default dispatcher
+        // (the `SetChargingProfile` command installs a ceiling into it) and kept on
+        // the CP (the metering sampler and `GetCompositeSchedule` cap the resolved
+        // limit by it; `installed_station_ceiling` reads it back). Like the
+        // TxDefaultProfile store it is station configuration that persists across
+        // transactions, so nothing clears it on close.
+        let v201_station_ceilings = Arc::new(V201StationCeilingStore::new());
+
         // Running-cost store the 2.0.1 `CostUpdated` handler upserts into
         // (Issue #502). Shared into the default dispatcher so the V201 arm can
         // record an inbound cost; read back via `recorded_transaction_cost`.
@@ -1227,6 +1249,7 @@ impl ChargePoint {
             charging_profiles.clone(),
             v201_tx_profiles.clone(),
             v201_tx_default_profiles.clone(),
+            v201_station_ceilings.clone(),
             v201_display_messages.clone(),
             v201_costs.clone(),
             expiry_timers.clone(),
@@ -1260,6 +1283,7 @@ impl ChargePoint {
             v201_sessions,
             v201_tx_profiles,
             v201_tx_default_profiles,
+            v201_station_ceilings,
             v201_display_messages,
             v201_costs,
             reservations,
@@ -1301,6 +1325,7 @@ impl ChargePoint {
         charging_profiles: Arc<ChargingProfileStore>,
         v201_tx_profiles: Arc<V201TxProfileStore>,
         v201_tx_default_profiles: Arc<V201TxDefaultProfileStore>,
+        v201_station_ceilings: Arc<V201StationCeilingStore>,
         v201_display_messages: Arc<V201DisplayMessageStore>,
         v201_costs: Arc<V201CostStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
@@ -3417,20 +3442,22 @@ impl ChargePoint {
             // `@on(Action.set_charging_profile)` dispatch shape from
             // `ocpp/charge_point.py`.
             //
-            // Non-`TxProfile` purposes (TxDefaultProfile / ChargingStationMaxProfile
-            // / ChargingStationExternalConstraints) and a `TxProfile` with no
-            // ongoing transaction on the target EVSE are Rejected
-            // with an explanatory `statusInfo`, mirroring the RequestStartTransaction
-            // guard above. Supporting the station-scoped purposes is deferred to a
-            // follow-up (see #469).
+            // Every `chargingProfilePurpose` is now honored: `TxProfile` (bound to a
+            // live transaction), `TxDefaultProfile` (#512), and the station-wide
+            // ceilings `ChargingStationMaxProfile` / `ChargingStationExternalConstraints`
+            // (#511) — each routed to its own store below. Only a `TxProfile` with no
+            // ongoing transaction on the target EVSE is Rejected, with an explanatory
+            // `statusInfo`, mirroring the RequestStartTransaction guard above.
             OcppVersion::V201 => {
                 let active_transactions = active_transactions.clone();
                 let v201_tx_profiles = v201_tx_profiles.clone();
                 let v201_tx_default_profiles = v201_tx_default_profiles.clone();
+                let v201_station_ceilings = v201_station_ceilings.clone();
                 d.on(move |req: V201SetChargingProfileRequest| {
                     let active_transactions = active_transactions.clone();
                     let v201_tx_profiles = v201_tx_profiles.clone();
                     let v201_tx_default_profiles = v201_tx_default_profiles.clone();
+                    let v201_station_ceilings = v201_station_ceilings.clone();
                     async move {
                         let evse_id = req.evse_id;
                         // An ongoing transaction on the target EVSE. The v201 store
@@ -3466,10 +3493,12 @@ impl ChargePoint {
                         //   applied as the fallback when no `TxProfile` is in force
                         //   (`evseId = 0` installs the station-wide default). Nothing
                         //   clears it on transaction end (Issue #471).
-                        //
-                        // The station-ceiling purposes never reach here — the
-                        // decision above rejects them — so an accept is only ever one
-                        // of these two.
+                        // - `ChargingStationMaxProfile` /
+                        //   `ChargingStationExternalConstraints` → `v201_station_ceilings`,
+                        //   station-wide *ceilings* that cap the resolved limit rather
+                        //   than substitute for it (`evseId = 0` installs the
+                        //   whole-station ceiling). Also persists across transactions
+                        //   (Issue #511).
                         if status == ChargingProfileStatusEnumType::Accepted {
                             match purpose {
                                 ChargingProfilePurposeEnumType::TxProfile => {
@@ -3483,7 +3512,16 @@ impl ChargePoint {
                                         .await;
                                 }
                                 ChargingProfilePurposeEnumType::ChargingStationMaxProfile
-                                | ChargingProfilePurposeEnumType::ChargingStationExternalConstraints => {}
+                                | ChargingProfilePurposeEnumType::ChargingStationExternalConstraints => {
+                                    // `from_purpose` is `Some` for exactly these two
+                                    // arms; the decision only `Accept`s a ceiling for
+                                    // one of them, so this never silently drops one.
+                                    if let Some(kind) = CeilingKind::from_purpose(purpose) {
+                                        v201_station_ceilings
+                                            .install(kind, evse_id, req.charging_profile)
+                                            .await;
+                                    }
+                                }
                             }
                         }
 
@@ -3643,12 +3681,15 @@ impl ChargePoint {
             // OCPP 2.0.1 (Part 2, `GetCompositeSchedule`) — the CSMS asks the
             // station to compute the net schedule it will enforce for an EVSE over
             // the requested window, after stacking the applicable profiles. The
-            // simulator holds at most one `TxProfile` per EVSE in
-            // `v201_tx_profiles`, so the composite is that profile resolved over the
-            // window by the same core the periodic-metering path uses
-            // (`v201_charging_profiles`, #464/#466). An EVSE with no installed
-            // profile — or a profile that constrains no instant in the window (incl.
-            // a non-positive `duration`) — yields `Rejected` with no schedule. Ports
+            // simulator resolves the `TxProfile` (else the `TxDefaultProfile`
+            // fallback) in force on the EVSE and composes it over the window by the
+            // same core the periodic-metering path uses (`v201_charging_profiles`,
+            // #464/#466), then **caps** each reported period by any station ceiling
+            // in force — `min(resolved, ChargingStationMaxProfile,
+            // ChargingStationExternalConstraints)` (#511). An EVSE with no installed
+            // base profile — or a profile that constrains no instant in the window
+            // (incl. a non-positive `duration`) — yields `Rejected` with no schedule
+            // (a ceiling alone never manufactures a schedule). Ports
             // `ocpp.v201.call.GetCompositeSchedule` and the
             // `@on(Action.get_composite_schedule)` dispatch shape from
             // `ocpp/charge_point.py`.
@@ -3656,10 +3697,12 @@ impl ChargePoint {
                 let connectors = connectors.clone();
                 let v201_tx_profiles = v201_tx_profiles.clone();
                 let v201_tx_default_profiles = v201_tx_default_profiles.clone();
+                let v201_station_ceilings = v201_station_ceilings.clone();
                 d.on(move |req: V201GetCompositeScheduleRequest| {
                     let connectors = connectors.clone();
                     let v201_tx_profiles = v201_tx_profiles.clone();
                     let v201_tx_default_profiles = v201_tx_default_profiles.clone();
+                    let v201_station_ceilings = v201_station_ceilings.clone();
                     async move {
                         let rejected = V201GetCompositeScheduleResponse {
                             status: GenericStatusEnumType::Rejected,
@@ -3696,10 +3739,25 @@ impl ChargePoint {
                                 .map_or(230.0, |c| c.config().max_voltage),
                             Err(_) => 230.0,
                         };
+                        // The station ceilings in force for this EVSE (Issue #511):
+                        // each caps the composed schedule's periods by `min`. Absent
+                        // ceilings, the composite is exactly the base profile's.
+                        let max_ceiling = v201_station_ceilings
+                            .effective_for(CeilingKind::Max, req.evse_id)
+                            .await;
+                        let external_ceiling = v201_station_ceilings
+                            .effective_for(CeilingKind::External, req.evse_id)
+                            .await;
+                        let ceilings: Vec<&ChargingProfileType> =
+                            [max_ceiling.as_ref(), external_ceiling.as_ref()]
+                                .into_iter()
+                                .flatten()
+                                .collect();
                         let window_start = chrono::Utc::now();
-                        match v201_charging_profiles::compose_composite_schedule(
+                        match v201_charging_profiles::compose_composite_schedule_capped(
                             req.evse_id,
                             &profile,
+                            &ceilings,
                             window_start,
                             req.duration,
                             req.charging_rate_unit,
@@ -4719,6 +4777,10 @@ impl ChargePoint {
         // The `TxDefaultProfile` store, consulted as the fallback each tick when
         // no `TxProfile` bounds this transaction (Issue #471).
         let tx_default_profiles = self.v201_tx_default_profiles.clone();
+        // The station-ceiling store, capping the resolved limit each tick by any
+        // installed `ChargingStationMaxProfile` / `ChargingStationExternalConstraints`
+        // (Issue #511).
+        let station_ceilings = self.v201_station_ceilings.clone();
         let evse_id = connector_id.value() as i32;
         let txid_str = transaction_id.to_string();
 
@@ -4775,23 +4837,35 @@ impl ChargePoint {
                 // The profile bounding this reading, by the Issue #471 precedence:
                 // the `TxProfile` in force on the EVSE, else its `TxDefaultProfile`
                 // fallback (specific-EVSE default, else the `evseId = 0` station-wide
-                // default). If that profile's active limit is tighter than the
-                // connector's natural rate, surface the bounded power on the reading;
-                // otherwise (no profile in force, or a looser limit) it is unchanged.
+                // default). That resolved limit is then **capped** by any station
+                // ceiling in force — `min(resolved, ChargingStationMaxProfile,
+                // ChargingStationExternalConstraints)` (Issue #511). A ceiling binds
+                // even with no `TxProfile`/`TxDefaultProfile` present. If the composed
+                // limit is tighter than the connector's natural rate, surface the
+                // bounded power on the reading; otherwise it is unchanged.
                 let effective_profile = match tx_profiles.get(evse_id).await {
                     Some(profile) => Some(profile),
                     None => tx_default_profiles.effective_for(evse_id).await,
                 };
-                let bounded_power_w = match effective_profile {
-                    Some(profile) => crate::v201_charging_profiles::bounded_power_w(
-                        &profile,
-                        now_elapsed,
-                        tx_start,
-                        natural_power_w,
-                        nominal_voltage_v,
-                    ),
-                    None => None,
-                };
+                let max_ceiling = station_ceilings
+                    .effective_for(CeilingKind::Max, evse_id)
+                    .await;
+                let external_ceiling = station_ceilings
+                    .effective_for(CeilingKind::External, evse_id)
+                    .await;
+                let ceilings: Vec<&ChargingProfileType> =
+                    [max_ceiling.as_ref(), external_ceiling.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                let bounded_power_w = crate::v201_charging_profiles::bounded_power_w_capped(
+                    effective_profile.as_ref(),
+                    &ceilings,
+                    now_elapsed,
+                    tx_start,
+                    natural_power_w,
+                    nominal_voltage_v,
+                );
 
                 let session = v201_transaction::SessionRef {
                     transaction_id: &txid_str,
@@ -5186,6 +5260,26 @@ impl ChargePoint {
     /// `None` on the 1.6J path (which has no v201 profile store).
     pub async fn installed_tx_default_profile(&self, evse_id: i32) -> Option<ChargingProfileType> {
         self.v201_tx_default_profiles.get(evse_id).await
+    }
+
+    /// The 2.0.1 station ceiling of `kind` installed under the exact key `evse_id`
+    /// by a `SetChargingProfile`, if any (Issue #511) — the read path making an
+    /// installed `ChargingStationMaxProfile` / `ChargingStationExternalConstraints`
+    /// observable.
+    ///
+    /// Returns the ceiling stored under `(kind, evse_id)` verbatim (key `0` is the
+    /// whole-station ceiling). It does **not** apply the `evseId = 0` wildcard
+    /// fallback — a query for a specific EVSE with only a whole-station ceiling
+    /// returns `None` here; the metering resolver and `GetCompositeSchedule` apply
+    /// that fallback themselves. A ceiling persists across transactions, so a
+    /// `Some` here does not imply a live transaction. Always `None` on the 1.6J
+    /// path (which has no v201 profile store).
+    pub async fn installed_station_ceiling(
+        &self,
+        kind: CeilingKind,
+        evse_id: i32,
+    ) -> Option<ChargingProfileType> {
+        self.v201_station_ceilings.get(kind, evse_id).await
     }
 
     /// The display message currently installed under `id` by `SetDisplayMessage`,
@@ -6640,6 +6734,21 @@ impl ChargePoint {
             .await;
     }
 
+    /// Install a v201 station ceiling directly into the store the
+    /// `GetCompositeSchedule` and periodic-metering handlers cap by, bypassing the
+    /// `SetChargingProfile` wire path (Issue #511). `evse_id = 0` seeds the
+    /// whole-station ceiling for `kind`.
+    async fn test_install_v201_station_ceiling(
+        &self,
+        kind: CeilingKind,
+        evse_id: i32,
+        profile: ChargingProfileType,
+    ) {
+        self.v201_station_ceilings
+            .install(kind, evse_id, profile)
+            .await;
+    }
+
     /// Seed a live reservation exactly as an accepted `ReserveNow` would — reserve
     /// the connector (`Available → Reserved`) and record `reservationId →
     /// connector` in the shared store — so a `CancelReservation` wire test has a
@@ -7233,9 +7342,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v201_set_charging_profile_rejects_a_station_ceiling_purpose() {
-        // The station-wide ceiling purposes are deferred: still Rejected with an
-        // UnsupportedPurpose statusInfo, and nothing is stored.
+    async fn v201_set_charging_profile_accepts_and_installs_a_station_ceiling() {
+        // A ChargingStationMaxProfile is station configuration, not
+        // transaction-scoped, so it is Accepted with no live transaction and lands
+        // in the *ceiling* store (read via `installed_station_ceiling`) — never a
+        // Tx/TxDefault store. `evseId = 0` installs the whole-station ceiling
+        // (Issue #511).
         let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
         let call = make_v201_set_charging_profile(
             0,
@@ -7249,15 +7361,108 @@ mod tests {
         match resp.unwrap() {
             Message::CallResult(r) => {
                 let body: ocpp_messages::v201::SetChargingProfileResponse = r.payload_as().unwrap();
-                assert_eq!(body.status, ChargingProfileStatusEnumType::Rejected);
-                assert_eq!(
-                    body.status_info.as_ref().map(|i| i.reason_code.as_str()),
-                    Some("UnsupportedPurpose")
+                assert_eq!(body.status, ChargingProfileStatusEnumType::Accepted);
+                assert!(
+                    body.status_info.is_none(),
+                    "an accepted ceiling has no rejection detail"
                 );
             }
             other => panic!("expected CallResult, got: {other:?}"),
         }
-        assert!(cp.installed_tx_default_profile(0).await.is_none());
+        assert_eq!(
+            cp.installed_station_ceiling(CeilingKind::Max, 0)
+                .await
+                .expect("stored")
+                .id,
+            9,
+            "the ceiling landed in the ceiling store under the whole-station key"
+        );
+        assert!(
+            cp.installed_tx_default_profile(0).await.is_none(),
+            "a ceiling does not land in the TxDefaultProfile store"
+        );
+        assert!(
+            cp.installed_tx_profile(0).await.is_none(),
+            "a ceiling does not land in the TxProfile store"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_set_charging_profile_installs_an_external_constraints_ceiling() {
+        // The second ceiling purpose routes to its own kind, not the Max kind.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let call = make_v201_set_charging_profile(
+            1,
+            v201_flat_profile(
+                12,
+                ChargingProfilePurposeEnumType::ChargingStationExternalConstraints,
+                4_000.0,
+            ),
+        );
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetChargingProfileResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, ChargingProfileStatusEnumType::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.installed_station_ceiling(CeilingKind::External, 1)
+                .await
+                .expect("stored")
+                .id,
+            12
+        );
+        assert!(
+            cp.installed_station_ceiling(CeilingKind::Max, 1)
+                .await
+                .is_none(),
+            "an external-constraints install does not populate the Max kind"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_get_composite_schedule_caps_the_txprofile_by_a_station_ceiling() {
+        use ocpp_types::v201::ChargingRateUnitEnumType;
+        // A TxProfile (11 kW) capped by a whole-station ceiling (6 kW): the composed
+        // schedule reports min(11k, 6k) = 6 kW end to end (Issue #511).
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.test_install_v201_tx_profile(
+            1,
+            v201_flat_profile(1, ChargingProfilePurposeEnumType::TxProfile, 11_000.0),
+        )
+        .await;
+        cp.test_install_v201_station_ceiling(
+            CeilingKind::Max,
+            0,
+            v201_flat_profile(
+                9,
+                ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
+                6_000.0,
+            ),
+        )
+        .await;
+        let call = make_call(V201GetCompositeScheduleRequest {
+            duration: 3_600,
+            charging_rate_unit: None,
+            evse_id: 1,
+            custom_data: None,
+        });
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: V201GetCompositeScheduleResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, GenericStatusEnumType::Accepted);
+                let schedule = body.schedule.expect("composed schedule");
+                assert_eq!(schedule.charging_rate_unit, ChargingRateUnitEnumType::W);
+                assert_eq!(
+                    schedule.charging_schedule_period[0].limit, 6_000.0,
+                    "the station ceiling caps the TxProfile limit"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
