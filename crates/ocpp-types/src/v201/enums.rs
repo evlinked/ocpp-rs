@@ -1252,8 +1252,9 @@ pub enum CertificateSignedStatusEnumType {
 /// (`"V2GRootCertificate"`, `"MORootCertificate"`, `"CSMSRootCertificate"`,
 /// `"ManufacturerRootCertificate"`) and identical between the reference dataclass
 /// enum and the bundled OCPP 2.0.1 FINAL JSON Schema, so no `#[serde(rename)]` is
-/// needed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// needed. Derives `Hash` so the CP simulator's trust-anchor store
+/// (`V201CertificateStore`) can key installed certificates by the use they serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InstallCertificateUseEnumType {
     V2GRootCertificate,
     MORootCertificate,

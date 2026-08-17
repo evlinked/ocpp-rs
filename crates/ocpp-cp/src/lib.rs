@@ -18,12 +18,14 @@ pub mod message_handler;
 pub mod meter_sampler;
 pub mod state_machine;
 pub mod transaction;
+pub mod v201_certificate_store;
 pub mod v201_charging_profiles;
 pub mod v201_command;
 pub mod v201_cost;
 pub mod v201_data_transfer;
 pub mod v201_device_model;
 pub mod v201_display_message;
+pub mod v201_station_ceiling;
 pub mod v201_transaction;
 pub mod v201_tx_default_profile;
 
@@ -72,10 +74,12 @@ use ocpp_types::{
     CallErrorCode, CallErrorMessage, CallResultMessage, ConnectorId, OcppError, OcppResult,
     OcppVersion,
 };
+use v201_certificate_store::V201CertificateStore;
 use v201_charging_profiles::V201TxProfileStore;
 use v201_cost::V201CostStore;
 use v201_device_model::V201DeviceModel;
 use v201_display_message::V201DisplayMessageStore;
+use v201_station_ceiling::{CeilingKind, V201StationCeilingStore};
 use v201_tx_default_profile::V201TxDefaultProfileStore;
 // 2.0.1 provisioning message + enum types used by the version-aware runtime
 // (slice 2). Aliased to avoid clashing with the unqualified 1.6J names imported
@@ -101,7 +105,9 @@ use ocpp_messages::v201::{
     GetReportRequest as V201GetReportRequest, GetReportResponse as V201GetReportResponse,
     GetTransactionStatusRequest as V201GetTransactionStatusRequest,
     GetVariablesRequest as V201GetVariablesRequest,
-    GetVariablesResponse as V201GetVariablesResponse, MeterValuesRequest as V201MeterValuesRequest,
+    GetVariablesResponse as V201GetVariablesResponse,
+    InstallCertificateRequest as V201InstallCertificateRequest,
+    MeterValuesRequest as V201MeterValuesRequest,
     NotifyMonitoringReportRequest as V201NotifyMonitoringReportRequest,
     NotifyReportRequest as V201NotifyReportRequest,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
@@ -125,7 +131,8 @@ use ocpp_types::v201::{
     AttributeEnumType, AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType,
     ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
     ConnectorStatusEnumType, DisplayMessageStatusEnumType, GenericDeviceModelStatusEnumType,
-    GenericStatusEnumType, GetVariableResultType, IdTokenType as V201IdTokenType, MessageInfoType,
+    GenericStatusEnumType, GetVariableResultType, IdTokenType as V201IdTokenType,
+    InstallCertificateStatusEnumType, InstallCertificateUseEnumType, MessageInfoType,
     MessageTriggerEnumType, MonitoringDataType, OperationalStatusEnumType,
     RegistrationStatusEnumType, ReportDataType, RequestStartStopStatusEnumType,
     ReserveNowStatusEnumType, ResetStatusEnumType, SetVariableResultType, StatusInfoType,
@@ -992,6 +999,17 @@ pub struct ChargePoint {
     /// read back via [`installed_tx_default_profile`](Self::installed_tx_default_profile).
     /// Consulted as the fallback by the metering resolver and `GetCompositeSchedule`.
     v201_tx_default_profiles: Arc<V201TxDefaultProfileStore>,
+    /// v201 station-ceiling store (Issue #511): the `ChargingStationMaxProfile` /
+    /// `ChargingStationExternalConstraints` profiles that **cap** — rather than
+    /// substitute for — the resolved [`v201_tx_profiles`](Self::v201_tx_profiles) /
+    /// [`v201_tx_default_profiles`](Self::v201_tx_default_profiles) limit. Installed
+    /// out-of-band by a `SetChargingProfile`, keyed by `(kind, evseId)` with
+    /// `evseId = 0` the whole-station ceiling; station configuration that persists
+    /// across transactions (not touched by `close_transaction`). The metering
+    /// resolver and `GetCompositeSchedule` apply it as `min(resolved, ceiling…)`;
+    /// read back via [`installed_station_ceiling`](Self::installed_station_ceiling).
+    /// Empty on the 1.6J path.
+    v201_station_ceilings: Arc<V201StationCeilingStore>,
     /// v201 display messages installed by `SetDisplayMessage` (OCPP 2.0.1 Part 2,
     /// E05–E08, Issue #505), keyed by `MessageInfoType.id`. The foundational store
     /// of the display-message family: a same-id re-install upserts, a future
@@ -1000,6 +1018,15 @@ pub struct ChargePoint {
     /// `SetDisplayMessage` handler (only once its pure decision returns `Accepted`).
     /// Empty on the 1.6J path (the handler is V201-only).
     v201_display_messages: Arc<V201DisplayMessageStore>,
+    /// v201 root/CA trust anchors installed by `InstallCertificate` (OCPP 2.0.1
+    /// Part 2, A02 / M03–M05, Issue #518), keyed by `InstallCertificateUseEnumType`.
+    /// The foundational store of the certificate-*management* family: an install
+    /// under a use upserts (rotates), and future `GetInstalledCertificateIds`
+    /// (enumerate) / `DeleteCertificate` (remove) handlers read/mutate it — one
+    /// source of truth for all three. Populated by the `InstallCertificate`
+    /// handler only once its pure decision returns `Accepted`. Empty on the 1.6J
+    /// path (the handler is V201-only; 1.6 has no per-use trust model here).
+    v201_certificates: Arc<V201CertificateStore>,
     /// Latest running total cost the CSMS has pushed per transaction id via the
     /// 2.0.1 `CostUpdated` message (Issue #502), keyed by the wire
     /// `transactionId` string. Upserted by the V201-only `CostUpdated` handler
@@ -1177,6 +1204,12 @@ impl ChargePoint {
         // into (Issue #505). Shared into the default dispatcher so the handler can
         // install straight from the CALL path.
         let v201_display_messages = Arc::new(V201DisplayMessageStore::new());
+        // The trust-anchor store the V201 `InstallCertificate` handler installs
+        // into (Issue #518). Shared into the default dispatcher so the handler can
+        // install straight from the CALL path; the foundational store the
+        // certificate-management follow-ups (`GetInstalledCertificateIds` /
+        // `DeleteCertificate`) will read/mutate.
+        let v201_certificates = Arc::new(V201CertificateStore::new());
 
         // Issue #471: v201 `TxDefaultProfile` store, shared into the default
         // dispatcher (the `SetChargingProfile` command installs a default into it)
@@ -1185,6 +1218,15 @@ impl ChargePoint {
         // reads it back). Persists across transactions — station configuration,
         // not a transaction-scoped profile — so nothing clears it on close.
         let v201_tx_default_profiles = Arc::new(V201TxDefaultProfileStore::new());
+
+        // Issue #511: v201 station-ceiling store (ChargingStationMaxProfile /
+        // ChargingStationExternalConstraints), shared into the default dispatcher
+        // (the `SetChargingProfile` command installs a ceiling into it) and kept on
+        // the CP (the metering sampler and `GetCompositeSchedule` cap the resolved
+        // limit by it; `installed_station_ceiling` reads it back). Like the
+        // TxDefaultProfile store it is station configuration that persists across
+        // transactions, so nothing clears it on close.
+        let v201_station_ceilings = Arc::new(V201StationCeilingStore::new());
 
         // Running-cost store the 2.0.1 `CostUpdated` handler upserts into
         // (Issue #502). Shared into the default dispatcher so the V201 arm can
@@ -1228,7 +1270,9 @@ impl ChargePoint {
             charging_profiles.clone(),
             v201_tx_profiles.clone(),
             v201_tx_default_profiles.clone(),
+            v201_station_ceilings.clone(),
             v201_display_messages.clone(),
+            v201_certificates.clone(),
             v201_costs.clone(),
             expiry_timers.clone(),
             config.unlock_connector_outcome,
@@ -1261,7 +1305,9 @@ impl ChargePoint {
             v201_sessions,
             v201_tx_profiles,
             v201_tx_default_profiles,
+            v201_station_ceilings,
             v201_display_messages,
+            v201_certificates,
             v201_costs,
             reservations,
             expiry_timers,
@@ -1302,7 +1348,9 @@ impl ChargePoint {
         charging_profiles: Arc<ChargingProfileStore>,
         v201_tx_profiles: Arc<V201TxProfileStore>,
         v201_tx_default_profiles: Arc<V201TxDefaultProfileStore>,
+        v201_station_ceilings: Arc<V201StationCeilingStore>,
         v201_display_messages: Arc<V201DisplayMessageStore>,
+        v201_certificates: Arc<V201CertificateStore>,
         v201_costs: Arc<V201CostStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
         unlock_outcome: UnlockConnectorOutcome,
@@ -1798,6 +1846,72 @@ impl ChargePoint {
                     }
 
                     Ok(v201_command::v201_set_display_message_response(
+                        status,
+                        status_info,
+                    ))
+                }
+            });
+        }
+
+        // InstallCertificate (OCPP 2.0.1 only) — the CSMS installs a root/CA
+        // certificate into the station's trust store (Part 2, A02 / M03–M05,
+        // Issue #518). The **write** side of the certificate-*management* family
+        // (`InstallCertificate` / `DeleteCertificate` / `GetInstalledCertificateIds`),
+        // distinct from the provisioning pair (`SignCertificate` / `CertificateSigned`
+        // — the station's own certificate). Registered only on the V201 arm — 1.6
+        // has no per-use trust model here.
+        //
+        // A pure decide-and-answer with at most one store side effect (the upsert
+        // of an accepted anchor), no queued command. The decision
+        // (`v201_command::v201_install_certificate_status`) is a lightweight
+        // predicate on the PEM string — **no X.509 parse** (a documented simulator
+        // boundary): empty / non-PEM → `Rejected`, PEM-armored but empty-bodied →
+        // `Failed`, a well-formed PEM → `Accepted` and upserted into the
+        // `V201CertificateStore` keyed by `certificateType` (a re-install under the
+        // same use rotates the anchor, never duplicates). A non-`Accepted` outcome
+        // leaves the store unchanged and carries a `statusInfo` reason (the same
+        // "a non-accept leaves state unchanged" shape as `SetDisplayMessage`'s
+        // refusal).
+        //
+        // Trust boundary: `certificate` is attacker-influenced CSMS input, treated
+        // as an opaque bounded string — inspected, never parsed/unwrapped, so no
+        // wire value (empty, garbage, very long, control chars) can panic;
+        // `certificateType` is a closed enum (an unknown wire value fails
+        // deserialization → CALLERROR before the handler). Ports
+        // `ocpp.v201.call.InstallCertificate` →
+        // `ocpp.v201.call_result.InstallCertificate`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let certificates = v201_certificates.clone();
+            d.on(move |req: V201InstallCertificateRequest| {
+                let certificates = certificates.clone();
+                async move {
+                    let status = v201_command::v201_install_certificate_status(&req.certificate);
+                    let status_info = match status {
+                        InstallCertificateStatusEnumType::Accepted => {
+                            // Install only an accepted anchor; a re-install under
+                            // the same use rotates it in place.
+                            certificates
+                                .install(req.certificate_type, req.certificate)
+                                .await;
+                            None
+                        }
+                        InstallCertificateStatusEnumType::Rejected => Some(StatusInfoType {
+                            reason_code: "InvalidCertificate".to_string(),
+                            additional_info: Some(
+                                "certificate is empty or not a PEM-encoded certificate".to_string(),
+                            ),
+                            custom_data: None,
+                        }),
+                        InstallCertificateStatusEnumType::Failed => Some(StatusInfoType {
+                            reason_code: "InstallationFailed".to_string(),
+                            additional_info: Some(
+                                "certificate is PEM-armored but carries no usable key material"
+                                    .to_string(),
+                            ),
+                            custom_data: None,
+                        }),
+                    };
+                    Ok(v201_command::v201_install_certificate_response(
                         status,
                         status_info,
                     ))
@@ -3455,20 +3569,22 @@ impl ChargePoint {
             // `@on(Action.set_charging_profile)` dispatch shape from
             // `ocpp/charge_point.py`.
             //
-            // Non-`TxProfile` purposes (TxDefaultProfile / ChargingStationMaxProfile
-            // / ChargingStationExternalConstraints) and a `TxProfile` with no
-            // ongoing transaction on the target EVSE are Rejected
-            // with an explanatory `statusInfo`, mirroring the RequestStartTransaction
-            // guard above. Supporting the station-scoped purposes is deferred to a
-            // follow-up (see #469).
+            // Every `chargingProfilePurpose` is now honored: `TxProfile` (bound to a
+            // live transaction), `TxDefaultProfile` (#512), and the station-wide
+            // ceilings `ChargingStationMaxProfile` / `ChargingStationExternalConstraints`
+            // (#511) — each routed to its own store below. Only a `TxProfile` with no
+            // ongoing transaction on the target EVSE is Rejected, with an explanatory
+            // `statusInfo`, mirroring the RequestStartTransaction guard above.
             OcppVersion::V201 => {
                 let active_transactions = active_transactions.clone();
                 let v201_tx_profiles = v201_tx_profiles.clone();
                 let v201_tx_default_profiles = v201_tx_default_profiles.clone();
+                let v201_station_ceilings = v201_station_ceilings.clone();
                 d.on(move |req: V201SetChargingProfileRequest| {
                     let active_transactions = active_transactions.clone();
                     let v201_tx_profiles = v201_tx_profiles.clone();
                     let v201_tx_default_profiles = v201_tx_default_profiles.clone();
+                    let v201_station_ceilings = v201_station_ceilings.clone();
                     async move {
                         let evse_id = req.evse_id;
                         // An ongoing transaction on the target EVSE. The v201 store
@@ -3504,10 +3620,12 @@ impl ChargePoint {
                         //   applied as the fallback when no `TxProfile` is in force
                         //   (`evseId = 0` installs the station-wide default). Nothing
                         //   clears it on transaction end (Issue #471).
-                        //
-                        // The station-ceiling purposes never reach here — the
-                        // decision above rejects them — so an accept is only ever one
-                        // of these two.
+                        // - `ChargingStationMaxProfile` /
+                        //   `ChargingStationExternalConstraints` → `v201_station_ceilings`,
+                        //   station-wide *ceilings* that cap the resolved limit rather
+                        //   than substitute for it (`evseId = 0` installs the
+                        //   whole-station ceiling). Also persists across transactions
+                        //   (Issue #511).
                         if status == ChargingProfileStatusEnumType::Accepted {
                             match purpose {
                                 ChargingProfilePurposeEnumType::TxProfile => {
@@ -3521,7 +3639,16 @@ impl ChargePoint {
                                         .await;
                                 }
                                 ChargingProfilePurposeEnumType::ChargingStationMaxProfile
-                                | ChargingProfilePurposeEnumType::ChargingStationExternalConstraints => {}
+                                | ChargingProfilePurposeEnumType::ChargingStationExternalConstraints => {
+                                    // `from_purpose` is `Some` for exactly these two
+                                    // arms; the decision only `Accept`s a ceiling for
+                                    // one of them, so this never silently drops one.
+                                    if let Some(kind) = CeilingKind::from_purpose(purpose) {
+                                        v201_station_ceilings
+                                            .install(kind, evse_id, req.charging_profile)
+                                            .await;
+                                    }
+                                }
                             }
                         }
 
@@ -3681,12 +3808,15 @@ impl ChargePoint {
             // OCPP 2.0.1 (Part 2, `GetCompositeSchedule`) — the CSMS asks the
             // station to compute the net schedule it will enforce for an EVSE over
             // the requested window, after stacking the applicable profiles. The
-            // simulator holds at most one `TxProfile` per EVSE in
-            // `v201_tx_profiles`, so the composite is that profile resolved over the
-            // window by the same core the periodic-metering path uses
-            // (`v201_charging_profiles`, #464/#466). An EVSE with no installed
-            // profile — or a profile that constrains no instant in the window (incl.
-            // a non-positive `duration`) — yields `Rejected` with no schedule. Ports
+            // simulator resolves the `TxProfile` (else the `TxDefaultProfile`
+            // fallback) in force on the EVSE and composes it over the window by the
+            // same core the periodic-metering path uses (`v201_charging_profiles`,
+            // #464/#466), then **caps** each reported period by any station ceiling
+            // in force — `min(resolved, ChargingStationMaxProfile,
+            // ChargingStationExternalConstraints)` (#511). An EVSE with no installed
+            // base profile — or a profile that constrains no instant in the window
+            // (incl. a non-positive `duration`) — yields `Rejected` with no schedule
+            // (a ceiling alone never manufactures a schedule). Ports
             // `ocpp.v201.call.GetCompositeSchedule` and the
             // `@on(Action.get_composite_schedule)` dispatch shape from
             // `ocpp/charge_point.py`.
@@ -3694,10 +3824,12 @@ impl ChargePoint {
                 let connectors = connectors.clone();
                 let v201_tx_profiles = v201_tx_profiles.clone();
                 let v201_tx_default_profiles = v201_tx_default_profiles.clone();
+                let v201_station_ceilings = v201_station_ceilings.clone();
                 d.on(move |req: V201GetCompositeScheduleRequest| {
                     let connectors = connectors.clone();
                     let v201_tx_profiles = v201_tx_profiles.clone();
                     let v201_tx_default_profiles = v201_tx_default_profiles.clone();
+                    let v201_station_ceilings = v201_station_ceilings.clone();
                     async move {
                         let rejected = V201GetCompositeScheduleResponse {
                             status: GenericStatusEnumType::Rejected,
@@ -3734,10 +3866,25 @@ impl ChargePoint {
                                 .map_or(230.0, |c| c.config().max_voltage),
                             Err(_) => 230.0,
                         };
+                        // The station ceilings in force for this EVSE (Issue #511):
+                        // each caps the composed schedule's periods by `min`. Absent
+                        // ceilings, the composite is exactly the base profile's.
+                        let max_ceiling = v201_station_ceilings
+                            .effective_for(CeilingKind::Max, req.evse_id)
+                            .await;
+                        let external_ceiling = v201_station_ceilings
+                            .effective_for(CeilingKind::External, req.evse_id)
+                            .await;
+                        let ceilings: Vec<&ChargingProfileType> =
+                            [max_ceiling.as_ref(), external_ceiling.as_ref()]
+                                .into_iter()
+                                .flatten()
+                                .collect();
                         let window_start = chrono::Utc::now();
-                        match v201_charging_profiles::compose_composite_schedule(
+                        match v201_charging_profiles::compose_composite_schedule_capped(
                             req.evse_id,
                             &profile,
+                            &ceilings,
                             window_start,
                             req.duration,
                             req.charging_rate_unit,
@@ -4757,6 +4904,10 @@ impl ChargePoint {
         // The `TxDefaultProfile` store, consulted as the fallback each tick when
         // no `TxProfile` bounds this transaction (Issue #471).
         let tx_default_profiles = self.v201_tx_default_profiles.clone();
+        // The station-ceiling store, capping the resolved limit each tick by any
+        // installed `ChargingStationMaxProfile` / `ChargingStationExternalConstraints`
+        // (Issue #511).
+        let station_ceilings = self.v201_station_ceilings.clone();
         let evse_id = connector_id.value() as i32;
         let txid_str = transaction_id.to_string();
 
@@ -4813,23 +4964,35 @@ impl ChargePoint {
                 // The profile bounding this reading, by the Issue #471 precedence:
                 // the `TxProfile` in force on the EVSE, else its `TxDefaultProfile`
                 // fallback (specific-EVSE default, else the `evseId = 0` station-wide
-                // default). If that profile's active limit is tighter than the
-                // connector's natural rate, surface the bounded power on the reading;
-                // otherwise (no profile in force, or a looser limit) it is unchanged.
+                // default). That resolved limit is then **capped** by any station
+                // ceiling in force — `min(resolved, ChargingStationMaxProfile,
+                // ChargingStationExternalConstraints)` (Issue #511). A ceiling binds
+                // even with no `TxProfile`/`TxDefaultProfile` present. If the composed
+                // limit is tighter than the connector's natural rate, surface the
+                // bounded power on the reading; otherwise it is unchanged.
                 let effective_profile = match tx_profiles.get(evse_id).await {
                     Some(profile) => Some(profile),
                     None => tx_default_profiles.effective_for(evse_id).await,
                 };
-                let bounded_power_w = match effective_profile {
-                    Some(profile) => crate::v201_charging_profiles::bounded_power_w(
-                        &profile,
-                        now_elapsed,
-                        tx_start,
-                        natural_power_w,
-                        nominal_voltage_v,
-                    ),
-                    None => None,
-                };
+                let max_ceiling = station_ceilings
+                    .effective_for(CeilingKind::Max, evse_id)
+                    .await;
+                let external_ceiling = station_ceilings
+                    .effective_for(CeilingKind::External, evse_id)
+                    .await;
+                let ceilings: Vec<&ChargingProfileType> =
+                    [max_ceiling.as_ref(), external_ceiling.as_ref()]
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                let bounded_power_w = crate::v201_charging_profiles::bounded_power_w_capped(
+                    effective_profile.as_ref(),
+                    &ceilings,
+                    now_elapsed,
+                    tx_start,
+                    natural_power_w,
+                    nominal_voltage_v,
+                );
 
                 let session = v201_transaction::SessionRef {
                     transaction_id: &txid_str,
@@ -5226,6 +5389,26 @@ impl ChargePoint {
         self.v201_tx_default_profiles.get(evse_id).await
     }
 
+    /// The 2.0.1 station ceiling of `kind` installed under the exact key `evse_id`
+    /// by a `SetChargingProfile`, if any (Issue #511) — the read path making an
+    /// installed `ChargingStationMaxProfile` / `ChargingStationExternalConstraints`
+    /// observable.
+    ///
+    /// Returns the ceiling stored under `(kind, evse_id)` verbatim (key `0` is the
+    /// whole-station ceiling). It does **not** apply the `evseId = 0` wildcard
+    /// fallback — a query for a specific EVSE with only a whole-station ceiling
+    /// returns `None` here; the metering resolver and `GetCompositeSchedule` apply
+    /// that fallback themselves. A ceiling persists across transactions, so a
+    /// `Some` here does not imply a live transaction. Always `None` on the 1.6J
+    /// path (which has no v201 profile store).
+    pub async fn installed_station_ceiling(
+        &self,
+        kind: CeilingKind,
+        evse_id: i32,
+    ) -> Option<ChargingProfileType> {
+        self.v201_station_ceilings.get(kind, evse_id).await
+    }
+
     /// The display message currently installed under `id` by `SetDisplayMessage`,
     /// if any (OCPP 2.0.1 Part 2 E05–E08, Issue #505).
     ///
@@ -5239,6 +5422,25 @@ impl ChargePoint {
     /// `GetDisplayMessages` / `ClearDisplayMessage` handlers build on.
     pub async fn installed_display_message(&self, id: i32) -> Option<MessageInfoType> {
         self.v201_display_messages.get(id).await
+    }
+
+    /// The root/CA certificate currently installed for the trust anchor `use_` by
+    /// `InstallCertificate`, if any (OCPP 2.0.1 Part 2, A02 / M03–M05, Issue #518).
+    ///
+    /// The read path making an installed trust anchor observable: an operator (or
+    /// a test) can confirm an `InstallCertificate` the station answered `Accepted`
+    /// was actually taken up into the store — and a re-install under the same use
+    /// rotated rather than duplicated it — rather than parsed off the wire and
+    /// dropped. Returns the PEM as delivered (the simulator does no X.509 parse).
+    /// Always `None` on the 1.6J path (which has no v201 trust store) and for a use
+    /// the station never installed (or one a later `DeleteCertificate` removed).
+    /// The reader the follow-up `GetInstalledCertificateIds` / `DeleteCertificate`
+    /// handlers build on.
+    pub async fn installed_certificate(
+        &self,
+        use_: InstallCertificateUseEnumType,
+    ) -> Option<String> {
+        self.v201_certificates.installed(use_).await
     }
 
     /// The latest running total cost the CSMS has pushed for `transaction_id`
@@ -6678,6 +6880,21 @@ impl ChargePoint {
             .await;
     }
 
+    /// Install a v201 station ceiling directly into the store the
+    /// `GetCompositeSchedule` and periodic-metering handlers cap by, bypassing the
+    /// `SetChargingProfile` wire path (Issue #511). `evse_id = 0` seeds the
+    /// whole-station ceiling for `kind`.
+    async fn test_install_v201_station_ceiling(
+        &self,
+        kind: CeilingKind,
+        evse_id: i32,
+        profile: ChargingProfileType,
+    ) {
+        self.v201_station_ceilings
+            .install(kind, evse_id, profile)
+            .await;
+    }
+
     /// Seed a live reservation exactly as an accepted `ReserveNow` would — reserve
     /// the connector (`Available → Reserved`) and record `reservationId →
     /// connector` in the shared store — so a `CancelReservation` wire test has a
@@ -7271,9 +7488,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v201_set_charging_profile_rejects_a_station_ceiling_purpose() {
-        // The station-wide ceiling purposes are deferred: still Rejected with an
-        // UnsupportedPurpose statusInfo, and nothing is stored.
+    async fn v201_set_charging_profile_accepts_and_installs_a_station_ceiling() {
+        // A ChargingStationMaxProfile is station configuration, not
+        // transaction-scoped, so it is Accepted with no live transaction and lands
+        // in the *ceiling* store (read via `installed_station_ceiling`) — never a
+        // Tx/TxDefault store. `evseId = 0` installs the whole-station ceiling
+        // (Issue #511).
         let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
         let call = make_v201_set_charging_profile(
             0,
@@ -7287,15 +7507,108 @@ mod tests {
         match resp.unwrap() {
             Message::CallResult(r) => {
                 let body: ocpp_messages::v201::SetChargingProfileResponse = r.payload_as().unwrap();
-                assert_eq!(body.status, ChargingProfileStatusEnumType::Rejected);
-                assert_eq!(
-                    body.status_info.as_ref().map(|i| i.reason_code.as_str()),
-                    Some("UnsupportedPurpose")
+                assert_eq!(body.status, ChargingProfileStatusEnumType::Accepted);
+                assert!(
+                    body.status_info.is_none(),
+                    "an accepted ceiling has no rejection detail"
                 );
             }
             other => panic!("expected CallResult, got: {other:?}"),
         }
-        assert!(cp.installed_tx_default_profile(0).await.is_none());
+        assert_eq!(
+            cp.installed_station_ceiling(CeilingKind::Max, 0)
+                .await
+                .expect("stored")
+                .id,
+            9,
+            "the ceiling landed in the ceiling store under the whole-station key"
+        );
+        assert!(
+            cp.installed_tx_default_profile(0).await.is_none(),
+            "a ceiling does not land in the TxDefaultProfile store"
+        );
+        assert!(
+            cp.installed_tx_profile(0).await.is_none(),
+            "a ceiling does not land in the TxProfile store"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_set_charging_profile_installs_an_external_constraints_ceiling() {
+        // The second ceiling purpose routes to its own kind, not the Max kind.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let call = make_v201_set_charging_profile(
+            1,
+            v201_flat_profile(
+                12,
+                ChargingProfilePurposeEnumType::ChargingStationExternalConstraints,
+                4_000.0,
+            ),
+        );
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetChargingProfileResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, ChargingProfileStatusEnumType::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.installed_station_ceiling(CeilingKind::External, 1)
+                .await
+                .expect("stored")
+                .id,
+            12
+        );
+        assert!(
+            cp.installed_station_ceiling(CeilingKind::Max, 1)
+                .await
+                .is_none(),
+            "an external-constraints install does not populate the Max kind"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_get_composite_schedule_caps_the_txprofile_by_a_station_ceiling() {
+        use ocpp_types::v201::ChargingRateUnitEnumType;
+        // A TxProfile (11 kW) capped by a whole-station ceiling (6 kW): the composed
+        // schedule reports min(11k, 6k) = 6 kW end to end (Issue #511).
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.test_install_v201_tx_profile(
+            1,
+            v201_flat_profile(1, ChargingProfilePurposeEnumType::TxProfile, 11_000.0),
+        )
+        .await;
+        cp.test_install_v201_station_ceiling(
+            CeilingKind::Max,
+            0,
+            v201_flat_profile(
+                9,
+                ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
+                6_000.0,
+            ),
+        )
+        .await;
+        let call = make_call(V201GetCompositeScheduleRequest {
+            duration: 3_600,
+            charging_rate_unit: None,
+            evse_id: 1,
+            custom_data: None,
+        });
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: V201GetCompositeScheduleResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, GenericStatusEnumType::Accepted);
+                let schedule = body.schedule.expect("composed schedule");
+                assert_eq!(schedule.charging_rate_unit, ChargingRateUnitEnumType::W);
+                assert_eq!(
+                    schedule.charging_schedule_period[0].limit, 6_000.0,
+                    "the station ceiling caps the TxProfile limit"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -8646,6 +8959,261 @@ mod tests {
             validator
                 .validate_call_result("SetDisplayMessage", &serde_json::to_value(&resp).unwrap())
                 .expect("SetDisplayMessage response is schema-valid");
+        }
+    }
+
+    // --- OCPP 2.0.1 InstallCertificate (M7, issue #518) --------------------
+    // A `for_version(V201)` CP installs a root/CA certificate into its
+    // `V201CertificateStore`. These exercise the wired V201 arm end-to-end over
+    // `handle_message`: accept-and-store, per-use isolation, same-use rotation,
+    // the reject/fail non-store paths, and V201-only registration.
+
+    // A minimal but structurally-valid PEM certificate (armor + one body line).
+    const SAMPLE_INSTALL_PEM: &str =
+        "-----BEGIN CERTIFICATE-----\nMIIBkTCB+w==\n-----END CERTIFICATE-----";
+
+    fn make_v201_install_certificate(
+        certificate_type: InstallCertificateUseEnumType,
+        certificate: &str,
+    ) -> CallMessage {
+        make_call(V201InstallCertificateRequest {
+            certificate_type,
+            certificate: certificate.to_string(),
+            custom_data: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn v201_install_certificate_accepts_and_stores_a_pem() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_install_certificate(
+                InstallCertificateUseEnumType::CSMSRootCertificate,
+                SAMPLE_INSTALL_PEM,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::InstallCertificateResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, InstallCertificateStatusEnumType::Accepted);
+                // Accepted carries no statusInfo.
+                assert!(body.status_info.is_none());
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        // The accepted anchor is observable in the store, read back by use.
+        assert_eq!(
+            cp.installed_certificate(InstallCertificateUseEnumType::CSMSRootCertificate)
+                .await,
+            Some(SAMPLE_INSTALL_PEM.to_string()),
+        );
+        // A pure install queues no side-effect command.
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_install_certificate_second_use_installs_independently() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.handle_message(Message::Call(make_v201_install_certificate(
+            InstallCertificateUseEnumType::CSMSRootCertificate,
+            SAMPLE_INSTALL_PEM,
+        )))
+        .await
+        .unwrap();
+
+        // A second anchor under a DIFFERENT use, with distinct body content.
+        let v2g_pem = "-----BEGIN CERTIFICATE-----\nQzJHUk9PVA==\n-----END CERTIFICATE-----";
+        let resp = cp
+            .handle_message(Message::Call(make_v201_install_certificate(
+                InstallCertificateUseEnumType::V2GRootCertificate,
+                v2g_pem,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::InstallCertificateResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, InstallCertificateStatusEnumType::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        // Both anchors hold their own PEM; the first was not disturbed.
+        assert_eq!(
+            cp.installed_certificate(InstallCertificateUseEnumType::CSMSRootCertificate)
+                .await,
+            Some(SAMPLE_INSTALL_PEM.to_string()),
+        );
+        assert_eq!(
+            cp.installed_certificate(InstallCertificateUseEnumType::V2GRootCertificate)
+                .await,
+            Some(v2g_pem.to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_install_certificate_same_use_rotates_the_anchor() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.handle_message(Message::Call(make_v201_install_certificate(
+            InstallCertificateUseEnumType::CSMSRootCertificate,
+            SAMPLE_INSTALL_PEM,
+        )))
+        .await
+        .unwrap();
+
+        // Re-install a DIFFERENT certificate under the SAME use (a root rotation).
+        let rotated = "-----BEGIN CERTIFICATE-----\nUk9UQVRFRA==\n-----END CERTIFICATE-----";
+        let resp = cp
+            .handle_message(Message::Call(make_v201_install_certificate(
+                InstallCertificateUseEnumType::CSMSRootCertificate,
+                rotated,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::InstallCertificateResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, InstallCertificateStatusEnumType::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.installed_certificate(InstallCertificateUseEnumType::CSMSRootCertificate)
+                .await,
+            Some(rotated.to_string()),
+            "a same-use re-install rotates the anchor in place, no duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_install_certificate_rejects_empty_and_stores_nothing() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // An empty certificate is refused up front; nothing is installed, and the
+        // CSMS-supplied string never panics the handler.
+        let resp = cp
+            .handle_message(Message::Call(make_v201_install_certificate(
+                InstallCertificateUseEnumType::ManufacturerRootCertificate,
+                "",
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::InstallCertificateResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, InstallCertificateStatusEnumType::Rejected);
+                assert_eq!(
+                    body.status_info
+                        .expect("a refusal carries a statusInfo reason")
+                        .reason_code,
+                    "InvalidCertificate"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.installed_certificate(InstallCertificateUseEnumType::ManufacturerRootCertificate)
+                .await,
+            None,
+            "a rejected certificate is not stored"
+        );
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_install_certificate_fails_on_a_pem_with_no_body_and_stores_nothing() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // PEM-armored but carrying no key material → attempted, could not complete.
+        let empty_body = "-----BEGIN CERTIFICATE-----\n\n-----END CERTIFICATE-----";
+        let resp = cp
+            .handle_message(Message::Call(make_v201_install_certificate(
+                InstallCertificateUseEnumType::MORootCertificate,
+                empty_body,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::InstallCertificateResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, InstallCertificateStatusEnumType::Failed);
+                assert_eq!(
+                    body.status_info
+                        .expect("a failure carries a statusInfo reason")
+                        .reason_code,
+                    "InstallationFailed"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.installed_certificate(InstallCertificateUseEnumType::MORootCertificate)
+                .await,
+            None,
+            "a failed install stores nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_install_certificate_is_v201_only() {
+        // A 1.6J CP has no InstallCertificate handler (1.6 has no per-use trust
+        // model here), so the v201-only action is unrouted → CallError, never a
+        // CallResult.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V16J)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_install_certificate(
+                InstallCertificateUseEnumType::CSMSRootCertificate,
+                SAMPLE_INSTALL_PEM,
+            )))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Some(Message::CallError(_))),
+            "a 1.6J CP does not answer InstallCertificate with a CallResult, got: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn v201_install_certificate_request_and_response_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        // A request carrying a certificateType + PEM is schema-valid.
+        let req = V201InstallCertificateRequest {
+            certificate_type: InstallCertificateUseEnumType::CSMSRootCertificate,
+            certificate: SAMPLE_INSTALL_PEM.to_string(),
+            custom_data: None,
+        };
+        validator
+            .validate_call("InstallCertificate", &serde_json::to_value(&req).unwrap())
+            .expect("InstallCertificate request is schema-valid");
+
+        // All three answer shapes the handler emits — Accepted (no statusInfo),
+        // Rejected and Failed (each with a statusInfo reason) — serialize to a
+        // schema-valid response.
+        for (status, status_info) in [
+            (InstallCertificateStatusEnumType::Accepted, None),
+            (
+                InstallCertificateStatusEnumType::Rejected,
+                Some(StatusInfoType {
+                    reason_code: "InvalidCertificate".to_string(),
+                    additional_info: None,
+                    custom_data: None,
+                }),
+            ),
+            (
+                InstallCertificateStatusEnumType::Failed,
+                Some(StatusInfoType {
+                    reason_code: "InstallationFailed".to_string(),
+                    additional_info: None,
+                    custom_data: None,
+                }),
+            ),
+        ] {
+            let resp = ocpp_messages::v201::InstallCertificateResponse {
+                status,
+                status_info,
+                custom_data: None,
+            };
+            validator
+                .validate_call_result("InstallCertificate", &serde_json::to_value(&resp).unwrap())
+                .expect("InstallCertificate response is schema-valid");
         }
     }
 
