@@ -18,6 +18,7 @@ pub mod message_handler;
 pub mod meter_sampler;
 pub mod state_machine;
 pub mod transaction;
+pub mod v201_certificate_store;
 pub mod v201_charging_profiles;
 pub mod v201_command;
 pub mod v201_cost;
@@ -73,6 +74,7 @@ use ocpp_types::{
     CallErrorCode, CallErrorMessage, CallResultMessage, ConnectorId, OcppError, OcppResult,
     OcppVersion,
 };
+use v201_certificate_store::V201CertificateStore;
 use v201_charging_profiles::V201TxProfileStore;
 use v201_cost::V201CostStore;
 use v201_device_model::V201DeviceModel;
@@ -102,7 +104,9 @@ use ocpp_messages::v201::{
     GetReportRequest as V201GetReportRequest, GetReportResponse as V201GetReportResponse,
     GetTransactionStatusRequest as V201GetTransactionStatusRequest,
     GetVariablesRequest as V201GetVariablesRequest,
-    GetVariablesResponse as V201GetVariablesResponse, MeterValuesRequest as V201MeterValuesRequest,
+    GetVariablesResponse as V201GetVariablesResponse,
+    InstallCertificateRequest as V201InstallCertificateRequest,
+    MeterValuesRequest as V201MeterValuesRequest,
     NotifyMonitoringReportRequest as V201NotifyMonitoringReportRequest,
     NotifyReportRequest as V201NotifyReportRequest,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
@@ -126,7 +130,8 @@ use ocpp_types::v201::{
     AttributeEnumType, AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType,
     ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
     ConnectorStatusEnumType, DisplayMessageStatusEnumType, GenericDeviceModelStatusEnumType,
-    GenericStatusEnumType, GetVariableResultType, IdTokenType as V201IdTokenType, MessageInfoType,
+    GenericStatusEnumType, GetVariableResultType, IdTokenType as V201IdTokenType,
+    InstallCertificateStatusEnumType, InstallCertificateUseEnumType, MessageInfoType,
     MessageTriggerEnumType, MonitoringDataType, OperationalStatusEnumType,
     RegistrationStatusEnumType, ReportDataType, RequestStartStopStatusEnumType,
     ReserveNowStatusEnumType, ResetStatusEnumType, SetVariableResultType, StatusInfoType,
@@ -1012,6 +1017,15 @@ pub struct ChargePoint {
     /// `SetDisplayMessage` handler (only once its pure decision returns `Accepted`).
     /// Empty on the 1.6J path (the handler is V201-only).
     v201_display_messages: Arc<V201DisplayMessageStore>,
+    /// v201 root/CA trust anchors installed by `InstallCertificate` (OCPP 2.0.1
+    /// Part 2, A02 / M03–M05, Issue #518), keyed by `InstallCertificateUseEnumType`.
+    /// The foundational store of the certificate-*management* family: an install
+    /// under a use upserts (rotates), and future `GetInstalledCertificateIds`
+    /// (enumerate) / `DeleteCertificate` (remove) handlers read/mutate it — one
+    /// source of truth for all three. Populated by the `InstallCertificate`
+    /// handler only once its pure decision returns `Accepted`. Empty on the 1.6J
+    /// path (the handler is V201-only; 1.6 has no per-use trust model here).
+    v201_certificates: Arc<V201CertificateStore>,
     /// Latest running total cost the CSMS has pushed per transaction id via the
     /// 2.0.1 `CostUpdated` message (Issue #502), keyed by the wire
     /// `transactionId` string. Upserted by the V201-only `CostUpdated` handler
@@ -1189,6 +1203,12 @@ impl ChargePoint {
         // into (Issue #505). Shared into the default dispatcher so the handler can
         // install straight from the CALL path.
         let v201_display_messages = Arc::new(V201DisplayMessageStore::new());
+        // The trust-anchor store the V201 `InstallCertificate` handler installs
+        // into (Issue #518). Shared into the default dispatcher so the handler can
+        // install straight from the CALL path; the foundational store the
+        // certificate-management follow-ups (`GetInstalledCertificateIds` /
+        // `DeleteCertificate`) will read/mutate.
+        let v201_certificates = Arc::new(V201CertificateStore::new());
 
         // Issue #471: v201 `TxDefaultProfile` store, shared into the default
         // dispatcher (the `SetChargingProfile` command installs a default into it)
@@ -1251,6 +1271,7 @@ impl ChargePoint {
             v201_tx_default_profiles.clone(),
             v201_station_ceilings.clone(),
             v201_display_messages.clone(),
+            v201_certificates.clone(),
             v201_costs.clone(),
             expiry_timers.clone(),
             config.unlock_connector_outcome,
@@ -1285,6 +1306,7 @@ impl ChargePoint {
             v201_tx_default_profiles,
             v201_station_ceilings,
             v201_display_messages,
+            v201_certificates,
             v201_costs,
             reservations,
             expiry_timers,
@@ -1327,6 +1349,7 @@ impl ChargePoint {
         v201_tx_default_profiles: Arc<V201TxDefaultProfileStore>,
         v201_station_ceilings: Arc<V201StationCeilingStore>,
         v201_display_messages: Arc<V201DisplayMessageStore>,
+        v201_certificates: Arc<V201CertificateStore>,
         v201_costs: Arc<V201CostStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
         unlock_outcome: UnlockConnectorOutcome,
@@ -1822,6 +1845,72 @@ impl ChargePoint {
                     }
 
                     Ok(v201_command::v201_set_display_message_response(
+                        status,
+                        status_info,
+                    ))
+                }
+            });
+        }
+
+        // InstallCertificate (OCPP 2.0.1 only) — the CSMS installs a root/CA
+        // certificate into the station's trust store (Part 2, A02 / M03–M05,
+        // Issue #518). The **write** side of the certificate-*management* family
+        // (`InstallCertificate` / `DeleteCertificate` / `GetInstalledCertificateIds`),
+        // distinct from the provisioning pair (`SignCertificate` / `CertificateSigned`
+        // — the station's own certificate). Registered only on the V201 arm — 1.6
+        // has no per-use trust model here.
+        //
+        // A pure decide-and-answer with at most one store side effect (the upsert
+        // of an accepted anchor), no queued command. The decision
+        // (`v201_command::v201_install_certificate_status`) is a lightweight
+        // predicate on the PEM string — **no X.509 parse** (a documented simulator
+        // boundary): empty / non-PEM → `Rejected`, PEM-armored but empty-bodied →
+        // `Failed`, a well-formed PEM → `Accepted` and upserted into the
+        // `V201CertificateStore` keyed by `certificateType` (a re-install under the
+        // same use rotates the anchor, never duplicates). A non-`Accepted` outcome
+        // leaves the store unchanged and carries a `statusInfo` reason (the same
+        // "a non-accept leaves state unchanged" shape as `SetDisplayMessage`'s
+        // refusal).
+        //
+        // Trust boundary: `certificate` is attacker-influenced CSMS input, treated
+        // as an opaque bounded string — inspected, never parsed/unwrapped, so no
+        // wire value (empty, garbage, very long, control chars) can panic;
+        // `certificateType` is a closed enum (an unknown wire value fails
+        // deserialization → CALLERROR before the handler). Ports
+        // `ocpp.v201.call.InstallCertificate` →
+        // `ocpp.v201.call_result.InstallCertificate`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let certificates = v201_certificates.clone();
+            d.on(move |req: V201InstallCertificateRequest| {
+                let certificates = certificates.clone();
+                async move {
+                    let status = v201_command::v201_install_certificate_status(&req.certificate);
+                    let status_info = match status {
+                        InstallCertificateStatusEnumType::Accepted => {
+                            // Install only an accepted anchor; a re-install under
+                            // the same use rotates it in place.
+                            certificates
+                                .install(req.certificate_type, req.certificate)
+                                .await;
+                            None
+                        }
+                        InstallCertificateStatusEnumType::Rejected => Some(StatusInfoType {
+                            reason_code: "InvalidCertificate".to_string(),
+                            additional_info: Some(
+                                "certificate is empty or not a PEM-encoded certificate".to_string(),
+                            ),
+                            custom_data: None,
+                        }),
+                        InstallCertificateStatusEnumType::Failed => Some(StatusInfoType {
+                            reason_code: "InstallationFailed".to_string(),
+                            additional_info: Some(
+                                "certificate is PEM-armored but carries no usable key material"
+                                    .to_string(),
+                            ),
+                            custom_data: None,
+                        }),
+                    };
+                    Ok(v201_command::v201_install_certificate_response(
                         status,
                         status_info,
                     ))
@@ -5295,6 +5384,25 @@ impl ChargePoint {
     /// `GetDisplayMessages` / `ClearDisplayMessage` handlers build on.
     pub async fn installed_display_message(&self, id: i32) -> Option<MessageInfoType> {
         self.v201_display_messages.get(id).await
+    }
+
+    /// The root/CA certificate currently installed for the trust anchor `use_` by
+    /// `InstallCertificate`, if any (OCPP 2.0.1 Part 2, A02 / M03–M05, Issue #518).
+    ///
+    /// The read path making an installed trust anchor observable: an operator (or
+    /// a test) can confirm an `InstallCertificate` the station answered `Accepted`
+    /// was actually taken up into the store — and a re-install under the same use
+    /// rotated rather than duplicated it — rather than parsed off the wire and
+    /// dropped. Returns the PEM as delivered (the simulator does no X.509 parse).
+    /// Always `None` on the 1.6J path (which has no v201 trust store) and for a use
+    /// the station never installed (or one a later `DeleteCertificate` removed).
+    /// The reader the follow-up `GetInstalledCertificateIds` / `DeleteCertificate`
+    /// handlers build on.
+    pub async fn installed_certificate(
+        &self,
+        use_: InstallCertificateUseEnumType,
+    ) -> Option<String> {
+        self.v201_certificates.installed(use_).await
     }
 
     /// The latest running total cost the CSMS has pushed for `transaction_id`
@@ -8813,6 +8921,261 @@ mod tests {
             validator
                 .validate_call_result("SetDisplayMessage", &serde_json::to_value(&resp).unwrap())
                 .expect("SetDisplayMessage response is schema-valid");
+        }
+    }
+
+    // --- OCPP 2.0.1 InstallCertificate (M7, issue #518) --------------------
+    // A `for_version(V201)` CP installs a root/CA certificate into its
+    // `V201CertificateStore`. These exercise the wired V201 arm end-to-end over
+    // `handle_message`: accept-and-store, per-use isolation, same-use rotation,
+    // the reject/fail non-store paths, and V201-only registration.
+
+    // A minimal but structurally-valid PEM certificate (armor + one body line).
+    const SAMPLE_INSTALL_PEM: &str =
+        "-----BEGIN CERTIFICATE-----\nMIIBkTCB+w==\n-----END CERTIFICATE-----";
+
+    fn make_v201_install_certificate(
+        certificate_type: InstallCertificateUseEnumType,
+        certificate: &str,
+    ) -> CallMessage {
+        make_call(V201InstallCertificateRequest {
+            certificate_type,
+            certificate: certificate.to_string(),
+            custom_data: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn v201_install_certificate_accepts_and_stores_a_pem() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_install_certificate(
+                InstallCertificateUseEnumType::CSMSRootCertificate,
+                SAMPLE_INSTALL_PEM,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::InstallCertificateResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, InstallCertificateStatusEnumType::Accepted);
+                // Accepted carries no statusInfo.
+                assert!(body.status_info.is_none());
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        // The accepted anchor is observable in the store, read back by use.
+        assert_eq!(
+            cp.installed_certificate(InstallCertificateUseEnumType::CSMSRootCertificate)
+                .await,
+            Some(SAMPLE_INSTALL_PEM.to_string()),
+        );
+        // A pure install queues no side-effect command.
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_install_certificate_second_use_installs_independently() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.handle_message(Message::Call(make_v201_install_certificate(
+            InstallCertificateUseEnumType::CSMSRootCertificate,
+            SAMPLE_INSTALL_PEM,
+        )))
+        .await
+        .unwrap();
+
+        // A second anchor under a DIFFERENT use, with distinct body content.
+        let v2g_pem = "-----BEGIN CERTIFICATE-----\nQzJHUk9PVA==\n-----END CERTIFICATE-----";
+        let resp = cp
+            .handle_message(Message::Call(make_v201_install_certificate(
+                InstallCertificateUseEnumType::V2GRootCertificate,
+                v2g_pem,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::InstallCertificateResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, InstallCertificateStatusEnumType::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        // Both anchors hold their own PEM; the first was not disturbed.
+        assert_eq!(
+            cp.installed_certificate(InstallCertificateUseEnumType::CSMSRootCertificate)
+                .await,
+            Some(SAMPLE_INSTALL_PEM.to_string()),
+        );
+        assert_eq!(
+            cp.installed_certificate(InstallCertificateUseEnumType::V2GRootCertificate)
+                .await,
+            Some(v2g_pem.to_string()),
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_install_certificate_same_use_rotates_the_anchor() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.handle_message(Message::Call(make_v201_install_certificate(
+            InstallCertificateUseEnumType::CSMSRootCertificate,
+            SAMPLE_INSTALL_PEM,
+        )))
+        .await
+        .unwrap();
+
+        // Re-install a DIFFERENT certificate under the SAME use (a root rotation).
+        let rotated = "-----BEGIN CERTIFICATE-----\nUk9UQVRFRA==\n-----END CERTIFICATE-----";
+        let resp = cp
+            .handle_message(Message::Call(make_v201_install_certificate(
+                InstallCertificateUseEnumType::CSMSRootCertificate,
+                rotated,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::InstallCertificateResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, InstallCertificateStatusEnumType::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.installed_certificate(InstallCertificateUseEnumType::CSMSRootCertificate)
+                .await,
+            Some(rotated.to_string()),
+            "a same-use re-install rotates the anchor in place, no duplicate"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_install_certificate_rejects_empty_and_stores_nothing() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // An empty certificate is refused up front; nothing is installed, and the
+        // CSMS-supplied string never panics the handler.
+        let resp = cp
+            .handle_message(Message::Call(make_v201_install_certificate(
+                InstallCertificateUseEnumType::ManufacturerRootCertificate,
+                "",
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::InstallCertificateResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, InstallCertificateStatusEnumType::Rejected);
+                assert_eq!(
+                    body.status_info
+                        .expect("a refusal carries a statusInfo reason")
+                        .reason_code,
+                    "InvalidCertificate"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.installed_certificate(InstallCertificateUseEnumType::ManufacturerRootCertificate)
+                .await,
+            None,
+            "a rejected certificate is not stored"
+        );
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_install_certificate_fails_on_a_pem_with_no_body_and_stores_nothing() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // PEM-armored but carrying no key material → attempted, could not complete.
+        let empty_body = "-----BEGIN CERTIFICATE-----\n\n-----END CERTIFICATE-----";
+        let resp = cp
+            .handle_message(Message::Call(make_v201_install_certificate(
+                InstallCertificateUseEnumType::MORootCertificate,
+                empty_body,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::InstallCertificateResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, InstallCertificateStatusEnumType::Failed);
+                assert_eq!(
+                    body.status_info
+                        .expect("a failure carries a statusInfo reason")
+                        .reason_code,
+                    "InstallationFailed"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.installed_certificate(InstallCertificateUseEnumType::MORootCertificate)
+                .await,
+            None,
+            "a failed install stores nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_install_certificate_is_v201_only() {
+        // A 1.6J CP has no InstallCertificate handler (1.6 has no per-use trust
+        // model here), so the v201-only action is unrouted → CallError, never a
+        // CallResult.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V16J)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_install_certificate(
+                InstallCertificateUseEnumType::CSMSRootCertificate,
+                SAMPLE_INSTALL_PEM,
+            )))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Some(Message::CallError(_))),
+            "a 1.6J CP does not answer InstallCertificate with a CallResult, got: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn v201_install_certificate_request_and_response_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        // A request carrying a certificateType + PEM is schema-valid.
+        let req = V201InstallCertificateRequest {
+            certificate_type: InstallCertificateUseEnumType::CSMSRootCertificate,
+            certificate: SAMPLE_INSTALL_PEM.to_string(),
+            custom_data: None,
+        };
+        validator
+            .validate_call("InstallCertificate", &serde_json::to_value(&req).unwrap())
+            .expect("InstallCertificate request is schema-valid");
+
+        // All three answer shapes the handler emits — Accepted (no statusInfo),
+        // Rejected and Failed (each with a statusInfo reason) — serialize to a
+        // schema-valid response.
+        for (status, status_info) in [
+            (InstallCertificateStatusEnumType::Accepted, None),
+            (
+                InstallCertificateStatusEnumType::Rejected,
+                Some(StatusInfoType {
+                    reason_code: "InvalidCertificate".to_string(),
+                    additional_info: None,
+                    custom_data: None,
+                }),
+            ),
+            (
+                InstallCertificateStatusEnumType::Failed,
+                Some(StatusInfoType {
+                    reason_code: "InstallationFailed".to_string(),
+                    additional_info: None,
+                    custom_data: None,
+                }),
+            ),
+        ] {
+            let resp = ocpp_messages::v201::InstallCertificateResponse {
+                status,
+                status_info,
+                custom_data: None,
+            };
+            validator
+                .validate_call_result("InstallCertificate", &serde_json::to_value(&resp).unwrap())
+                .expect("InstallCertificate response is schema-valid");
         }
     }
 

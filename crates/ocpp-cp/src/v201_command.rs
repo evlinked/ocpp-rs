@@ -148,20 +148,21 @@ use ocpp_types::v201::{
     ChargingProfileType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
     ClearChargingProfileType, DisplayMessageStatusEnumType, GenericDeviceModelStatusEnumType,
     GenericStatusEnumType, GetChargingProfileStatusEnumType, GetDisplayMessagesStatusEnumType,
-    MessageInfoType, MessagePriorityEnumType, MessageStateEnumType, MessageTriggerEnumType,
-    OperationalStatusEnumType, RequestStartStopStatusEnumType, ReserveNowStatusEnumType,
-    ResetEnumType, ResetStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
-    UnlockStatusEnumType,
+    InstallCertificateStatusEnumType, MessageInfoType, MessagePriorityEnumType,
+    MessageStateEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
+    RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType,
+    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 
 use ocpp_messages::v201::{
     CancelReservationResponse, ChangeAvailabilityResponse, ClearCacheResponse,
     ClearChargingProfileResponse, CostUpdatedResponse, GetChargingProfilesResponse,
     GetDisplayMessagesResponse, GetMonitoringReportResponse, GetTransactionStatusResponse,
-    NotifyDisplayMessagesRequest, ReportChargingProfilesRequest, RequestStartTransactionResponse,
-    RequestStopTransactionResponse, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
-    SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
-    TriggerMessageResponse, UnlockConnectorResponse,
+    InstallCertificateResponse, NotifyDisplayMessagesRequest, ReportChargingProfilesRequest,
+    RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
+    ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
+    SetMonitoringBaseResponse, SetMonitoringLevelResponse, TriggerMessageResponse,
+    UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1637,6 +1638,80 @@ pub fn v201_notify_display_messages_pages(
 #[must_use]
 pub fn v201_cost_updated_response() -> CostUpdatedResponse {
     CostUpdatedResponse { custom_data: None }
+}
+
+/// Decide whether the station accepts, refuses, or fails to install the root
+/// certificate an `InstallCertificate` delivered (OCPP 2.0.1 Part 2, A02 /
+/// M03–M05).
+///
+/// Ports the accept/reject/fail decision behind
+/// [`ocpp.v201.call_result.InstallCertificate`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call_result.py)'s
+/// [`InstallCertificateStatusEnumType`]. The simulator models the *protocol*
+/// decision, not a PKI, so this is a deliberately lightweight predicate on the
+/// PEM string — **no X.509 parse, no chain/signature verification** (a documented
+/// boundary; a real validation seam is a natural follow-up). `certificate` is
+/// untrusted CSMS input, so it is treated as an opaque, bounded string and is
+/// only ever inspected, never parsed or unwrapped — no wire value can panic.
+///
+/// The three wire statuses are distinguished by the certificate's *shape*, so all
+/// of `Accepted` / `Rejected` / `Failed` are reachable and unit-testable:
+///
+/// - **`Rejected`** — the station refuses up front: the certificate is empty /
+///   whitespace-only, or is not PEM-armored at all (missing the
+///   `-----BEGIN … -----` / `-----END … -----` markers). There is nothing that
+///   looks like a certificate to install.
+/// - **`Failed`** — the station recognized a PEM certificate and *attempted* the
+///   install, but it could not complete: the certificate is PEM-armored yet
+///   carries no key material between the markers (an empty body). This is the
+///   "attempted but did not complete" arm the spec distinguishes from an up-front
+///   refusal.
+/// - **`Accepted`** — a PEM-armored certificate with a non-empty body; the
+///   station installs it.
+#[must_use]
+pub fn v201_install_certificate_status(certificate: &str) -> InstallCertificateStatusEnumType {
+    let trimmed = certificate.trim();
+
+    // Nothing to install, or not a PEM certificate at all → refuse up front.
+    if trimmed.is_empty() || !trimmed.contains("-----BEGIN") || !trimmed.contains("-----END") {
+        return InstallCertificateStatusEnumType::Rejected;
+    }
+
+    // PEM-armored, but is there any key material between the markers? The armor
+    // lines (`-----BEGIN … -----`, `-----END … -----`) are stripped; whatever
+    // remains, minus whitespace, is the base64 body.
+    let has_body = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("-----"))
+        .any(|line| !line.is_empty());
+
+    if has_body {
+        InstallCertificateStatusEnumType::Accepted
+    } else {
+        // Recognized as a certificate but unusable — attempted, could not complete.
+        InstallCertificateStatusEnumType::Failed
+    }
+}
+
+/// Build a schema-valid `InstallCertificate.conf` ([`InstallCertificateResponse`]).
+///
+/// Pure constructor mirroring [`v201_set_display_message_response`]: carries the
+/// decided [`status`](InstallCertificateStatusEnumType) plus the optional 2.0.1
+/// `statusInfo` — a vendor-agnostic `reasonCode` and human-readable detail the
+/// handler attaches to a non-`Accepted` outcome (why the install was `Rejected`
+/// or `Failed`).
+///
+/// Ports `ocpp.v201.call_result.InstallCertificate`.
+#[must_use]
+pub fn v201_install_certificate_response(
+    status: InstallCertificateStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> InstallCertificateResponse {
+    InstallCertificateResponse {
+        status,
+        status_info,
+        custom_data: None,
+    }
 }
 
 #[cfg(test)]
@@ -3982,5 +4057,103 @@ mod tests {
                 .is_ok(),
             "built CostUpdatedResponse should be schema-valid, got: {payload}"
         );
+    }
+
+    // --- InstallCertificate (v201) decision + response builder (Issue #518) ---
+
+    /// A minimal but structurally-valid PEM certificate, armor + one body line.
+    const SAMPLE_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBkTCB+w==\n-----END CERTIFICATE-----";
+
+    #[test]
+    fn install_certificate_accepts_a_pem_shaped_certificate() {
+        assert_eq!(
+            v201_install_certificate_status(SAMPLE_PEM),
+            InstallCertificateStatusEnumType::Accepted
+        );
+        // Surrounding whitespace does not change the decision.
+        assert_eq!(
+            v201_install_certificate_status(&format!("  \n{SAMPLE_PEM}\n  ")),
+            InstallCertificateStatusEnumType::Accepted
+        );
+    }
+
+    #[test]
+    fn install_certificate_rejects_empty_or_non_pem_input() {
+        // Nothing to install.
+        for empty in ["", "   ", "\n\t "] {
+            assert_eq!(
+                v201_install_certificate_status(empty),
+                InstallCertificateStatusEnumType::Rejected,
+                "an empty/blank certificate is refused up front"
+            );
+        }
+        // Non-empty but not PEM-armored at all → still refused, never a panic on
+        // arbitrary CSMS input.
+        for garbage in [
+            "not a certificate",
+            "-----BEGIN CERTIFICATE-----",
+            "MIIBkTCB+w==",
+        ] {
+            assert_eq!(
+                v201_install_certificate_status(garbage),
+                InstallCertificateStatusEnumType::Rejected,
+                "a non-PEM-armored string is refused: {garbage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn install_certificate_fails_on_a_pem_armored_but_empty_body() {
+        // Recognized as a certificate (both markers present) but no key material
+        // between them → attempted, could not complete.
+        let empty_body = "-----BEGIN CERTIFICATE-----\n\n-----END CERTIFICATE-----";
+        assert_eq!(
+            v201_install_certificate_status(empty_body),
+            InstallCertificateStatusEnumType::Failed
+        );
+        // Whitespace-only body is likewise unusable.
+        let blank_body = "-----BEGIN CERTIFICATE-----\n   \n-----END CERTIFICATE-----";
+        assert_eq!(
+            v201_install_certificate_status(blank_body),
+            InstallCertificateStatusEnumType::Failed
+        );
+    }
+
+    #[test]
+    fn install_certificate_does_not_panic_on_hostile_input() {
+        // Very long and control-char-laden strings are inspected, never parsed.
+        let long = "-".repeat(100_000);
+        let _ = v201_install_certificate_status(&long);
+        let _ = v201_install_certificate_status("\0\u{1}\u{2}-----BEGIN-----\u{7f}");
+        // A body made only of the armor prefix on every line has no key material.
+        let all_armor = "-----BEGIN CERTIFICATE-----\n-----X-----\n-----END CERTIFICATE-----";
+        assert_eq!(
+            v201_install_certificate_status(all_armor),
+            InstallCertificateStatusEnumType::Failed
+        );
+    }
+
+    #[test]
+    fn built_install_certificate_responses_are_schema_valid() {
+        // All three wire statuses, with and without a statusInfo, satisfy the
+        // bundled OCPP 2.0.1 InstallCertificate response JSON Schema.
+        let validator = SchemaValidator::v201();
+        for status in [
+            InstallCertificateStatusEnumType::Accepted,
+            InstallCertificateStatusEnumType::Rejected,
+            InstallCertificateStatusEnumType::Failed,
+        ] {
+            let info = (!matches!(status, InstallCertificateStatusEnumType::Accepted)).then(|| {
+                StatusInfoType {
+                    reason_code: "Unusable".to_string(),
+                    additional_info: Some("simulated".to_string()),
+                    custom_data: None,
+                }
+            });
+            let resp = v201_install_certificate_response(status, info);
+            validator
+                .validate_call_result("InstallCertificate", &serde_json::to_value(&resp).unwrap())
+                .expect("built InstallCertificate response is schema-valid");
+        }
     }
 }
