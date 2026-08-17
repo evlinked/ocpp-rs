@@ -143,27 +143,27 @@
 use ocpp_types::common::Reason;
 use ocpp_types::v16j::ResetType;
 use ocpp_types::v201::{
-    CancelReservationStatusEnumType, ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType,
-    ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
-    ChargingProfileType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
-    ClearChargingProfileType, ClearMessageStatusEnumType, DisplayMessageStatusEnumType,
-    GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetChargingProfileStatusEnumType,
-    GetDisplayMessagesStatusEnumType, InstallCertificateStatusEnumType, MessageInfoType,
-    MessagePriorityEnumType, MessageStateEnumType, MessageTriggerEnumType,
-    OperationalStatusEnumType, RequestStartStopStatusEnumType, ReserveNowStatusEnumType,
-    ResetEnumType, ResetStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
-    UnlockStatusEnumType,
+    CancelReservationStatusEnumType, CertificateSignedStatusEnumType,
+    ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType, ChargingProfileCriterionType,
+    ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
+    ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType, ClearChargingProfileType,
+    ClearMessageStatusEnumType, DisplayMessageStatusEnumType, GenericDeviceModelStatusEnumType,
+    GenericStatusEnumType, GetChargingProfileStatusEnumType, GetDisplayMessagesStatusEnumType,
+    InstallCertificateStatusEnumType, MessageInfoType, MessagePriorityEnumType,
+    MessageStateEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
+    RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType,
+    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 
 use ocpp_messages::v201::{
-    CancelReservationResponse, ChangeAvailabilityResponse, ClearCacheResponse,
-    ClearChargingProfileResponse, ClearDisplayMessageResponse, CostUpdatedResponse,
-    GetChargingProfilesResponse, GetDisplayMessagesResponse, GetMonitoringReportResponse,
-    GetTransactionStatusResponse, InstallCertificateResponse, NotifyDisplayMessagesRequest,
-    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
-    ReserveNowResponse, ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
-    SetMonitoringBaseResponse, SetMonitoringLevelResponse, TriggerMessageResponse,
-    UnlockConnectorResponse,
+    CancelReservationResponse, CertificateSignedResponse, ChangeAvailabilityResponse,
+    ClearCacheResponse, ClearChargingProfileResponse, ClearDisplayMessageResponse,
+    CostUpdatedResponse, GetChargingProfilesResponse, GetDisplayMessagesResponse,
+    GetMonitoringReportResponse, GetTransactionStatusResponse, InstallCertificateResponse,
+    NotifyDisplayMessagesRequest, ReportChargingProfilesRequest, RequestStartTransactionResponse,
+    RequestStopTransactionResponse, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
+    SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
+    TriggerMessageResponse, UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1734,6 +1734,82 @@ pub fn v201_install_certificate_response(
     status_info: Option<StatusInfoType>,
 ) -> InstallCertificateResponse {
     InstallCertificateResponse {
+        status,
+        status_info,
+        custom_data: None,
+    }
+}
+
+/// Decide whether the station accepts or refuses the signed certificate chain a
+/// `CertificateSigned` delivered (OCPP 2.0.1 Part 2, A02).
+///
+/// Ports the accept/reject decision behind
+/// [`ocpp.v201.call_result.CertificateSigned`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call_result.py)'s
+/// [`CertificateSignedStatusEnumType`]. `CertificateSigned` is the delivery
+/// terminus of the certificate-*provisioning* flow: after the station submits a
+/// CSR via `SignCertificate`, the CSMS pushes the CA-signed chain here and the
+/// station installs it and answers `Accepted`, or refuses a malformed / unusable
+/// chain with `Rejected`.
+///
+/// The simulator models the *protocol* decision, not a PKI, so this is a
+/// deliberately lightweight predicate on the PEM string — **no X.509 parse, no
+/// signature/chain verification** (the same documented "no PKI" boundary
+/// [`v201_install_certificate_status`] sets; a real validation seam is a natural
+/// follow-up). `certificate_chain` is untrusted CSMS input, so it is treated as
+/// an opaque, bounded string and is only ever inspected, never parsed or
+/// unwrapped — no wire value (empty, garbage, very long, control chars) can
+/// panic.
+///
+/// Unlike `InstallCertificate`'s three-value enum, `CertificateSignedStatusEnumType`
+/// is binary (`Accepted` / `Rejected`), so the "recognized but unusable" arm
+/// `InstallCertificate` reports as `Failed` collapses into `Rejected` here:
+///
+/// - **`Rejected`** — the chain is empty / whitespace-only, is not PEM-armored at
+///   all (missing the `-----BEGIN … -----` / `-----END … -----` markers), or is
+///   PEM-armored yet carries no key material between the markers. There is
+///   nothing usable to install.
+/// - **`Accepted`** — a PEM-armored chain with a non-empty body; the station
+///   installs it.
+#[must_use]
+pub fn v201_certificate_signed_status(certificate_chain: &str) -> CertificateSignedStatusEnumType {
+    let trimmed = certificate_chain.trim();
+
+    // Nothing to install, or not a PEM chain at all → refuse.
+    if trimmed.is_empty() || !trimmed.contains("-----BEGIN") || !trimmed.contains("-----END") {
+        return CertificateSignedStatusEnumType::Rejected;
+    }
+
+    // PEM-armored, but is there any body between the markers? The armor lines
+    // (`-----BEGIN … -----`, `-----END … -----`) are stripped; whatever remains,
+    // minus whitespace, is the base64 body.
+    let has_body = trimmed
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("-----"))
+        .any(|line| !line.is_empty());
+
+    if has_body {
+        CertificateSignedStatusEnumType::Accepted
+    } else {
+        CertificateSignedStatusEnumType::Rejected
+    }
+}
+
+/// Build a schema-valid `CertificateSigned.conf` ([`CertificateSignedResponse`]).
+///
+/// Pure constructor mirroring [`v201_install_certificate_response`]: carries the
+/// decided [`status`](CertificateSignedStatusEnumType) plus the optional 2.0.1
+/// `statusInfo` — a vendor-agnostic `reasonCode` and human-readable detail the
+/// handler attaches to a `Rejected` outcome (why the chain was refused). An
+/// `Accepted` carries no `statusInfo`.
+///
+/// Ports `ocpp.v201.call_result.CertificateSigned`.
+#[must_use]
+pub fn v201_certificate_signed_response(
+    status: CertificateSignedStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> CertificateSignedResponse {
+    CertificateSignedResponse {
         status,
         status_info,
         custom_data: None,
@@ -4214,6 +4290,109 @@ mod tests {
             validator
                 .validate_call_result("InstallCertificate", &serde_json::to_value(&resp).unwrap())
                 .expect("built InstallCertificate response is schema-valid");
+        }
+    }
+
+    // --- CertificateSigned (v201) decision + response builder (Issue #516) ---
+
+    /// A minimal but structurally-valid signed chain, armor + one body line.
+    const SAMPLE_SIGNED_CHAIN: &str =
+        "-----BEGIN CERTIFICATE-----\nMIIBkTCB+w==\n-----END CERTIFICATE-----";
+
+    #[test]
+    fn certificate_signed_accepts_a_pem_shaped_chain() {
+        assert_eq!(
+            v201_certificate_signed_status(SAMPLE_SIGNED_CHAIN),
+            CertificateSignedStatusEnumType::Accepted
+        );
+        // Surrounding whitespace does not change the decision.
+        assert_eq!(
+            v201_certificate_signed_status(&format!("  \n{SAMPLE_SIGNED_CHAIN}\n  ")),
+            CertificateSignedStatusEnumType::Accepted
+        );
+        // A multi-certificate chain (leaf + sub-CA) is likewise accepted.
+        let chain = format!("{SAMPLE_SIGNED_CHAIN}\n{SAMPLE_SIGNED_CHAIN}");
+        assert_eq!(
+            v201_certificate_signed_status(&chain),
+            CertificateSignedStatusEnumType::Accepted
+        );
+    }
+
+    #[test]
+    fn certificate_signed_rejects_empty_blank_or_non_pem_input() {
+        // Nothing to install.
+        for empty in ["", "   ", "\n\t "] {
+            assert_eq!(
+                v201_certificate_signed_status(empty),
+                CertificateSignedStatusEnumType::Rejected,
+                "an empty/blank chain is refused"
+            );
+        }
+        // Non-empty but not PEM-armored at all → refused, never a panic.
+        for garbage in [
+            "not a certificate",
+            "-----BEGIN CERTIFICATE-----",
+            "MIIBkTCB+w==",
+        ] {
+            assert_eq!(
+                v201_certificate_signed_status(garbage),
+                CertificateSignedStatusEnumType::Rejected,
+                "a non-PEM-armored string is refused: {garbage:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn certificate_signed_rejects_a_pem_armored_but_empty_body() {
+        // Both markers present but no key material between them — the "recognized
+        // but unusable" case that `InstallCertificate` reports as `Failed`
+        // collapses into `Rejected` for `CertificateSigned`'s binary enum.
+        let empty_body = "-----BEGIN CERTIFICATE-----\n\n-----END CERTIFICATE-----";
+        assert_eq!(
+            v201_certificate_signed_status(empty_body),
+            CertificateSignedStatusEnumType::Rejected
+        );
+        let blank_body = "-----BEGIN CERTIFICATE-----\n   \n-----END CERTIFICATE-----";
+        assert_eq!(
+            v201_certificate_signed_status(blank_body),
+            CertificateSignedStatusEnumType::Rejected
+        );
+    }
+
+    #[test]
+    fn certificate_signed_does_not_panic_on_hostile_input() {
+        // Very long and control-char-laden strings are inspected, never parsed.
+        let long = "-".repeat(100_000);
+        let _ = v201_certificate_signed_status(&long);
+        let _ = v201_certificate_signed_status("\0\u{1}\u{2}-----BEGIN-----\u{7f}");
+        // A body made only of armor lines has no key material.
+        let all_armor = "-----BEGIN CERTIFICATE-----\n-----X-----\n-----END CERTIFICATE-----";
+        assert_eq!(
+            v201_certificate_signed_status(all_armor),
+            CertificateSignedStatusEnumType::Rejected
+        );
+    }
+
+    #[test]
+    fn built_certificate_signed_responses_are_schema_valid() {
+        // Both wire statuses, with and without a statusInfo, satisfy the bundled
+        // OCPP 2.0.1 CertificateSigned response JSON Schema.
+        let validator = SchemaValidator::v201();
+        for status in [
+            CertificateSignedStatusEnumType::Accepted,
+            CertificateSignedStatusEnumType::Rejected,
+        ] {
+            let info = matches!(status, CertificateSignedStatusEnumType::Rejected).then(|| {
+                StatusInfoType {
+                    reason_code: "InvalidChain".to_string(),
+                    additional_info: Some("simulated".to_string()),
+                    custom_data: None,
+                }
+            });
+            let resp = v201_certificate_signed_response(status, info);
+            validator
+                .validate_call_result("CertificateSigned", &serde_json::to_value(&resp).unwrap())
+                .expect("built CertificateSigned response is schema-valid");
         }
     }
 }
