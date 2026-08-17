@@ -100,6 +100,7 @@ use ocpp_messages::v201::{
     GetCompositeScheduleRequest as V201GetCompositeScheduleRequest,
     GetCompositeScheduleResponse as V201GetCompositeScheduleResponse,
     GetDisplayMessagesRequest as V201GetDisplayMessagesRequest,
+    GetInstalledCertificateIdsRequest as V201GetInstalledCertificateIdsRequest,
     GetLocalListVersionRequest as V201GetLocalListVersionRequest,
     GetLocalListVersionResponse as V201GetLocalListVersionResponse,
     GetMonitoringReportRequest as V201GetMonitoringReportRequest,
@@ -1915,6 +1916,50 @@ impl ChargePoint {
                     Ok(v201_command::v201_install_certificate_response(
                         status,
                         status_info,
+                    ))
+                }
+            });
+        }
+
+        // GetInstalledCertificateIds (OCPP 2.0.1 only) — the CSMS asks the station
+        // to enumerate the trust anchors it currently holds (Part 2, A02 / M03–M05,
+        // Issue #521). The **read** side of the certificate-*management* family
+        // (`InstallCertificate` writes, this reads, `DeleteCertificate` removes),
+        // over the same `V201CertificateStore` the `InstallCertificate` handler
+        // populates. Registered only on the V201 arm — 1.6 has no per-use trust
+        // model here.
+        //
+        // A pure read-and-answer: unlike `GetDisplayMessages` (whose matches stream
+        // back asynchronously as `NotifyDisplayMessages`), the hash chain rides on
+        // the `GetInstalledCertificateIds.conf` itself, so this snapshots the store,
+        // resolves the optional `certificateType` filter against it
+        // (`v201_command::v201_get_installed_certificate_ids_matches`), and answers
+        // directly — no queued command, no store mutation. `Accepted` with a chain
+        // when ≥1 anchor matched, `NotFound` with no chain otherwise.
+        //
+        // The reported per-anchor `CertificateHashDataType` is a deterministic
+        // placeholder derived from `(use, PEM)` (`v201_certificate_hash_data`) — the
+        // simulator does no X.509 parse (the "no PKI" boundary Issue #518 set) — and
+        // is the shared hash model a future `DeleteCertificate` (#522) reuses so an
+        // enumerated hash round-trips to a delete of the same anchor.
+        //
+        // Trust boundary: `certificateType` is an `Option<Vec<_>>` of a closed enum
+        // (an unknown wire value fails deserialization → CALLERROR before the
+        // handler); a filter naming a category the store cannot hold simply matches
+        // nothing. Ports `ocpp.v201.call.GetInstalledCertificateIds` →
+        // `ocpp.v201.call_result.GetInstalledCertificateIds`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let certificates = v201_certificates.clone();
+            d.on(move |req: V201GetInstalledCertificateIdsRequest| {
+                let certificates = certificates.clone();
+                async move {
+                    let snapshot = certificates.snapshot().await;
+                    let chain = v201_command::v201_get_installed_certificate_ids_matches(
+                        req.certificate_type.as_deref(),
+                        &snapshot,
+                    );
+                    Ok(v201_command::v201_get_installed_certificate_ids_response(
+                        chain,
                     ))
                 }
             });
@@ -9266,6 +9311,23 @@ mod tests {
         }
     }
 
+    // --- OCPP 2.0.1 GetInstalledCertificateIds (M7, issue #521) ------------
+    // A `for_version(V201)` CP enumerates its `V201CertificateStore` synchronously
+    // — the hash chain rides on the CALLRESULT (no async stream). These exercise
+    // the wired V201 arm end-to-end over `handle_message`: enumerate-all, filtered,
+    // empty-store `NotFound`, filter-matches-nothing, hostile/duplicate filters,
+    // V201-only registration, and the shared-hash round-trip readiness #522 relies
+    // on.
+
+    fn make_v201_get_installed_certificate_ids(
+        certificate_type: Option<Vec<ocpp_types::v201::GetCertificateIdUseEnumType>>,
+    ) -> CallMessage {
+        make_call(V201GetInstalledCertificateIdsRequest {
+            certificate_type,
+            custom_data: None,
+        })
+    }
+
     // --- OCPP 2.0.1 CertificateSigned (M7, issue #516) ---------------------
     // A `for_version(V201)` CP receives a CA-signed certificate chain and answers
     // accept/reject synchronously — a stateless responder, no store, nothing
@@ -9288,6 +9350,25 @@ mod tests {
         })
     }
 
+    /// Install `SAMPLE_INSTALL_PEM` under `use_` on `cp` (asserting it is accepted),
+    /// so the enumerate tests have known anchors to read back.
+    async fn install_anchor(cp: &ChargePoint, use_: InstallCertificateUseEnumType) {
+        let resp = cp
+            .handle_message(Message::Call(make_v201_install_certificate(
+                use_,
+                SAMPLE_INSTALL_PEM,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::InstallCertificateResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, InstallCertificateStatusEnumType::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
     /// Read the `CertificateSigned.conf` out of a `handle_message` reply,
     /// asserting the reply is a CALLRESULT.
     async fn certificate_signed_response(
@@ -9306,6 +9387,51 @@ mod tests {
             Message::CallResult(r) => r.payload_as().unwrap(),
             other => panic!("expected CallResult, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn v201_get_installed_certificate_ids_enumerates_all() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        install_anchor(&cp, InstallCertificateUseEnumType::CSMSRootCertificate).await;
+        install_anchor(&cp, InstallCertificateUseEnumType::V2GRootCertificate).await;
+
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_installed_certificate_ids(None)))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::GetInstalledCertificateIdsResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    ocpp_types::v201::GetInstalledCertificateStatusEnumType::Accepted
+                );
+                let chain = body
+                    .certificate_hash_data_chain
+                    .expect("Accepted carries a chain");
+                assert_eq!(chain.len(), 2, "both installed anchors are enumerated");
+                // The reported hash is the shared seam's hash for (use, PEM), so it
+                // round-trips to a future DeleteCertificate (#522).
+                let csms = chain
+                    .iter()
+                    .find(|e| {
+                        e.certificate_type
+                            == ocpp_types::v201::GetCertificateIdUseEnumType::CSMSRootCertificate
+                    })
+                    .expect("the CSMS anchor is reported");
+                assert_eq!(
+                    csms.certificate_hash_data,
+                    v201_command::v201_certificate_hash_data(
+                        InstallCertificateUseEnumType::CSMSRootCertificate,
+                        SAMPLE_INSTALL_PEM,
+                    )
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        // A pure read queues no side-effect command.
+        assert!(v201_drain_commands(&cp).await.is_empty());
     }
 
     #[tokio::test]
@@ -9369,6 +9495,111 @@ mod tests {
             );
         }
         assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_get_installed_certificate_ids_applies_the_filter() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        install_anchor(&cp, InstallCertificateUseEnumType::CSMSRootCertificate).await;
+        install_anchor(&cp, InstallCertificateUseEnumType::V2GRootCertificate).await;
+
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_installed_certificate_ids(
+                Some(vec![
+                    ocpp_types::v201::GetCertificateIdUseEnumType::V2GRootCertificate,
+                ]),
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::GetInstalledCertificateIdsResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    ocpp_types::v201::GetInstalledCertificateStatusEnumType::Accepted
+                );
+                let chain = body.certificate_hash_data_chain.expect("a match → a chain");
+                assert_eq!(chain.len(), 1);
+                assert_eq!(
+                    chain[0].certificate_type,
+                    ocpp_types::v201::GetCertificateIdUseEnumType::V2GRootCertificate
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_get_installed_certificate_ids_empty_store_is_not_found() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_installed_certificate_ids(None)))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::GetInstalledCertificateIdsResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    ocpp_types::v201::GetInstalledCertificateStatusEnumType::NotFound
+                );
+                assert!(
+                    body.certificate_hash_data_chain.is_none(),
+                    "NotFound carries no chain"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_get_installed_certificate_ids_filter_matching_nothing_is_not_found() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        install_anchor(&cp, InstallCertificateUseEnumType::CSMSRootCertificate).await;
+
+        // A store the CSMS root is installed in, queried for anchors it does not
+        // hold: a different root, plus V2GCertificateChain (never a store key) and a
+        // duplicated value — no panic, and NotFound.
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_installed_certificate_ids(
+                Some(vec![
+                    ocpp_types::v201::GetCertificateIdUseEnumType::ManufacturerRootCertificate,
+                    ocpp_types::v201::GetCertificateIdUseEnumType::V2GCertificateChain,
+                    ocpp_types::v201::GetCertificateIdUseEnumType::V2GCertificateChain,
+                ]),
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::GetInstalledCertificateIdsResponse =
+                    r.payload_as().unwrap();
+                assert_eq!(
+                    body.status,
+                    ocpp_types::v201::GetInstalledCertificateStatusEnumType::NotFound
+                );
+                assert!(body.certificate_hash_data_chain.is_none());
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_get_installed_certificate_ids_is_v201_only() {
+        // A 1.6J CP has no GetInstalledCertificateIds handler (no per-use trust
+        // model), so the v201-only action is unrouted → CallError, never a
+        // CallResult.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V16J)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_installed_certificate_ids(None)))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Some(Message::CallError(_))),
+            "a 1.6J CP does not answer GetInstalledCertificateIds with a CallResult, got: {resp:?}"
+        );
     }
 
     #[tokio::test]

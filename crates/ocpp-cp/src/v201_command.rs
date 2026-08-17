@@ -143,27 +143,30 @@
 use ocpp_types::common::Reason;
 use ocpp_types::v16j::ResetType;
 use ocpp_types::v201::{
-    CancelReservationStatusEnumType, CertificateSignedStatusEnumType,
-    ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType, ChargingProfileCriterionType,
-    ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
-    ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType, ClearChargingProfileType,
-    ClearMessageStatusEnumType, DisplayMessageStatusEnumType, GenericDeviceModelStatusEnumType,
-    GenericStatusEnumType, GetChargingProfileStatusEnumType, GetDisplayMessagesStatusEnumType,
-    InstallCertificateStatusEnumType, MessageInfoType, MessagePriorityEnumType,
-    MessageStateEnumType, MessageTriggerEnumType, OperationalStatusEnumType,
-    RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType,
-    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    CancelReservationStatusEnumType, CertificateHashDataChainType, CertificateHashDataType,
+    CertificateSignedStatusEnumType, ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType,
+    ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
+    ChargingProfileType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
+    ClearChargingProfileType, ClearMessageStatusEnumType, DisplayMessageStatusEnumType,
+    GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetCertificateIdUseEnumType,
+    GetChargingProfileStatusEnumType, GetDisplayMessagesStatusEnumType,
+    GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType, InstallCertificateStatusEnumType,
+    InstallCertificateUseEnumType, MessageInfoType, MessagePriorityEnumType, MessageStateEnumType,
+    MessageTriggerEnumType, OperationalStatusEnumType, RequestStartStopStatusEnumType,
+    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 
 use ocpp_messages::v201::{
     CancelReservationResponse, CertificateSignedResponse, ChangeAvailabilityResponse,
     ClearCacheResponse, ClearChargingProfileResponse, ClearDisplayMessageResponse,
     CostUpdatedResponse, GetChargingProfilesResponse, GetDisplayMessagesResponse,
-    GetMonitoringReportResponse, GetTransactionStatusResponse, InstallCertificateResponse,
-    NotifyDisplayMessagesRequest, ReportChargingProfilesRequest, RequestStartTransactionResponse,
-    RequestStopTransactionResponse, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
-    SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
-    TriggerMessageResponse, UnlockConnectorResponse,
+    GetInstalledCertificateIdsResponse, GetMonitoringReportResponse, GetTransactionStatusResponse,
+    InstallCertificateResponse, NotifyDisplayMessagesRequest, ReportChargingProfilesRequest,
+    RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
+    ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
+    SetMonitoringBaseResponse, SetMonitoringLevelResponse, TriggerMessageResponse,
+    UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1740,6 +1743,61 @@ pub fn v201_install_certificate_response(
     }
 }
 
+/// A small stable 64-bit digest of `input`, rendered as 16 lowercase hex chars.
+///
+/// FNV-1a — deterministic across runs and platforms (unlike the standard
+/// library's `DefaultHasher`, whose output is unspecified), which is the whole
+/// point: it lets the certificate-hash placeholders round-trip
+/// `GetInstalledCertificateIds` → `DeleteCertificate` within a run. It is a
+/// content digest for *identification*, **not** a cryptographic hash — the
+/// simulator does no X.509 parse (the "no PKI" boundary Issue #518 set), so this
+/// stands in for a genuine certificate-hash derivation. 16 hex chars fits every
+/// `CertificateHashDataType` field bound (`serialNumber` ≤ 40, the two issuer
+/// hashes ≤ 128).
+fn stable_hash_hex(input: &str) -> String {
+    const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut hash = FNV_OFFSET;
+    for byte in input.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    format!("{hash:016x}")
+}
+
+/// Derive the placeholder [`CertificateHashDataType`] that identifies the anchor
+/// installed under `use_` with PEM `pem`.
+///
+/// The **shared hash seam** of the certificate-management read/remove pair: the
+/// hash `GetInstalledCertificateIds` reports for an anchor is exactly the hash a
+/// later `DeleteCertificate` names to remove that same anchor, so this one
+/// function is the single source of truth both go through (Issue #522 reuses it
+/// to resolve a requested hash back to its `use_`). Because the derivation is a
+/// pure, deterministic function of `(use_, pem)`, a hash returned by an enumerate
+/// round-trips to a delete of the same anchor for as long as that anchor holds
+/// that PEM; rotating the anchor (a re-install under the same use with different
+/// PEM) changes its hash, exactly as a real certificate hash would.
+///
+/// The simulator does **no** X.509 parse, so the three hash fields are stable
+/// digests of salted `(use_, pem)` inputs rather than genuine issuer-name /
+/// issuer-key / serial hashes; [`hash_algorithm`](CertificateHashDataType::hash_algorithm)
+/// is reported as `SHA256` as a placeholder. This is a documented boundary — a
+/// real derivation is a natural follow-up behind an X.509 feature.
+#[must_use]
+pub fn v201_certificate_hash_data(
+    use_: InstallCertificateUseEnumType,
+    pem: &str,
+) -> CertificateHashDataType {
+    let use_tag = format!("{use_:?}");
+    CertificateHashDataType {
+        hash_algorithm: HashAlgorithmEnumType::Sha256,
+        issuer_name_hash: stable_hash_hex(&format!("issuer-name|{use_tag}|{pem}")),
+        issuer_key_hash: stable_hash_hex(&format!("issuer-key|{use_tag}|{pem}")),
+        serial_number: stable_hash_hex(&format!("serial|{use_tag}|{pem}")),
+        custom_data: None,
+    }
+}
+
 /// Decide whether the station accepts or refuses the signed certificate chain a
 /// `CertificateSigned` delivered (OCPP 2.0.1 Part 2, A02).
 ///
@@ -1813,6 +1871,127 @@ pub fn v201_certificate_signed_response(
         status,
         status_info,
         custom_data: None,
+    }
+}
+
+/// Map an [`InstallCertificateUseEnumType`] (what the store keys by) to the
+/// [`GetCertificateIdUseEnumType`] (`GetInstalledCertificateIds` reports and
+/// filters by).
+///
+/// `GetCertificateIdUseEnumType` is a superset of `InstallCertificateUseEnumType`
+/// — it adds `V2GCertificateChain`, which names the station's installed V2G *leaf*
+/// chain rather than a trust-anchor root. The store only ever holds the four
+/// roots, so this mapping is total and never produces `V2GCertificateChain`; a
+/// filter that names it simply matches nothing installed.
+fn get_use_of_install_use(use_: InstallCertificateUseEnumType) -> GetCertificateIdUseEnumType {
+    match use_ {
+        InstallCertificateUseEnumType::V2GRootCertificate => {
+            GetCertificateIdUseEnumType::V2GRootCertificate
+        }
+        InstallCertificateUseEnumType::MORootCertificate => {
+            GetCertificateIdUseEnumType::MORootCertificate
+        }
+        InstallCertificateUseEnumType::CSMSRootCertificate => {
+            GetCertificateIdUseEnumType::CSMSRootCertificate
+        }
+        InstallCertificateUseEnumType::ManufacturerRootCertificate => {
+            GetCertificateIdUseEnumType::ManufacturerRootCertificate
+        }
+    }
+}
+
+/// A stable ordering index over [`GetCertificateIdUseEnumType`], used only to make
+/// the reported chain deterministic (the store snapshot is an unordered `HashMap`
+/// walk). The exact order is arbitrary but fixed.
+fn get_use_order(use_: GetCertificateIdUseEnumType) -> u8 {
+    match use_ {
+        GetCertificateIdUseEnumType::V2GRootCertificate => 0,
+        GetCertificateIdUseEnumType::MORootCertificate => 1,
+        GetCertificateIdUseEnumType::CSMSRootCertificate => 2,
+        GetCertificateIdUseEnumType::V2GCertificateChain => 3,
+        GetCertificateIdUseEnumType::ManufacturerRootCertificate => 4,
+    }
+}
+
+/// Resolve which installed trust anchors a `GetInstalledCertificateIds` query
+/// enumerates, given its optional `certificate_type` filter and an owned
+/// `snapshot()` of the [`V201CertificateStore`](crate::v201_certificate_store::V201CertificateStore).
+///
+/// The **read** half of the certificate-management family (ports
+/// [`ocpp.v201.call.GetInstalledCertificateIds`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py)),
+/// mirroring [`v201_get_display_messages_matches`]. The filter is a set of
+/// [`GetCertificateIdUseEnumType`] categories:
+///
+/// - **absent (`None`)** — a wildcard: every installed anchor matches.
+/// - **present** — an anchor matches when its use is one of the listed categories.
+///   The schema guarantees a present list is non-empty (`minItems` 1). Duplicate
+///   entries are harmless (membership, not iteration), and a category the store
+///   cannot hold — notably `V2GCertificateChain`, or any root not installed —
+///   simply matches nothing.
+///
+/// Each matched anchor becomes one [`CertificateHashDataChainType`] carrying its
+/// [`certificate_type`](CertificateHashDataChainType::certificate_type) and the
+/// placeholder [`v201_certificate_hash_data`] for `(use, PEM)`; no child chain is
+/// synthesized (the simulator holds only the root PEM). The result is sorted by a
+/// fixed use order so the reported chain is deterministic regardless of the
+/// snapshot's `HashMap` walk order.
+///
+/// Pure over its inputs (the filter plus an owned snapshot), so it is
+/// unit-testable without a runtime or the store lock; taking the snapshot and
+/// answering is the wiring layer's job.
+#[must_use]
+pub fn v201_get_installed_certificate_ids_matches(
+    filter: Option<&[GetCertificateIdUseEnumType]>,
+    snapshot: &[(InstallCertificateUseEnumType, String)],
+) -> Vec<CertificateHashDataChainType> {
+    let mut chain: Vec<CertificateHashDataChainType> = snapshot
+        .iter()
+        .filter_map(|(use_, pem)| {
+            let get_use = get_use_of_install_use(*use_);
+            filter
+                .is_none_or(|types| types.contains(&get_use))
+                .then(|| CertificateHashDataChainType {
+                    certificate_type: get_use,
+                    certificate_hash_data: v201_certificate_hash_data(*use_, pem),
+                    child_certificate_hash_data: None,
+                    custom_data: None,
+                })
+        })
+        .collect();
+    chain.sort_by_key(|entry| get_use_order(entry.certificate_type));
+    chain
+}
+
+/// Build a schema-valid `GetInstalledCertificateIds.conf`
+/// ([`GetInstalledCertificateIdsResponse`]) from the matched `chain`.
+///
+/// Pure constructor: the station reports
+/// [`Accepted`](GetInstalledCertificateStatusEnumType::Accepted) with the matched
+/// hash chain when at least one installed anchor matched the query, or
+/// [`NotFound`](GetInstalledCertificateStatusEnumType::NotFound) with no chain
+/// when nothing matched (an empty store, or a filter naming nothing installed) —
+/// exactly the two-value contract `ocpp.v201.enums.GetInstalledCertificateStatusEnumType`
+/// defines. The `certificate_hash_data_chain` is left absent rather than an empty
+/// array on `NotFound`, satisfying the schema's `minItems: 1`-when-present rule.
+/// Ports `ocpp.v201.call_result.GetInstalledCertificateIds`.
+#[must_use]
+pub fn v201_get_installed_certificate_ids_response(
+    chain: Vec<CertificateHashDataChainType>,
+) -> GetInstalledCertificateIdsResponse {
+    if chain.is_empty() {
+        GetInstalledCertificateIdsResponse {
+            status: GetInstalledCertificateStatusEnumType::NotFound,
+            status_info: None,
+            certificate_hash_data_chain: None,
+            custom_data: None,
+        }
+    } else {
+        GetInstalledCertificateIdsResponse {
+            status: GetInstalledCertificateStatusEnumType::Accepted,
+            status_info: None,
+            certificate_hash_data_chain: Some(chain),
+            custom_data: None,
+        }
     }
 }
 
@@ -4293,6 +4472,84 @@ mod tests {
         }
     }
 
+    // --- GetInstalledCertificateIds (v201) decision + response builder (#521) ---
+
+    /// Two distinct installed anchors, as a `snapshot()` would present them.
+    fn two_anchors() -> Vec<(InstallCertificateUseEnumType, String)> {
+        vec![
+            (
+                InstallCertificateUseEnumType::CSMSRootCertificate,
+                "pem-csms".to_string(),
+            ),
+            (
+                InstallCertificateUseEnumType::V2GRootCertificate,
+                "pem-v2g".to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn certificate_hash_is_deterministic_and_distinct_per_anchor() {
+        // Same (use, PEM) → identical hash: the property #522's delete-by-hash
+        // round-trip relies on.
+        let a = v201_certificate_hash_data(InstallCertificateUseEnumType::CSMSRootCertificate, "p");
+        let b = v201_certificate_hash_data(InstallCertificateUseEnumType::CSMSRootCertificate, "p");
+        assert_eq!(a, b);
+
+        // A different use, or a different PEM (a rotation), changes the hash.
+        let other_use =
+            v201_certificate_hash_data(InstallCertificateUseEnumType::V2GRootCertificate, "p");
+        let other_pem =
+            v201_certificate_hash_data(InstallCertificateUseEnumType::CSMSRootCertificate, "q");
+        assert_ne!(a, other_use, "distinct uses hash distinctly");
+        assert_ne!(a, other_pem, "a rotation changes the hash");
+
+        // The three hash fields are independently salted, so they differ from one
+        // another, and every field satisfies its schema length bound.
+        assert_ne!(a.issuer_name_hash, a.issuer_key_hash);
+        assert_ne!(a.issuer_name_hash, a.serial_number);
+        assert!(a.issuer_name_hash.len() <= 128 && a.issuer_key_hash.len() <= 128);
+        assert!(a.serial_number.len() <= 40);
+        assert_eq!(a.hash_algorithm, HashAlgorithmEnumType::Sha256);
+    }
+
+    #[test]
+    fn get_installed_certificate_ids_enumerates_all_with_no_filter() {
+        let snapshot = two_anchors();
+        let chain = v201_get_installed_certificate_ids_matches(None, &snapshot);
+        assert_eq!(chain.len(), 2, "a wildcard query returns every anchor");
+        // Deterministically ordered by the fixed use order (V2G before CSMS).
+        assert_eq!(
+            chain[0].certificate_type,
+            GetCertificateIdUseEnumType::V2GRootCertificate
+        );
+        assert_eq!(
+            chain[1].certificate_type,
+            GetCertificateIdUseEnumType::CSMSRootCertificate
+        );
+        // Each entry carries the placeholder hash for its (use, PEM); no child chain.
+        assert_eq!(
+            chain[1].certificate_hash_data,
+            v201_certificate_hash_data(
+                InstallCertificateUseEnumType::CSMSRootCertificate,
+                "pem-csms"
+            )
+        );
+        assert!(chain[0].child_certificate_hash_data.is_none());
+    }
+
+    #[test]
+    fn get_installed_certificate_ids_applies_the_filter() {
+        let snapshot = two_anchors();
+        let filter = [GetCertificateIdUseEnumType::CSMSRootCertificate];
+        let chain = v201_get_installed_certificate_ids_matches(Some(&filter), &snapshot);
+        assert_eq!(chain.len(), 1, "only the named use is returned");
+        assert_eq!(
+            chain[0].certificate_type,
+            GetCertificateIdUseEnumType::CSMSRootCertificate
+        );
+    }
+
     // --- CertificateSigned (v201) decision + response builder (Issue #516) ---
 
     /// A minimal but structurally-valid signed chain, armor + one body line.
@@ -4319,6 +4576,22 @@ mod tests {
     }
 
     #[test]
+    fn get_installed_certificate_ids_filter_matching_nothing_is_empty() {
+        let snapshot = two_anchors();
+        // A root that is not installed, and V2GCertificateChain which the store can
+        // never hold — both match nothing.
+        for filter in [
+            vec![GetCertificateIdUseEnumType::ManufacturerRootCertificate],
+            vec![GetCertificateIdUseEnumType::V2GCertificateChain],
+        ] {
+            assert!(
+                v201_get_installed_certificate_ids_matches(Some(&filter), &snapshot).is_empty(),
+                "a filter naming nothing installed matches nothing: {filter:?}"
+            );
+        }
+    }
+
+    #[test]
     fn certificate_signed_rejects_empty_blank_or_non_pem_input() {
         // Nothing to install.
         for empty in ["", "   ", "\n\t "] {
@@ -4339,6 +4612,67 @@ mod tests {
                 CertificateSignedStatusEnumType::Rejected,
                 "a non-PEM-armored string is refused: {garbage:?}"
             );
+        }
+    }
+
+    #[test]
+    fn get_installed_certificate_ids_tolerates_duplicate_and_extreme_filters() {
+        let snapshot = two_anchors();
+        // Duplicate entries are membership, not iteration — no duplicate output, no
+        // panic.
+        let dup = [
+            GetCertificateIdUseEnumType::V2GRootCertificate,
+            GetCertificateIdUseEnumType::V2GRootCertificate,
+        ];
+        let chain = v201_get_installed_certificate_ids_matches(Some(&dup), &snapshot);
+        assert_eq!(chain.len(), 1, "a duplicated filter value yields one entry");
+
+        // All five categories at once returns exactly the two installed anchors.
+        let all = [
+            GetCertificateIdUseEnumType::V2GRootCertificate,
+            GetCertificateIdUseEnumType::MORootCertificate,
+            GetCertificateIdUseEnumType::CSMSRootCertificate,
+            GetCertificateIdUseEnumType::V2GCertificateChain,
+            GetCertificateIdUseEnumType::ManufacturerRootCertificate,
+        ];
+        assert_eq!(
+            v201_get_installed_certificate_ids_matches(Some(&all), &snapshot).len(),
+            2
+        );
+
+        // An empty store snapshots to an empty chain regardless of filter.
+        assert!(v201_get_installed_certificate_ids_matches(None, &[]).is_empty());
+    }
+
+    #[test]
+    fn get_installed_certificate_ids_response_maps_chain_to_status() {
+        // A non-empty chain → Accepted, carrying the chain.
+        let chain = v201_get_installed_certificate_ids_matches(None, &two_anchors());
+        let resp = v201_get_installed_certificate_ids_response(chain);
+        assert_eq!(resp.status, GetInstalledCertificateStatusEnumType::Accepted);
+        assert_eq!(resp.certificate_hash_data_chain.map(|c| c.len()), Some(2));
+
+        // An empty chain → NotFound, with no chain (absent, not an empty array).
+        let resp = v201_get_installed_certificate_ids_response(vec![]);
+        assert_eq!(resp.status, GetInstalledCertificateStatusEnumType::NotFound);
+        assert!(resp.certificate_hash_data_chain.is_none());
+    }
+
+    #[test]
+    fn built_get_installed_certificate_ids_responses_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        // Accepted-with-chain and NotFound-without both serialize schema-valid.
+        let accepted = v201_get_installed_certificate_ids_response(
+            v201_get_installed_certificate_ids_matches(None, &two_anchors()),
+        );
+        let not_found = v201_get_installed_certificate_ids_response(vec![]);
+        for resp in [accepted, not_found] {
+            validator
+                .validate_call_result(
+                    "GetInstalledCertificateIds",
+                    &serde_json::to_value(&resp).unwrap(),
+                )
+                .expect("built GetInstalledCertificateIds response is schema-valid");
         }
     }
 
