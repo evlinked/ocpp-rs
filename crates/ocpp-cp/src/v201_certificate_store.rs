@@ -99,6 +99,26 @@ impl V201CertificateStore {
         self.by_use.write().await.remove(&use_)
     }
 
+    /// A cloned snapshot of every installed anchor as `(use, PEM)` pairs.
+    ///
+    /// The read `GetInstalledCertificateIds` needs: its optional `certificate_type`
+    /// filter is resolved against the store's current contents by a pure decision
+    /// ([`v201_get_installed_certificate_ids_matches`](crate::v201_command::v201_get_installed_certificate_ids_matches)).
+    /// Returning an owned snapshot lets that matching — and the placeholder
+    /// certificate-hash derivation — run without holding the store lock, exactly as
+    /// [`V201DisplayMessageStore::snapshot`](crate::v201_display_message::V201DisplayMessageStore::snapshot)
+    /// does for `GetDisplayMessages`. The order is unspecified (a `HashMap` walk);
+    /// callers key off the [`InstallCertificateUseEnumType`], never position, and
+    /// sort the result themselves when a deterministic order matters.
+    pub async fn snapshot(&self) -> Vec<(InstallCertificateUseEnumType, String)> {
+        self.by_use
+            .read()
+            .await
+            .iter()
+            .map(|(use_, pem)| (*use_, pem.clone()))
+            .collect()
+    }
+
     /// How many trust anchors currently hold a certificate. A cheap read used by
     /// tests and a future `GetInstalledCertificateIds` "how many installed" answer.
     pub async fn len(&self) -> usize {
@@ -196,5 +216,40 @@ mod tests {
             None,
             "removing an absent anchor is a no-op"
         );
+    }
+
+    #[tokio::test]
+    async fn snapshot_reflects_every_installed_anchor_by_use() {
+        let store = V201CertificateStore::new();
+        assert!(
+            store.snapshot().await.is_empty(),
+            "an empty store snapshots to nothing"
+        );
+
+        store.install(CSMS_ROOT, "pem-csms".to_string()).await;
+        store.install(V2G_ROOT, "pem-v2g".to_string()).await;
+
+        // Sort the (unordered) HashMap walk into a deterministic order for the
+        // assertion; the store makes no ordering promise.
+        let mut snap = store.snapshot().await;
+        snap.sort_by_key(|(use_, _)| format!("{use_:?}"));
+        assert_eq!(
+            snap,
+            vec![
+                (CSMS_ROOT, "pem-csms".to_string()),
+                (V2G_ROOT, "pem-v2g".to_string()),
+            ]
+        );
+
+        // The snapshot is a detached clone: mutating the store afterward does not
+        // change an already-taken snapshot.
+        let taken = store.snapshot().await;
+        store.remove(CSMS_ROOT).await;
+        assert_eq!(
+            taken.len(),
+            2,
+            "a taken snapshot is independent of the store"
+        );
+        assert_eq!(store.snapshot().await.len(), 1);
     }
 }
