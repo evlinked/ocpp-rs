@@ -89,6 +89,7 @@ use ocpp_messages::v201::{
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
     ClearCacheRequest as V201ClearCacheRequest, ClearCacheResponse as V201ClearCacheResponse,
     ClearChargingProfileRequest as V201ClearChargingProfileRequest,
+    ClearDisplayMessageRequest as V201ClearDisplayMessageRequest,
     ClearVariableMonitoringRequest as V201ClearVariableMonitoringRequest,
     ClearVariableMonitoringResponse as V201ClearVariableMonitoringResponse,
     CostUpdatedRequest as V201CostUpdatedRequest, DataTransferRequest as V201DataTransferRequest,
@@ -2317,6 +2318,43 @@ impl ChargePoint {
                         );
                     }
                     Ok(v201_command::v201_get_display_messages_response(matched))
+                }
+            });
+        }
+
+        // ClearDisplayMessage (OCPP 2.0.1 only) — the teardown half of the display-
+        // message family (#509), alongside SetDisplayMessage (#505) and
+        // GetDisplayMessages (#508). A CSMS removes one previously-installed message
+        // by its `id`. Unlike GetDisplayMessages, this is a pure remove-and-answer
+        // with a single side effect and no queued command — the display-message
+        // analogue of ClearVariableMonitoring's remove-by-id.
+        //
+        // `remove(req.id)` on the `v201_display_messages` store (under its write
+        // lock) returns the displaced message if the id was installed: `Some` →
+        // `Accepted` (found and removed), `None` → `Unknown` (no message with that
+        // id). The write is applied on the CALL path (cheap, and must be visible to
+        // the CALLRESULT); nothing is queued, so a re-clear of the same id is
+        // idempotent (`Unknown` the second time).
+        //
+        // Like `ClearChargingProfileStatusEnumType`, `ClearMessageStatusEnumType`
+        // has only `Accepted` / `Unknown` — there is no capability-failure variant
+        // to report, and no consumer to have gone away (nothing is queued), so the
+        // answer is decided entirely by whether the id matched.
+        //
+        // Trust boundary: `id` is a bare `i32`, never parsed or indexed — an
+        // unknown, negative, or `i32::MIN`/`MAX` id simply fails to match in the
+        // `HashMap` and answers `Unknown`, never a panic (the store's `remove`
+        // tolerance is tested in #505). Registered on the V201 arm only;
+        // "ClearDisplayMessage" has no 1.6J twin. Ports
+        // `ocpp.v201.call.ClearDisplayMessage` →
+        // `ocpp.v201.call_result.ClearDisplayMessage`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let v201_display_messages = v201_display_messages.clone();
+            d.on(move |req: V201ClearDisplayMessageRequest| {
+                let v201_display_messages = v201_display_messages.clone();
+                async move {
+                    let removed = v201_display_messages.remove(req.id).await.is_some();
+                    Ok(v201_command::v201_clear_display_message_response(removed))
                 }
             });
         }
@@ -9362,6 +9400,139 @@ mod tests {
             validator
                 .validate_call("GetDisplayMessages", &serde_json::to_value(&req).unwrap())
                 .expect("GetDisplayMessages request is schema-valid");
+        }
+    }
+
+    // --- OCPP 2.0.1 ClearDisplayMessage (M7, issue #509) -------------------
+    // A `for_version(V201)` CP removes one installed display message by id from
+    // the same `V201DisplayMessageStore` SetDisplayMessage populates, answering
+    // `Accepted` when the id was installed and removed, `Unknown` when it named
+    // nothing. Pure remove-and-answer — nothing is queued. These exercise the
+    // wired V201 arm end-to-end over `handle_message`.
+
+    fn make_v201_clear_display_message(id: i32) -> CallMessage {
+        make_call(V201ClearDisplayMessageRequest {
+            id,
+            custom_data: None,
+        })
+    }
+
+    /// Read the `ClearDisplayMessage.conf` status out of a `handle_message` reply,
+    /// asserting the reply is a CALLRESULT.
+    async fn clear_display_message_status(
+        cp: &ChargePoint,
+        id: i32,
+    ) -> ocpp_types::v201::ClearMessageStatusEnumType {
+        let resp = cp
+            .handle_message(Message::Call(make_v201_clear_display_message(id)))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::ClearDisplayMessageResponse =
+                    r.payload_as().unwrap();
+                body.status
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_clear_display_message_removes_an_installed_message() {
+        use ocpp_types::v201::ClearMessageStatusEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        install_v201_display_message(&cp, make_v201_display_message(7, None)).await;
+        install_v201_display_message(&cp, make_v201_display_message(8, None)).await;
+
+        // Clearing an installed id → Accepted.
+        assert_eq!(
+            clear_display_message_status(&cp, 7).await,
+            ClearMessageStatusEnumType::Accepted
+        );
+        // Removing the message is a pure side effect — nothing is queued (the
+        // single-shot `v201_drain_commands` may be called once per CP).
+        assert!(
+            v201_drain_commands(&cp).await.is_empty(),
+            "ClearDisplayMessage queues no command"
+        );
+
+        // The clear is scoped to exactly the requested id: id 7 is gone from the
+        // store, while its sibling id 8 is untouched. Read the store directly
+        // (non-destructively) rather than through a second GetDisplayMessages, so
+        // this assertion does not depend on the command channel the drain above
+        // already consumed.
+        assert!(
+            cp.installed_display_message(7).await.is_none(),
+            "the cleared id 7 no longer sees a message"
+        );
+        assert!(
+            cp.installed_display_message(8).await.is_some(),
+            "clearing id 7 must not touch id 8"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_clear_display_message_unknown_id_is_unknown_and_never_panics() {
+        use ocpp_types::v201::ClearMessageStatusEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        install_v201_display_message(&cp, make_v201_display_message(1, None)).await;
+
+        // An id naming nothing installed → Unknown, no panic — including the
+        // extreme wire ids a CSMS could send.
+        for id in [404, -1, i32::MIN, i32::MAX] {
+            assert_eq!(
+                clear_display_message_status(&cp, id).await,
+                ClearMessageStatusEnumType::Unknown,
+                "clearing an uninstalled id {id} answers Unknown"
+            );
+        }
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_clear_display_message_is_idempotent_on_re_clear() {
+        use ocpp_types::v201::ClearMessageStatusEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        install_v201_display_message(&cp, make_v201_display_message(5, None)).await;
+
+        // First clear removes it (Accepted); a second clear of the same id finds
+        // nothing (Unknown) — remove-and-answer is idempotent.
+        assert_eq!(
+            clear_display_message_status(&cp, 5).await,
+            ClearMessageStatusEnumType::Accepted
+        );
+        assert_eq!(
+            clear_display_message_status(&cp, 5).await,
+            ClearMessageStatusEnumType::Unknown,
+            "a re-clear of an already-removed id is Unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_clear_display_message_response_is_schema_valid() {
+        // The station's synchronous CALLRESULT for both an installed and an
+        // unknown id is OCPP 2.0.1 schema-valid over the wire.
+        let validator = SchemaValidator::v201();
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        install_v201_display_message(&cp, make_v201_display_message(3, None)).await;
+        for id in [3, 999] {
+            let resp = cp
+                .handle_message(Message::Call(make_v201_clear_display_message(id)))
+                .await
+                .unwrap();
+            match resp.unwrap() {
+                Message::CallResult(r) => {
+                    let body: ocpp_messages::v201::ClearDisplayMessageResponse =
+                        r.payload_as().unwrap();
+                    validator
+                        .validate_call_result(
+                            "ClearDisplayMessage",
+                            &serde_json::to_value(&body).unwrap(),
+                        )
+                        .expect("ClearDisplayMessage response is schema-valid");
+                }
+                other => panic!("expected CallResult, got: {other:?}"),
+            }
         }
     }
 
