@@ -86,6 +86,7 @@ use v201_tx_default_profile::V201TxDefaultProfileStore;
 // above (`StatusNotificationRequest`, `RegistrationStatus`).
 use ocpp_messages::v201::{
     CancelReservationRequest as V201CancelReservationRequest,
+    CertificateSignedRequest as V201CertificateSignedRequest,
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
     ClearCacheRequest as V201ClearCacheRequest, ClearCacheResponse as V201ClearCacheResponse,
     ClearChargingProfileRequest as V201ClearChargingProfileRequest,
@@ -129,15 +130,15 @@ use ocpp_messages::v201::{
     UnlockConnectorRequest as V201UnlockConnectorRequest,
 };
 use ocpp_types::v201::{
-    AttributeEnumType, AuthorizationStatusEnumType, ChangeAvailabilityStatusEnumType,
-    ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
-    ConnectorStatusEnumType, DisplayMessageStatusEnumType, GenericDeviceModelStatusEnumType,
-    GenericStatusEnumType, GetVariableResultType, IdTokenType as V201IdTokenType,
-    InstallCertificateStatusEnumType, InstallCertificateUseEnumType, MessageInfoType,
-    MessageTriggerEnumType, MonitoringDataType, OperationalStatusEnumType,
-    RegistrationStatusEnumType, ReportDataType, RequestStartStopStatusEnumType,
-    ReserveNowStatusEnumType, ResetStatusEnumType, SetVariableResultType, StatusInfoType,
-    TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    AttributeEnumType, AuthorizationStatusEnumType, CertificateSignedStatusEnumType,
+    ChangeAvailabilityStatusEnumType, ChargingProfilePurposeEnumType,
+    ChargingProfileStatusEnumType, ChargingProfileType, ConnectorStatusEnumType,
+    DisplayMessageStatusEnumType, GenericDeviceModelStatusEnumType, GenericStatusEnumType,
+    GetVariableResultType, IdTokenType as V201IdTokenType, InstallCertificateStatusEnumType,
+    InstallCertificateUseEnumType, MessageInfoType, MessageTriggerEnumType, MonitoringDataType,
+    OperationalStatusEnumType, RegistrationStatusEnumType, ReportDataType,
+    RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
+    SetVariableResultType, StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1961,6 +1962,54 @@ impl ChargePoint {
                         chain,
                     ))
                 }
+            });
+        }
+
+        // CertificateSigned (OCPP 2.0.1 only) — the CSMS delivers a CA-signed
+        // certificate chain to the station (Part 2, A02). The delivery terminus of
+        // the certificate-*provisioning* flow (`SignCertificate` → `CertificateSigned`
+        // — the station's *own* certificate), distinct from the certificate-
+        // *management* family (`InstallCertificate` / `DeleteCertificate` /
+        // `GetInstalledCertificateIds` — trust anchors). Registered only on the
+        // V201 arm — 1.6 has no such provisioning message here.
+        //
+        // A **stateless** pure decide-and-answer: no store side effect, no queued
+        // command. The decision (`v201_command::v201_certificate_signed_status`) is
+        // a lightweight predicate on the PEM string — **no X.509 parse** (the same
+        // documented simulator boundary as `InstallCertificate`): a PEM-armored
+        // chain with a non-empty body → `Accepted`; an empty / blank / non-PEM /
+        // empty-bodied chain → `Rejected` with a `statusInfo` reason. Unlike
+        // `InstallCertificate`'s three-value enum, `CertificateSignedStatusEnumType`
+        // is binary, so the "recognized but unusable" arm collapses into `Rejected`.
+        // A future station-certificate store could persist an accepted chain; for
+        // this slice a stateless responder is sufficient and keeps the diff small.
+        //
+        // Trust boundary: `certificate_chain` is attacker-influenced CSMS input,
+        // treated as an opaque bounded string — inspected, never parsed/unwrapped,
+        // so no wire value (empty, garbage, very long, control chars) can panic.
+        // `certificate_type` is a closed enum (`ChargingStationCertificate` /
+        // `V2GCertificate`, or absent) and does not change the decision; an unknown
+        // wire value fails deserialization → CALLERROR before the handler. Ports
+        // `ocpp.v201.call.CertificateSigned` →
+        // `ocpp.v201.call_result.CertificateSigned`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            d.on(move |req: V201CertificateSignedRequest| async move {
+                let status = v201_command::v201_certificate_signed_status(&req.certificate_chain);
+                let status_info = match status {
+                    CertificateSignedStatusEnumType::Accepted => None,
+                    CertificateSignedStatusEnumType::Rejected => Some(StatusInfoType {
+                        reason_code: "InvalidChain".to_string(),
+                        additional_info: Some(
+                            "certificate chain is empty or not a usable PEM-encoded certificate"
+                                .to_string(),
+                        ),
+                        custom_data: None,
+                    }),
+                };
+                Ok(v201_command::v201_certificate_signed_response(
+                    status,
+                    status_info,
+                ))
             });
         }
 
@@ -9279,6 +9328,28 @@ mod tests {
         })
     }
 
+    // --- OCPP 2.0.1 CertificateSigned (M7, issue #516) ---------------------
+    // A `for_version(V201)` CP receives a CA-signed certificate chain and answers
+    // accept/reject synchronously — a stateless responder, no store, nothing
+    // queued. These exercise the wired V201 arm end-to-end over `handle_message`:
+    // accept for each `certificateType` (and the absent case), the reject/hostile
+    // paths, and V201-only registration.
+
+    // A minimal but structurally-valid signed chain, armor + one body line.
+    const SAMPLE_SIGNED_PEM: &str =
+        "-----BEGIN CERTIFICATE-----\nMIIBkTCB+w==\n-----END CERTIFICATE-----";
+
+    fn make_v201_certificate_signed(
+        certificate_chain: &str,
+        certificate_type: Option<ocpp_types::v201::CertificateSigningUseEnumType>,
+    ) -> CallMessage {
+        make_call(V201CertificateSignedRequest {
+            certificate_chain: certificate_chain.to_string(),
+            certificate_type,
+            custom_data: None,
+        })
+    }
+
     /// Install `SAMPLE_INSTALL_PEM` under `use_` on `cp` (asserting it is accepted),
     /// so the enumerate tests have known anchors to read back.
     async fn install_anchor(cp: &ChargePoint, use_: InstallCertificateUseEnumType) {
@@ -9294,6 +9365,26 @@ mod tests {
                 let body: ocpp_messages::v201::InstallCertificateResponse = r.payload_as().unwrap();
                 assert_eq!(body.status, InstallCertificateStatusEnumType::Accepted);
             }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    /// Read the `CertificateSigned.conf` out of a `handle_message` reply,
+    /// asserting the reply is a CALLRESULT.
+    async fn certificate_signed_response(
+        cp: &ChargePoint,
+        certificate_chain: &str,
+        certificate_type: Option<ocpp_types::v201::CertificateSigningUseEnumType>,
+    ) -> ocpp_messages::v201::CertificateSignedResponse {
+        let resp = cp
+            .handle_message(Message::Call(make_v201_certificate_signed(
+                certificate_chain,
+                certificate_type,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => r.payload_as().unwrap(),
             other => panic!("expected CallResult, got: {other:?}"),
         }
     }
@@ -9340,6 +9431,69 @@ mod tests {
             other => panic!("expected CallResult, got: {other:?}"),
         }
         // A pure read queues no side-effect command.
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_certificate_signed_accepts_a_pem_chain_for_each_type() {
+        use ocpp_types::v201::CertificateSigningUseEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+
+        // Both certificate types, and an absent certificate_type, accept a
+        // well-formed chain with no statusInfo — and nothing is queued.
+        for certificate_type in [
+            Some(CertificateSigningUseEnumType::ChargingStationCertificate),
+            Some(CertificateSigningUseEnumType::V2GCertificate),
+            None,
+        ] {
+            let body = certificate_signed_response(&cp, SAMPLE_SIGNED_PEM, certificate_type).await;
+            assert_eq!(body.status, CertificateSignedStatusEnumType::Accepted);
+            assert!(
+                body.status_info.is_none(),
+                "an accepted chain carries no statusInfo (type={certificate_type:?})"
+            );
+        }
+        assert!(
+            v201_drain_commands(&cp).await.is_empty(),
+            "CertificateSigned is a stateless responder — it queues nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_certificate_signed_rejects_empty_or_hostile_input_and_never_panics() {
+        use ocpp_types::v201::CertificateSigningUseEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+
+        // Empty, blank, non-PEM, empty-bodied, and control-char CSMS inputs (all
+        // within the schema's 10000-char cap, so they reach the handler rather than
+        // being rejected at the wire layer) are refused with a statusInfo reason —
+        // and never panic the handler. (Over-length input is caught upstream by the
+        // schema; the pure `v201_command` test covers the very-long case directly.)
+        for chain in [
+            "",
+            "   ",
+            "not a certificate",
+            "-----BEGIN CERTIFICATE-----\n\n-----END CERTIFICATE-----",
+            "\0\u{1}\u{2}-----BEGIN-----\u{7f}",
+        ] {
+            let body = certificate_signed_response(
+                &cp,
+                chain,
+                Some(CertificateSigningUseEnumType::ChargingStationCertificate),
+            )
+            .await;
+            assert_eq!(
+                body.status,
+                CertificateSignedStatusEnumType::Rejected,
+                "a malformed chain is refused: {chain:?}"
+            );
+            assert_eq!(
+                body.status_info
+                    .expect("a refusal carries a statusInfo reason")
+                    .reason_code,
+                "InvalidChain"
+            );
+        }
         assert!(v201_drain_commands(&cp).await.is_empty());
     }
 
@@ -9446,6 +9600,62 @@ mod tests {
             matches!(resp, Some(Message::CallError(_))),
             "a 1.6J CP does not answer GetInstalledCertificateIds with a CallResult, got: {resp:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn v201_certificate_signed_is_v201_only() {
+        // A 1.6J CP has no CertificateSigned handler, so the v201-only action is
+        // unrouted → CallError, never a CallResult.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V16J)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_certificate_signed(
+                SAMPLE_SIGNED_PEM,
+                None,
+            )))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Some(Message::CallError(_))),
+            "a 1.6J CP does not answer CertificateSigned with a CallResult, got: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn v201_certificate_signed_request_and_response_are_schema_valid() {
+        use ocpp_types::v201::CertificateSigningUseEnumType;
+        let validator = SchemaValidator::v201();
+        // A request carrying a certificateType + PEM chain is schema-valid.
+        let req = V201CertificateSignedRequest {
+            certificate_chain: SAMPLE_SIGNED_PEM.to_string(),
+            certificate_type: Some(CertificateSigningUseEnumType::ChargingStationCertificate),
+            custom_data: None,
+        };
+        validator
+            .validate_call("CertificateSigned", &serde_json::to_value(&req).unwrap())
+            .expect("CertificateSigned request is schema-valid");
+
+        // Both answer shapes the handler emits — Accepted (no statusInfo) and
+        // Rejected (with a statusInfo reason) — serialize to a schema-valid response.
+        for (status, status_info) in [
+            (CertificateSignedStatusEnumType::Accepted, None),
+            (
+                CertificateSignedStatusEnumType::Rejected,
+                Some(StatusInfoType {
+                    reason_code: "InvalidChain".to_string(),
+                    additional_info: None,
+                    custom_data: None,
+                }),
+            ),
+        ] {
+            let resp = ocpp_messages::v201::CertificateSignedResponse {
+                status,
+                status_info,
+                custom_data: None,
+            };
+            validator
+                .validate_call_result("CertificateSigned", &serde_json::to_value(&resp).unwrap())
+                .expect("CertificateSigned response is schema-valid");
+        }
     }
 
     // --- OCPP 2.0.1 GetDisplayMessages (M7, issue #508) --------------------
