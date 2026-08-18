@@ -142,6 +142,7 @@ use ocpp_types::v201::{
     MonitoringDataType, OperationalStatusEnumType, RegistrationStatusEnumType, ReportDataType,
     RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
     SetVariableResultType, StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    UploadLogStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -378,6 +379,16 @@ pub struct ChargePointConfig {
     /// fails, not just one that succeeds. Defaults to `false` (happy path);
     /// the failure path is strictly opt-in so existing behavior is unchanged.
     pub diagnostics_upload_should_fail: bool,
+    /// Fault injection: when `true`, the simulated OCPP 2.0.1 log upload
+    /// (`GetLog`, Part 2, security profile) takes the failure branch — its async
+    /// `LogStatusNotification` stream closes `Uploading → UploadFailure` instead
+    /// of `Uploading → Uploaded` — so a CSMS / back office can be exercised
+    /// against a log upload that fails, not just one that succeeds. Defaults to
+    /// `false` (happy path); the failure path is strictly opt-in so existing
+    /// behavior is unchanged. A `GetLog` superseded by a newer request still
+    /// reports `AcceptedCanceled` regardless of this flag — a canceled upload
+    /// never "fails".
+    pub log_upload_should_fail: bool,
     /// Fault injection for the simulated firmware update (`UpdateFirmware`,
     /// OCPP 1.6J §4.x). Defaults to [`FirmwareUpdateOutcome::Succeed`] (happy
     /// path); set [`FirmwareUpdateOutcome::DownloadFailed`] or
@@ -439,6 +450,7 @@ impl Default for ChargePointConfig {
             offline_auth_stale_ok: false,
             local_auth_list_enabled: true,
             diagnostics_upload_should_fail: false,
+            log_upload_should_fail: false,
             firmware_update_outcome: FirmwareUpdateOutcome::Succeed,
             unlock_connector_outcome: UnlockConnectorOutcome::Unlock,
             local_auth_list_max_length: local_list::DEFAULT_LOCAL_AUTH_LIST_MAX_LENGTH,
@@ -665,6 +677,18 @@ enum RemoteCommand {
         request_id: i32,
         messages: Vec<MessageInfoType>,
     },
+    /// Run the simulated async log-upload state machine for an `Accepted` /
+    /// `AcceptedCanceled` OCPP 2.0.1 `GetLog` (Part 2, security profile, Issue
+    /// #526). The synchronous `GetLog.conf` only acks; the station then reports
+    /// upload progress asynchronously via `LogStatusNotification.req`, correlated
+    /// by `request_id` — this drives that stream (`Uploading` → a terminal
+    /// `Uploaded` / `UploadFailure` / `AcceptedCanceled`) and, on settling as the
+    /// still-current upload, clears the `V201LogUploadStore` back to idle. Queued
+    /// off the inbound-CALL path for the same reason as the other side effects —
+    /// the outbound `LogStatusNotification` CALLs must not re-enter the receive
+    /// loop mid-dispatch. The `GetLog` twin of the 1.6J
+    /// [`GetDiagnostics`](Self::GetDiagnostics) upload flow.
+    V201LogUpload { request_id: i32 },
     /// Run the simulated diagnostics-upload state machine for an `Accepted`
     /// `GetDiagnostics` (OCPP 1.6J §4.x, firmware-management profile). Emits
     /// `DiagnosticsStatusNotification(Uploading)` then `Uploaded`.
@@ -754,6 +778,12 @@ fn trigger_message_supported(message: &MessageTrigger) -> bool {
 /// `Uploading` and `Uploaded` `DiagnosticsStatusNotification`s. Short so the
 /// simulator stays responsive; the CP has no real archive to upload.
 const DIAGNOSTICS_UPLOAD_DURATION: Duration = Duration::from_millis(200);
+
+/// How long the simulated OCPP 2.0.1 log upload "takes" between the `Uploading`
+/// and terminal `LogStatusNotification`s (`GetLog`, Part 2, security profile).
+/// Short so the simulator stays responsive; the CP has no real archive to
+/// upload. Mirrors [`DIAGNOSTICS_UPLOAD_DURATION`], the 1.6J analog.
+const LOG_UPLOAD_DURATION: Duration = Duration::from_millis(200);
 
 /// How long each simulated firmware-update step "takes" between consecutive
 /// `FirmwareStatusNotification`s (`Downloading` → `Downloaded` → `Installing`
@@ -1946,8 +1976,9 @@ impl ChargePoint {
         // security profile, Issue #517). The station *synchronously* acks with a
         // `LogStatusEnumType` and, when it will upload, the `filename` it will
         // produce; upload progress is then reported asynchronously via
-        // `LogStatusNotification.req` (a natural follow-up slice). Registered only
-        // on the V201 arm — "GetLog" has no 1.6J twin.
+        // `LogStatusNotification.req` (#526), driven off the command queue by the
+        // `V201LogUpload` command this handler enqueues. Registered only on the
+        // V201 arm — "GetLog" has no 1.6J twin.
         //
         // A station uploads one log at a time, so this handler reads the single
         // in-flight `requestId` from the `V201LogUploadStore`, lets the pure
@@ -1961,6 +1992,14 @@ impl ChargePoint {
         // window is not lock-guarded: two racing `GetLog`s both produce valid acks
         // (one supersedes the other), so no cross-lock is needed.
         //
+        // On a *fresh* accept or a *supersede* the handler queues a
+        // `RemoteCommand::V201LogUpload` to run the async progress stream off the
+        // inbound-CALL path (so the CALLRESULT is flushed first — no receive-loop
+        // re-entrancy). A pure *retry* (the same `requestId` already in flight)
+        // deliberately queues nothing: the original upload is still streaming, so
+        // a second stream would double-report. `begin` returning `Some(request_id)`
+        // (the id it displaced equals this one) is exactly that retry case.
+        //
         // Trust boundary: `req.log.remoteLocation` is attacker-influenced CSMS
         // input and is never read here (the simulator does not actually upload);
         // `req.request_id` is only compared and formatted into the filename, never
@@ -1970,8 +2009,10 @@ impl ChargePoint {
         // `ocpp.v201.call.GetLog` → `ocpp.v201.call_result.GetLog`.
         if matches!(protocol_version, OcppVersion::V201) {
             let log_uploads = v201_log_uploads.clone();
+            let command_sender = command_sender.clone();
             d.on(move |req: V201GetLogRequest| {
                 let log_uploads = log_uploads.clone();
+                let command_sender = command_sender.clone();
                 async move {
                     // Snapshot the in-flight upload (read lock dropped before the
                     // decision), decide, then record the accepted request.
@@ -1985,7 +2026,29 @@ impl ChargePoint {
                         status,
                         LogStatusEnumType::Accepted | LogStatusEnumType::AcceptedCanceled
                     ) {
-                        log_uploads.begin(req.request_id).await;
+                        let displaced = log_uploads.begin(req.request_id).await;
+
+                        // Drive the async progress stream — but not for a pure
+                        // retry (the id it displaced is this same request, whose
+                        // upload is already streaming). Fresh start (`displaced`
+                        // is `None`) and supersede (`displaced` is a *different*
+                        // id) both queue a new stream.
+                        if displaced != Some(req.request_id)
+                            && command_sender
+                                .send(RemoteCommand::V201LogUpload {
+                                    request_id: req.request_id,
+                                })
+                                .is_err()
+                        {
+                            // Consumer gone (CP shutting down): the ack is still
+                            // honest — the request was accepted — but the async
+                            // progress cannot be streamed. Surface the drop.
+                            warn!(
+                                "v201 GetLog: consumer gone, cannot stream \
+                                 LogStatusNotification for request {}",
+                                req.request_id
+                            );
+                        }
                     }
 
                     Ok(v201_command::v201_get_log_response(status, None, filename))
@@ -4493,6 +4556,9 @@ impl ChargePoint {
                             cp.send_v201_notify_display_messages(request_id, messages)
                                 .await;
                         }
+                        RemoteCommand::V201LogUpload { request_id } => {
+                            cp.run_v201_log_upload(request_id).await;
+                        }
                         RemoteCommand::V201ApplyAvailability {
                             connector_id,
                             target,
@@ -5617,8 +5683,9 @@ impl ChargePoint {
     /// `AcceptedCanceled` was recorded as the request now in flight — so a later
     /// `GetLog` supersedes it rather than starting a second concurrent upload.
     /// Always `None` on the 1.6J path (which has no v201 log-upload tracker) and
-    /// whenever the station is idle. The reader a follow-up async
-    /// `LogStatusNotification(Uploaded)` slice will pair with `clear`.
+    /// whenever the station is idle — including once the async
+    /// `LogStatusNotification` stream (#526) settles and compare-and-clears the
+    /// slot back to idle.
     pub async fn in_flight_log_upload(&self) -> Option<i32> {
         self.v201_log_uploads.in_flight().await
     }
@@ -6543,6 +6610,69 @@ impl ChargePoint {
                      request {request_id}: {e}"
                 );
             }
+        }
+    }
+
+    /// Run the simulated async log-upload state machine for an `Accepted` /
+    /// `AcceptedCanceled` OCPP 2.0.1 `GetLog` (Part 2, security profile, Issue
+    /// #526).
+    ///
+    /// Invoked only from the command-consumer task (see [`connect`](Self::connect)),
+    /// never inline in the inbound-CALL handler, so the `GetLog` CALLRESULT is
+    /// flushed before the first `LogStatusNotification` and there is no
+    /// receive-loop re-entrancy/deadlock — the same discipline as
+    /// [`run_diagnostics_upload`](Self::run_diagnostics_upload), the 1.6J analog.
+    ///
+    /// The simulator has no real archive to upload, so it models the transfer on
+    /// a short timer: report [`Uploading`](UploadLogStatusEnumType::Uploading),
+    /// wait [`LOG_UPLOAD_DURATION`], then report a terminal status correlated by
+    /// the same `request_id`. The terminal status comes from
+    /// [`compare-and-clearing`](crate::v201_log_upload::V201LogUploadStore::complete)
+    /// the in-flight slot:
+    ///
+    /// - still the owner → the store is cleared to idle and the terminal status is
+    ///   [`Uploaded`](UploadLogStatusEnumType::Uploaded), or
+    ///   [`UploadFailure`](UploadLogStatusEnumType::UploadFailure) under the opt-in
+    ///   [`log_upload_should_fail`](ChargePointConfig::log_upload_should_fail)
+    ///   fault injection;
+    /// - superseded while it slept (a newer `GetLog` took the slot) → the store is
+    ///   left to the newer upload and this one reports
+    ///   [`AcceptedCanceled`](UploadLogStatusEnumType::AcceptedCanceled).
+    ///
+    /// Because the consumer runs commands serially, a superseding `GetLog`'s own
+    /// `V201LogUpload` is not dequeued until this one returns, so the canceled
+    /// upload's terminal notification is always emitted before the superseding
+    /// upload's `Uploading` — the CSMS sees the cancel before the new upload
+    /// begins. Ports the `LogStatusNotification` progress flow from
+    /// [`ocpp/v201/enums.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/enums.py)'s
+    /// `UploadLogStatusEnumType`.
+    async fn run_v201_log_upload(&self, request_id: i32) {
+        self.send_v201_log_status(v201_command::V201_LOG_UPLOAD_IN_PROGRESS, request_id)
+            .await;
+        tokio::time::sleep(LOG_UPLOAD_DURATION).await;
+
+        // Compare-and-clear: settle (and return to idle) only if we still own the
+        // in-flight slot. `!still_owner` is the supersede signal the terminal
+        // decision keys off — a newer GetLog took the slot while we slept.
+        let still_owner = self.v201_log_uploads.complete(request_id).await;
+        let terminal = v201_command::v201_log_upload_terminal_status(
+            !still_owner,
+            self.config.log_upload_should_fail,
+        );
+        self.send_v201_log_status(terminal, request_id).await;
+    }
+
+    /// Send a single `LogStatusNotification(status)` CALL correlated by
+    /// `request_id` (OCPP 2.0.1 Part 2). A best-effort progress report: a send
+    /// failure is logged, not propagated (the upload state machine continues).
+    async fn send_v201_log_status(&self, status: UploadLogStatusEnumType, request_id: i32) {
+        if let Err(e) = self
+            .call(v201_command::v201_log_status_notification(
+                status, request_id,
+            ))
+            .await
+        {
+            warn!("v201 GetLog: LogStatusNotification({status:?}) for request {request_id}: {e}");
         }
     }
 
@@ -9805,10 +9935,17 @@ mod tests {
             assert!(!filename.is_empty());
             assert_eq!(filename, format!("{prefix}42.log"));
 
-            // The accept is recorded as the in-flight upload; a synchronous ack
-            // queues no side-effect command.
+            // The accept is recorded as the in-flight upload and queues exactly
+            // one V201LogUpload to drive the async LogStatusNotification stream,
+            // correlated by the same requestId.
             assert_eq!(cp.in_flight_log_upload().await, Some(42));
-            assert!(v201_drain_commands(&cp).await.is_empty());
+            let commands = v201_drain_commands(&cp).await;
+            assert_eq!(commands.len(), 1, "an accepted GetLog queues one upload");
+            assert!(
+                matches!(&commands[0], RemoteCommand::V201LogUpload { request_id } if *request_id == 42),
+                "the queued upload is correlated by requestId, got: {:?}",
+                commands[0]
+            );
         }
     }
 
@@ -9831,6 +9968,22 @@ mod tests {
             Some(2),
             "the superseding request becomes the one in flight"
         );
+
+        // Each accept — the fresh one and the supersede — queued its own upload
+        // stream, correlated by its requestId.
+        let ids: Vec<i32> = v201_drain_commands(&cp)
+            .await
+            .into_iter()
+            .filter_map(|c| match c {
+                RemoteCommand::V201LogUpload { request_id } => Some(request_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1, 2],
+            "fresh accept then supersede each queue an upload"
+        );
     }
 
     #[tokio::test]
@@ -9847,6 +10000,76 @@ mod tests {
         assert_eq!(retry.status, LogStatusEnumType::Accepted);
         assert_eq!(retry.filename, first.filename);
         assert_eq!(cp.in_flight_log_upload().await, Some(5));
+
+        // The retry must NOT queue a second upload stream — the original is still
+        // streaming. Only the first accept queued one (requestId 5).
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(
+            commands.len(),
+            1,
+            "a retry queues no second upload; only the original accept did"
+        );
+        assert!(
+            matches!(&commands[0], RemoteCommand::V201LogUpload { request_id } if *request_id == 5),
+            "the single queued upload is the original, got: {:?}",
+            commands[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_log_upload_completes_and_returns_the_station_to_idle() {
+        use ocpp_types::v201::LogEnumType;
+        // AC #526: after the async upload settles, the store is idle again, so a
+        // subsequent GetLog is a FRESH Accepted — not an AcceptedCanceled against
+        // a phantom upload. Drive the state machine directly (the CP is not
+        // connected, so the LogStatusNotification CALLs fail-and-warn, but the
+        // store transitions are what this asserts).
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+
+        // Accept an upload, then run its async stream to completion.
+        let first = get_log_response(&cp, LogEnumType::DiagnosticsLog, 5).await;
+        assert_eq!(first.status, LogStatusEnumType::Accepted);
+        assert_eq!(cp.in_flight_log_upload().await, Some(5));
+        cp.run_v201_log_upload(5).await;
+        assert_eq!(
+            cp.in_flight_log_upload().await,
+            None,
+            "a settled upload clears the store back to idle"
+        );
+
+        // A subsequent GetLog now starts fresh — Accepted, not AcceptedCanceled.
+        let next = get_log_response(&cp, LogEnumType::SecurityLog, 6).await;
+        assert_eq!(
+            next.status,
+            LogStatusEnumType::Accepted,
+            "after completion the next GetLog is fresh, not a supersede"
+        );
+        assert_eq!(cp.in_flight_log_upload().await, Some(6));
+    }
+
+    #[tokio::test]
+    async fn v201_log_upload_superseded_does_not_clear_the_newer_upload() {
+        // A superseded upload settling must not wipe the newer upload's slot: the
+        // compare-and-clear leaves the store to whoever currently owns it. Model
+        // the serial-consumer supersede: requestId 1 begins, requestId 2
+        // supersedes it (now in flight), then 1's async task finishes.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.v201_log_uploads.begin(1).await;
+        cp.v201_log_uploads.begin(2).await; // 2 supersedes 1; slot is now 2's.
+
+        cp.run_v201_log_upload(1).await; // the superseded upload settles...
+        assert_eq!(
+            cp.in_flight_log_upload().await,
+            Some(2),
+            "a superseded upload settling leaves the newer upload in flight"
+        );
+
+        cp.run_v201_log_upload(2).await; // ...then the owner settles.
+        assert_eq!(
+            cp.in_flight_log_upload().await,
+            None,
+            "the owning upload settles the store back to idle"
+        );
     }
 
     #[tokio::test]
