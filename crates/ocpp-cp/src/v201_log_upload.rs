@@ -1,0 +1,151 @@
+//! v201 log-upload tracker — the single in-flight `GetLog` request a Charging
+//! Station is currently serving (OCPP 2.0.1 Part 2, security profile).
+//!
+//! `GetLog` is how a CSMS asks the station to collect a diagnostics or security
+//! log and upload it to a remote location. The station acks *synchronously* with
+//! a [`LogStatusEnumType`](ocpp_types::v201::LogStatusEnumType), then reports
+//! upload progress *asynchronously* via `LogStatusNotification.req`, correlated
+//! by the request's `requestId`. A station uploads one log at a time, so it
+//! needs to remember which `requestId` is in flight to answer a second `GetLog`
+//! deterministically:
+//!
+//! - a `GetLog` while **nothing** is in flight starts a fresh upload
+//!   ([`Accepted`](ocpp_types::v201::LogStatusEnumType::Accepted));
+//! - a `GetLog` carrying the **same** `requestId` as the in-flight one is a
+//!   retry — idempotently the same answer, no second upload;
+//! - a `GetLog` carrying a **different** `requestId` supersedes the in-flight
+//!   upload ([`AcceptedCanceled`](ocpp_types::v201::LogStatusEnumType::AcceptedCanceled)):
+//!   the previous upload is canceled to serve the new one.
+//!
+//! This store keeps *only* the in-flight `requestId`; deciding the
+//! [`LogStatusEnumType`](ocpp_types::v201::LogStatusEnumType) a `GetLog` answers
+//! is deliberately **not** its job — that pure decision lives in
+//! [`v201_get_log_decision`](crate::v201_command::v201_get_log_decision), and the
+//! handler calls [`begin`](V201LogUploadStore::begin) only once it has decided to
+//! accept. [`clear`](V201LogUploadStore::clear) is the completion seam a future
+//! async `LogStatusNotification(Uploaded)` slice will call when the upload
+//! finishes (or permanently fails), returning the station to idle.
+//!
+//! Interior-mutable behind an [`RwLock`] so a single `Arc<V201LogUploadStore>`
+//! can be shared across the charge point's tasks, exactly like the v201
+//! [`V201DisplayMessageStore`](crate::v201_display_message::V201DisplayMessageStore).
+
+use tokio::sync::RwLock;
+
+/// Tracks the single `GetLog` upload a station is currently serving, by its
+/// `requestId`.
+///
+/// `None` means idle (no upload in flight); `Some(request_id)` names the request
+/// whose upload is underway. The `requestId` is CSMS-supplied and stored as an
+/// opaque `i32` — never parsed or indexed — so no wire value (including
+/// `i32::MIN`/`MAX`) can panic here.
+#[derive(Debug, Default)]
+pub struct V201LogUploadStore {
+    /// The `requestId` of the upload currently in flight, or `None` when idle.
+    in_flight: RwLock<Option<i32>>,
+}
+
+impl V201LogUploadStore {
+    /// A new, idle store (no upload in flight).
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The `requestId` of the upload currently in flight, or `None` when idle.
+    ///
+    /// A cheap read the `GetLog` handler takes before deciding: the pure decision
+    /// ([`v201_get_log_decision`](crate::v201_command::v201_get_log_decision))
+    /// keys off whether — and which — request is in flight. Returns a copied
+    /// `Option<i32>`, so the caller decides without holding the store lock.
+    pub async fn in_flight(&self) -> Option<i32> {
+        *self.in_flight.read().await
+    }
+
+    /// Whether no upload is currently in flight (the station is idle).
+    pub async fn is_idle(&self) -> bool {
+        self.in_flight.read().await.is_none()
+    }
+
+    /// Record `request_id` as the upload now in flight, returning the `requestId`
+    /// it displaced (if any).
+    ///
+    /// Called by the `GetLog` handler once its pure decision has accepted the
+    /// request. A `Some(previous)` return where `previous != request_id` is a
+    /// supersede (the decision answered `AcceptedCanceled`); `Some(previous)`
+    /// where `previous == request_id` is an idempotent retry of the same request;
+    /// `None` is a fresh start from idle.
+    pub async fn begin(&self, request_id: i32) -> Option<i32> {
+        self.in_flight.write().await.replace(request_id)
+    }
+
+    /// Return the station to idle, yielding the `requestId` that was in flight (if
+    /// any).
+    ///
+    /// The completion seam a future async `LogStatusNotification(Uploaded)` /
+    /// permanent-failure slice will call when the upload settles. Idempotent —
+    /// clearing an already-idle store is a no-op returning `None`.
+    pub async fn clear(&self) -> Option<i32> {
+        self.in_flight.write().await.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn a_new_store_is_idle() {
+        let store = V201LogUploadStore::new();
+        assert!(store.is_idle().await);
+        assert_eq!(store.in_flight().await, None);
+    }
+
+    #[tokio::test]
+    async fn begin_records_in_flight_and_returns_the_previous() {
+        let store = V201LogUploadStore::new();
+        // A fresh start from idle displaces nothing.
+        assert_eq!(store.begin(7).await, None);
+        assert_eq!(store.in_flight().await, Some(7));
+        assert!(!store.is_idle().await);
+
+        // A supersede returns the request it displaced and installs the new one.
+        assert_eq!(
+            store.begin(8).await,
+            Some(7),
+            "begin returns the requestId it superseded"
+        );
+        assert_eq!(store.in_flight().await, Some(8));
+
+        // Re-beginning the same id is idempotent — returns itself, stays itself.
+        assert_eq!(store.begin(8).await, Some(8));
+        assert_eq!(store.in_flight().await, Some(8));
+    }
+
+    #[tokio::test]
+    async fn clear_returns_to_idle_and_is_a_noop_when_already_idle() {
+        let store = V201LogUploadStore::new();
+        store.begin(3).await;
+        assert_eq!(
+            store.clear().await,
+            Some(3),
+            "clear yields what was in flight"
+        );
+        assert!(store.is_idle().await);
+        assert_eq!(
+            store.clear().await,
+            None,
+            "clearing an idle store is a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn extreme_request_ids_do_not_panic() {
+        // `requestId` is CSMS-supplied; an extreme value is stored opaquely.
+        let store = V201LogUploadStore::new();
+        assert_eq!(store.begin(i32::MIN).await, None);
+        assert_eq!(store.in_flight().await, Some(i32::MIN));
+        assert_eq!(store.begin(i32::MAX).await, Some(i32::MIN));
+        assert_eq!(store.in_flight().await, Some(i32::MAX));
+    }
+}
