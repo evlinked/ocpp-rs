@@ -151,23 +151,23 @@ use ocpp_types::v201::{
     DisplayMessageStatusEnumType, GenericDeviceModelStatusEnumType, GenericStatusEnumType,
     GetCertificateIdUseEnumType, GetChargingProfileStatusEnumType,
     GetDisplayMessagesStatusEnumType, GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType,
-    InstallCertificateStatusEnumType, InstallCertificateUseEnumType, MessageInfoType,
-    MessagePriorityEnumType, MessageStateEnumType, MessageTriggerEnumType,
-    OperationalStatusEnumType, RequestStartStopStatusEnumType, ReserveNowStatusEnumType,
-    ResetEnumType, ResetStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
-    UnlockStatusEnumType,
+    InstallCertificateStatusEnumType, InstallCertificateUseEnumType, LogEnumType,
+    LogStatusEnumType, MessageInfoType, MessagePriorityEnumType, MessageStateEnumType,
+    MessageTriggerEnumType, OperationalStatusEnumType, RequestStartStopStatusEnumType,
+    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
 
 use ocpp_messages::v201::{
     CancelReservationResponse, CertificateSignedResponse, ChangeAvailabilityResponse,
     ClearCacheResponse, ClearChargingProfileResponse, ClearDisplayMessageResponse,
     CostUpdatedResponse, DeleteCertificateResponse, GetChargingProfilesResponse,
-    GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse, GetMonitoringReportResponse,
-    GetTransactionStatusResponse, InstallCertificateResponse, NotifyDisplayMessagesRequest,
-    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
-    ReserveNowResponse, ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
-    SetMonitoringBaseResponse, SetMonitoringLevelResponse, TriggerMessageResponse,
-    UnlockConnectorResponse,
+    GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse,
+    GetMonitoringReportResponse, GetTransactionStatusResponse, InstallCertificateResponse,
+    NotifyDisplayMessagesRequest, ReportChargingProfilesRequest, RequestStartTransactionResponse,
+    RequestStopTransactionResponse, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
+    SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
+    TriggerMessageResponse, UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1740,6 +1740,97 @@ pub fn v201_install_certificate_response(
     InstallCertificateResponse {
         status,
         status_info,
+        custom_data: None,
+    }
+}
+
+/// Synthesize the deterministic `filename` a `GetLog` upload will produce for
+/// `(log_type, request_id)`.
+///
+/// The simulator has no real log file to name, so it mints a stable one: the log
+/// kind (`diagnostics` / `security`) joined to the request's `requestId`, e.g.
+/// `diagnostics_42.log`. Deterministic — the same inputs always yield the same
+/// name, so a retry of the same `GetLog` reports the same `filename` — and always
+/// non-empty. The result is far under the schema's `filename` `maxLength: 255`:
+/// the longest possible spelling, `diagnostics_-2147483648.log` (an `i32::MIN`
+/// request id), is 27 characters, so no wire `requestId` can overflow the bound.
+#[must_use]
+pub fn v201_log_filename(log_type: LogEnumType, request_id: i32) -> String {
+    let kind = match log_type {
+        LogEnumType::DiagnosticsLog => "diagnostics",
+        LogEnumType::SecurityLog => "security",
+    };
+    format!("{kind}_{request_id}.log")
+}
+
+/// Decide how a `for_version(V201)` station answers a `GetLog.req`, given the
+/// request and the `requestId` of any upload already in flight.
+///
+/// A station uploads one log at a time, so the answer turns on whether — and
+/// which — request is currently in flight (the caller reads that from the
+/// [`V201LogUploadStore`](crate::v201_log_upload::V201LogUploadStore); `None` is
+/// idle):
+///
+/// - **idle** (`in_flight` is `None`) → [`Accepted`](LogStatusEnumType::Accepted):
+///   a fresh upload starts;
+/// - **retry** (`in_flight` names this same `requestId`) →
+///   [`Accepted`](LogStatusEnumType::Accepted): idempotently the same answer, the
+///   same `filename`, no second upload and no cancellation — a `GetLog` retried
+///   under its original `requestId` must not report a spurious cancel;
+/// - **supersede** (`in_flight` names a *different* `requestId`) →
+///   [`AcceptedCanceled`](LogStatusEnumType::AcceptedCanceled): the new request is
+///   accepted and the in-progress upload is canceled to serve it, so a CSMS can
+///   always kick off a fresh log collection.
+///
+/// The returned `filename` is [`v201_log_filename`]'s deterministic name and is
+/// present on every arm (all three are accepts that will upload).
+/// [`Rejected`](LogStatusEnumType::Rejected) is a **documented modeled seam** this
+/// simulator does not produce: a real station that refuses concurrent uploads
+/// outright (rather than superseding) would answer it, and it stays in the ported
+/// status enum for the wire and the response builder's schema coverage —
+/// mirroring how [`v201_set_display_message_status`] documents its unproduced
+/// `NotSupported*` / `Rejected` statuses.
+///
+/// This is the *pure* decision, depending only on the request and the in-flight
+/// snapshot — no runtime handles, no store lock — so it is unit-testable in
+/// isolation. Recording the accepted request as the new in-flight upload (the
+/// side effect) is the wiring layer's job. Trust boundary: `request.log`
+/// (carrying the untrusted `remoteLocation`) is never read here, and `request_id`
+/// is only compared and formatted, never parsed or indexed, so no wire value
+/// (including `i32::MIN`/`MAX`) can panic. Ports `ocpp.v201.call.GetLog` →
+/// `ocpp.v201.call_result.GetLog`.
+#[must_use]
+pub fn v201_get_log_decision(
+    request: &GetLogRequest,
+    in_flight: Option<i32>,
+) -> (LogStatusEnumType, Option<String>) {
+    let filename = v201_log_filename(request.log_type, request.request_id);
+    let status = match in_flight {
+        None => LogStatusEnumType::Accepted,
+        Some(current) if current == request.request_id => LogStatusEnumType::Accepted,
+        Some(_) => LogStatusEnumType::AcceptedCanceled,
+    };
+    (status, Some(filename))
+}
+
+/// Build a schema-valid `GetLog.conf` ([`GetLogResponse`]).
+///
+/// Pure constructor mirroring [`v201_install_certificate_response`]: carries the
+/// decided [`status`](LogStatusEnumType), the optional 2.0.1 `statusInfo`, and the
+/// `filename` the station will produce (present on an accept, absent on a refusal
+/// — the `maxLength: 255` bound is enforced at the schema layer).
+///
+/// Ports `ocpp.v201.call_result.GetLog`.
+#[must_use]
+pub fn v201_get_log_response(
+    status: LogStatusEnumType,
+    status_info: Option<StatusInfoType>,
+    filename: Option<String>,
+) -> GetLogResponse {
+    GetLogResponse {
+        status,
+        status_info,
+        filename,
         custom_data: None,
     }
 }
@@ -4556,6 +4647,123 @@ mod tests {
             validator
                 .validate_call_result("InstallCertificate", &serde_json::to_value(&resp).unwrap())
                 .expect("built InstallCertificate response is schema-valid");
+        }
+    }
+
+    // --- GetLog (v201) decision + filename + response builder (Issue #517) ----
+
+    /// A schema-shaped `GetLogRequest` for `(log_type, request_id)`, with an
+    /// arbitrary but valid remote-location URI. The retry hints are left absent —
+    /// the decision ignores them.
+    fn get_log_request(log_type: LogEnumType, request_id: i32) -> GetLogRequest {
+        GetLogRequest {
+            log: ocpp_types::v201::LogParametersType {
+                remote_location: "https://logs.example.test/upload".to_string(),
+                oldest_timestamp: None,
+                latest_timestamp: None,
+                custom_data: None,
+            },
+            log_type,
+            request_id,
+            retries: None,
+            retry_interval: None,
+            custom_data: None,
+        }
+    }
+
+    #[test]
+    fn get_log_accepts_and_names_a_file_when_idle() {
+        // No upload in flight: both log kinds are Accepted and carry a non-empty,
+        // kind-tagged filename.
+        for (log_type, prefix) in [
+            (LogEnumType::DiagnosticsLog, "diagnostics_"),
+            (LogEnumType::SecurityLog, "security_"),
+        ] {
+            let (status, filename) = v201_get_log_decision(&get_log_request(log_type, 42), None);
+            assert_eq!(status, LogStatusEnumType::Accepted);
+            let filename = filename.expect("an accepted GetLog names a file");
+            assert!(!filename.is_empty(), "the filename must be non-empty");
+            assert_eq!(filename, format!("{prefix}42.log"));
+        }
+    }
+
+    #[test]
+    fn get_log_is_idempotent_for_a_retry_of_the_in_flight_request() {
+        // A GetLog carrying the SAME requestId as the in-flight upload is a retry:
+        // idempotently Accepted (not AcceptedCanceled), same filename as the idle
+        // answer — a retry must not report a spurious cancel.
+        let req = get_log_request(LogEnumType::DiagnosticsLog, 7);
+        let idle = v201_get_log_decision(&req, None);
+        let retry = v201_get_log_decision(&req, Some(7));
+        assert_eq!(retry.0, LogStatusEnumType::Accepted);
+        assert_eq!(retry.1, idle.1, "a retry reports the same filename");
+    }
+
+    #[test]
+    fn get_log_supersedes_a_different_in_flight_upload() {
+        // A new requestId while a different upload is in flight supersedes it:
+        // AcceptedCanceled, still naming the new file.
+        let (status, filename) =
+            v201_get_log_decision(&get_log_request(LogEnumType::SecurityLog, 9), Some(8));
+        assert_eq!(status, LogStatusEnumType::AcceptedCanceled);
+        assert_eq!(
+            filename,
+            Some("security_9.log".to_string()),
+            "a supersede still names the file it will upload"
+        );
+    }
+
+    #[test]
+    fn get_log_filename_is_deterministic_and_bounded() {
+        // Deterministic: the same (kind, id) always yields the same name.
+        assert_eq!(
+            v201_log_filename(LogEnumType::DiagnosticsLog, 3),
+            v201_log_filename(LogEnumType::DiagnosticsLog, 3)
+        );
+        // Distinct per kind and per id — no two requests collide on a name.
+        assert_ne!(
+            v201_log_filename(LogEnumType::DiagnosticsLog, 3),
+            v201_log_filename(LogEnumType::SecurityLog, 3)
+        );
+        assert_ne!(
+            v201_log_filename(LogEnumType::DiagnosticsLog, 3),
+            v201_log_filename(LogEnumType::DiagnosticsLog, 4)
+        );
+        // Extreme wire request ids: non-empty, well under the schema's 255 bound,
+        // no panic.
+        for request_id in [i32::MIN, i32::MAX, 0, -1] {
+            let name = v201_log_filename(LogEnumType::SecurityLog, request_id);
+            assert!(!name.is_empty());
+            assert!(name.len() <= 255, "filename {name:?} exceeds maxLength 255");
+        }
+    }
+
+    #[test]
+    fn built_get_log_responses_are_schema_valid() {
+        // Every built response — each LogStatusEnumType crossed with with/without a
+        // statusInfo and with/without a filename — satisfies the bundled OCPP 2.0.1
+        // GetLog response JSON Schema.
+        let validator = SchemaValidator::v201();
+        let info = StatusInfoType {
+            reason_code: "Superseded".to_string(),
+            additional_info: Some("a previous log upload was canceled".to_string()),
+            custom_data: None,
+        };
+        for status in [
+            LogStatusEnumType::Accepted,
+            LogStatusEnumType::Rejected,
+            LogStatusEnumType::AcceptedCanceled,
+        ] {
+            for status_info in [None, Some(info.clone())] {
+                for filename in [None, Some("diagnostics_1.log".to_string())] {
+                    let resp = v201_get_log_response(status, status_info.clone(), filename);
+                    let payload = serde_json::to_value(&resp).unwrap();
+                    assert!(
+                        validator.validate_call_result("GetLog", &payload).is_ok(),
+                        "built {status:?} GetLogResponse should be schema-valid, got: {payload}"
+                    );
+                }
+            }
         }
     }
 

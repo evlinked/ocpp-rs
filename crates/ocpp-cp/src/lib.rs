@@ -25,6 +25,7 @@ pub mod v201_cost;
 pub mod v201_data_transfer;
 pub mod v201_device_model;
 pub mod v201_display_message;
+pub mod v201_log_upload;
 pub mod v201_station_ceiling;
 pub mod v201_transaction;
 pub mod v201_tx_default_profile;
@@ -79,6 +80,7 @@ use v201_charging_profiles::V201TxProfileStore;
 use v201_cost::V201CostStore;
 use v201_device_model::V201DeviceModel;
 use v201_display_message::V201DisplayMessageStore;
+use v201_log_upload::V201LogUploadStore;
 use v201_station_ceiling::{CeilingKind, V201StationCeilingStore};
 use v201_tx_default_profile::V201TxDefaultProfileStore;
 // 2.0.1 provisioning message + enum types used by the version-aware runtime
@@ -104,6 +106,7 @@ use ocpp_messages::v201::{
     GetInstalledCertificateIdsRequest as V201GetInstalledCertificateIdsRequest,
     GetLocalListVersionRequest as V201GetLocalListVersionRequest,
     GetLocalListVersionResponse as V201GetLocalListVersionResponse,
+    GetLogRequest as V201GetLogRequest,
     GetMonitoringReportRequest as V201GetMonitoringReportRequest,
     GetReportRequest as V201GetReportRequest, GetReportResponse as V201GetReportResponse,
     GetTransactionStatusRequest as V201GetTransactionStatusRequest,
@@ -137,8 +140,8 @@ use ocpp_types::v201::{
     DeleteCertificateStatusEnumType, DisplayMessageStatusEnumType,
     GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetVariableResultType,
     IdTokenType as V201IdTokenType, InstallCertificateStatusEnumType,
-    InstallCertificateUseEnumType, MessageInfoType, MessageTriggerEnumType, MonitoringDataType,
-    OperationalStatusEnumType, RegistrationStatusEnumType, ReportDataType,
+    InstallCertificateUseEnumType, LogStatusEnumType, MessageInfoType, MessageTriggerEnumType,
+    MonitoringDataType, OperationalStatusEnumType, RegistrationStatusEnumType, ReportDataType,
     RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
     SetVariableResultType, StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
 };
@@ -1031,6 +1034,14 @@ pub struct ChargePoint {
     /// handler only once its pure decision returns `Accepted`. Empty on the 1.6J
     /// path (the handler is V201-only; 1.6 has no per-use trust model here).
     v201_certificates: Arc<V201CertificateStore>,
+    /// The single in-flight `GetLog` upload the station is serving (OCPP 2.0.1
+    /// Part 2, security profile, Issue #517), by its `requestId`. A station
+    /// uploads one log at a time, so the V201-only `GetLog` handler records the
+    /// accepted request here to answer a later `GetLog` deterministically: a retry
+    /// of the same `requestId` is idempotent, a different one supersedes
+    /// (`AcceptedCanceled`). Idle on the 1.6J path (the handler is V201-only). See
+    /// [`V201LogUploadStore`].
+    v201_log_uploads: Arc<V201LogUploadStore>,
     /// Latest running total cost the CSMS has pushed per transaction id via the
     /// 2.0.1 `CostUpdated` message (Issue #502), keyed by the wire
     /// `transactionId` string. Upserted by the V201-only `CostUpdated` handler
@@ -1215,6 +1226,12 @@ impl ChargePoint {
         // `DeleteCertificate`) will read/mutate.
         let v201_certificates = Arc::new(V201CertificateStore::new());
 
+        // The in-flight `GetLog` upload tracker the V201 `GetLog` handler records
+        // into (Issue #517). Shared into the default dispatcher so the handler can
+        // read/set the single in-flight `requestId` straight from the CALL path;
+        // idle on the 1.6J path (the handler is V201-only).
+        let v201_log_uploads = Arc::new(V201LogUploadStore::new());
+
         // Issue #471: v201 `TxDefaultProfile` store, shared into the default
         // dispatcher (the `SetChargingProfile` command installs a default into it)
         // and kept on the CP (the metering sampler and `GetCompositeSchedule` read
@@ -1277,6 +1294,7 @@ impl ChargePoint {
             v201_station_ceilings.clone(),
             v201_display_messages.clone(),
             v201_certificates.clone(),
+            v201_log_uploads.clone(),
             v201_costs.clone(),
             expiry_timers.clone(),
             config.unlock_connector_outcome,
@@ -1312,6 +1330,7 @@ impl ChargePoint {
             v201_station_ceilings,
             v201_display_messages,
             v201_certificates,
+            v201_log_uploads,
             v201_costs,
             reservations,
             expiry_timers,
@@ -1355,6 +1374,7 @@ impl ChargePoint {
         v201_station_ceilings: Arc<V201StationCeilingStore>,
         v201_display_messages: Arc<V201DisplayMessageStore>,
         v201_certificates: Arc<V201CertificateStore>,
+        v201_log_uploads: Arc<V201LogUploadStore>,
         v201_costs: Arc<V201CostStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
         unlock_outcome: UnlockConnectorOutcome,
@@ -1919,6 +1939,58 @@ impl ChargePoint {
                         status,
                         status_info,
                     ))
+                }
+            });
+        }
+
+        // GetLog (OCPP 2.0.1 only) — the CSMS asks the station to collect a
+        // diagnostics or security log and upload it to a remote location (Part 2,
+        // security profile, Issue #517). The station *synchronously* acks with a
+        // `LogStatusEnumType` and, when it will upload, the `filename` it will
+        // produce; upload progress is then reported asynchronously via
+        // `LogStatusNotification.req` (a natural follow-up slice). Registered only
+        // on the V201 arm — "GetLog" has no 1.6J twin.
+        //
+        // A station uploads one log at a time, so this handler reads the single
+        // in-flight `requestId` from the `V201LogUploadStore`, lets the pure
+        // decision (`v201_command::v201_get_log_decision`) resolve the status +
+        // synthesized `filename`, then — on an accept — records the request as the
+        // new in-flight upload. The decision: idle → `Accepted` (fresh upload); the
+        // same in-flight `requestId` (a retry) → idempotent `Accepted`, same
+        // filename; a different `requestId` → `AcceptedCanceled` (supersede the
+        // in-progress upload). `Rejected` is a documented unproduced seam (a real
+        // station that refuses concurrent uploads outright). The snapshot→begin
+        // window is not lock-guarded: two racing `GetLog`s both produce valid acks
+        // (one supersedes the other), so no cross-lock is needed.
+        //
+        // Trust boundary: `req.log.remoteLocation` is attacker-influenced CSMS
+        // input and is never read here (the simulator does not actually upload);
+        // `req.request_id` is only compared and formatted into the filename, never
+        // parsed or indexed, so no wire value (including `i32::MIN`/`MAX`) can
+        // panic. `req.log_type` is a closed enum (an unknown wire value fails
+        // deserialization → CALLERROR before the handler). Ports
+        // `ocpp.v201.call.GetLog` → `ocpp.v201.call_result.GetLog`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let log_uploads = v201_log_uploads.clone();
+            d.on(move |req: V201GetLogRequest| {
+                let log_uploads = log_uploads.clone();
+                async move {
+                    // Snapshot the in-flight upload (read lock dropped before the
+                    // decision), decide, then record the accepted request.
+                    let in_flight = log_uploads.in_flight().await;
+                    let (status, filename) = v201_command::v201_get_log_decision(&req, in_flight);
+
+                    // Every produced status (Accepted / AcceptedCanceled) is an
+                    // accept that will upload, so it becomes the new in-flight
+                    // request; a re-begin of the same id is an idempotent no-op.
+                    if matches!(
+                        status,
+                        LogStatusEnumType::Accepted | LogStatusEnumType::AcceptedCanceled
+                    ) {
+                        log_uploads.begin(req.request_id).await;
+                    }
+
+                    Ok(v201_command::v201_get_log_response(status, None, filename))
                 }
             });
         }
@@ -5612,6 +5684,20 @@ impl ChargePoint {
         use_: InstallCertificateUseEnumType,
     ) -> Option<String> {
         self.v201_certificates.installed(use_).await
+    }
+
+    /// The `requestId` of the `GetLog` upload the station is currently serving, if
+    /// any (OCPP 2.0.1 Part 2, security profile, Issue #517).
+    ///
+    /// The read path making the in-flight log upload observable: an operator (or a
+    /// test) can confirm a `GetLog` the station answered `Accepted` /
+    /// `AcceptedCanceled` was recorded as the request now in flight — so a later
+    /// `GetLog` supersedes it rather than starting a second concurrent upload.
+    /// Always `None` on the 1.6J path (which has no v201 log-upload tracker) and
+    /// whenever the station is idle. The reader a follow-up async
+    /// `LogStatusNotification(Uploaded)` slice will pair with `clear`.
+    pub async fn in_flight_log_upload(&self) -> Option<i32> {
+        self.v201_log_uploads.in_flight().await
     }
 
     /// The latest running total cost the CSMS has pushed for `transaction_id`
@@ -9752,6 +9838,31 @@ mod tests {
         })
     }
 
+    // --- OCPP 2.0.1 GetLog (M7, issue #517) --------------------------------
+    // A `for_version(V201)` CP acks a diagnostics/security log-upload request
+    // synchronously off its `V201LogUploadStore` (in-flight `requestId` tracker):
+    // idle → Accepted + a synthesized filename; a new requestId while one is in
+    // flight → AcceptedCanceled (supersede); the same requestId → idempotent
+    // Accepted. These exercise the wired V201 arm end-to-end over `handle_message`:
+    // both log kinds, supersede, retry, extreme requestId, and V201-only
+    // registration.
+
+    fn make_v201_get_log(log_type: ocpp_types::v201::LogEnumType, request_id: i32) -> CallMessage {
+        make_call(V201GetLogRequest {
+            log: ocpp_types::v201::LogParametersType {
+                remote_location: "https://logs.example.test/upload".to_string(),
+                oldest_timestamp: None,
+                latest_timestamp: None,
+                custom_data: None,
+            },
+            log_type,
+            request_id,
+            retries: None,
+            retry_interval: None,
+            custom_data: None,
+        })
+    }
+
     /// Read the `DeleteCertificate.conf` out of a `handle_message` reply,
     /// asserting the reply is a CALLRESULT.
     async fn delete_certificate_response(
@@ -9760,6 +9871,23 @@ mod tests {
     ) -> ocpp_messages::v201::DeleteCertificateResponse {
         let resp = cp
             .handle_message(Message::Call(make_v201_delete_certificate(hash)))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => r.payload_as().unwrap(),
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    /// Read the `GetLog.conf` out of a `handle_message` reply, asserting the reply
+    /// is a CALLRESULT.
+    async fn get_log_response(
+        cp: &ChargePoint,
+        log_type: ocpp_types::v201::LogEnumType,
+        request_id: i32,
+    ) -> ocpp_messages::v201::GetLogResponse {
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_log(log_type, request_id)))
             .await
             .unwrap();
         match resp.unwrap() {
@@ -9909,6 +10037,101 @@ mod tests {
         assert!(
             matches!(resp, Some(Message::CallError(_))),
             "a 1.6J CP does not answer DeleteCertificate with a CallResult, got: {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_get_log_accepts_and_names_a_file_when_idle() {
+        use ocpp_types::v201::LogEnumType;
+        // Each log kind, from an idle station: Accepted, a non-empty kind-tagged
+        // filename, and the request recorded as the one now in flight. A fresh CP
+        // per kind so each starts idle.
+        for (log_type, prefix) in [
+            (LogEnumType::DiagnosticsLog, "diagnostics_"),
+            (LogEnumType::SecurityLog, "security_"),
+        ] {
+            let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+            assert_eq!(cp.in_flight_log_upload().await, None, "starts idle");
+
+            let body = get_log_response(&cp, log_type, 42).await;
+            assert_eq!(body.status, LogStatusEnumType::Accepted);
+            let filename = body.filename.expect("an accepted GetLog names a file");
+            assert!(!filename.is_empty());
+            assert_eq!(filename, format!("{prefix}42.log"));
+
+            // The accept is recorded as the in-flight upload; a synchronous ack
+            // queues no side-effect command.
+            assert_eq!(cp.in_flight_log_upload().await, Some(42));
+            assert!(v201_drain_commands(&cp).await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_get_log_supersedes_an_in_flight_upload() {
+        use ocpp_types::v201::LogEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+
+        // First upload is accepted and becomes in flight.
+        let first = get_log_response(&cp, LogEnumType::DiagnosticsLog, 1).await;
+        assert_eq!(first.status, LogStatusEnumType::Accepted);
+        assert_eq!(cp.in_flight_log_upload().await, Some(1));
+
+        // A second GetLog with a DIFFERENT requestId supersedes the first.
+        let second = get_log_response(&cp, LogEnumType::SecurityLog, 2).await;
+        assert_eq!(second.status, LogStatusEnumType::AcceptedCanceled);
+        assert_eq!(second.filename, Some("security_2.log".to_string()));
+        assert_eq!(
+            cp.in_flight_log_upload().await,
+            Some(2),
+            "the superseding request becomes the one in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_get_log_retry_of_the_same_request_is_idempotent() {
+        use ocpp_types::v201::LogEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+
+        let first = get_log_response(&cp, LogEnumType::DiagnosticsLog, 5).await;
+        assert_eq!(first.status, LogStatusEnumType::Accepted);
+
+        // The SAME requestId again (a retry) is idempotently Accepted, same file,
+        // no spurious cancel — the in-flight request is unchanged.
+        let retry = get_log_response(&cp, LogEnumType::DiagnosticsLog, 5).await;
+        assert_eq!(retry.status, LogStatusEnumType::Accepted);
+        assert_eq!(retry.filename, first.filename);
+        assert_eq!(cp.in_flight_log_upload().await, Some(5));
+    }
+
+    #[tokio::test]
+    async fn v201_get_log_tolerates_an_extreme_request_id() {
+        use ocpp_types::v201::LogEnumType;
+        // An `i32::MIN` requestId must not panic; it is accepted and named.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let body = get_log_response(&cp, LogEnumType::SecurityLog, i32::MIN).await;
+        assert_eq!(body.status, LogStatusEnumType::Accepted);
+        let filename = body.filename.expect("named");
+        assert!(!filename.is_empty());
+        assert!(filename.len() <= 255);
+        assert_eq!(cp.in_flight_log_upload().await, Some(i32::MIN));
+    }
+
+    #[tokio::test]
+    async fn v201_get_log_is_v201_only() {
+        use ocpp_types::v201::LogEnumType;
+        // A 1.6J CP has no GetLog handler, so the v201-only action is unrouted →
+        // CallError, never a CallResult.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V16J)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_log(
+                LogEnumType::DiagnosticsLog,
+                1,
+            )))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Some(Message::CallError(_))),
+            "a 1.6J CP does not answer GetLog with a CallResult, got: {resp:?}"
         );
     }
 
