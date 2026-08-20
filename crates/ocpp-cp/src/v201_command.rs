@@ -147,27 +147,28 @@ use ocpp_types::v201::{
     CertificateSignedStatusEnumType, ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType,
     ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
     ChargingProfileType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
-    ClearChargingProfileType, ClearMessageStatusEnumType, DisplayMessageStatusEnumType,
-    GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetCertificateIdUseEnumType,
-    GetChargingProfileStatusEnumType, GetDisplayMessagesStatusEnumType,
-    GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType, InstallCertificateStatusEnumType,
-    InstallCertificateUseEnumType, LogEnumType, LogStatusEnumType, MessageInfoType,
-    MessagePriorityEnumType, MessageStateEnumType, MessageTriggerEnumType,
-    OperationalStatusEnumType, RequestStartStopStatusEnumType, ReserveNowStatusEnumType,
-    ResetEnumType, ResetStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
-    UnlockStatusEnumType, UploadLogStatusEnumType,
+    ClearChargingProfileType, ClearMessageStatusEnumType, DeleteCertificateStatusEnumType,
+    DisplayMessageStatusEnumType, GenericDeviceModelStatusEnumType, GenericStatusEnumType,
+    GetCertificateIdUseEnumType, GetChargingProfileStatusEnumType,
+    GetDisplayMessagesStatusEnumType, GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType,
+    InstallCertificateStatusEnumType, InstallCertificateUseEnumType, LogEnumType,
+    LogStatusEnumType, MessageInfoType, MessagePriorityEnumType, MessageStateEnumType,
+    MessageTriggerEnumType, OperationalStatusEnumType, RequestStartStopStatusEnumType,
+    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType, UploadLogStatusEnumType,
 };
 
 use ocpp_messages::v201::{
     CancelReservationResponse, CertificateSignedResponse, ChangeAvailabilityResponse,
     ClearCacheResponse, ClearChargingProfileResponse, ClearDisplayMessageResponse,
-    CostUpdatedResponse, GetChargingProfilesResponse, GetDisplayMessagesResponse,
-    GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse, GetMonitoringReportResponse,
-    GetTransactionStatusResponse, InstallCertificateResponse, LogStatusNotificationRequest,
-    NotifyDisplayMessagesRequest, ReportChargingProfilesRequest, RequestStartTransactionResponse,
-    RequestStopTransactionResponse, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
-    SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
-    TriggerMessageResponse, UnlockConnectorResponse,
+    CostUpdatedResponse, DeleteCertificateResponse, GetChargingProfilesResponse,
+    GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse,
+    GetMonitoringReportResponse, GetTransactionStatusResponse, InstallCertificateResponse,
+    LogStatusNotificationRequest, NotifyDisplayMessagesRequest, ReportChargingProfilesRequest,
+    RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
+    ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
+    SetMonitoringBaseResponse, SetMonitoringLevelResponse, TriggerMessageResponse,
+    UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -2157,6 +2158,92 @@ pub fn v201_get_installed_certificate_ids_response(
             certificate_hash_data_chain: Some(chain),
             custom_data: None,
         }
+    }
+}
+
+/// Whether two [`CertificateHashDataType`] name the **same** certificate.
+///
+/// Identity is the OCPP hash triple plus the algorithm that produced it —
+/// [`hash_algorithm`](CertificateHashDataType::hash_algorithm),
+/// [`issuer_name_hash`](CertificateHashDataType::issuer_name_hash),
+/// [`issuer_key_hash`](CertificateHashDataType::issuer_key_hash), and
+/// [`serial_number`](CertificateHashDataType::serial_number). The `customData`
+/// vendor extension is deliberately excluded: it is an optional annotation, not
+/// part of what the hash *identifies*, so a `DeleteCertificate` that carries a
+/// `customData` still matches the anchor it names (and derived hashes, which
+/// carry none, match a request that does). This is a field-wise compare rather
+/// than the derived `PartialEq` precisely so that extension cannot change the
+/// match.
+#[must_use]
+pub fn v201_certificate_hash_matches(
+    a: &CertificateHashDataType,
+    b: &CertificateHashDataType,
+) -> bool {
+    a.hash_algorithm == b.hash_algorithm
+        && a.issuer_name_hash == b.issuer_name_hash
+        && a.issuer_key_hash == b.issuer_key_hash
+        && a.serial_number == b.serial_number
+}
+
+/// Resolve which installed trust anchor (if any) a `DeleteCertificate` request's
+/// `certificate_hash_data` names, over an owned `snapshot()` of the
+/// [`V201CertificateStore`](crate::v201_certificate_store::V201CertificateStore).
+///
+/// The **remove** half of the certificate-management family (ports
+/// [`ocpp.v201.call.DeleteCertificate`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py)),
+/// the counterpart of [`v201_get_installed_certificate_ids_matches`]. It reuses
+/// the **same** [`v201_certificate_hash_data`] seam the enumerate side reports
+/// through: each stored `(use, PEM)` is hashed to the placeholder
+/// [`CertificateHashDataType`] `GetInstalledCertificateIds` would return for it,
+/// and the requested hash is matched against those by
+/// [`v201_certificate_hash_matches`]. So a hash a CSMS learned from
+/// `GetInstalledCertificateIds` round-trips to a delete of exactly that anchor,
+/// for as long as it still holds that PEM (a rotation changes the anchor's hash,
+/// exactly as a real certificate hash would, and a stale hash then resolves to
+/// nothing).
+///
+/// Returns the [`InstallCertificateUseEnumType`] of the first matching anchor, or
+/// `None` when nothing installed matches — the wiring layer maps `None` to
+/// `NotFound` and drives the removal itself, since whether a matched anchor can
+/// actually be removed (`Accepted` vs `Failed`) depends on the live store, not on
+/// this pure snapshot. At most one anchor is held per use and each use derives a
+/// distinct hash, so at most one entry can match; `find_map` short-circuits on it.
+///
+/// Pure over its inputs (the requested hash plus an owned snapshot), so it is
+/// unit-testable without a runtime or the store lock. The requested hash is
+/// untrusted CSMS input, but every field is only ever string-compared here —
+/// never parsed or unwrapped — so no hostile value (arbitrary bytes, over-long
+/// strings) can panic.
+#[must_use]
+pub fn v201_delete_certificate_target(
+    requested: &CertificateHashDataType,
+    snapshot: &[(InstallCertificateUseEnumType, String)],
+) -> Option<InstallCertificateUseEnumType> {
+    snapshot.iter().find_map(|(use_, pem)| {
+        v201_certificate_hash_matches(requested, &v201_certificate_hash_data(*use_, pem))
+            .then_some(*use_)
+    })
+}
+
+/// Build a schema-valid `DeleteCertificate.conf` ([`DeleteCertificateResponse`]).
+///
+/// Pure constructor mirroring [`v201_install_certificate_response`]: carries the
+/// decided [`status`](DeleteCertificateStatusEnumType) plus the optional 2.0.1
+/// `statusInfo` — a vendor-agnostic `reasonCode` and human-readable detail the
+/// handler attaches to a non-`Accepted` outcome (why nothing was removed:
+/// `NotFound` with no matching anchor, or `Failed` when a matched anchor could
+/// not be removed). An `Accepted` carries no `statusInfo`.
+///
+/// Ports `ocpp.v201.call_result.DeleteCertificate`.
+#[must_use]
+pub fn v201_delete_certificate_response(
+    status: DeleteCertificateStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> DeleteCertificateResponse {
+    DeleteCertificateResponse {
+        status,
+        status_info,
+        custom_data: None,
     }
 }
 
@@ -5032,6 +5119,139 @@ mod tests {
                     &serde_json::to_value(&resp).unwrap(),
                 )
                 .expect("built GetInstalledCertificateIds response is schema-valid");
+        }
+    }
+
+    // --- DeleteCertificate (v201) decision + response builder (#522) ---
+
+    #[test]
+    fn certificate_hash_matches_on_identity_fields_only() {
+        let base = v201_certificate_hash_data(
+            InstallCertificateUseEnumType::CSMSRootCertificate,
+            "pem-csms",
+        );
+        // Reflexive: a hash matches itself.
+        assert!(v201_certificate_hash_matches(&base, &base));
+
+        // `customData` is a vendor annotation, not identity — a request carrying it
+        // still matches the derived (customData-less) hash of the same anchor.
+        let with_custom = CertificateHashDataType {
+            custom_data: Some(ocpp_types::v201::CustomDataType {
+                vendor_id: "acme".to_string(),
+                extra: serde_json::Map::new(),
+            }),
+            ..base.clone()
+        };
+        assert!(
+            v201_certificate_hash_matches(&base, &with_custom),
+            "customData is excluded from the identity compare"
+        );
+
+        // Changing any single identity field breaks the match.
+        let mut algo = base.clone();
+        algo.hash_algorithm = HashAlgorithmEnumType::Sha384;
+        let mut name = base.clone();
+        name.issuer_name_hash = "different".to_string();
+        let mut key = base.clone();
+        key.issuer_key_hash = "different".to_string();
+        let mut serial = base.clone();
+        serial.serial_number = "different".to_string();
+        for differ in [algo, name, key, serial] {
+            assert!(
+                !v201_certificate_hash_matches(&base, &differ),
+                "a differing identity field is not a match: {differ:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_certificate_target_resolves_the_named_anchor() {
+        let snapshot = two_anchors();
+        // The hash `GetInstalledCertificateIds` reports for the CSMS anchor resolves
+        // back to that anchor's use — the round-trip #522 guarantees.
+        let csms_hash = v201_certificate_hash_data(
+            InstallCertificateUseEnumType::CSMSRootCertificate,
+            "pem-csms",
+        );
+        assert_eq!(
+            v201_delete_certificate_target(&csms_hash, &snapshot),
+            Some(InstallCertificateUseEnumType::CSMSRootCertificate)
+        );
+        // The V2G anchor's hash resolves to the V2G use, not the CSMS one — the
+        // resolver picks the right entry among several.
+        let v2g_hash = v201_certificate_hash_data(
+            InstallCertificateUseEnumType::V2GRootCertificate,
+            "pem-v2g",
+        );
+        assert_eq!(
+            v201_delete_certificate_target(&v2g_hash, &snapshot),
+            Some(InstallCertificateUseEnumType::V2GRootCertificate)
+        );
+    }
+
+    #[test]
+    fn delete_certificate_target_is_none_for_unknown_empty_or_hostile() {
+        let snapshot = two_anchors();
+        // A hash for the right use but a stale PEM (a rotation) resolves to nothing.
+        let stale = v201_certificate_hash_data(
+            InstallCertificateUseEnumType::CSMSRootCertificate,
+            "pem-rotated",
+        );
+        assert_eq!(v201_delete_certificate_target(&stale, &snapshot), None);
+
+        // An anchor that isn't installed matches nothing.
+        let uninstalled =
+            v201_certificate_hash_data(InstallCertificateUseEnumType::MORootCertificate, "pem-mo");
+        assert_eq!(
+            v201_delete_certificate_target(&uninstalled, &snapshot),
+            None
+        );
+
+        // An empty store never matches.
+        assert_eq!(v201_delete_certificate_target(&stale, &[]), None);
+
+        // Hostile hash fields are only string-compared, never parsed — no panic,
+        // no match.
+        let hostile = CertificateHashDataType {
+            hash_algorithm: HashAlgorithmEnumType::Sha512,
+            issuer_name_hash: "\0\u{1}".repeat(10_000),
+            issuer_key_hash: "-".repeat(100_000),
+            serial_number: "💥".to_string(),
+            custom_data: None,
+        };
+        assert_eq!(v201_delete_certificate_target(&hostile, &snapshot), None);
+    }
+
+    #[test]
+    fn built_delete_certificate_responses_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        // All three wire values the handler can emit serialize schema-valid:
+        // Accepted (no statusInfo), plus NotFound and Failed each with a reason.
+        let cases = [
+            (DeleteCertificateStatusEnumType::Accepted, None),
+            (
+                DeleteCertificateStatusEnumType::NotFound,
+                Some(StatusInfoType {
+                    reason_code: "NotFound".to_string(),
+                    additional_info: Some("no installed certificate matches".to_string()),
+                    custom_data: None,
+                }),
+            ),
+            (
+                DeleteCertificateStatusEnumType::Failed,
+                Some(StatusInfoType {
+                    reason_code: "RemovalFailed".to_string(),
+                    additional_info: None,
+                    custom_data: None,
+                }),
+            ),
+        ];
+        for (status, status_info) in cases {
+            let resp = v201_delete_certificate_response(status, status_info);
+            assert_eq!(resp.status, status);
+            validator
+                .validate_call_result("DeleteCertificate", &serde_json::to_value(&resp).unwrap())
+                .expect("built DeleteCertificate response is schema-valid");
         }
     }
 

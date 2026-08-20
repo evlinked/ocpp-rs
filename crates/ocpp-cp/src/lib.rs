@@ -96,6 +96,7 @@ use ocpp_messages::v201::{
     ClearVariableMonitoringRequest as V201ClearVariableMonitoringRequest,
     ClearVariableMonitoringResponse as V201ClearVariableMonitoringResponse,
     CostUpdatedRequest as V201CostUpdatedRequest, DataTransferRequest as V201DataTransferRequest,
+    DeleteCertificateRequest as V201DeleteCertificateRequest,
     GetBaseReportRequest as V201GetBaseReportRequest,
     GetBaseReportResponse as V201GetBaseReportResponse,
     GetChargingProfilesRequest as V201GetChargingProfilesRequest,
@@ -136,8 +137,9 @@ use ocpp_types::v201::{
     AttributeEnumType, AuthorizationStatusEnumType, CertificateSignedStatusEnumType,
     ChangeAvailabilityStatusEnumType, ChargingProfilePurposeEnumType,
     ChargingProfileStatusEnumType, ChargingProfileType, ConnectorStatusEnumType,
-    DisplayMessageStatusEnumType, GenericDeviceModelStatusEnumType, GenericStatusEnumType,
-    GetVariableResultType, IdTokenType as V201IdTokenType, InstallCertificateStatusEnumType,
+    DeleteCertificateStatusEnumType, DisplayMessageStatusEnumType,
+    GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetVariableResultType,
+    IdTokenType as V201IdTokenType, InstallCertificateStatusEnumType,
     InstallCertificateUseEnumType, LogStatusEnumType, MessageInfoType, MessageTriggerEnumType,
     MonitoringDataType, OperationalStatusEnumType, RegistrationStatusEnumType, ReportDataType,
     RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
@@ -2145,6 +2147,81 @@ impl ChargePoint {
                     status,
                     status_info,
                 ))
+            });
+        }
+
+        // DeleteCertificate (OCPP 2.0.1 only) — the CSMS removes a previously
+        // installed trust anchor, named by its `CertificateHashDataType` (Part 2,
+        // A02 / M03–M05, Issue #522). The **remove** side of the certificate-
+        // *management* family (`InstallCertificate` writes, `GetInstalledCertificateIds`
+        // reads, this removes), over the same `V201CertificateStore` those two use.
+        // Registered only on the V201 arm — 1.6 has no per-use trust model here.
+        //
+        // A read-resolve-then-remove: snapshot the store, resolve the requested hash
+        // to the anchor it names (`v201_command::v201_delete_certificate_target`,
+        // which reuses the shared `v201_certificate_hash_data` seam so a hash
+        // enumerated by `GetInstalledCertificateIds` round-trips to a delete of the
+        // same anchor), then act:
+        //
+        // - no anchor matched → `NotFound`, nothing removed. A re-delete of an
+        //   already-removed anchor takes this arm, so delete is idempotent.
+        // - matched → `remove(use)` under the write lock. `Some` (removed) →
+        //   `Accepted`; `None` means the matched anchor was gone by removal time — a
+        //   concurrent `DeleteCertificate` for the same anchor raced in between the
+        //   snapshot and the remove — which is the "matched but could not remove"
+        //   arm → `Failed`.
+        //
+        // Trust boundary: `certificate_hash_data` is attacker-influenced CSMS input;
+        // its fields are only ever string-compared against derived hashes, never
+        // parsed or unwrapped, so no wire value (arbitrary bytes, over-long strings)
+        // can panic. Ports `ocpp.v201.call.DeleteCertificate` →
+        // `ocpp.v201.call_result.DeleteCertificate`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let certificates = v201_certificates.clone();
+            d.on(move |req: V201DeleteCertificateRequest| {
+                let certificates = certificates.clone();
+                async move {
+                    let snapshot = certificates.snapshot().await;
+                    let (status, status_info) = match v201_command::v201_delete_certificate_target(
+                        &req.certificate_hash_data,
+                        &snapshot,
+                    ) {
+                        None => (
+                            DeleteCertificateStatusEnumType::NotFound,
+                            Some(StatusInfoType {
+                                reason_code: "NotFound".to_string(),
+                                additional_info: Some(
+                                    "no installed certificate matches the requested hash"
+                                        .to_string(),
+                                ),
+                                custom_data: None,
+                            }),
+                        ),
+                        Some(use_) => {
+                            if certificates.remove(use_).await.is_some() {
+                                (DeleteCertificateStatusEnumType::Accepted, None)
+                            } else {
+                                // Matched a snapshot anchor, but it was already gone
+                                // by removal time (a concurrent delete raced in).
+                                (
+                                    DeleteCertificateStatusEnumType::Failed,
+                                    Some(StatusInfoType {
+                                        reason_code: "RemovalFailed".to_string(),
+                                        additional_info: Some(
+                                            "the matched certificate was already removed"
+                                                .to_string(),
+                                        ),
+                                        custom_data: None,
+                                    }),
+                                )
+                            }
+                        }
+                    };
+                    Ok(v201_command::v201_delete_certificate_response(
+                        status,
+                        status_info,
+                    ))
+                }
             });
         }
 
@@ -9874,6 +9951,23 @@ mod tests {
         }
     }
 
+    // --- OCPP 2.0.1 DeleteCertificate (M7, issue #522) ---------------------
+    // A `for_version(V201)` CP removes an installed trust anchor from its
+    // `V201CertificateStore`, named by the same hash `GetInstalledCertificateIds`
+    // reports for it. These exercise the wired V201 arm end-to-end over
+    // `handle_message`: delete-existing round-trips off the shared hash seam,
+    // delete-unknown is `NotFound`, re-delete is idempotent, hostile input never
+    // panics, and the handler is V201-only.
+
+    fn make_v201_delete_certificate(
+        hash: ocpp_types::v201::CertificateHashDataType,
+    ) -> CallMessage {
+        make_call(V201DeleteCertificateRequest {
+            certificate_hash_data: hash,
+            custom_data: None,
+        })
+    }
+
     // --- OCPP 2.0.1 GetLog (M7, issue #517) --------------------------------
     // A `for_version(V201)` CP acks a diagnostics/security log-upload request
     // synchronously off its `V201LogUploadStore` (in-flight `requestId` tracker):
@@ -9899,6 +9993,22 @@ mod tests {
         })
     }
 
+    /// Read the `DeleteCertificate.conf` out of a `handle_message` reply,
+    /// asserting the reply is a CALLRESULT.
+    async fn delete_certificate_response(
+        cp: &ChargePoint,
+        hash: ocpp_types::v201::CertificateHashDataType,
+    ) -> ocpp_messages::v201::DeleteCertificateResponse {
+        let resp = cp
+            .handle_message(Message::Call(make_v201_delete_certificate(hash)))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => r.payload_as().unwrap(),
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
     /// Read the `GetLog.conf` out of a `handle_message` reply, asserting the reply
     /// is a CALLRESULT.
     async fn get_log_response(
@@ -9914,6 +10024,150 @@ mod tests {
             Message::CallResult(r) => r.payload_as().unwrap(),
             other => panic!("expected CallResult, got: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn v201_delete_certificate_removes_an_installed_anchor() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        install_anchor(&cp, InstallCertificateUseEnumType::CSMSRootCertificate).await;
+        install_anchor(&cp, InstallCertificateUseEnumType::V2GRootCertificate).await;
+
+        // Delete by the exact hash GetInstalledCertificateIds would report for the
+        // CSMS anchor — the round-trip the shared seam guarantees.
+        let csms_hash = v201_command::v201_certificate_hash_data(
+            InstallCertificateUseEnumType::CSMSRootCertificate,
+            SAMPLE_INSTALL_PEM,
+        );
+        let body = delete_certificate_response(&cp, csms_hash).await;
+        assert_eq!(body.status, DeleteCertificateStatusEnumType::Accepted);
+        assert!(
+            body.status_info.is_none(),
+            "an accepted delete carries no statusInfo"
+        );
+
+        // The CSMS anchor is gone; the untouched V2G anchor remains.
+        assert_eq!(
+            cp.installed_certificate(InstallCertificateUseEnumType::CSMSRootCertificate)
+                .await,
+            None,
+            "the deleted anchor is no longer installed"
+        );
+        assert!(
+            cp.installed_certificate(InstallCertificateUseEnumType::V2GRootCertificate)
+                .await
+                .is_some(),
+            "a sibling anchor is undisturbed"
+        );
+
+        // GetInstalledCertificateIds now enumerates only the surviving anchor.
+        let resp = cp
+            .handle_message(Message::Call(make_v201_get_installed_certificate_ids(None)))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let ids: ocpp_messages::v201::GetInstalledCertificateIdsResponse =
+                    r.payload_as().unwrap();
+                let chain = ids
+                    .certificate_hash_data_chain
+                    .expect("one anchor still installed");
+                assert_eq!(chain.len(), 1);
+                assert_eq!(
+                    chain[0].certificate_type,
+                    ocpp_types::v201::GetCertificateIdUseEnumType::V2GRootCertificate
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+
+        // A pure remove queues no side-effect command.
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_delete_certificate_unknown_hash_is_not_found_and_changes_nothing() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        install_anchor(&cp, InstallCertificateUseEnumType::CSMSRootCertificate).await;
+
+        // A hash naming an anchor that is not installed removes nothing.
+        let unknown = v201_command::v201_certificate_hash_data(
+            InstallCertificateUseEnumType::MORootCertificate,
+            SAMPLE_INSTALL_PEM,
+        );
+        let body = delete_certificate_response(&cp, unknown).await;
+        assert_eq!(body.status, DeleteCertificateStatusEnumType::NotFound);
+        assert!(
+            body.status_info.is_some(),
+            "a NotFound carries a statusInfo reason"
+        );
+
+        // The installed anchor is untouched.
+        assert!(
+            cp.installed_certificate(InstallCertificateUseEnumType::CSMSRootCertificate)
+                .await
+                .is_some(),
+            "a non-matching delete removes nothing"
+        );
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_delete_certificate_is_idempotent() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        install_anchor(&cp, InstallCertificateUseEnumType::CSMSRootCertificate).await;
+        let hash = v201_command::v201_certificate_hash_data(
+            InstallCertificateUseEnumType::CSMSRootCertificate,
+            SAMPLE_INSTALL_PEM,
+        );
+
+        // First delete removes the anchor.
+        let first = delete_certificate_response(&cp, hash.clone()).await;
+        assert_eq!(first.status, DeleteCertificateStatusEnumType::Accepted);
+
+        // Re-deleting the same hash finds nothing to remove — idempotent NotFound.
+        let second = delete_certificate_response(&cp, hash).await;
+        assert_eq!(second.status, DeleteCertificateStatusEnumType::NotFound);
+    }
+
+    #[tokio::test]
+    async fn v201_delete_certificate_does_not_panic_on_hostile_hash() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        install_anchor(&cp, InstallCertificateUseEnumType::CSMSRootCertificate).await;
+
+        // Control-char and multi-byte hash fields (within the schema length bounds
+        // so they reach the handler, rather than being rejected as CALLERROR up
+        // front) are only string-compared, never parsed — the handler answers
+        // NotFound without panicking. Over-length fields are refused at the schema
+        // layer before the handler, which the pure `v201_delete_certificate_target`
+        // test covers for arbitrary byte lengths.
+        let hostile = ocpp_types::v201::CertificateHashDataType {
+            hash_algorithm: ocpp_types::v201::HashAlgorithmEnumType::Sha512,
+            issuer_name_hash: "\0\u{1}\u{7f}control\u{feff}".to_string(),
+            issuer_key_hash: "💥🔥".repeat(10),
+            serial_number: "\0\u{1}\u{2}not-a-hash".to_string(),
+            custom_data: None,
+        };
+        let body = delete_certificate_response(&cp, hostile).await;
+        assert_eq!(body.status, DeleteCertificateStatusEnumType::NotFound);
+    }
+
+    #[tokio::test]
+    async fn v201_delete_certificate_is_v201_only() {
+        // A 1.6J CP has no DeleteCertificate handler (no per-use trust model), so
+        // the v201-only action is unrouted → CallError, never a CallResult.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V16J)).unwrap();
+        let hash = v201_command::v201_certificate_hash_data(
+            InstallCertificateUseEnumType::CSMSRootCertificate,
+            SAMPLE_INSTALL_PEM,
+        );
+        let resp = cp
+            .handle_message(Message::Call(make_v201_delete_certificate(hash)))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Some(Message::CallError(_))),
+            "a 1.6J CP does not answer DeleteCertificate with a CallResult, got: {resp:?}"
+        );
     }
 
     #[tokio::test]
