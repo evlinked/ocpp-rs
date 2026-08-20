@@ -26,6 +26,7 @@ pub mod v201_data_transfer;
 pub mod v201_device_model;
 pub mod v201_display_message;
 pub mod v201_log_upload;
+pub mod v201_network_profile;
 pub mod v201_station_ceiling;
 pub mod v201_transaction;
 pub mod v201_tx_default_profile;
@@ -81,6 +82,7 @@ use v201_cost::V201CostStore;
 use v201_device_model::V201DeviceModel;
 use v201_display_message::V201DisplayMessageStore;
 use v201_log_upload::V201LogUploadStore;
+use v201_network_profile::V201NetworkProfileStore;
 use v201_station_ceiling::{CeilingKind, V201StationCeilingStore};
 use v201_tx_default_profile::V201TxDefaultProfileStore;
 // 2.0.1 provisioning message + enum types used by the version-aware runtime
@@ -125,6 +127,7 @@ use ocpp_messages::v201::{
     SetDisplayMessageRequest as V201SetDisplayMessageRequest,
     SetMonitoringBaseRequest as V201SetMonitoringBaseRequest,
     SetMonitoringLevelRequest as V201SetMonitoringLevelRequest,
+    SetNetworkProfileRequest as V201SetNetworkProfileRequest,
     SetVariableMonitoringRequest as V201SetVariableMonitoringRequest,
     SetVariableMonitoringResponse as V201SetVariableMonitoringResponse,
     SetVariablesRequest as V201SetVariablesRequest,
@@ -141,8 +144,9 @@ use ocpp_types::v201::{
     GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetVariableResultType,
     IdTokenType as V201IdTokenType, InstallCertificateStatusEnumType,
     InstallCertificateUseEnumType, LogStatusEnumType, MessageInfoType, MessageTriggerEnumType,
-    MonitoringDataType, OperationalStatusEnumType, RegistrationStatusEnumType, ReportDataType,
-    RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
+    MonitoringDataType, NetworkConnectionProfileType, OperationalStatusEnumType,
+    RegistrationStatusEnumType, ReportDataType, RequestStartStopStatusEnumType,
+    ReserveNowStatusEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType,
     SetVariableResultType, StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
     UploadLogStatusEnumType,
 };
@@ -1064,6 +1068,16 @@ pub struct ChargePoint {
     /// handler only once its pure decision returns `Accepted`. Empty on the 1.6J
     /// path (the handler is V201-only; 1.6 has no per-use trust model here).
     v201_certificates: Arc<V201CertificateStore>,
+    /// v201 network connection profiles installed by `SetNetworkProfile` (OCPP
+    /// 2.0.1 Part 2, provisioning, B09/B10, Issue #528), keyed by the numbered
+    /// `configurationSlot` each occupies. A same-slot re-provision upserts
+    /// (last-writer-wins); a distinct slot stores independently. Populated by the
+    /// V201-only `SetNetworkProfile` handler once its pure decision returns
+    /// `Accepted`; read back via [`network_profile`](Self::network_profile) /
+    /// [`configured_network_slots`](Self::configured_network_slots). Empty on the
+    /// 1.6J path (the handler is V201-only; 1.6 has no equivalent command). A
+    /// self-contained configuration store with no async follow-up.
+    v201_network_profiles: Arc<V201NetworkProfileStore>,
     /// The single in-flight `GetLog` upload the station is serving (OCPP 2.0.1
     /// Part 2, security profile, Issue #517), by its `requestId`. A station
     /// uploads one log at a time, so the V201-only `GetLog` handler records the
@@ -1256,6 +1270,12 @@ impl ChargePoint {
         // `DeleteCertificate`) will read/mutate.
         let v201_certificates = Arc::new(V201CertificateStore::new());
 
+        // The network-profile store the V201 `SetNetworkProfile` handler upserts
+        // into (Issue #528). Shared into the default dispatcher so the handler can
+        // store straight from the CALL path; keyed by `configurationSlot`, a
+        // self-contained configuration store with no async follow-up.
+        let v201_network_profiles = Arc::new(V201NetworkProfileStore::new());
+
         // The in-flight `GetLog` upload tracker the V201 `GetLog` handler records
         // into (Issue #517). Shared into the default dispatcher so the handler can
         // read/set the single in-flight `requestId` straight from the CALL path;
@@ -1324,6 +1344,7 @@ impl ChargePoint {
             v201_station_ceilings.clone(),
             v201_display_messages.clone(),
             v201_certificates.clone(),
+            v201_network_profiles.clone(),
             v201_log_uploads.clone(),
             v201_costs.clone(),
             expiry_timers.clone(),
@@ -1360,6 +1381,7 @@ impl ChargePoint {
             v201_station_ceilings,
             v201_display_messages,
             v201_certificates,
+            v201_network_profiles,
             v201_log_uploads,
             v201_costs,
             reservations,
@@ -1404,6 +1426,7 @@ impl ChargePoint {
         v201_station_ceilings: Arc<V201StationCeilingStore>,
         v201_display_messages: Arc<V201DisplayMessageStore>,
         v201_certificates: Arc<V201CertificateStore>,
+        v201_network_profiles: Arc<V201NetworkProfileStore>,
         v201_log_uploads: Arc<V201LogUploadStore>,
         v201_costs: Arc<V201CostStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
@@ -1966,6 +1989,79 @@ impl ChargePoint {
                         }),
                     };
                     Ok(v201_command::v201_install_certificate_response(
+                        status,
+                        status_info,
+                    ))
+                }
+            });
+        }
+
+        // SetNetworkProfile (OCPP 2.0.1 only) — the CSMS provisions the
+        // connectivity settings a station uses to reach it (the OCPP
+        // transport/version, message timeout, security profile, network
+        // interface, and cellular/VPN bearer), writing a
+        // `NetworkConnectionProfileType` into a numbered `configurationSlot`
+        // (Part 2, provisioning, B09/B10, Issue #528). Registered only on the
+        // V201 arm — "SetNetworkProfile" has no 1.6J twin.
+        //
+        // A pure decide-and-answer with at most one store side effect (the upsert
+        // of an accepted profile), no queued command — the same shape as
+        // `SetDisplayMessage` / `InstallCertificate`. The decision
+        // (`v201_command::v201_set_network_profile_decision`) is a lightweight
+        // predicate on the profile — **no real network dial** (a documented
+        // simulator boundary): a profile whose `ocppCsmsUrl` is blank names no
+        // reachable CSMS → `Rejected` (nothing stored, a `statusInfo` reason
+        // attached); a well-formed profile → `Accepted` and upserted into the
+        // `V201NetworkProfileStore` keyed by `configurationSlot` (a re-provision
+        // of the same slot rotates it in place, last-writer-wins, never a
+        // duplicate). `Failed` — the spec's "accepted but could not apply" runtime
+        // arm — is a documented unproduced seam (see the decision's docs).
+        //
+        // Trust boundary: `connection_data` is attacker-influenced CSMS input.
+        // It is only inspected (`ocppCsmsUrl` presence) and stored — never dialed,
+        // parsed, or unwrapped — so no wire value (blank, garbage, very long,
+        // control chars) can panic; over-length string fields inside
+        // `NetworkConnectionProfileType` are refused at the schema layer (→
+        // CALLERROR) before the handler runs. `configuration_slot` is only used as
+        // a `HashMap` key (hashed/compared), never indexed into a `Vec`, so
+        // extreme values (`i32::MIN`/`MAX`) cannot panic. The snapshot-free
+        // upsert needs no cross-lock: a repeated `SetNetworkProfile` for the same
+        // slot deterministically last-writer-wins, a valid outcome. Ports
+        // `ocpp.v201.call.SetNetworkProfile` →
+        // `ocpp.v201.call_result.SetNetworkProfile`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let network_profiles = v201_network_profiles.clone();
+            d.on(move |req: V201SetNetworkProfileRequest| {
+                let network_profiles = network_profiles.clone();
+                async move {
+                    let status = v201_command::v201_set_network_profile_decision(&req);
+                    let status_info = match status {
+                        SetNetworkProfileStatusEnumType::Accepted => {
+                            // Store only an accepted profile; a re-provision of the
+                            // same slot rotates it in place.
+                            network_profiles
+                                .upsert(req.configuration_slot, req.connection_data)
+                                .await;
+                            None
+                        }
+                        SetNetworkProfileStatusEnumType::Rejected => Some(StatusInfoType {
+                            reason_code: "InvalidProfile".to_string(),
+                            additional_info: Some(
+                                "connectionData.ocppCsmsUrl is empty; the profile names no \
+                                 reachable CSMS"
+                                    .to_string(),
+                            ),
+                            custom_data: None,
+                        }),
+                        SetNetworkProfileStatusEnumType::Failed => Some(StatusInfoType {
+                            reason_code: "ApplicationFailed".to_string(),
+                            additional_info: Some(
+                                "profile accepted but the station could not apply it".to_string(),
+                            ),
+                            custom_data: None,
+                        }),
+                    };
+                    Ok(v201_command::v201_set_network_profile_response(
                         status,
                         status_info,
                     ))
@@ -5750,6 +5846,34 @@ impl ChargePoint {
         use_: InstallCertificateUseEnumType,
     ) -> Option<String> {
         self.v201_certificates.installed(use_).await
+    }
+
+    /// The network connection profile stored in `configuration_slot`, if any
+    /// (OCPP 2.0.1 Part 2, provisioning, B09/B10, Issue #528).
+    ///
+    /// The read path making an accepted `SetNetworkProfile` observable: an
+    /// operator (or a test) can confirm a profile the station answered `Accepted`
+    /// was actually taken up into the store — and a re-provision of the same slot
+    /// rotated rather than duplicated it — rather than parsed off the wire and
+    /// dropped. Returns the profile as delivered (the simulator never dials it).
+    /// Always `None` on the 1.6J path (which has no v201 network-profile store)
+    /// and for a slot the station never provisioned.
+    pub async fn network_profile(
+        &self,
+        configuration_slot: i32,
+    ) -> Option<NetworkConnectionProfileType> {
+        self.v201_network_profiles.get(configuration_slot).await
+    }
+
+    /// The `configurationSlot`s that currently hold a network connection profile,
+    /// in ascending order (OCPP 2.0.1, Issue #528).
+    ///
+    /// The enumerate-side read making the whole network-profile store observable:
+    /// a test can confirm which slots a sequence of `SetNetworkProfile`s
+    /// populated (and that a same-slot re-provision did not grow the set). Empty
+    /// on the 1.6J path and before any profile is provisioned.
+    pub async fn configured_network_slots(&self) -> Vec<i32> {
+        self.v201_network_profiles.slots().await
     }
 
     /// The `requestId` of the `GetLog` upload the station is currently serving, if
@@ -9602,6 +9726,228 @@ mod tests {
                 .validate_call_result("InstallCertificate", &serde_json::to_value(&resp).unwrap())
                 .expect("InstallCertificate response is schema-valid");
         }
+    }
+
+    // --- OCPP 2.0.1 SetNetworkProfile (M7, issue #528) --------------------
+    // A `for_version(V201)` CP stores a network connection profile into its
+    // `V201NetworkProfileStore`, keyed by `configurationSlot`. These exercise the
+    // wired V201 arm end-to-end over `handle_message`: accept-and-store, per-slot
+    // isolation, same-slot rotation, the blank-URL reject non-store path, extreme
+    // slots, and V201-only registration.
+
+    /// A minimal, well-formed `NetworkConnectionProfileType` whose `ocppCsmsUrl`
+    /// embeds `tag` so tests can tell one stored profile from another.
+    fn sample_network_profile(tag: &str) -> NetworkConnectionProfileType {
+        use ocpp_types::v201::{OCPPInterfaceEnumType, OCPPTransportEnumType, OCPPVersionEnumType};
+        NetworkConnectionProfileType {
+            ocpp_version: OCPPVersionEnumType::Ocpp20,
+            ocpp_transport: OCPPTransportEnumType::Json,
+            ocpp_csms_url: format!("wss://csms.example.com/{tag}"),
+            message_timeout: 30,
+            security_profile: 2,
+            ocpp_interface: OCPPInterfaceEnumType::Wireless0,
+            apn: None,
+            vpn: None,
+            custom_data: None,
+        }
+    }
+
+    fn make_v201_set_network_profile(
+        configuration_slot: i32,
+        connection_data: NetworkConnectionProfileType,
+    ) -> CallMessage {
+        make_call(V201SetNetworkProfileRequest {
+            configuration_slot,
+            connection_data,
+            custom_data: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn v201_set_network_profile_accepts_and_stores_a_profile() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let profile = sample_network_profile("a");
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_network_profile(
+                1,
+                profile.clone(),
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetNetworkProfileResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, SetNetworkProfileStatusEnumType::Accepted);
+                // Accepted carries no statusInfo.
+                assert!(body.status_info.is_none());
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        // The accepted profile is observable in the store, read back by slot.
+        assert_eq!(cp.network_profile(1).await, Some(profile));
+        assert_eq!(cp.configured_network_slots().await, vec![1]);
+        // A pure store queues no side-effect command.
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_set_network_profile_second_slot_stores_independently() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.handle_message(Message::Call(make_v201_set_network_profile(
+            1,
+            sample_network_profile("a"),
+        )))
+        .await
+        .unwrap();
+
+        // A second profile in a DIFFERENT slot, with distinct content.
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_network_profile(
+                2,
+                sample_network_profile("b"),
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetNetworkProfileResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, SetNetworkProfileStatusEnumType::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        // Both slots hold their own profile; the first was not disturbed.
+        assert_eq!(
+            cp.network_profile(1).await,
+            Some(sample_network_profile("a"))
+        );
+        assert_eq!(
+            cp.network_profile(2).await,
+            Some(sample_network_profile("b"))
+        );
+        assert_eq!(cp.configured_network_slots().await, vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn v201_set_network_profile_same_slot_rotates_the_profile() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.handle_message(Message::Call(make_v201_set_network_profile(
+            1,
+            sample_network_profile("old"),
+        )))
+        .await
+        .unwrap();
+
+        // Re-provision a DIFFERENT profile into the SAME slot (last-writer-wins).
+        let rotated = sample_network_profile("new");
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_network_profile(
+                1,
+                rotated.clone(),
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetNetworkProfileResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, SetNetworkProfileStatusEnumType::Accepted);
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.network_profile(1).await,
+            Some(rotated),
+            "a same-slot re-provision rotates the profile in place, no duplicate"
+        );
+        assert_eq!(
+            cp.configured_network_slots().await,
+            vec![1],
+            "a rotation does not grow the set of configured slots"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_set_network_profile_rejects_a_blank_url_and_stores_nothing() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // A profile whose ocppCsmsUrl is blank names no reachable CSMS — refused
+        // up front (schema-valid on the wire: ocppCsmsUrl has no minLength), and
+        // the CSMS-supplied profile never panics the handler.
+        let mut blank = sample_network_profile("x");
+        blank.ocpp_csms_url = "   ".to_string();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_network_profile(7, blank)))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetNetworkProfileResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, SetNetworkProfileStatusEnumType::Rejected);
+                assert_eq!(
+                    body.status_info
+                        .expect("a refusal carries a statusInfo reason")
+                        .reason_code,
+                    "InvalidProfile"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            cp.network_profile(7).await,
+            None,
+            "a rejected profile is not stored"
+        );
+        assert!(cp.configured_network_slots().await.is_empty());
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_set_network_profile_handles_extreme_slots() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // Extreme configurationSlot values are ordinary HashMap keys — no panic,
+        // stored and read back independently.
+        for slot in [i32::MIN, i32::MAX] {
+            let resp = cp
+                .handle_message(Message::Call(make_v201_set_network_profile(
+                    slot,
+                    sample_network_profile("edge"),
+                )))
+                .await
+                .unwrap();
+            match resp.unwrap() {
+                Message::CallResult(r) => {
+                    let body: ocpp_messages::v201::SetNetworkProfileResponse =
+                        r.payload_as().unwrap();
+                    assert_eq!(body.status, SetNetworkProfileStatusEnumType::Accepted);
+                }
+                other => panic!("expected CallResult, got: {other:?}"),
+            }
+            assert_eq!(
+                cp.network_profile(slot).await,
+                Some(sample_network_profile("edge"))
+            );
+        }
+        assert_eq!(
+            cp.configured_network_slots().await,
+            vec![i32::MIN, i32::MAX]
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_set_network_profile_is_v201_only() {
+        // A 1.6J CP has no SetNetworkProfile handler (1.6 has no equivalent
+        // command), so the v201-only action is unrouted → CallError, never a
+        // CallResult.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V16J)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_network_profile(
+                1,
+                sample_network_profile("a"),
+            )))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Some(Message::CallError(_))),
+            "a 1.6J CP does not answer SetNetworkProfile with a CallResult, got: {resp:?}"
+        );
     }
 
     // --- OCPP 2.0.1 GetInstalledCertificateIds (M7, issue #521) ------------
