@@ -25,6 +25,7 @@ pub mod v201_cost;
 pub mod v201_data_transfer;
 pub mod v201_device_model;
 pub mod v201_display_message;
+pub mod v201_firmware_update;
 pub mod v201_log_upload;
 pub mod v201_network_profile;
 pub mod v201_station_ceiling;
@@ -81,6 +82,7 @@ use v201_charging_profiles::V201TxProfileStore;
 use v201_cost::V201CostStore;
 use v201_device_model::V201DeviceModel;
 use v201_display_message::V201DisplayMessageStore;
+use v201_firmware_update::V201FirmwareUpdateStore;
 use v201_log_upload::V201LogUploadStore;
 use v201_network_profile::V201NetworkProfileStore;
 use v201_station_ceiling::{CeilingKind, V201StationCeilingStore};
@@ -135,6 +137,7 @@ use ocpp_messages::v201::{
     StatusNotificationRequest as V201StatusNotificationRequest,
     TriggerMessageRequest as V201TriggerMessageRequest,
     UnlockConnectorRequest as V201UnlockConnectorRequest,
+    UpdateFirmwareRequest as V201UpdateFirmwareRequest,
 };
 use ocpp_types::v201::{
     AttributeEnumType, AuthorizationStatusEnumType, CertificateSignedStatusEnumType,
@@ -148,7 +151,7 @@ use ocpp_types::v201::{
     RegistrationStatusEnumType, ReportDataType, RequestStartStopStatusEnumType,
     ReserveNowStatusEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType,
     SetVariableResultType, StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
-    UploadLogStatusEnumType,
+    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1086,6 +1089,15 @@ pub struct ChargePoint {
     /// (`AcceptedCanceled`). Idle on the 1.6J path (the handler is V201-only). See
     /// [`V201LogUploadStore`].
     v201_log_uploads: Arc<V201LogUploadStore>,
+    /// The single in-flight `UpdateFirmware` rollout the station is serving (OCPP
+    /// 2.0.1 Part 2, firmware management, L01–L03, Issue #532), by its `requestId`.
+    /// A station runs one firmware update at a time, so the V201-only
+    /// `UpdateFirmware` handler records the accepted request here to answer a later
+    /// `UpdateFirmware` deterministically: a retry of the same `requestId` is
+    /// idempotent, a different one supersedes (`AcceptedCanceled`). Idle on the 1.6J
+    /// path (which keeps the empty-conf `UpdateFirmware` handler and its own
+    /// firmware state machine). See [`V201FirmwareUpdateStore`].
+    v201_firmware_updates: Arc<V201FirmwareUpdateStore>,
     /// Latest running total cost the CSMS has pushed per transaction id via the
     /// 2.0.1 `CostUpdated` message (Issue #502), keyed by the wire
     /// `transactionId` string. Upserted by the V201-only `CostUpdated` handler
@@ -1282,6 +1294,12 @@ impl ChargePoint {
         // idle on the 1.6J path (the handler is V201-only).
         let v201_log_uploads = Arc::new(V201LogUploadStore::new());
 
+        // The in-flight `UpdateFirmware` rollout tracker the V201 `UpdateFirmware`
+        // handler records into (Issue #532). Shared into the default dispatcher so
+        // the handler can read/set the single in-flight `requestId` straight from
+        // the CALL path; idle on the 1.6J path (which keeps the empty-conf handler).
+        let v201_firmware_updates = Arc::new(V201FirmwareUpdateStore::new());
+
         // Issue #471: v201 `TxDefaultProfile` store, shared into the default
         // dispatcher (the `SetChargingProfile` command installs a default into it)
         // and kept on the CP (the metering sampler and `GetCompositeSchedule` read
@@ -1346,6 +1364,7 @@ impl ChargePoint {
             v201_certificates.clone(),
             v201_network_profiles.clone(),
             v201_log_uploads.clone(),
+            v201_firmware_updates.clone(),
             v201_costs.clone(),
             expiry_timers.clone(),
             config.unlock_connector_outcome,
@@ -1383,6 +1402,7 @@ impl ChargePoint {
             v201_certificates,
             v201_network_profiles,
             v201_log_uploads,
+            v201_firmware_updates,
             v201_costs,
             reservations,
             expiry_timers,
@@ -1428,6 +1448,7 @@ impl ChargePoint {
         v201_certificates: Arc<V201CertificateStore>,
         v201_network_profiles: Arc<V201NetworkProfileStore>,
         v201_log_uploads: Arc<V201LogUploadStore>,
+        v201_firmware_updates: Arc<V201FirmwareUpdateStore>,
         v201_costs: Arc<V201CostStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
         unlock_outcome: UnlockConnectorOutcome,
@@ -2314,6 +2335,75 @@ impl ChargePoint {
                         }
                     };
                     Ok(v201_command::v201_delete_certificate_response(
+                        status,
+                        status_info,
+                    ))
+                }
+            });
+        }
+
+        // UpdateFirmware (OCPP 2.0.1 only) — the CSMS asks the station to fetch and
+        // install a firmware image from a URL, identifying the rollout by a
+        // `requestId` (Part 2, firmware management, L01–L03, Issue #532). The 2.0.1
+        // successor to the 1.6J empty-conf handler above: where 1.6J answers an
+        // empty `.conf`, 2.0.1 carries an `UpdateFirmwareStatusEnumType`. Registered
+        // on the V201 arm only (the 1.6J arm keeps the empty-conf handler); the two
+        // share the action name `"UpdateFirmware"`, so this arm-split is what keeps a
+        // 2.0.1 CSMS from getting the wrong (empty) ack — the exact gap #532 fixes.
+        //
+        // Mirrors the `GetLog` single-in-flight / supersede model: snapshot the
+        // in-flight `requestId` from the `V201FirmwareUpdateStore` (read lock
+        // dropped before the decision), decide
+        // (`v201_command::v201_update_firmware_decision`), then on an accept record
+        // the request. `Accepted` (fresh or retry) and `AcceptedCanceled` (supersede)
+        // both `begin` the request as the update now in flight (a re-begin of the
+        // same id is an idempotent no-op); `InvalidCertificate` refuses a present-
+        // but-unusable signing certificate and stores nothing. This slice wires only
+        // the synchronous ack — the async `FirmwareStatusNotification` progress
+        // stream (the analogue of the GetLog → LogStatusNotification split, #526) is
+        // a documented follow-up, so no command is queued here.
+        //
+        // Trust boundary: `firmware.location` / `firmware.signature` are never read;
+        // `firmware.signing_certificate` is only inspected for PEM shape (no X.509
+        // parse — the same boundary `InstallCertificate` set); `request_id` is only
+        // compared and stored, never indexed, so no wire value (incl. `i32::MIN` /
+        // `MAX`) can panic. Over-length fields are refused at the schema layer
+        // (→ CALLERROR) before the handler runs. Ports
+        // `ocpp.v201.call.UpdateFirmware` → `ocpp.v201.call_result.UpdateFirmware`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            let firmware_updates = v201_firmware_updates.clone();
+            d.on(move |req: V201UpdateFirmwareRequest| {
+                let firmware_updates = firmware_updates.clone();
+                async move {
+                    let in_flight = firmware_updates.in_flight().await;
+                    let status = v201_command::v201_update_firmware_decision(&req, in_flight);
+
+                    // An accept (fresh, retry, or supersede) becomes the new
+                    // in-flight update; a re-begin of the same id is idempotent. A
+                    // refusal (InvalidCertificate, or the unproduced Rejected /
+                    // RevokedCertificate seams) records nothing.
+                    if matches!(
+                        status,
+                        UpdateFirmwareStatusEnumType::Accepted
+                            | UpdateFirmwareStatusEnumType::AcceptedCanceled
+                    ) {
+                        firmware_updates.begin(req.request_id).await;
+                    }
+
+                    let status_info = match status {
+                        UpdateFirmwareStatusEnumType::InvalidCertificate => Some(StatusInfoType {
+                            reason_code: "InvalidCertificate".to_string(),
+                            additional_info: Some(
+                                "the firmware signing certificate is empty or not a usable \
+                                 PEM-encoded certificate"
+                                    .to_string(),
+                            ),
+                            custom_data: None,
+                        }),
+                        _ => None,
+                    };
+
+                    Ok(v201_command::v201_update_firmware_response(
                         status,
                         status_info,
                     ))
@@ -3305,9 +3395,9 @@ impl ChargePoint {
             });
         }
 
-        // UpdateFirmware — acknowledge with the empty conf the spec defines (no
-        // status field), then run the firmware-update state machine as a real
-        // side effect (OCPP 1.6J §4.x, firmware-management profile). Like
+        // UpdateFirmware (1.6J arm) — acknowledge with the empty conf the spec
+        // defines (no status field), then run the firmware-update state machine as
+        // a real side effect (OCPP 1.6J §4.x, firmware-management profile). Like
         // GetDiagnostics, the update is queued on the command channel and run by
         // the consumer task spawned in `connect()`, so the UpdateFirmware
         // CALLRESULT is flushed before the first `FirmwareStatusNotification` and
@@ -3316,7 +3406,16 @@ impl ChargePoint {
         // on a timer. If the consumer has gone away (CP shutting down) the
         // update can't run, but the spec response is empty either way, so we
         // only log.
-        {
+        //
+        // The 1.6J and 2.0.1 `UpdateFirmware` share the action name `"UpdateFirmware"`
+        // but differ in response shape — 1.6J is an empty `.conf`, 2.0.1 carries an
+        // `UpdateFirmwareStatusEnumType` — so exactly one handler is registered per
+        // `protocol_version` (the same version-split discipline as ChangeAvailability
+        // / Reset above). Since the dispatcher keys routes by action name, an
+        // ungated registration here would overwrite the V201 handler on a 2.0.1 CP;
+        // gating it to the non-V201 arm keeps the empty-conf handler for 1.6J only
+        // and leaves the V201 arm to the status-carrying handler below (Issue #532).
+        if !matches!(protocol_version, OcppVersion::V201) {
             let command_sender = command_sender.clone();
             d.on(move |_req: UpdateFirmwareRequest| {
                 let command_sender = command_sender.clone();
@@ -5889,6 +5988,21 @@ impl ChargePoint {
     /// slot back to idle.
     pub async fn in_flight_log_upload(&self) -> Option<i32> {
         self.v201_log_uploads.in_flight().await
+    }
+
+    /// The `requestId` of the `UpdateFirmware` rollout the station is currently
+    /// serving, if any (OCPP 2.0.1 Part 2, firmware management, L01–L03, Issue #532).
+    ///
+    /// The read path making the in-flight firmware update observable: an operator
+    /// (or a test) can confirm an `UpdateFirmware` the station answered `Accepted` /
+    /// `AcceptedCanceled` was recorded as the request now in flight — so a later
+    /// `UpdateFirmware` supersedes it rather than starting a second concurrent
+    /// rollout. Always `None` on the 1.6J path (which keeps the empty-conf
+    /// `UpdateFirmware` handler and has no v201 firmware-update tracker), whenever
+    /// the station is idle, and after a refused request (`InvalidCertificate`)
+    /// which records nothing.
+    pub async fn in_flight_firmware_update(&self) -> Option<i32> {
+        self.v201_firmware_updates.in_flight().await
     }
 
     /// The latest running total cost the CSMS has pushed for `transaction_id`
@@ -10701,6 +10815,196 @@ mod tests {
         assert!(
             matches!(resp, Some(Message::CallError(_))),
             "a 1.6J CP does not answer GetLog with a CallResult, got: {resp:?}"
+        );
+    }
+
+    // --- OCPP 2.0.1 UpdateFirmware (M7, issue #532) ------------------------
+    // A `for_version(V201)` CP acks a firmware-update request synchronously off
+    // its `V201FirmwareUpdateStore` (in-flight `requestId` tracker), the direct
+    // sibling of the GetLog supersede model: idle → Accepted; the same requestId
+    // → idempotent Accepted; a different requestId → AcceptedCanceled (supersede);
+    // a present-but-malformed signing certificate → InvalidCertificate (nothing
+    // recorded). The 1.6J arm keeps its status-less empty conf. These exercise the
+    // wired V201 arm end-to-end over `handle_message` — accept + record, retry,
+    // supersede, InvalidCertificate, extreme requestId, and the V201-vs-1.6J split.
+
+    fn make_v201_update_firmware(
+        request_id: i32,
+        signing_certificate: Option<&str>,
+    ) -> CallMessage {
+        make_call(V201UpdateFirmwareRequest {
+            request_id,
+            firmware: ocpp_types::v201::FirmwareType {
+                location: "https://firmware.example.test/image.bin".to_string(),
+                retrieve_date_time: "2026-08-20T00:00:00Z".to_string(),
+                install_date_time: None,
+                signing_certificate: signing_certificate.map(str::to_string),
+                signature: None,
+                custom_data: None,
+            },
+            retries: None,
+            retry_interval: None,
+            custom_data: None,
+        })
+    }
+
+    /// Read the v201 `UpdateFirmware.conf` out of a `handle_message` reply,
+    /// asserting the reply is a CALLRESULT.
+    async fn v201_update_firmware_response(
+        cp: &ChargePoint,
+        request_id: i32,
+        signing_certificate: Option<&str>,
+    ) -> ocpp_messages::v201::UpdateFirmwareResponse {
+        let resp = cp
+            .handle_message(Message::Call(make_v201_update_firmware(
+                request_id,
+                signing_certificate,
+            )))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => r.payload_as().unwrap(),
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_update_firmware_accepts_when_idle_and_records_in_flight() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        assert_eq!(cp.in_flight_firmware_update().await, None, "starts idle");
+
+        let body = v201_update_firmware_response(&cp, 42, None).await;
+        assert_eq!(body.status, UpdateFirmwareStatusEnumType::Accepted);
+        assert!(
+            body.status_info.is_none(),
+            "an accepted update carries no statusInfo"
+        );
+
+        // The accept is recorded as the in-flight rollout. This sync-ack slice
+        // queues NO async progress command — the FirmwareStatusNotification stream
+        // is a documented follow-up.
+        assert_eq!(cp.in_flight_firmware_update().await, Some(42));
+        assert!(
+            v201_drain_commands(&cp).await.is_empty(),
+            "the sync ack queues no async firmware-progress command (out of scope)"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_update_firmware_accepts_a_well_formed_signing_certificate() {
+        // A present, usable PEM signing certificate does not take the
+        // InvalidCertificate arm — the update is accepted and recorded.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let body = v201_update_firmware_response(&cp, 1, Some(SAMPLE_INSTALL_PEM)).await;
+        assert_eq!(body.status, UpdateFirmwareStatusEnumType::Accepted);
+        assert_eq!(cp.in_flight_firmware_update().await, Some(1));
+    }
+
+    #[tokio::test]
+    async fn v201_update_firmware_retry_of_the_same_request_is_idempotent() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+
+        let first = v201_update_firmware_response(&cp, 5, None).await;
+        assert_eq!(first.status, UpdateFirmwareStatusEnumType::Accepted);
+        assert_eq!(cp.in_flight_firmware_update().await, Some(5));
+
+        // The SAME requestId again (a retry) is idempotently Accepted — no spurious
+        // cancel — and the in-flight request is unchanged.
+        let retry = v201_update_firmware_response(&cp, 5, None).await;
+        assert_eq!(retry.status, UpdateFirmwareStatusEnumType::Accepted);
+        assert_eq!(cp.in_flight_firmware_update().await, Some(5));
+    }
+
+    #[tokio::test]
+    async fn v201_update_firmware_supersedes_a_different_in_flight_update() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+
+        let first = v201_update_firmware_response(&cp, 1, None).await;
+        assert_eq!(first.status, UpdateFirmwareStatusEnumType::Accepted);
+        assert_eq!(cp.in_flight_firmware_update().await, Some(1));
+
+        // A second UpdateFirmware with a DIFFERENT requestId supersedes the first.
+        let second = v201_update_firmware_response(&cp, 2, None).await;
+        assert_eq!(
+            second.status,
+            UpdateFirmwareStatusEnumType::AcceptedCanceled
+        );
+        assert_eq!(
+            cp.in_flight_firmware_update().await,
+            Some(2),
+            "the superseding request becomes the one in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_update_firmware_rejects_a_malformed_signing_certificate() {
+        // A present-but-unusable signing certificate is refused with
+        // InvalidCertificate + a statusInfo reason, and nothing is recorded — an
+        // untrusted image never becomes the in-flight rollout.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let body = v201_update_firmware_response(&cp, 7, Some("not a certificate")).await;
+        assert_eq!(
+            body.status,
+            UpdateFirmwareStatusEnumType::InvalidCertificate
+        );
+        assert!(
+            body.status_info.is_some(),
+            "an InvalidCertificate carries a statusInfo reason"
+        );
+        assert_eq!(
+            cp.in_flight_firmware_update().await,
+            None,
+            "a refused update records nothing"
+        );
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_update_firmware_tolerates_an_extreme_request_id() {
+        // An `i32::MIN` requestId must not panic; it is accepted and recorded.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let body = v201_update_firmware_response(&cp, i32::MIN, None).await;
+        assert_eq!(body.status, UpdateFirmwareStatusEnumType::Accepted);
+        assert_eq!(cp.in_flight_firmware_update().await, Some(i32::MIN));
+    }
+
+    #[tokio::test]
+    async fn v201_update_firmware_version_split_preserves_the_1_6j_empty_conf() {
+        // The core of #532: the two versions share the action name "UpdateFirmware"
+        // but answer different shapes. A V201 CP answers the status-carrying 2.0.1
+        // conf; a V16J CP still answers the empty 1.6J conf (no regression), routed
+        // to the preserved 1.6J handler.
+
+        // V201 arm: a status-carrying response, and the request recorded in flight.
+        let v201 = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let body = v201_update_firmware_response(&v201, 1, None).await;
+        assert_eq!(body.status, UpdateFirmwareStatusEnumType::Accepted);
+        assert_eq!(v201.in_flight_firmware_update().await, Some(1));
+
+        // V16J arm: the 1.6J UpdateFirmware still answers its empty conf `{}`, and
+        // has no v201 firmware-update tracker (always idle).
+        let v16 = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V16J)).unwrap();
+        let call = make_call(UpdateFirmwareRequest {
+            location: "ftp://firmware.example.test/image.bin".to_string(),
+            retries: None,
+            retrieve_date: chrono::Utc::now(),
+            retry_interval: None,
+        });
+        let resp = v16.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                assert_eq!(
+                    r.payload,
+                    serde_json::json!({}),
+                    "the 1.6J UpdateFirmware answers the empty conf (no status field)"
+                );
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+        assert_eq!(
+            v16.in_flight_firmware_update().await,
+            None,
+            "the 1.6J path has no v201 firmware-update tracker"
         );
     }
 

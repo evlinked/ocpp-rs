@@ -155,7 +155,8 @@ use ocpp_types::v201::{
     LogStatusEnumType, MessageInfoType, MessagePriorityEnumType, MessageStateEnumType,
     MessageTriggerEnumType, OperationalStatusEnumType, RequestStartStopStatusEnumType,
     ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType,
-    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType, UploadLogStatusEnumType,
+    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
 };
 
 use ocpp_messages::v201::{
@@ -169,6 +170,7 @@ use ocpp_messages::v201::{
     ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
     SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
     SetNetworkProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
+    UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1890,6 +1892,103 @@ pub fn v201_get_log_response(
         status,
         status_info,
         filename,
+        custom_data: None,
+    }
+}
+
+/// Decide how a `for_version(V201)` station answers an `UpdateFirmware.req`, given
+/// the request and the `requestId` of any firmware update already in flight.
+///
+/// `UpdateFirmware` asks the station to fetch and install a firmware image named
+/// by a `FirmwareType` (download `location`, retrieve/install timestamps, and an
+/// optional signing certificate + signature). The decision has two independent
+/// axes, checked in this precedence:
+///
+/// 1. **Signing certificate.** If `firmware.signing_certificate` is *present* but
+///    not a usable PEM certificate, the image cannot be trusted, so the request is
+///    refused outright with
+///    [`InvalidCertificate`](UpdateFirmwareStatusEnumType::InvalidCertificate) —
+///    regardless of the in-flight state, and nothing is recorded. "Usable" reuses
+///    the same **no-X.509-parse** boundary as
+///    [`v201_install_certificate_status`]: a present certificate passes only when
+///    it is PEM-armored with a non-empty body; empty / whitespace-only / non-PEM /
+///    empty-bodied all take the `InvalidCertificate` arm. An *absent* certificate
+///    (the common case — the image is unsigned or the signature rides elsewhere)
+///    skips this axis entirely.
+/// 2. **In-flight state** (a station runs one update at a time; the caller reads
+///    the in-flight `requestId` from the
+///    [`V201FirmwareUpdateStore`](crate::v201_firmware_update::V201FirmwareUpdateStore),
+///    `None` is idle):
+///    - **idle** (`in_flight` is `None`) →
+///      [`Accepted`](UpdateFirmwareStatusEnumType::Accepted): a fresh update
+///      starts;
+///    - **retry** (`in_flight` names this same `requestId`) →
+///      [`Accepted`](UpdateFirmwareStatusEnumType::Accepted): idempotently the same
+///      answer, no second update and no cancellation — an `UpdateFirmware` retried
+///      under its original `requestId` must not report a spurious cancel;
+///    - **supersede** (`in_flight` names a *different* `requestId`) →
+///      [`AcceptedCanceled`](UpdateFirmwareStatusEnumType::AcceptedCanceled): the
+///      new request is accepted and the in-progress update is canceled to serve it.
+///
+/// [`Rejected`](UpdateFirmwareStatusEnumType::Rejected) (a policy refusal the
+/// simulator does not model) and
+/// [`RevokedCertificate`](UpdateFirmwareStatusEnumType::RevokedCertificate) (the
+/// simulator holds no revocation list) are **documented unproduced seams** kept in
+/// the ported status enum for the wire and the response builder's schema coverage,
+/// mirroring how [`v201_get_log_decision`] documents its unproduced `Rejected` and
+/// [`v201_delete_certificate_target`] its `Failed` race arm.
+///
+/// This is the *pure* decision, depending only on the request and the in-flight
+/// snapshot — no runtime handles, no store lock — so it is unit-testable in
+/// isolation. Recording the accepted request as the new in-flight update (the side
+/// effect) is the wiring layer's job. Trust boundary: `firmware.location` and
+/// `firmware.signature` are never read here, `firmware.signing_certificate` is only
+/// inspected for PEM shape (never parsed or unwrapped), and `request_id` is only
+/// compared, never parsed or indexed, so no wire value (including `i32::MIN`/`MAX`)
+/// can panic. Ports `ocpp.v201.call.UpdateFirmware` →
+/// `ocpp.v201.call_result.UpdateFirmware`.
+#[must_use]
+pub fn v201_update_firmware_decision(
+    request: &UpdateFirmwareRequest,
+    in_flight: Option<i32>,
+) -> UpdateFirmwareStatusEnumType {
+    // Axis 1: a present-but-unusable signing certificate refuses the whole
+    // request up front, before any in-flight bookkeeping. A well-formed PEM
+    // certificate reuses the `InstallCertificate` "no X.509 parse" boundary — it
+    // is usable iff `v201_install_certificate_status` accepts it; an absent
+    // certificate skips this axis.
+    if let Some(certificate) = &request.firmware.signing_certificate {
+        if v201_install_certificate_status(certificate)
+            != InstallCertificateStatusEnumType::Accepted
+        {
+            return UpdateFirmwareStatusEnumType::InvalidCertificate;
+        }
+    }
+
+    // Axis 2: single-in-flight supersede model, identical to `v201_get_log_decision`.
+    match in_flight {
+        None => UpdateFirmwareStatusEnumType::Accepted,
+        Some(current) if current == request.request_id => UpdateFirmwareStatusEnumType::Accepted,
+        Some(_) => UpdateFirmwareStatusEnumType::AcceptedCanceled,
+    }
+}
+
+/// Build a schema-valid `UpdateFirmware.conf` ([`UpdateFirmwareResponse`]).
+///
+/// Pure constructor mirroring [`v201_get_log_response`]: carries the decided
+/// [`status`](UpdateFirmwareStatusEnumType) plus the optional 2.0.1 `statusInfo` —
+/// a vendor-agnostic `reasonCode` and human-readable detail the handler attaches to
+/// a non-accept outcome (e.g. why the update was `InvalidCertificate`).
+///
+/// Ports `ocpp.v201.call_result.UpdateFirmware`.
+#[must_use]
+pub fn v201_update_firmware_response(
+    status: UpdateFirmwareStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> UpdateFirmwareResponse {
+    UpdateFirmwareResponse {
+        status,
+        status_info,
         custom_data: None,
     }
 }
@@ -4989,6 +5088,145 @@ mod tests {
                         "built {status:?} GetLogResponse should be schema-valid, got: {payload}"
                     );
                 }
+            }
+        }
+    }
+
+    // --- UpdateFirmware (v201) decision + response builder (Issue #532) --------
+
+    /// A schema-shaped `UpdateFirmwareRequest` for `request_id`, carrying an
+    /// arbitrary but valid image `location` and the given optional signing
+    /// certificate. The retry hints are left absent — the decision ignores them.
+    fn update_firmware_request(
+        request_id: i32,
+        signing_certificate: Option<&str>,
+    ) -> UpdateFirmwareRequest {
+        UpdateFirmwareRequest {
+            request_id,
+            firmware: ocpp_types::v201::FirmwareType {
+                location: "https://firmware.example.test/image.bin".to_string(),
+                retrieve_date_time: "2026-08-20T00:00:00Z".to_string(),
+                install_date_time: None,
+                signing_certificate: signing_certificate.map(str::to_string),
+                signature: None,
+                custom_data: None,
+            },
+            retries: None,
+            retry_interval: None,
+            custom_data: None,
+        }
+    }
+
+    #[test]
+    fn update_firmware_accepts_a_fresh_request_when_idle() {
+        // Nothing in flight, no signing certificate → a fresh update is Accepted,
+        // for ordinary and extreme request ids alike (the id is only compared).
+        for request_id in [42, 0, -1, i32::MIN, i32::MAX] {
+            let status =
+                v201_update_firmware_decision(&update_firmware_request(request_id, None), None);
+            assert_eq!(
+                status,
+                UpdateFirmwareStatusEnumType::Accepted,
+                "an idle station accepts request {request_id}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_firmware_accepts_a_well_formed_signing_certificate() {
+        // A present, usable PEM signing certificate does NOT take the
+        // InvalidCertificate arm — the update is accepted on its in-flight merits.
+        let status =
+            v201_update_firmware_decision(&update_firmware_request(1, Some(SAMPLE_PEM)), None);
+        assert_eq!(status, UpdateFirmwareStatusEnumType::Accepted);
+        // Padded with surrounding whitespace is still a usable certificate.
+        let padded = format!("  \n{SAMPLE_PEM}\n  ");
+        let status =
+            v201_update_firmware_decision(&update_firmware_request(1, Some(&padded)), None);
+        assert_eq!(status, UpdateFirmwareStatusEnumType::Accepted);
+    }
+
+    #[test]
+    fn update_firmware_is_idempotent_for_a_retry_of_the_in_flight_request() {
+        // An UpdateFirmware carrying the SAME requestId as the in-flight update is
+        // a retry: idempotently Accepted, never AcceptedCanceled — a retry must not
+        // report a spurious cancel.
+        let status = v201_update_firmware_decision(&update_firmware_request(7, None), Some(7));
+        assert_eq!(status, UpdateFirmwareStatusEnumType::Accepted);
+    }
+
+    #[test]
+    fn update_firmware_supersedes_a_different_in_flight_update() {
+        // A new requestId while a different update is in flight supersedes it →
+        // AcceptedCanceled.
+        let status = v201_update_firmware_decision(&update_firmware_request(9, None), Some(8));
+        assert_eq!(status, UpdateFirmwareStatusEnumType::AcceptedCanceled);
+    }
+
+    #[test]
+    fn update_firmware_rejects_a_present_but_malformed_signing_certificate() {
+        // A present-but-unusable signing certificate is refused up front with
+        // InvalidCertificate: empty, whitespace-only, non-PEM garbage, and a
+        // PEM-armored-but-empty-bodied certificate all take the arm. None of them
+        // panics on hostile bytes.
+        let empty_body = "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----";
+        for bad in [
+            "",
+            "   \n\t  ",
+            "not a certificate at all",
+            "\u{0}\u{1}\u{2}garbage\u{7f}",
+            empty_body,
+        ] {
+            let status =
+                v201_update_firmware_decision(&update_firmware_request(1, Some(bad)), None);
+            assert_eq!(
+                status,
+                UpdateFirmwareStatusEnumType::InvalidCertificate,
+                "a present-but-malformed certificate {bad:?} → InvalidCertificate"
+            );
+        }
+    }
+
+    #[test]
+    fn update_firmware_certificate_check_precedes_the_in_flight_decision() {
+        // The signing-certificate axis wins over the in-flight axis: a bad
+        // certificate answers InvalidCertificate even when a *different* request is
+        // in flight (where a good request would supersede → AcceptedCanceled). The
+        // refusal must never be masked by the supersede path, so nothing gets
+        // recorded for an untrusted image.
+        let status =
+            v201_update_firmware_decision(&update_firmware_request(9, Some("garbage")), Some(8));
+        assert_eq!(status, UpdateFirmwareStatusEnumType::InvalidCertificate);
+    }
+
+    #[test]
+    fn built_update_firmware_responses_are_schema_valid() {
+        // Every built response — each UpdateFirmwareStatusEnumType crossed with
+        // with/without a statusInfo — satisfies the bundled OCPP 2.0.1
+        // UpdateFirmware response JSON Schema. This is where the two unproduced
+        // seams (Rejected / RevokedCertificate) earn their wire + schema coverage.
+        let validator = SchemaValidator::v201();
+        let info = StatusInfoType {
+            reason_code: "InvalidCertificate".to_string(),
+            additional_info: Some("the firmware signing certificate is not usable".to_string()),
+            custom_data: None,
+        };
+        for status in [
+            UpdateFirmwareStatusEnumType::Accepted,
+            UpdateFirmwareStatusEnumType::Rejected,
+            UpdateFirmwareStatusEnumType::AcceptedCanceled,
+            UpdateFirmwareStatusEnumType::InvalidCertificate,
+            UpdateFirmwareStatusEnumType::RevokedCertificate,
+        ] {
+            for status_info in [None, Some(info.clone())] {
+                let resp = v201_update_firmware_response(status, status_info.clone());
+                let payload = serde_json::to_value(&resp).unwrap();
+                assert!(
+                    validator
+                        .validate_call_result("UpdateFirmware", &payload)
+                        .is_ok(),
+                    "built {status:?} UpdateFirmwareResponse should be schema-valid, got: {payload}"
+                );
             }
         }
     }
