@@ -155,7 +155,7 @@ use ocpp_types::v201::{
     LogStatusEnumType, MessageInfoType, MessagePriorityEnumType, MessageStateEnumType,
     MessageTriggerEnumType, OperationalStatusEnumType, RequestStartStopStatusEnumType,
     ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
-    TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType, UploadLogStatusEnumType,
 };
 
 use ocpp_messages::v201::{
@@ -164,10 +164,11 @@ use ocpp_messages::v201::{
     CostUpdatedResponse, DeleteCertificateResponse, GetChargingProfilesResponse,
     GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse,
     GetMonitoringReportResponse, GetTransactionStatusResponse, InstallCertificateResponse,
-    NotifyDisplayMessagesRequest, ReportChargingProfilesRequest, RequestStartTransactionResponse,
-    RequestStopTransactionResponse, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
-    SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
-    TriggerMessageResponse, UnlockConnectorResponse,
+    LogStatusNotificationRequest, NotifyDisplayMessagesRequest, ReportChargingProfilesRequest,
+    RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
+    ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
+    SetMonitoringBaseResponse, SetMonitoringLevelResponse, TriggerMessageResponse,
+    UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1831,6 +1832,79 @@ pub fn v201_get_log_response(
         status,
         status_info,
         filename,
+        custom_data: None,
+    }
+}
+
+/// The first async status a station reports once it *begins* uploading the log
+/// an `Accepted` `GetLog` asked for — [`Uploading`](UploadLogStatusEnumType::Uploading).
+///
+/// The `GetLog` CALLRESULT only acks; the station then streams upload progress
+/// as `LogStatusNotification.req`, opening with this status and closing with a
+/// terminal one from [`v201_log_upload_terminal_status`]. Named so the flow
+/// reads as `IN_PROGRESS → terminal` at both the handler and the tests.
+pub const V201_LOG_UPLOAD_IN_PROGRESS: UploadLogStatusEnumType = UploadLogStatusEnumType::Uploading;
+
+/// Decide the terminal [`UploadLogStatusEnumType`] a simulated `GetLog` upload
+/// settles on, closing the async `LogStatusNotification.req` stream it opened
+/// with [`V201_LOG_UPLOAD_IN_PROGRESS`].
+///
+/// The simulator has no real archive to upload, so it models the transfer on a
+/// short timer and reports one of three terminal outcomes, in precedence order:
+///
+/// - **`superseded`** (a newer `GetLog` took the station's single upload slot
+///   while this one was in flight) → [`AcceptedCanceled`](UploadLogStatusEnumType::AcceptedCanceled):
+///   the transfer was canceled to serve the newer request, so it reports the
+///   cancel rather than a completion — and a canceled upload never reports a
+///   `UploadFailure`, so this arm wins even under fault injection;
+/// - **`should_fail`** (opt-in fault injection,
+///   [`ChargePointConfig::log_upload_should_fail`](crate::ChargePointConfig::log_upload_should_fail))
+///   → [`UploadFailure`](UploadLogStatusEnumType::UploadFailure): the transfer
+///   ran as the owner but failed, so a CSMS can be exercised against a log
+///   upload that fails, not just one that succeeds;
+/// - otherwise → [`Uploaded`](UploadLogStatusEnumType::Uploaded): the happy path,
+///   the transfer completed as the owner.
+///
+/// `superseded` is what the compare-and-clear completion seam
+/// ([`V201LogUploadStore::complete`](crate::v201_log_upload::V201LogUploadStore::complete))
+/// reports as `!still_owner`. The remaining `UploadLogStatusEnumType` values
+/// (`Idle`, `BadMessage`, `NotSupportedOperation`, `PermissionDenied`) are
+/// documented modeled seams this simulator does not drive from a `GetLog`: `Idle`
+/// is the resting state (never a transition this stream reports), and the three
+/// rejections belong to a station that refuses the request outright — which this
+/// simulator, superseding rather than refusing, never does. They stay in the
+/// ported enum for the wire and schema coverage.
+#[must_use]
+pub fn v201_log_upload_terminal_status(
+    superseded: bool,
+    should_fail: bool,
+) -> UploadLogStatusEnumType {
+    if superseded {
+        UploadLogStatusEnumType::AcceptedCanceled
+    } else if should_fail {
+        UploadLogStatusEnumType::UploadFailure
+    } else {
+        UploadLogStatusEnumType::Uploaded
+    }
+}
+
+/// Build a schema-valid `LogStatusNotification.req`
+/// ([`LogStatusNotificationRequest`]) reporting `status` for the upload started
+/// by the `GetLog` carrying `request_id`.
+///
+/// The `requestId` is always carried here (it correlates the async progress
+/// report back to the triggering `GetLogRequest`); it is only absent when a
+/// `TriggerMessage` asks for a `LogStatusNotification` with no upload ongoing,
+/// which this `GetLog`-driven flow never is. Pure constructor mirroring
+/// [`v201_get_log_response`]. Ports `ocpp.v201.call.LogStatusNotification`.
+#[must_use]
+pub fn v201_log_status_notification(
+    status: UploadLogStatusEnumType,
+    request_id: i32,
+) -> LogStatusNotificationRequest {
+    LogStatusNotificationRequest {
+        status,
+        request_id: Some(request_id),
         custom_data: None,
     }
 }
@@ -4763,6 +4837,83 @@ mod tests {
                         "built {status:?} GetLogResponse should be schema-valid, got: {payload}"
                     );
                 }
+            }
+        }
+    }
+
+    // --- LogStatusNotification (v201) async upload flow (#526) -----------------
+
+    #[test]
+    fn log_upload_terminal_status_precedence() {
+        use UploadLogStatusEnumType::{AcceptedCanceled, UploadFailure, Uploaded};
+        // Owner + happy path → Uploaded.
+        assert_eq!(
+            v201_log_upload_terminal_status(false, false),
+            Uploaded,
+            "an owning upload on the happy path completes as Uploaded"
+        );
+        // Owner + fault injection → UploadFailure.
+        assert_eq!(
+            v201_log_upload_terminal_status(false, true),
+            UploadFailure,
+            "an owning upload under fault injection reports UploadFailure"
+        );
+        // Superseded wins over should_fail — a canceled upload never "fails".
+        assert_eq!(
+            v201_log_upload_terminal_status(true, false),
+            AcceptedCanceled
+        );
+        assert_eq!(
+            v201_log_upload_terminal_status(true, true),
+            AcceptedCanceled,
+            "supersede takes precedence over fault injection"
+        );
+        // The opening status is always Uploading.
+        assert_eq!(
+            V201_LOG_UPLOAD_IN_PROGRESS,
+            UploadLogStatusEnumType::Uploading
+        );
+    }
+
+    #[test]
+    fn log_status_notification_carries_the_request_id() {
+        let req = v201_log_status_notification(UploadLogStatusEnumType::Uploading, 42);
+        assert_eq!(req.status, UploadLogStatusEnumType::Uploading);
+        assert_eq!(
+            req.request_id,
+            Some(42),
+            "the async report is correlated by the GetLog requestId"
+        );
+        assert!(req.custom_data.is_none());
+    }
+
+    #[test]
+    fn built_log_status_notifications_are_schema_valid() {
+        // Every status this flow can emit — the Uploading opener, the three
+        // terminal outcomes, and every remaining ported UploadLogStatusEnumType
+        // value — is schema-valid as a LogStatusNotification.req, including at
+        // extreme requestIds (no wire value can produce an invalid payload).
+        let validator = SchemaValidator::v201();
+        for status in [
+            UploadLogStatusEnumType::Uploading,
+            UploadLogStatusEnumType::Uploaded,
+            UploadLogStatusEnumType::UploadFailure,
+            UploadLogStatusEnumType::AcceptedCanceled,
+            UploadLogStatusEnumType::Idle,
+            UploadLogStatusEnumType::BadMessage,
+            UploadLogStatusEnumType::NotSupportedOperation,
+            UploadLogStatusEnumType::PermissionDenied,
+        ] {
+            for request_id in [0, 1, -1, i32::MIN, i32::MAX] {
+                let req = v201_log_status_notification(status, request_id);
+                let payload = serde_json::to_value(&req).unwrap();
+                assert!(
+                    validator
+                        .validate_call("LogStatusNotification", &payload)
+                        .is_ok(),
+                    "built {status:?} LogStatusNotification.req (requestId {request_id}) \
+                     should be schema-valid, got: {payload}"
+                );
             }
         }
     }
