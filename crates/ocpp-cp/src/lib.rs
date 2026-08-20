@@ -143,7 +143,7 @@ use ocpp_types::v201::{
     AttributeEnumType, AuthorizationStatusEnumType, CertificateSignedStatusEnumType,
     ChangeAvailabilityStatusEnumType, ChargingProfilePurposeEnumType,
     ChargingProfileStatusEnumType, ChargingProfileType, ConnectorStatusEnumType,
-    DeleteCertificateStatusEnumType, DisplayMessageStatusEnumType,
+    DeleteCertificateStatusEnumType, DisplayMessageStatusEnumType, FirmwareStatusEnumType,
     GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetVariableResultType,
     IdTokenType as V201IdTokenType, InstallCertificateStatusEnumType,
     InstallCertificateUseEnumType, LogStatusEnumType, MessageInfoType, MessageTriggerEnumType,
@@ -165,9 +165,9 @@ use uuid::Uuid;
 use v201_command::ConnectorReservState;
 
 /// Opt-in outcome of the simulated firmware update (`UpdateFirmware`, OCPP
-/// 1.6J §4.x). Selects which branch of the firmware state machine the
-/// simulator follows so a CSMS can be tested against failed rollouts, not just
-/// successful ones.
+/// 1.6J §4.x and the OCPP 2.0.1 `FirmwareStatusNotification` flow, #534).
+/// Selects which branch of the firmware state machine the simulator follows so
+/// a CSMS can be tested against failed rollouts, not just successful ones.
 ///
 /// Firmware updates have two distinct failure points — the download phase and
 /// the install phase — so unlike the single-failure diagnostics upload
@@ -398,9 +398,12 @@ pub struct ChargePointConfig {
     /// reports `AcceptedCanceled` regardless of this flag — a canceled upload
     /// never "fails".
     pub log_upload_should_fail: bool,
-    /// Fault injection for the simulated firmware update (`UpdateFirmware`,
-    /// OCPP 1.6J §4.x). Defaults to [`FirmwareUpdateOutcome::Succeed`] (happy
-    /// path); set [`FirmwareUpdateOutcome::DownloadFailed`] or
+    /// Fault injection for the simulated firmware update (`UpdateFirmware`) —
+    /// shared by both the OCPP 1.6J §4.x and the OCPP 2.0.1 (Part 2, firmware
+    /// management, Issue #534) `FirmwareStatusNotification` flows, since a given
+    /// charge point speaks one protocol version at a time. Defaults to
+    /// [`FirmwareUpdateOutcome::Succeed`] (happy path); set
+    /// [`FirmwareUpdateOutcome::DownloadFailed`] or
     /// [`FirmwareUpdateOutcome::InstallationFailed`] to drive the simulator
     /// down the corresponding error branch, so a CSMS / back office can be
     /// exercised against a firmware rollout that fails, not just one that
@@ -698,6 +701,21 @@ enum RemoteCommand {
     /// loop mid-dispatch. The `GetLog` twin of the 1.6J
     /// [`GetDiagnostics`](Self::GetDiagnostics) upload flow.
     V201LogUpload { request_id: i32 },
+    /// Run the simulated async firmware-update state machine for an `Accepted`
+    /// (fresh) / `AcceptedCanceled` (supersede) OCPP 2.0.1 `UpdateFirmware`
+    /// (Part 2, firmware management, L01–L03, Issue #534). The synchronous
+    /// `UpdateFirmware.conf` only acks; the station then reports fetch/install
+    /// progress asynchronously via `FirmwareStatusNotification.req`, correlated
+    /// by `request_id` — this drives that stream (`Downloading` → `Downloaded` →
+    /// `Installing` → a terminal `Installed`, or the opt-in `DownloadFailed` /
+    /// `InstallationFailed` fault branches) and, on settling as the still-current
+    /// rollout, compare-and-clears the `V201FirmwareUpdateStore` back to idle.
+    /// Queued off the inbound-CALL path for the same reason as the other side
+    /// effects — the outbound `FirmwareStatusNotification` CALLs must not re-enter
+    /// the receive loop mid-dispatch. The 2.0.1 twin of the 1.6J
+    /// [`UpdateFirmware`](Self::UpdateFirmware) progress flow, and the firmware
+    /// sibling of [`V201LogUpload`](Self::V201LogUpload).
+    V201FirmwareUpdate { request_id: i32 },
     /// Run the simulated diagnostics-upload state machine for an `Accepted`
     /// `GetDiagnostics` (OCPP 1.6J §4.x, firmware-management profile). Emits
     /// `DiagnosticsStatusNotification(Uploading)` then `Uploaded`.
@@ -2358,10 +2376,15 @@ impl ChargePoint {
         // the request. `Accepted` (fresh or retry) and `AcceptedCanceled` (supersede)
         // both `begin` the request as the update now in flight (a re-begin of the
         // same id is an idempotent no-op); `InvalidCertificate` refuses a present-
-        // but-unusable signing certificate and stores nothing. This slice wires only
-        // the synchronous ack — the async `FirmwareStatusNotification` progress
-        // stream (the analogue of the GetLog → LogStatusNotification split, #526) is
-        // a documented follow-up, so no command is queued here.
+        // but-unusable signing certificate and stores nothing. On a *fresh* accept
+        // or a *supersede* the handler queues a `RemoteCommand::V201FirmwareUpdate`
+        // to run the async `FirmwareStatusNotification` progress stream (#534) off
+        // the inbound-CALL path (so the CALLRESULT is flushed first — no
+        // receive-loop re-entrancy). A pure *retry* (the same `requestId` already
+        // in flight) queues nothing: the original rollout is still streaming, so a
+        // second stream would double-report. `begin` returning `Some(request_id)`
+        // (the id it displaced equals this one) is exactly that retry case — the
+        // same discipline the `GetLog` handler uses.
         //
         // Trust boundary: `firmware.location` / `firmware.signature` are never read;
         // `firmware.signing_certificate` is only inspected for PEM shape (no X.509
@@ -2372,8 +2395,10 @@ impl ChargePoint {
         // `ocpp.v201.call.UpdateFirmware` → `ocpp.v201.call_result.UpdateFirmware`.
         if matches!(protocol_version, OcppVersion::V201) {
             let firmware_updates = v201_firmware_updates.clone();
+            let command_sender = command_sender.clone();
             d.on(move |req: V201UpdateFirmwareRequest| {
                 let firmware_updates = firmware_updates.clone();
+                let command_sender = command_sender.clone();
                 async move {
                     let in_flight = firmware_updates.in_flight().await;
                     let status = v201_command::v201_update_firmware_decision(&req, in_flight);
@@ -2387,7 +2412,29 @@ impl ChargePoint {
                         UpdateFirmwareStatusEnumType::Accepted
                             | UpdateFirmwareStatusEnumType::AcceptedCanceled
                     ) {
-                        firmware_updates.begin(req.request_id).await;
+                        let displaced = firmware_updates.begin(req.request_id).await;
+
+                        // Drive the async progress stream — but not for a pure
+                        // retry (the id it displaced is this same request, whose
+                        // rollout is already streaming). Fresh start (`displaced`
+                        // is `None`) and supersede (`displaced` is a *different*
+                        // id) both queue a new stream.
+                        if displaced != Some(req.request_id)
+                            && command_sender
+                                .send(RemoteCommand::V201FirmwareUpdate {
+                                    request_id: req.request_id,
+                                })
+                                .is_err()
+                        {
+                            // Consumer gone (CP shutting down): the ack is still
+                            // honest — the request was accepted — but the async
+                            // progress cannot be streamed. Surface the drop.
+                            warn!(
+                                "v201 UpdateFirmware: consumer gone, cannot stream \
+                                 FirmwareStatusNotification for request {}",
+                                req.request_id
+                            );
+                        }
                     }
 
                     let status_info = match status {
@@ -4831,6 +4878,9 @@ impl ChargePoint {
                         RemoteCommand::V201LogUpload { request_id } => {
                             cp.run_v201_log_upload(request_id).await;
                         }
+                        RemoteCommand::V201FirmwareUpdate { request_id } => {
+                            cp.run_v201_firmware_update(request_id).await;
+                        }
                         RemoteCommand::V201ApplyAvailability {
                             connector_id,
                             target,
@@ -6988,6 +7038,111 @@ impl ChargePoint {
             .await
         {
             warn!("v201 GetLog: LogStatusNotification({status:?}) for request {request_id}: {e}");
+        }
+    }
+
+    /// Run the simulated async firmware-update state machine for an `Accepted` /
+    /// `AcceptedCanceled` OCPP 2.0.1 `UpdateFirmware` (Part 2, firmware
+    /// management, L01–L03, Issue #534).
+    ///
+    /// Invoked only from the command-consumer task (see [`connect`](Self::connect)),
+    /// never inline in the inbound-CALL handler, so the `UpdateFirmware`
+    /// CALLRESULT is flushed before the first `FirmwareStatusNotification` and
+    /// there is no receive-loop re-entrancy/deadlock — the same discipline as
+    /// [`run_v201_log_upload`](Self::run_v201_log_upload) (the log-upload sibling)
+    /// and [`run_firmware_update`](Self::run_firmware_update) (the 1.6J analog).
+    ///
+    /// The simulator has no real image to download or install, so it models the
+    /// rollout on a short timer, stepping through the lifecycle and emitting a
+    /// `FirmwareStatusNotification.req` correlated by `request_id` at each step.
+    /// On the happy path (the default) that is `Downloading` → `Downloaded` →
+    /// `Installing` → `Installed`. With
+    /// [`ChargePointConfig::firmware_update_outcome`] set to a failure variant
+    /// (opt-in fault injection, shared with the 1.6J flow) it instead takes the
+    /// matching error branch — `Downloading → DownloadFailed`, or `Downloading →
+    /// Downloaded → Installing → InstallationFailed` — so a CSMS can be exercised
+    /// against a 2.0.1 rollout that fails, not just the happy path.
+    ///
+    /// The terminal status is emitted through
+    /// [`settle_v201_firmware_update`](Self::settle_v201_firmware_update), which
+    /// compare-and-clears the [`V201FirmwareUpdateStore`] via
+    /// [`complete`](crate::v201_firmware_update::V201FirmwareUpdateStore::complete):
+    /// a rollout that still owns the in-flight slot returns the station to idle and
+    /// reports its terminal status; a rollout superseded while it ran (a newer
+    /// `UpdateFirmware` took the slot) leaves the newer one in flight and reports
+    /// no terminal — `FirmwareStatusEnumType` has no cancel value, so an abandoned
+    /// rollout simply goes quiet while the newer one's stream (dequeued next by the
+    /// serial consumer) proceeds. Because the consumer runs commands serially, a
+    /// superseding `UpdateFirmware`'s own `V201FirmwareUpdate` is not dequeued until
+    /// this one returns, so the newer rollout's `Downloading` never interleaves
+    /// with this one's progress. Ports the `FirmwareStatusNotification` progress
+    /// flow from
+    /// [`ocpp/v201/enums.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/enums.py)'s
+    /// `FirmwareStatusEnumType`.
+    async fn run_v201_firmware_update(&self, request_id: i32) {
+        self.send_v201_firmware_status(FirmwareStatusEnumType::Downloading, request_id)
+            .await;
+        tokio::time::sleep(FIRMWARE_UPDATE_STEP_DURATION).await;
+
+        if self.config.firmware_update_outcome == FirmwareUpdateOutcome::DownloadFailed {
+            // Download phase fails: settle here with DownloadFailed; there is no
+            // image to install, so the sequence stops.
+            self.settle_v201_firmware_update(FirmwareStatusEnumType::DownloadFailed, request_id)
+                .await;
+            return;
+        }
+        self.send_v201_firmware_status(FirmwareStatusEnumType::Downloaded, request_id)
+            .await;
+        tokio::time::sleep(FIRMWARE_UPDATE_STEP_DURATION).await;
+
+        self.send_v201_firmware_status(FirmwareStatusEnumType::Installing, request_id)
+            .await;
+        tokio::time::sleep(FIRMWARE_UPDATE_STEP_DURATION).await;
+
+        let terminal =
+            if self.config.firmware_update_outcome == FirmwareUpdateOutcome::InstallationFailed {
+                FirmwareStatusEnumType::InstallationFailed
+            } else {
+                FirmwareStatusEnumType::Installed
+            };
+        self.settle_v201_firmware_update(terminal, request_id).await;
+    }
+
+    /// Settle a simulated 2.0.1 firmware rollout: compare-and-clear the in-flight
+    /// slot and emit the `terminal` `FirmwareStatusNotification` — but **only if**
+    /// `request_id` still owns the slot.
+    ///
+    /// [`complete`](crate::v201_firmware_update::V201FirmwareUpdateStore::complete)
+    /// returns the station to idle and reports `true` when this rollout is still
+    /// the one in flight; a `false` means a newer `UpdateFirmware` superseded it
+    /// while it ran, so the store is left to the newer rollout and this one emits
+    /// no terminal (there is no cancel `FirmwareStatusEnumType` — an abandoned
+    /// rollout simply stops). `request_id` is only compared, never parsed or
+    /// indexed, so no wire value can panic.
+    async fn settle_v201_firmware_update(&self, terminal: FirmwareStatusEnumType, request_id: i32) {
+        if self.v201_firmware_updates.complete(request_id).await {
+            self.send_v201_firmware_status(terminal, request_id).await;
+        }
+    }
+
+    /// Send a single `FirmwareStatusNotification(status)` CALL correlated by
+    /// `request_id` (OCPP 2.0.1 Part 2). A best-effort progress report: a send
+    /// failure is logged, not propagated (the update state machine continues).
+    /// The 2.0.1 twin of the 1.6J
+    /// [`send_firmware_status_notification`](Self::send_firmware_status_notification),
+    /// routed through the [`v201_command`] constructor so the v201 wire type stays
+    /// out of this module's imports.
+    async fn send_v201_firmware_status(&self, status: FirmwareStatusEnumType, request_id: i32) {
+        if let Err(e) = self
+            .call(v201_command::v201_firmware_status_notification(
+                status, request_id,
+            ))
+            .await
+        {
+            warn!(
+                "v201 UpdateFirmware: FirmwareStatusNotification({status:?}) for \
+                 request {request_id}: {e}"
+            );
         }
     }
 
@@ -10880,13 +11035,20 @@ mod tests {
             "an accepted update carries no statusInfo"
         );
 
-        // The accept is recorded as the in-flight rollout. This sync-ack slice
-        // queues NO async progress command — the FirmwareStatusNotification stream
-        // is a documented follow-up.
+        // The accept is recorded as the in-flight rollout and queues exactly one
+        // V201FirmwareUpdate to drive the async FirmwareStatusNotification stream
+        // (#534), correlated by the same requestId.
         assert_eq!(cp.in_flight_firmware_update().await, Some(42));
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(
+            commands.len(),
+            1,
+            "an accepted UpdateFirmware queues one progress stream"
+        );
         assert!(
-            v201_drain_commands(&cp).await.is_empty(),
-            "the sync ack queues no async firmware-progress command (out of scope)"
+            matches!(&commands[0], RemoteCommand::V201FirmwareUpdate { request_id } if *request_id == 42),
+            "the queued update is correlated by requestId, got: {:?}",
+            commands[0]
         );
     }
 
@@ -10913,6 +11075,20 @@ mod tests {
         let retry = v201_update_firmware_response(&cp, 5, None).await;
         assert_eq!(retry.status, UpdateFirmwareStatusEnumType::Accepted);
         assert_eq!(cp.in_flight_firmware_update().await, Some(5));
+
+        // The retry must NOT queue a second progress stream — the original is still
+        // streaming. Only the first accept queued one (requestId 5).
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(
+            commands.len(),
+            1,
+            "a retry queues no second update; only the original accept did"
+        );
+        assert!(
+            matches!(&commands[0], RemoteCommand::V201FirmwareUpdate { request_id } if *request_id == 5),
+            "the single queued update is the original, got: {:?}",
+            commands[0]
+        );
     }
 
     #[tokio::test]
@@ -10933,6 +11109,22 @@ mod tests {
             cp.in_flight_firmware_update().await,
             Some(2),
             "the superseding request becomes the one in flight"
+        );
+
+        // Each accept — the fresh one and the supersede — queued its own progress
+        // stream, correlated by its requestId.
+        let ids: Vec<i32> = v201_drain_commands(&cp)
+            .await
+            .into_iter()
+            .filter_map(|c| match c {
+                RemoteCommand::V201FirmwareUpdate { request_id } => Some(request_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec![1, 2],
+            "fresh accept then supersede each queue an update"
         );
     }
 
@@ -11006,6 +11198,88 @@ mod tests {
             None,
             "the 1.6J path has no v201 firmware-update tracker"
         );
+    }
+
+    #[tokio::test]
+    async fn v201_firmware_update_completes_and_returns_the_station_to_idle() {
+        // AC #534: after the async rollout settles, the store is idle again, so a
+        // subsequent UpdateFirmware is a FRESH Accepted — not an AcceptedCanceled
+        // against a phantom rollout. Drive the state machine directly (the CP is not
+        // connected, so the FirmwareStatusNotification CALLs fail-and-warn, but the
+        // store transitions are what this asserts).
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+
+        // Accept a rollout, then run its async stream to completion.
+        let first = v201_update_firmware_response(&cp, 5, None).await;
+        assert_eq!(first.status, UpdateFirmwareStatusEnumType::Accepted);
+        assert_eq!(cp.in_flight_firmware_update().await, Some(5));
+        cp.run_v201_firmware_update(5).await;
+        assert_eq!(
+            cp.in_flight_firmware_update().await,
+            None,
+            "a settled rollout clears the store back to idle"
+        );
+
+        // A subsequent UpdateFirmware now starts fresh — Accepted, not
+        // AcceptedCanceled against a phantom rollout.
+        let next = v201_update_firmware_response(&cp, 6, None).await;
+        assert_eq!(
+            next.status,
+            UpdateFirmwareStatusEnumType::Accepted,
+            "after completion the next UpdateFirmware is fresh, not a supersede"
+        );
+        assert_eq!(cp.in_flight_firmware_update().await, Some(6));
+    }
+
+    #[tokio::test]
+    async fn v201_firmware_update_superseded_does_not_clear_the_newer_update() {
+        // A superseded rollout settling must not wipe the newer rollout's slot: the
+        // compare-and-clear leaves the store to whoever currently owns it. Model the
+        // serial-consumer supersede: requestId 1 begins, requestId 2 supersedes it
+        // (now in flight), then 1's async task finishes.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.v201_firmware_updates.begin(1).await;
+        cp.v201_firmware_updates.begin(2).await; // 2 supersedes 1; slot is now 2's.
+
+        cp.run_v201_firmware_update(1).await; // the superseded rollout settles...
+        assert_eq!(
+            cp.in_flight_firmware_update().await,
+            Some(2),
+            "a superseded rollout settling leaves the newer one in flight"
+        );
+
+        cp.run_v201_firmware_update(2).await; // ...then the owner settles.
+        assert_eq!(
+            cp.in_flight_firmware_update().await,
+            None,
+            "the owning rollout settles the store back to idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_firmware_update_failure_branches_still_settle_to_idle() {
+        // Both fault-injection outcomes settle the owning rollout back to idle (the
+        // failed terminal is still a completion for slot purposes), so a subsequent
+        // UpdateFirmware is a fresh Accepted rather than a supersede against a
+        // phantom. Exercises the DownloadFailed early-return and the
+        // InstallationFailed terminal, each on its own CP.
+        for outcome in [
+            FirmwareUpdateOutcome::DownloadFailed,
+            FirmwareUpdateOutcome::InstallationFailed,
+        ] {
+            let cp = ChargePoint::new(ChargePointConfig {
+                firmware_update_outcome: outcome,
+                ..ChargePointConfig::for_version(OcppVersion::V201)
+            })
+            .unwrap();
+            cp.v201_firmware_updates.begin(9).await;
+            cp.run_v201_firmware_update(9).await;
+            assert_eq!(
+                cp.in_flight_firmware_update().await,
+                None,
+                "a {outcome:?} rollout still settles the store back to idle"
+            );
+        }
     }
 
     // --- OCPP 2.0.1 GetDisplayMessages (M7, issue #508) --------------------
