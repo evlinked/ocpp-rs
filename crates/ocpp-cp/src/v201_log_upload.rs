@@ -82,11 +82,45 @@ impl V201LogUploadStore {
     /// Return the station to idle, yielding the `requestId` that was in flight (if
     /// any).
     ///
-    /// The completion seam a future async `LogStatusNotification(Uploaded)` /
-    /// permanent-failure slice will call when the upload settles. Idempotent —
-    /// clearing an already-idle store is a no-op returning `None`.
+    /// The unconditional reset seam. Idempotent — clearing an already-idle store
+    /// is a no-op returning `None`. Prefer [`complete`](Self::complete) from an
+    /// async upload task, which only settles when the caller still owns the
+    /// in-flight slot (so a completing upload cannot wipe a newer one that
+    /// superseded it).
     pub async fn clear(&self) -> Option<i32> {
         self.in_flight.write().await.take()
+    }
+
+    /// Compare-and-clear the in-flight slot: return the station to idle **only
+    /// if** `request_id` is still the upload in flight, reporting whether it was.
+    ///
+    /// The completion seam the async `LogStatusNotification(Uploading→Uploaded)`
+    /// flow (#526) calls when an upload settles. A station uploads one log at a
+    /// time, but the CALL-path handler that records a supersede
+    /// ([`begin`](Self::begin)) runs *concurrently* with the previous upload's
+    /// async task: while that task sleeps, a second `GetLog` can install a new
+    /// `requestId`. An unconditional [`clear`](Self::clear) at the end of the
+    /// first task would then wipe the *second* upload's marker. This guards
+    /// against exactly that:
+    ///
+    /// - **`true`** — `request_id` was still in flight; it has been cleared and
+    ///   the station is idle (unless another upload begins). The upload settled
+    ///   as the owner: report its terminal `Uploaded` / `UploadFailure`.
+    /// - **`false`** — a different `requestId` is now in flight (a newer `GetLog`
+    ///   superseded this one, or the slot was already cleared). Nothing is
+    ///   changed — the newer upload keeps its slot — and this upload should report
+    ///   the canceled outcome rather than a completion.
+    ///
+    /// `request_id` is only compared, never parsed or indexed, so no wire value
+    /// (including `i32::MIN`/`MAX`) can panic.
+    pub async fn complete(&self, request_id: i32) -> bool {
+        let mut in_flight = self.in_flight.write().await;
+        if *in_flight == Some(request_id) {
+            *in_flight = None;
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -147,5 +181,49 @@ mod tests {
         assert_eq!(store.in_flight().await, Some(i32::MIN));
         assert_eq!(store.begin(i32::MAX).await, Some(i32::MIN));
         assert_eq!(store.in_flight().await, Some(i32::MAX));
+    }
+
+    #[tokio::test]
+    async fn complete_settles_only_when_the_id_still_owns_the_slot() {
+        let store = V201LogUploadStore::new();
+
+        // The owner completing returns to idle and reports it did.
+        store.begin(1).await;
+        assert!(
+            store.complete(1).await,
+            "the in-flight upload settles as owner"
+        );
+        assert!(store.is_idle().await);
+
+        // A completion for an id that no longer owns the slot (superseded) leaves
+        // the newer upload untouched and reports it did not settle.
+        store.begin(1).await;
+        store.begin(2).await; // 2 supersedes 1; the slot is now 2's.
+        assert!(
+            !store.complete(1).await,
+            "a superseded upload does not settle"
+        );
+        assert_eq!(
+            store.in_flight().await,
+            Some(2),
+            "the superseding upload keeps the slot"
+        );
+
+        // 2 can still settle as the current owner.
+        assert!(store.complete(2).await);
+        assert!(store.is_idle().await);
+    }
+
+    #[tokio::test]
+    async fn complete_on_an_idle_store_is_a_noop() {
+        let store = V201LogUploadStore::new();
+        assert!(
+            !store.complete(7).await,
+            "completing an idle store settles nothing"
+        );
+        assert!(store.is_idle().await);
+        // Extreme ids compare, never index — no panic.
+        assert!(!store.complete(i32::MIN).await);
+        assert!(!store.complete(i32::MAX).await);
     }
 }
