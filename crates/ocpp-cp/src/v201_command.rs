@@ -154,8 +154,8 @@ use ocpp_types::v201::{
     InstallCertificateStatusEnumType, InstallCertificateUseEnumType, LogEnumType,
     LogStatusEnumType, MessageInfoType, MessagePriorityEnumType, MessageStateEnumType,
     MessageTriggerEnumType, OperationalStatusEnumType, RequestStartStopStatusEnumType,
-    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, StatusInfoType,
-    TriggerMessageStatusEnumType, UnlockStatusEnumType, UploadLogStatusEnumType,
+    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType,
+    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType, UploadLogStatusEnumType,
 };
 
 use ocpp_messages::v201::{
@@ -167,8 +167,8 @@ use ocpp_messages::v201::{
     LogStatusNotificationRequest, NotifyDisplayMessagesRequest, ReportChargingProfilesRequest,
     RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
     ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
-    SetMonitoringBaseResponse, SetMonitoringLevelResponse, TriggerMessageResponse,
-    UnlockConnectorResponse,
+    SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
+    SetNetworkProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1739,6 +1739,64 @@ pub fn v201_install_certificate_response(
     status_info: Option<StatusInfoType>,
 ) -> InstallCertificateResponse {
     InstallCertificateResponse {
+        status,
+        status_info,
+        custom_data: None,
+    }
+}
+
+/// Decide the [`SetNetworkProfileStatusEnumType`] a `SetNetworkProfile.req`
+/// answers, given the requested profile.
+///
+/// Ports the accept/refuse decision of `ocpp.v201.call.SetNetworkProfile`
+/// (OCPP 2.0.1 Part 2, provisioning, B09/B10). A lightweight, pure predicate on
+/// the [`NetworkConnectionProfileType`](ocpp_types::v201::NetworkConnectionProfileType) —
+/// **no real network dial** (the documented simulator boundary: the station
+/// never actually connects with the profile), mirroring how
+/// [`v201_install_certificate_status`] inspects a PEM without an X.509 parse.
+///
+/// - **`Rejected`** — the profile is unusable up front: its `ocppCsmsUrl` is
+///   empty or whitespace-only, so it names no CSMS the station could ever reach.
+///   The schema permits an empty `ocppCsmsUrl` (`type: string, maxLength: 512`,
+///   no `minLength`), so this refusal is genuinely reachable from a
+///   schema-valid wire frame rather than pre-filtered to a CALLERROR — a real
+///   station refuses a provisioning it cannot act on.
+/// - **`Accepted`** — a profile naming a non-blank CSMS URL; the station stores
+///   it in the requested `configurationSlot`.
+/// - **`Failed`** is *not* produced here. It is the spec's "accepted the profile
+///   but could not apply it" runtime arm — a station that stored the slot yet
+///   could not bring the interface up. The simulator's store never fails to
+///   accept a well-formed profile, so no schema-valid input forces `Failed`
+///   deterministically; it is kept as a documented seam, exercised at the
+///   response-builder + schema level (all three statuses) rather than through
+///   `handle_message`. This mirrors the unproduced-status convention `GetLog`
+///   (`Rejected`) and `DeleteCertificate` (`Failed`, a race arm) follow.
+#[must_use]
+pub fn v201_set_network_profile_decision(
+    request: &SetNetworkProfileRequest,
+) -> SetNetworkProfileStatusEnumType {
+    if request.connection_data.ocpp_csms_url.trim().is_empty() {
+        // Nothing to connect to — the profile names no reachable CSMS.
+        SetNetworkProfileStatusEnumType::Rejected
+    } else {
+        SetNetworkProfileStatusEnumType::Accepted
+    }
+}
+
+/// Build a schema-valid `SetNetworkProfile.conf` ([`SetNetworkProfileResponse`]).
+///
+/// Pure constructor mirroring [`v201_install_certificate_response`]: carries the
+/// decided [`status`](SetNetworkProfileStatusEnumType) plus the optional 2.0.1
+/// `statusInfo` — a vendor-agnostic `reasonCode` and human-readable detail the
+/// handler attaches to a non-`Accepted` outcome (why the profile was `Rejected`).
+///
+/// Ports `ocpp.v201.call_result.SetNetworkProfile`.
+#[must_use]
+pub fn v201_set_network_profile_response(
+    status: SetNetworkProfileStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> SetNetworkProfileResponse {
+    SetNetworkProfileResponse {
         status,
         status_info,
         custom_data: None,
@@ -4721,6 +4779,100 @@ mod tests {
             validator
                 .validate_call_result("InstallCertificate", &serde_json::to_value(&resp).unwrap())
                 .expect("built InstallCertificate response is schema-valid");
+        }
+    }
+
+    // --- SetNetworkProfile (v201) decision + response builder (Issue #528) ---
+
+    /// A minimal, well-formed `SetNetworkProfileRequest` for `slot`, whose
+    /// profile names `csms_url`.
+    fn set_network_profile_request(slot: i32, csms_url: &str) -> SetNetworkProfileRequest {
+        use ocpp_types::v201::{
+            NetworkConnectionProfileType, OCPPInterfaceEnumType, OCPPTransportEnumType,
+            OCPPVersionEnumType,
+        };
+        SetNetworkProfileRequest {
+            configuration_slot: slot,
+            connection_data: NetworkConnectionProfileType {
+                ocpp_version: OCPPVersionEnumType::Ocpp20,
+                ocpp_transport: OCPPTransportEnumType::Json,
+                ocpp_csms_url: csms_url.to_string(),
+                message_timeout: 30,
+                security_profile: 2,
+                ocpp_interface: OCPPInterfaceEnumType::Wireless0,
+                apn: None,
+                vpn: None,
+                custom_data: None,
+            },
+            custom_data: None,
+        }
+    }
+
+    #[test]
+    fn set_network_profile_accepts_a_profile_with_a_reachable_url() {
+        assert_eq!(
+            v201_set_network_profile_decision(&set_network_profile_request(
+                1,
+                "wss://csms.example.com/ocpp"
+            )),
+            SetNetworkProfileStatusEnumType::Accepted
+        );
+        // The configuration slot does not change the decision — extreme slots are
+        // accepted just the same (the store keys on them; the decision does not).
+        for slot in [i32::MIN, 0, i32::MAX] {
+            assert_eq!(
+                v201_set_network_profile_decision(&set_network_profile_request(
+                    slot,
+                    "wss://csms.example.com/ocpp"
+                )),
+                SetNetworkProfileStatusEnumType::Accepted,
+                "slot {slot} is accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn set_network_profile_rejects_a_blank_csms_url() {
+        // A profile that names no reachable CSMS is refused up front. These are
+        // all schema-valid on the wire (ocppCsmsUrl has no minLength), so the
+        // refusal is genuinely input-reachable, never a panic on CSMS input.
+        for blank in ["", "   ", "\n\t "] {
+            assert_eq!(
+                v201_set_network_profile_decision(&set_network_profile_request(1, blank)),
+                SetNetworkProfileStatusEnumType::Rejected,
+                "a blank ocppCsmsUrl ({blank:?}) is refused"
+            );
+        }
+    }
+
+    #[test]
+    fn built_set_network_profile_responses_are_schema_valid() {
+        // All three wire statuses — including the unproduced `Failed` seam — with
+        // and without a statusInfo, satisfy the bundled OCPP 2.0.1
+        // SetNetworkProfile response JSON Schema.
+        let validator = SchemaValidator::v201();
+        for status in [
+            SetNetworkProfileStatusEnumType::Accepted,
+            SetNetworkProfileStatusEnumType::Rejected,
+            SetNetworkProfileStatusEnumType::Failed,
+        ] {
+            for status_info in [
+                None,
+                Some(StatusInfoType {
+                    reason_code: "InvalidProfile".to_string(),
+                    additional_info: Some("simulated".to_string()),
+                    custom_data: None,
+                }),
+            ] {
+                let resp = v201_set_network_profile_response(status, status_info);
+                let payload = serde_json::to_value(&resp).unwrap();
+                assert!(
+                    validator
+                        .validate_call_result("SetNetworkProfile", &payload)
+                        .is_ok(),
+                    "built {status:?} SetNetworkProfileResponse should be schema-valid, got: {payload}"
+                );
+            }
         }
     }
 
