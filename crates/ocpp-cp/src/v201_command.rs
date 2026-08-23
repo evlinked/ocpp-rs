@@ -156,8 +156,8 @@ use ocpp_types::v201::{
     MessagePriorityEnumType, MessageStateEnumType, MessageTriggerEnumType,
     OperationalStatusEnumType, RequestStartStopStatusEnumType, ReserveNowStatusEnumType,
     ResetEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType, StatusInfoType,
-    TriggerMessageStatusEnumType, UnlockStatusEnumType, UpdateFirmwareStatusEnumType,
-    UploadLogStatusEnumType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType, UnpublishFirmwareStatusEnumType,
+    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
 };
 
 use ocpp_messages::v201::{
@@ -173,7 +173,8 @@ use ocpp_messages::v201::{
     ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
     SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
     SetNetworkProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
-    UpdateFirmwareRequest, UpdateFirmwareResponse,
+    UnpublishFirmwareRequest, UnpublishFirmwareResponse, UpdateFirmwareRequest,
+    UpdateFirmwareResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -2646,6 +2647,82 @@ pub fn v201_publish_firmware_response(
     PublishFirmwareResponse {
         status,
         status_info,
+        custom_data: None,
+    }
+}
+
+/// Decide how a `for_version(V201)` station answers an `UnpublishFirmware.req`
+/// (OCPP 2.0.1 Part 2, the Local-Controller firmware-cache teardown).
+///
+/// `UnpublishFirmware` is the counterpart to
+/// [`v201_publish_firmware_decision`]: where `PublishFirmware` tells a station
+/// acting as a Local Controller to *download and cache* a firmware image,
+/// `UnpublishFirmware` tells it to *remove* a previously-cached image,
+/// identified by the same 32-char MD5 [`checksum`](UnpublishFirmwareRequest::checksum)
+/// used when it was published. Unlike `PublishFirmware`, the answer is a single
+/// **synchronous** terminal status — there is no asynchronous progress stream —
+/// so this is a self-contained decide-and-answer with no queued follow-up.
+///
+/// The simulator models the *protocol* decision, not a firmware cache, so this
+/// is a lightweight shape predicate — **no checksum is opened, followed,
+/// parsed, or indexed** to look up a real image:
+///
+/// - [`Unpublished`](UnpublishFirmwareStatusEnumType::Unpublished) — the
+///   `checksum` is a well-shaped MD5 digest (exactly 32 hexadecimal
+///   characters). The Local Controller would drop the matching cached image.
+/// - [`NoFirmware`](UnpublishFirmwareStatusEnumType::NoFirmware) — the
+///   `checksum` is not a 32-char hex string, so it cannot name any image the
+///   station could have cached (the stateless simulator holds no publish
+///   store, so a mis-shaped checksum can never match).
+/// - [`DownloadOngoing`](UnpublishFirmwareStatusEnumType::DownloadOngoing) is a
+///   **documented unproduced seam** — it would be reported only when the
+///   `checksum` names a publish still in flight (a `PublishFirmware` whose async
+///   stream has not reached its terminal `Published`). The stateless simulator
+///   models no publish-cache store, so it never emits this arm; it stays covered
+///   on the wire and in the schema for when a real store lands (mirroring the
+///   `GetLog` / `UpdateFirmware` convention of keeping every enum arm covered
+///   even when the simulator never produces it).
+///
+/// Trust boundary: `checksum` is attacker-influenced CSMS input, inspected only
+/// for shape and **never** opened, followed, parsed, or indexed, so no wire
+/// value (empty, garbage, control chars, non-ASCII) can panic. Over-length
+/// (`checksum` maxLength 32) is refused at the schema layer (→ CALLERROR) before
+/// this runs. Ports the decision behind
+/// [`ocpp.v201.call_result.UnpublishFirmware`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call_result.py)'s
+/// [`UnpublishFirmwareStatusEnumType`].
+#[must_use]
+pub fn v201_unpublish_firmware_decision(
+    request: &UnpublishFirmwareRequest,
+) -> UnpublishFirmwareStatusEnumType {
+    // An MD5 digest rendered as hex: exactly 32 ASCII hex characters. The schema
+    // caps the length (maxLength 32) but enforces neither the exact count nor
+    // hex-ness, so the handler checks the shape it can actually act on — the same
+    // predicate the `PublishFirmware` decision uses on this field.
+    let checksum = &request.checksum;
+    let well_shaped_checksum =
+        checksum.len() == 32 && checksum.bytes().all(|b| b.is_ascii_hexdigit());
+
+    if well_shaped_checksum {
+        UnpublishFirmwareStatusEnumType::Unpublished
+    } else {
+        UnpublishFirmwareStatusEnumType::NoFirmware
+    }
+}
+
+/// Build a schema-valid `UnpublishFirmware.conf` ([`UnpublishFirmwareResponse`]).
+///
+/// Pure constructor mirroring [`v201_publish_firmware_response`]. Unlike its
+/// publish sibling, the `UnpublishFirmware` response carries no `statusInfo`
+/// field (the 2.0.1 schema defines only `status` + `customData`), so the single
+/// terminal [`status`](UnpublishFirmwareStatusEnumType) is the whole answer.
+///
+/// Ports `ocpp.v201.call_result.UnpublishFirmware`.
+#[must_use]
+pub fn v201_unpublish_firmware_response(
+    status: UnpublishFirmwareStatusEnumType,
+) -> UnpublishFirmwareResponse {
+    UnpublishFirmwareResponse {
+        status,
         custom_data: None,
     }
 }
@@ -6369,6 +6446,98 @@ mod tests {
                     .validate_call_result("PublishFirmware", &serde_json::to_value(&resp).unwrap())
                     .expect("built PublishFirmware response is schema-valid");
             }
+        }
+    }
+
+    // --- UnpublishFirmware (v201) decision + response builder (Issue #542) ---
+
+    /// Build an `UnpublishFirmwareRequest` carrying the given checksum.
+    fn unpublish_firmware_req(checksum: &str) -> UnpublishFirmwareRequest {
+        UnpublishFirmwareRequest {
+            checksum: checksum.to_string(),
+            custom_data: None,
+        }
+    }
+
+    #[test]
+    fn unpublish_firmware_unpublishes_a_32_char_hex_checksum() {
+        // A well-shaped MD5 digest — lower, upper, and mixed case are all hex.
+        for checksum in [
+            SAMPLE_MD5,
+            &SAMPLE_MD5.to_uppercase(),
+            "0123456789ABCDEFabcdef0123456789",
+            "ffffffffffffffffffffffffffffffff",
+            "00000000000000000000000000000000",
+        ] {
+            assert_eq!(
+                v201_unpublish_firmware_decision(&unpublish_firmware_req(checksum)),
+                UnpublishFirmwareStatusEnumType::Unpublished,
+                "a 32-char hex checksum {checksum:?} unpublishes",
+            );
+        }
+    }
+
+    #[test]
+    fn unpublish_firmware_reports_no_firmware_for_a_misshaped_checksum() {
+        // A checksum that is not exactly 32 hex chars names no cached image: empty,
+        // too short, 32 chars with a non-hex character, or hex but the wrong length.
+        for checksum in [
+            "",
+            "   ",
+            "abc",
+            "0123456789abcdef0123456789abcde",  // 31 hex chars
+            "0123456789abcdef0123456789abcdeg", // 32 chars, trailing non-hex 'g'
+            "0123456789abcdef 123456789abcdef", // 32 chars, embedded space
+            "not-a-hex-digest-not-a-hex-diges", // 32 chars, non-hex
+        ] {
+            assert_eq!(
+                v201_unpublish_firmware_decision(&unpublish_firmware_req(checksum)),
+                UnpublishFirmwareStatusEnumType::NoFirmware,
+                "a mis-shaped checksum {checksum:?} reports NoFirmware",
+            );
+        }
+    }
+
+    #[test]
+    fn unpublish_firmware_does_not_panic_on_hostile_input() {
+        // Attacker-influenced checksum values must never panic; every one is only
+        // shape-inspected, never opened, followed, parsed, or indexed. A schema-
+        // over-length value (>32) would be refused before the handler, but a
+        // decision on one still yields NoFirmware without panicking.
+        for checksum in [
+            &"f".repeat(4096),
+            &"a\u{0}b".to_string(),
+            &"héllo-wörld-with-non-ascii-chars".to_string(),
+            &"\u{1F600}".repeat(32),
+        ] {
+            assert_eq!(
+                v201_unpublish_firmware_decision(&unpublish_firmware_req(checksum)),
+                UnpublishFirmwareStatusEnumType::NoFirmware,
+                "hostile checksum {checksum:?} is NoFirmware without panic",
+            );
+        }
+    }
+
+    #[test]
+    fn built_unpublish_firmware_responses_are_schema_valid() {
+        // Every status arm the wire can carry — including the documented unproduced
+        // `DownloadOngoing` seam — satisfies the bundled OCPP 2.0.1 UnpublishFirmware
+        // response JSON Schema.
+        let validator = SchemaValidator::v201();
+        for status in [
+            UnpublishFirmwareStatusEnumType::DownloadOngoing,
+            UnpublishFirmwareStatusEnumType::NoFirmware,
+            UnpublishFirmwareStatusEnumType::Unpublished,
+        ] {
+            let resp = v201_unpublish_firmware_response(status);
+            assert_eq!(resp.status, status);
+            assert!(
+                resp.custom_data.is_none(),
+                "the constructor attaches no vendor extension"
+            );
+            validator
+                .validate_call_result("UnpublishFirmware", &serde_json::to_value(&resp).unwrap())
+                .expect("built UnpublishFirmware response is schema-valid");
         }
     }
 }
