@@ -154,10 +154,10 @@ use ocpp_types::v201::{
     GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType, InstallCertificateStatusEnumType,
     InstallCertificateUseEnumType, LogEnumType, LogStatusEnumType, MessageInfoType,
     MessagePriorityEnumType, MessageStateEnumType, MessageTriggerEnumType,
-    OperationalStatusEnumType, RequestStartStopStatusEnumType, ReserveNowStatusEnumType,
-    ResetEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType, StatusInfoType,
-    TriggerMessageStatusEnumType, UnlockStatusEnumType, UpdateFirmwareStatusEnumType,
-    UploadLogStatusEnumType,
+    OperationalStatusEnumType, PublishFirmwareStatusEnumType, RequestStartStopStatusEnumType,
+    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType,
+    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
 };
 
 use ocpp_messages::v201::{
@@ -168,9 +168,9 @@ use ocpp_messages::v201::{
     GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse,
     GetMonitoringReportResponse, GetTransactionStatusResponse, InstallCertificateResponse,
     LogStatusNotificationRequest, NotifyCustomerInformationRequest, NotifyDisplayMessagesRequest,
-    PublishFirmwareRequest, PublishFirmwareResponse, ReportChargingProfilesRequest,
-    RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
-    ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
+    PublishFirmwareRequest, PublishFirmwareResponse, PublishFirmwareStatusNotificationRequest,
+    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
+    ReserveNowResponse, ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
     SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
     SetNetworkProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
     UpdateFirmwareRequest, UpdateFirmwareResponse,
@@ -2153,6 +2153,55 @@ pub fn v201_firmware_status_notification(
 ) -> FirmwareStatusNotificationRequest {
     FirmwareStatusNotificationRequest {
         status,
+        request_id: Some(request_id),
+        custom_data: None,
+    }
+}
+
+/// The URIs a simulated firmware *publish* reports the cached image is available
+/// from, carried on the terminal `Published`
+/// [`PublishFirmwareStatusNotification`](PublishFirmwareStatusNotificationRequest).
+///
+/// The Charging Station *simulator* caches no real image — there is nothing to
+/// actually serve — so an accepted publish reports a small, fixed set of
+/// LAN-style download URIs that stand in for the locations a production Local
+/// Controller would advertise. Kept as a standalone `const` (rather than inlined
+/// into the notification builder) so a test can assert the list directly, and so
+/// the simulated locations are a single documented seam a future "real firmware
+/// cache" slice would replace. Each entry is well under the schema's per-URI
+/// `maxLength: 512`.
+pub const V201_SIMULATED_PUBLISH_FIRMWARE_LOCATIONS: &[&str] = &[
+    "http://local-controller.lan/firmware/published.bin",
+    "ftp://local-controller.lan/firmware/published.bin",
+];
+
+/// Build a `PublishFirmwareStatusNotification.req`
+/// ([`PublishFirmwareStatusNotificationRequest`]) reporting `status` for the
+/// firmware publish identified by `request_id` — the publish-to-local-cache twin
+/// of [`v201_firmware_status_notification`].
+///
+/// Ports the progress carrier of
+/// [`ocpp.v201.call.PublishFirmwareStatusNotification`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py):
+/// the single [`PublishFirmwareStatusEnumType`], the correlating `requestId`
+/// (always present here — a simulator only emits these while driving a publish it
+/// accepted, never off a bare `TriggerMessage`), and the optional `location` URI
+/// list. Per the spec `location` is required only on the terminal
+/// [`Published`](PublishFirmwareStatusEnumType::Published) state and absent on the
+/// intermediate lifecycle states; the caller passes `Some(list)` only there, so
+/// this builder simply forwards whatever it is given.
+///
+/// `request_id` is copied into the message and never parsed or indexed, so an
+/// extreme value (`i32::MIN`/`MAX`) cannot panic; `location` is simulator-supplied
+/// (see [`V201_SIMULATED_PUBLISH_FIRMWARE_LOCATIONS`]), never attacker input.
+#[must_use]
+pub fn v201_publish_firmware_status_notification(
+    status: PublishFirmwareStatusEnumType,
+    location: Option<Vec<String>>,
+    request_id: i32,
+) -> PublishFirmwareStatusNotificationRequest {
+    PublishFirmwareStatusNotificationRequest {
+        status,
+        location,
         request_id: Some(request_id),
         custom_data: None,
     }
@@ -5067,6 +5116,115 @@ mod tests {
                     &serde_json::to_value(page).unwrap(),
                 )
                 .expect("NotifyCustomerInformation CALL is schema-valid");
+        }
+    }
+
+    // --- PublishFirmwareStatusNotification (v201, #540) ---------------------
+
+    #[test]
+    fn publish_firmware_status_notification_carries_status_and_correlating_request_id() {
+        // The intermediate lifecycle states carry no location; requestId always
+        // rides along so the CSMS can correlate the stream to its PublishFirmware.
+        let note = v201_publish_firmware_status_notification(
+            PublishFirmwareStatusEnumType::Downloading,
+            None,
+            42,
+        );
+        assert_eq!(note.status, PublishFirmwareStatusEnumType::Downloading);
+        assert_eq!(note.request_id, Some(42));
+        assert!(
+            note.location.is_none(),
+            "an intermediate state carries no location list"
+        );
+    }
+
+    #[test]
+    fn publish_firmware_status_notification_published_carries_the_location_list() {
+        // The terminal Published state advertises the URIs the image can be
+        // pulled from — the simulator-supplied location list, forwarded verbatim.
+        let locations: Vec<String> = V201_SIMULATED_PUBLISH_FIRMWARE_LOCATIONS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let note = v201_publish_firmware_status_notification(
+            PublishFirmwareStatusEnumType::Published,
+            Some(locations.clone()),
+            7,
+        );
+        assert_eq!(note.status, PublishFirmwareStatusEnumType::Published);
+        assert_eq!(note.location, Some(locations));
+        assert_eq!(note.request_id, Some(7));
+    }
+
+    #[test]
+    fn publish_firmware_status_notification_extreme_request_id_does_not_panic() {
+        // requestId is echoed, never parsed — extremes flow into the message safely.
+        for request_id in [i32::MIN, i32::MAX] {
+            let note = v201_publish_firmware_status_notification(
+                PublishFirmwareStatusEnumType::Idle,
+                None,
+                request_id,
+            );
+            assert_eq!(note.request_id, Some(request_id));
+        }
+    }
+
+    #[test]
+    fn simulated_publish_firmware_locations_are_non_empty_and_within_schema_bounds() {
+        // The simulated location list advertises at least one URI, each well
+        // under the schema's per-URI maxLength 512.
+        assert!(
+            !V201_SIMULATED_PUBLISH_FIRMWARE_LOCATIONS.is_empty(),
+            "the Published state advertises at least one download URI"
+        );
+        assert!(
+            V201_SIMULATED_PUBLISH_FIRMWARE_LOCATIONS
+                .iter()
+                .all(|uri| uri.chars().count() <= 512),
+            "each simulated location fits the schema's per-URI maxLength"
+        );
+    }
+
+    #[test]
+    fn built_publish_firmware_status_notifications_are_schema_valid() {
+        // Every status the simulated progression emits — the intermediate states
+        // (no location) and the terminal Published (with the location list) —
+        // satisfies the bundled OCPP 2.0.1 schema.
+        let validator = SchemaValidator::v201();
+        let locations: Vec<String> = V201_SIMULATED_PUBLISH_FIRMWARE_LOCATIONS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let notes = [
+            v201_publish_firmware_status_notification(PublishFirmwareStatusEnumType::Idle, None, 9),
+            v201_publish_firmware_status_notification(
+                PublishFirmwareStatusEnumType::DownloadScheduled,
+                None,
+                9,
+            ),
+            v201_publish_firmware_status_notification(
+                PublishFirmwareStatusEnumType::Downloading,
+                None,
+                9,
+            ),
+            v201_publish_firmware_status_notification(
+                PublishFirmwareStatusEnumType::Downloaded,
+                None,
+                9,
+            ),
+            v201_publish_firmware_status_notification(
+                PublishFirmwareStatusEnumType::Published,
+                Some(locations),
+                9,
+            ),
+        ];
+        for note in &notes {
+            validator
+                .validate_call(
+                    "PublishFirmwareStatusNotification",
+                    &serde_json::to_value(note).unwrap(),
+                )
+                .expect("PublishFirmwareStatusNotification CALL is schema-valid");
         }
     }
 
