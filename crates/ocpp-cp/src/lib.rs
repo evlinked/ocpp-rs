@@ -122,6 +122,7 @@ use ocpp_messages::v201::{
     MeterValuesRequest as V201MeterValuesRequest,
     NotifyMonitoringReportRequest as V201NotifyMonitoringReportRequest,
     NotifyReportRequest as V201NotifyReportRequest,
+    PublishFirmwareRequest as V201PublishFirmwareRequest,
     RequestStartTransactionRequest as V201RequestStartTransactionRequest,
     RequestStopTransactionRequest as V201RequestStopTransactionRequest,
     ReserveNowRequest as V201ReserveNowRequest, ResetRequest as V201ResetRequest,
@@ -2332,6 +2333,56 @@ impl ChargePoint {
                     | CustomerInformationStatusEnumType::Rejected => None,
                 };
                 Ok(v201_command::v201_customer_information_response(
+                    status,
+                    status_info,
+                ))
+            });
+        }
+
+        // PublishFirmware (OCPP 2.0.1 only) — the CSMS tells a station acting as a
+        // Local Controller to download a firmware image once and cache it locally,
+        // so the chargers behind it can pull it over the LAN instead of each
+        // fetching it from the CSMS over the WAN (Part 2, the firmware-cache
+        // trigger, Issue #538). Registered only on the V201 arm — 1.6J has no
+        // `PublishFirmware`, so a 1.6J CP answers CALLERROR.
+        //
+        // A **stateless** pure decide-and-answer: no store side effect, no queued
+        // command. This slice wires only the synchronous accept/reject; when
+        // `Accepted` a real Local Controller drives the download and reports
+        // progress asynchronously via `PublishFirmwareStatusNotification`, which is
+        // a separate follow-up (the same sync-ack-first split GetLog / UpdateFirmware
+        // used). The decision (`v201_command::v201_publish_firmware_decision`) is a
+        // lightweight shape predicate — **no URL is opened/followed** (the same
+        // documented simulator boundary as `CertificateSigned`'s no-PKI arm): a
+        // non-empty `location` plus a well-shaped 32-char hex `checksum` → `Accepted`;
+        // an empty `location` or a mis-shaped `checksum` → `Rejected` with a
+        // `statusInfo` reason. `GenericStatusEnumType` is binary, so there is no
+        // third arm.
+        //
+        // Trust boundary: `location` and `checksum` are attacker-influenced CSMS
+        // input, inspected only for shape and never opened/followed/parsed/indexed,
+        // so no wire value (empty, garbage, very long, control chars) can panic;
+        // `request_id` is not read by the decision, so extreme values
+        // (`i32::MIN`/`MAX`) are safe. Over-length fields (`location` maxLength 512,
+        // `checksum` maxLength 32) are refused at the schema layer (→ CALLERROR)
+        // before the handler runs. Ports `ocpp.v201.call.PublishFirmware` →
+        // `ocpp.v201.call_result.PublishFirmware`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            d.on(move |req: V201PublishFirmwareRequest| async move {
+                let status = v201_command::v201_publish_firmware_decision(&req);
+                let status_info = match status {
+                    GenericStatusEnumType::Accepted => None,
+                    GenericStatusEnumType::Rejected => Some(StatusInfoType {
+                        reason_code: "InvalidRequest".to_string(),
+                        additional_info: Some(
+                            "PublishFirmware requires a non-empty location and a 32-char hex \
+                             checksum"
+                                .to_string(),
+                        ),
+                        custom_data: None,
+                    }),
+                };
+                Ok(v201_command::v201_publish_firmware_response(
                     status,
                     status_info,
                 ))
@@ -10818,6 +10869,164 @@ mod tests {
             validator
                 .validate_call_result("CustomerInformation", &serde_json::to_value(&resp).unwrap())
                 .expect("CustomerInformation response is schema-valid");
+        }
+    }
+
+    // --- OCPP 2.0.1 PublishFirmware (M7, issue #538) -----------------------
+    // A `for_version(V201)` CP synchronously accepts/rejects the Local-Controller
+    // firmware-cache trigger: a non-empty `location` plus a 32-char hex `checksum`
+    // → Accepted; an empty location or a mis-shaped checksum → Rejected with a
+    // statusInfo reason. Stateless (queues nothing), and V201-only. These exercise
+    // the wired V201 arm end-to-end over `handle_message`.
+
+    /// A syntactically valid 32-char hex MD5 digest for the wire fixtures.
+    const SAMPLE_FW_MD5: &str = "0123456789abcdef0123456789abcdef";
+
+    fn make_v201_publish_firmware(location: &str, checksum: &str, request_id: i32) -> CallMessage {
+        make_call(V201PublishFirmwareRequest {
+            location: location.to_string(),
+            retries: None,
+            checksum: checksum.to_string(),
+            request_id,
+            retry_interval: None,
+            custom_data: None,
+        })
+    }
+
+    /// Read the `PublishFirmware.conf` out of a `handle_message` reply, asserting
+    /// the reply is a CALLRESULT.
+    async fn publish_firmware_response(
+        cp: &ChargePoint,
+        call: CallMessage,
+    ) -> ocpp_messages::v201::PublishFirmwareResponse {
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => r.payload_as().unwrap(),
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_publish_firmware_accepts_a_location_with_a_hex_checksum() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let body = publish_firmware_response(
+            &cp,
+            make_v201_publish_firmware("https://fw.example/img.bin", SAMPLE_FW_MD5, 7),
+        )
+        .await;
+        assert_eq!(body.status, GenericStatusEnumType::Accepted);
+        assert!(
+            body.status_info.is_none(),
+            "an accepted publish request carries no statusInfo"
+        );
+        assert!(
+            v201_drain_commands(&cp).await.is_empty(),
+            "PublishFirmware is a stateless responder in this slice — it queues nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_publish_firmware_rejects_empty_location_or_bad_checksum() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+
+        // Empty location → Rejected, with an InvalidRequest reason.
+        let body =
+            publish_firmware_response(&cp, make_v201_publish_firmware("", SAMPLE_FW_MD5, 7)).await;
+        assert_eq!(body.status, GenericStatusEnumType::Rejected);
+        assert_eq!(
+            body.status_info
+                .expect("a Rejected answer carries a statusInfo reason")
+                .reason_code,
+            "InvalidRequest"
+        );
+
+        // Mis-shaped checksum (not 32 hex chars) → Rejected.
+        let body = publish_firmware_response(
+            &cp,
+            make_v201_publish_firmware("https://fw.example/img.bin", "not-a-hex-digest", 7),
+        )
+        .await;
+        assert_eq!(body.status, GenericStatusEnumType::Rejected);
+
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_publish_firmware_extreme_request_id_never_panics() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // request_id is echoed only by the async follow-up, never read by the sync
+        // decision — an actionable request at every extreme is Accepted without panic.
+        for request_id in [0, 1, -1, i32::MIN, i32::MAX] {
+            let body = publish_firmware_response(
+                &cp,
+                make_v201_publish_firmware("https://fw.example/img.bin", SAMPLE_FW_MD5, request_id),
+            )
+            .await;
+            assert_eq!(
+                body.status,
+                GenericStatusEnumType::Accepted,
+                "request_id={request_id} is accepted without panic"
+            );
+        }
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_publish_firmware_is_v201_only() {
+        // A 1.6J CP has no PublishFirmware handler (1.6J has no such command), so the
+        // v201-only action is unrouted → CallError, never a CallResult.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V16J)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_publish_firmware(
+                "https://fw.example/img.bin",
+                SAMPLE_FW_MD5,
+                7,
+            )))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Some(Message::CallError(_))),
+            "a 1.6J CP does not answer PublishFirmware with a CallResult, got: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn v201_publish_firmware_request_and_response_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        // A request carrying the optional retry tuning is schema-valid.
+        let req = V201PublishFirmwareRequest {
+            location: "https://fw.example/img.bin".to_string(),
+            retries: Some(3),
+            checksum: SAMPLE_FW_MD5.to_string(),
+            request_id: 7,
+            retry_interval: Some(60),
+            custom_data: None,
+        };
+        validator
+            .validate_call("PublishFirmware", &serde_json::to_value(&req).unwrap())
+            .expect("PublishFirmware request is schema-valid");
+
+        // Both answer shapes the handler emits — Accepted (no statusInfo) and Rejected
+        // (with a statusInfo reason) — serialize to a schema-valid response.
+        for (status, status_info) in [
+            (GenericStatusEnumType::Accepted, None),
+            (
+                GenericStatusEnumType::Rejected,
+                Some(StatusInfoType {
+                    reason_code: "InvalidRequest".to_string(),
+                    additional_info: None,
+                    custom_data: None,
+                }),
+            ),
+        ] {
+            let resp = ocpp_messages::v201::PublishFirmwareResponse {
+                status,
+                status_info,
+                custom_data: None,
+            };
+            validator
+                .validate_call_result("PublishFirmware", &serde_json::to_value(&resp).unwrap())
+                .expect("PublishFirmware response is schema-valid");
         }
     }
 
