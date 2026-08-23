@@ -167,12 +167,12 @@ use ocpp_messages::v201::{
     DeleteCertificateResponse, FirmwareStatusNotificationRequest, GetChargingProfilesResponse,
     GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse,
     GetMonitoringReportResponse, GetTransactionStatusResponse, InstallCertificateResponse,
-    LogStatusNotificationRequest, NotifyDisplayMessagesRequest, ReportChargingProfilesRequest,
-    RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
-    ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
-    SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
-    SetNetworkProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
-    UpdateFirmwareRequest, UpdateFirmwareResponse,
+    LogStatusNotificationRequest, NotifyDisplayMessagesRequest, PublishFirmwareRequest,
+    PublishFirmwareResponse, ReportChargingProfilesRequest, RequestStartTransactionResponse,
+    RequestStopTransactionResponse, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
+    SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
+    SetNetworkProfileRequest, SetNetworkProfileResponse, TriggerMessageResponse,
+    UnlockConnectorResponse, UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -2502,6 +2502,81 @@ pub fn v201_customer_information_response(
     status_info: Option<StatusInfoType>,
 ) -> CustomerInformationResponse {
     CustomerInformationResponse {
+        status,
+        status_info,
+        custom_data: None,
+    }
+}
+
+/// Decide how a `for_version(V201)` station answers a `PublishFirmware.req`
+/// (OCPP 2.0.1 Part 2, the Local-Controller firmware-cache trigger).
+///
+/// `PublishFirmware` tells a station acting as a Local Controller to download a
+/// firmware image from [`location`](PublishFirmwareRequest::location) once and
+/// cache it locally, so the chargers behind it can pull it over the LAN instead
+/// of each fetching it from the CSMS over the WAN. The image is identified by a
+/// 32-char MD5 [`checksum`](PublishFirmwareRequest::checksum) and correlated by
+/// [`request_id`](PublishFirmwareRequest::request_id); the actual download
+/// progress is reported asynchronously via `PublishFirmwareStatusNotification`
+/// (a separate follow-up). This is the **synchronous accept/reject** decision.
+///
+/// The simulator models the *protocol* decision, not a firmware downloader, so
+/// this is a lightweight shape predicate — **no URL is opened, followed, or
+/// parsed**, and the checksum is never used to verify a real image:
+///
+/// - [`Accepted`](GenericStatusEnumType::Accepted) — the request carries a
+///   non-empty `location` **and** a well-shaped `checksum` (exactly 32
+///   hexadecimal characters, an MD5 digest). The Local Controller would begin
+///   the cached download.
+/// - [`Rejected`](GenericStatusEnumType::Rejected) — the `location` is empty /
+///   whitespace-only, or the `checksum` is not a 32-char hex string; there is
+///   nothing actionable to download or verify against.
+///
+/// [`retries`](PublishFirmwareRequest::retries) /
+/// [`retry_interval`](PublishFirmwareRequest::retry_interval) are advisory
+/// download tuning, not policy inputs, and do not affect the decision.
+///
+/// Trust boundary: `location` and `checksum` are attacker-influenced CSMS input,
+/// inspected only for shape and **never** opened, followed, parsed, or indexed,
+/// so no wire value (empty, garbage, very long, control chars) can panic.
+/// `request_id` is not read here, so extreme values (`i32::MIN`/`MAX`) are safe.
+/// Over-length fields (`location` maxLength 512, `checksum` maxLength 32) are
+/// refused at the schema layer (→ CALLERROR) before this runs. Ports the
+/// accept/reject decision behind
+/// [`ocpp.v201.call_result.PublishFirmware`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call_result.py)'s
+/// [`GenericStatusEnumType`].
+#[must_use]
+pub fn v201_publish_firmware_decision(request: &PublishFirmwareRequest) -> GenericStatusEnumType {
+    let has_location = !request.location.trim().is_empty();
+    // An MD5 digest rendered as hex: exactly 32 ASCII hex characters. The schema
+    // caps the length (maxLength 32) but does not enforce the count or hex-ness,
+    // so the handler checks the shape it can actually act on.
+    let checksum = &request.checksum;
+    let well_shaped_checksum =
+        checksum.len() == 32 && checksum.bytes().all(|b| b.is_ascii_hexdigit());
+
+    if has_location && well_shaped_checksum {
+        GenericStatusEnumType::Accepted
+    } else {
+        GenericStatusEnumType::Rejected
+    }
+}
+
+/// Build a schema-valid `PublishFirmware.conf` ([`PublishFirmwareResponse`]).
+///
+/// Pure constructor mirroring [`v201_customer_information_response`]: carries the
+/// decided [`status`](GenericStatusEnumType) plus the optional 2.0.1
+/// `statusInfo` — a vendor-agnostic `reasonCode` and human-readable detail the
+/// handler attaches to a `Rejected` outcome (why the publish request was
+/// refused). An `Accepted` carries no `statusInfo`.
+///
+/// Ports `ocpp.v201.call_result.PublishFirmware`.
+#[must_use]
+pub fn v201_publish_firmware_response(
+    status: GenericStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> PublishFirmwareResponse {
+    PublishFirmwareResponse {
         status,
         status_info,
         custom_data: None,
@@ -6008,6 +6083,135 @@ mod tests {
                         &serde_json::to_value(&resp).unwrap(),
                     )
                     .expect("built CustomerInformation response is schema-valid");
+            }
+        }
+    }
+
+    // --- PublishFirmware (v201) decision + response builder (Issue #538) ---
+
+    /// A syntactically valid 32-char lowercase-hex MD5 digest for the fixtures.
+    const SAMPLE_MD5: &str = "0123456789abcdef0123456789abcdef";
+
+    /// Build a `PublishFirmwareRequest` with a fixed `request_id` and no retry
+    /// tuning, varying only the two shape-relevant fields.
+    fn publish_firmware_req(location: &str, checksum: &str) -> PublishFirmwareRequest {
+        PublishFirmwareRequest {
+            location: location.to_string(),
+            retries: None,
+            checksum: checksum.to_string(),
+            request_id: 7,
+            retry_interval: None,
+            custom_data: None,
+        }
+    }
+
+    #[test]
+    fn publish_firmware_accepts_a_location_with_a_32_char_hex_checksum() {
+        // A non-empty location plus a well-shaped 32-char hex checksum is
+        // actionable → Accepted. Hex is case-insensitive (both nibble cases).
+        for checksum in [
+            SAMPLE_MD5,
+            &SAMPLE_MD5.to_uppercase(),
+            "ABCDEF0123456789abcdef0123456789",
+        ] {
+            let req = publish_firmware_req("https://fw.example/img.bin", checksum);
+            assert_eq!(
+                v201_publish_firmware_decision(&req),
+                GenericStatusEnumType::Accepted,
+                "checksum={checksum}"
+            );
+        }
+        // retries / retryInterval are advisory and do not change the decision.
+        let mut tuned = publish_firmware_req("ftp://host/fw", SAMPLE_MD5);
+        tuned.retries = Some(3);
+        tuned.retry_interval = Some(60);
+        assert_eq!(
+            v201_publish_firmware_decision(&tuned),
+            GenericStatusEnumType::Accepted
+        );
+    }
+
+    #[test]
+    fn publish_firmware_rejects_an_empty_or_blank_location() {
+        // No place to download from → nothing actionable, even with a good checksum.
+        for location in ["", "   ", "\t\n"] {
+            let req = publish_firmware_req(location, SAMPLE_MD5);
+            assert_eq!(
+                v201_publish_firmware_decision(&req),
+                GenericStatusEnumType::Rejected,
+                "location={location:?} is Rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_firmware_rejects_a_misshaped_checksum() {
+        // The checksum must be exactly 32 hex chars: too short, too long, or with a
+        // non-hex character is not an MD5 digest we can verify against → Rejected.
+        let bad = [
+            "",                                  // empty
+            "0123456789abcdef",                  // 16 chars — too short
+            "0123456789abcdef0123456789abcde",   // 31 chars — one short
+            "0123456789abcdef0123456789abcdef0", // 33 chars — one long
+            "0123456789abcdef0123456789abcdeg",  // 32 chars but 'g' is not hex
+            "0123456789abcdef0123456789abcde ",  // 32 chars but a trailing space
+        ];
+        for checksum in bad {
+            let req = publish_firmware_req("https://fw.example/img.bin", checksum);
+            assert_eq!(
+                v201_publish_firmware_decision(&req),
+                GenericStatusEnumType::Rejected,
+                "checksum={checksum:?} is Rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn publish_firmware_does_not_panic_on_hostile_input() {
+        // location / checksum are opaque CSMS input — inspected, never opened or
+        // parsed — and request_id is not read by the decision, so no wire value
+        // (very long, control chars, extreme id) can panic.
+        let long = "x".repeat(4096);
+        let _ = v201_publish_firmware_decision(&publish_firmware_req(&long, &long));
+        let _ = v201_publish_firmware_decision(&publish_firmware_req(
+            "\0\u{1}\u{2}://\u{7f}",
+            "\0\u{1}\u{2}\u{3}\u{4}\u{5}\u{6}\u{7}\u{8}\u{9}\u{a}\u{b}\u{c}\u{d}\u{e}\u{f}0123456789abcdef",
+        ));
+        for request_id in [0, 1, -1, i32::MIN, i32::MAX] {
+            let mut req = publish_firmware_req("https://fw.example/img.bin", SAMPLE_MD5);
+            req.request_id = request_id;
+            assert_eq!(
+                v201_publish_firmware_decision(&req),
+                GenericStatusEnumType::Accepted,
+                "request_id={request_id} does not affect the decision"
+            );
+        }
+    }
+
+    #[test]
+    fn built_publish_firmware_responses_are_schema_valid() {
+        // Both statuses the wire can carry, with and without a statusInfo, satisfy
+        // the bundled OCPP 2.0.1 PublishFirmware response JSON Schema.
+        let validator = SchemaValidator::v201();
+        for status in [
+            GenericStatusEnumType::Accepted,
+            GenericStatusEnumType::Rejected,
+        ] {
+            for status_info in [
+                None,
+                Some(StatusInfoType {
+                    reason_code: "InvalidRequest".to_string(),
+                    additional_info: Some(
+                        "location empty or checksum not a 32-char hex digest".to_string(),
+                    ),
+                    custom_data: None,
+                }),
+            ] {
+                let resp = v201_publish_firmware_response(status, status_info);
+                assert_eq!(resp.status, status);
+                validator
+                    .validate_call_result("PublishFirmware", &serde_json::to_value(&resp).unwrap())
+                    .expect("built PublishFirmware response is schema-valid");
             }
         }
     }
