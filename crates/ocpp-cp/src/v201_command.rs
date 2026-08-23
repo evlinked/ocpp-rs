@@ -147,30 +147,31 @@ use ocpp_types::v201::{
     CertificateSignedStatusEnumType, ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType,
     ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
     ChargingProfileType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
-    ClearChargingProfileType, ClearMessageStatusEnumType, DeleteCertificateStatusEnumType,
-    DisplayMessageStatusEnumType, GenericDeviceModelStatusEnumType, GenericStatusEnumType,
-    GetCertificateIdUseEnumType, GetChargingProfileStatusEnumType,
-    GetDisplayMessagesStatusEnumType, GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType,
-    InstallCertificateStatusEnumType, InstallCertificateUseEnumType, LogEnumType,
-    LogStatusEnumType, MessageInfoType, MessagePriorityEnumType, MessageStateEnumType,
-    MessageTriggerEnumType, OperationalStatusEnumType, RequestStartStopStatusEnumType,
-    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType,
-    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
-    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
+    ClearChargingProfileType, ClearMessageStatusEnumType, CustomerInformationStatusEnumType,
+    DeleteCertificateStatusEnumType, DisplayMessageStatusEnumType,
+    GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetCertificateIdUseEnumType,
+    GetChargingProfileStatusEnumType, GetDisplayMessagesStatusEnumType,
+    GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType, InstallCertificateStatusEnumType,
+    InstallCertificateUseEnumType, LogEnumType, LogStatusEnumType, MessageInfoType,
+    MessagePriorityEnumType, MessageStateEnumType, MessageTriggerEnumType,
+    OperationalStatusEnumType, RequestStartStopStatusEnumType, ReserveNowStatusEnumType,
+    ResetEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType, UpdateFirmwareStatusEnumType,
+    UploadLogStatusEnumType,
 };
 
 use ocpp_messages::v201::{
     CancelReservationResponse, CertificateSignedResponse, ChangeAvailabilityResponse,
     ClearCacheResponse, ClearChargingProfileResponse, ClearDisplayMessageResponse,
-    CostUpdatedResponse, DeleteCertificateResponse, GetChargingProfilesResponse,
-    GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse,
-    GetMonitoringReportResponse, GetTransactionStatusResponse, InstallCertificateResponse,
-    LogStatusNotificationRequest, NotifyDisplayMessagesRequest, ReportChargingProfilesRequest,
-    RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
-    ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
-    SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
-    SetNetworkProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
-    UpdateFirmwareRequest, UpdateFirmwareResponse,
+    CostUpdatedResponse, CustomerInformationRequest, CustomerInformationResponse,
+    DeleteCertificateResponse, GetChargingProfilesResponse, GetDisplayMessagesResponse,
+    GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse, GetMonitoringReportResponse,
+    GetTransactionStatusResponse, InstallCertificateResponse, LogStatusNotificationRequest,
+    NotifyDisplayMessagesRequest, ReportChargingProfilesRequest, RequestStartTransactionResponse,
+    RequestStopTransactionResponse, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
+    SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
+    SetNetworkProfileRequest, SetNetworkProfileResponse, TriggerMessageResponse,
+    UnlockConnectorResponse, UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -2398,6 +2399,85 @@ pub fn v201_delete_certificate_response(
     status_info: Option<StatusInfoType>,
 ) -> DeleteCertificateResponse {
     DeleteCertificateResponse {
+        status,
+        status_info,
+        custom_data: None,
+    }
+}
+
+/// Decide how a `for_version(V201)` station answers a `CustomerInformation.req`
+/// (OCPP 2.0.1 Part 2, N09/N10 — the privacy / GDPR "report and/or clear stored
+/// customer data" command), given the inbound request.
+///
+/// The request identifies a customer by up to three optional selectors — a hashed
+/// customer certificate ([`customer_certificate`](CustomerInformationRequest::customer_certificate)),
+/// an authorization token ([`id_token`](CustomerInformationRequest::id_token)), or
+/// a free-form [`customer_identifier`](CustomerInformationRequest::customer_identifier))
+/// — and asks the station to [`report`](CustomerInformationRequest::report) the
+/// stored data, [`clear`](CustomerInformationRequest::clear) it, or both.
+///
+/// Faithful to the reference contract:
+///
+/// - **Actionable** — the request names **at least one** selector *and* requests
+///   **at least one** action (`report` or `clear`) →
+///   [`Accepted`](CustomerInformationStatusEnumType::Accepted). The station
+///   acknowledges the command; any requested report data then arrives
+///   asynchronously via `NotifyCustomerInformation` (a separate follow-up).
+/// - **Malformed** — the request names **no** selector, *or* requests **neither**
+///   `report` nor `clear` → [`Invalid`](CustomerInformationStatusEnumType::Invalid):
+///   there is no customer to act on / nothing to do. This is the input-reachable
+///   status, mirroring how the reference treats a request it cannot act on, and the
+///   same "malformed request" arm the [`v201_get_log_decision`] /
+///   [`v201_set_display_message_status`] siblings model.
+///
+/// [`Rejected`](CustomerInformationStatusEnumType::Rejected) is kept as a
+/// documented **unproduced** seam for wire + schema coverage: the simulator does
+/// not model an authorization-refusal policy (it holds no real customer-data
+/// store), so it never refuses an otherwise-actionable request. A real station
+/// enforcing an access policy maps to it. This follows the unproduced-status
+/// convention `GetLog` (`Rejected`) and `DeleteCertificate` (`Failed`, a race arm)
+/// already use.
+///
+/// This is the *pure* decision — no runtime handles, no lock — so it is
+/// unit-testable in isolation. The three selectors are attacker-influenced CSMS
+/// input, inspected only for **presence** ([`Option::is_some`]) and never
+/// unwrapped, parsed, or indexed; `report` / `clear` are booleans and `request_id`
+/// is not read here at all, so no wire value (including `i32::MIN`/`MAX`) can
+/// panic. Over-length selector fields are refused at the schema layer (→
+/// CALLERROR) before this runs. Ports `ocpp.v201.call.CustomerInformation` →
+/// `ocpp.v201.call_result.CustomerInformation`.
+#[must_use]
+pub fn v201_customer_information_decision(
+    request: &CustomerInformationRequest,
+) -> CustomerInformationStatusEnumType {
+    let names_a_customer = request.customer_certificate.is_some()
+        || request.id_token.is_some()
+        || request.customer_identifier.is_some();
+    let requests_an_action = request.report || request.clear;
+
+    if names_a_customer && requests_an_action {
+        CustomerInformationStatusEnumType::Accepted
+    } else {
+        CustomerInformationStatusEnumType::Invalid
+    }
+}
+
+/// Build a schema-valid `CustomerInformation.conf`
+/// ([`CustomerInformationResponse`]).
+///
+/// Pure constructor mirroring [`v201_certificate_signed_response`]: carries the
+/// decided [`status`](CustomerInformationStatusEnumType) plus the optional 2.0.1
+/// `statusInfo` — a vendor-agnostic `reasonCode` and human-readable detail the
+/// handler attaches to an `Invalid` outcome (why the request could not be acted
+/// on). An `Accepted` carries no `statusInfo`.
+///
+/// Ports `ocpp.v201.call_result.CustomerInformation`.
+#[must_use]
+pub fn v201_customer_information_response(
+    status: CustomerInformationStatusEnumType,
+    status_info: Option<StatusInfoType>,
+) -> CustomerInformationResponse {
+    CustomerInformationResponse {
         status,
         status_info,
         custom_data: None,
@@ -5696,6 +5776,163 @@ mod tests {
             validator
                 .validate_call_result("CertificateSigned", &serde_json::to_value(&resp).unwrap())
                 .expect("built CertificateSigned response is schema-valid");
+        }
+    }
+
+    // --- CustomerInformation (v201) decision + response builder (Issue #530) ---
+
+    fn sample_customer_hash() -> CertificateHashDataType {
+        CertificateHashDataType {
+            hash_algorithm: HashAlgorithmEnumType::Sha256,
+            issuer_name_hash: "a1".to_string(),
+            issuer_key_hash: "b2".to_string(),
+            serial_number: "c3".to_string(),
+            custom_data: None,
+        }
+    }
+
+    fn sample_customer_id_token() -> ocpp_types::v201::IdTokenType {
+        ocpp_types::v201::IdTokenType {
+            id_token: "RFID-1234".to_string(),
+            kind: ocpp_types::v201::IdTokenEnumType::Iso14443,
+            additional_info: None,
+            custom_data: None,
+        }
+    }
+
+    /// Build a `CustomerInformationRequest` with a fixed `request_id`, the given
+    /// actions, and the given selector presence.
+    fn customer_information_req(
+        report: bool,
+        clear: bool,
+        customer_certificate: Option<CertificateHashDataType>,
+        id_token: Option<ocpp_types::v201::IdTokenType>,
+        customer_identifier: Option<String>,
+    ) -> CustomerInformationRequest {
+        CustomerInformationRequest {
+            request_id: 1,
+            report,
+            clear,
+            customer_certificate,
+            id_token,
+            customer_identifier,
+            custom_data: None,
+        }
+    }
+
+    #[test]
+    fn customer_information_accepts_a_selector_with_an_action() {
+        // Each of the three selector kinds, crossed with report-only / clear-only /
+        // both, names a customer and asks for something → Accepted.
+        for selector_kind in 0..3 {
+            for (report, clear) in [(true, false), (false, true), (true, true)] {
+                let (cert, token, ident) = match selector_kind {
+                    0 => (Some(sample_customer_hash()), None, None),
+                    1 => (None, Some(sample_customer_id_token()), None),
+                    _ => (None, None, Some("customer-abc".to_string())),
+                };
+                let req = customer_information_req(report, clear, cert, token, ident);
+                assert_eq!(
+                    v201_customer_information_decision(&req),
+                    CustomerInformationStatusEnumType::Accepted,
+                    "selector_kind={selector_kind}, report={report}, clear={clear}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn customer_information_invalid_without_a_selector() {
+        // No selector at all — even with both actions requested — has no customer to
+        // act on, so it is malformed.
+        for (report, clear) in [(true, false), (false, true), (true, true)] {
+            let req = customer_information_req(report, clear, None, None, None);
+            assert_eq!(
+                v201_customer_information_decision(&req),
+                CustomerInformationStatusEnumType::Invalid,
+                "no selector is Invalid (report={report}, clear={clear})"
+            );
+        }
+    }
+
+    #[test]
+    fn customer_information_invalid_without_an_action() {
+        // A named customer but neither report nor clear: nothing to do.
+        let one = customer_information_req(false, false, Some(sample_customer_hash()), None, None);
+        assert_eq!(
+            v201_customer_information_decision(&one),
+            CustomerInformationStatusEnumType::Invalid
+        );
+        // Even all three selectors present, no action is still Invalid.
+        let all = customer_information_req(
+            false,
+            false,
+            Some(sample_customer_hash()),
+            Some(sample_customer_id_token()),
+            Some("customer-abc".to_string()),
+        );
+        assert_eq!(
+            v201_customer_information_decision(&all),
+            CustomerInformationStatusEnumType::Invalid
+        );
+    }
+
+    #[test]
+    fn customer_information_empty_request_is_invalid() {
+        // No selector and no action: the fully-degenerate request.
+        let req = customer_information_req(false, false, None, None, None);
+        assert_eq!(
+            v201_customer_information_decision(&req),
+            CustomerInformationStatusEnumType::Invalid
+        );
+    }
+
+    #[test]
+    fn customer_information_extreme_request_id_never_panics() {
+        // request_id is echoed only by the async follow-up, never read by the
+        // decision — an actionable request is Accepted at every extreme without
+        // panicking.
+        for request_id in [0, 1, -1, i32::MIN, i32::MAX] {
+            let mut req = customer_information_req(true, false, None, None, Some("c".to_string()));
+            req.request_id = request_id;
+            assert_eq!(
+                v201_customer_information_decision(&req),
+                CustomerInformationStatusEnumType::Accepted,
+                "request_id={request_id} is Accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn built_customer_information_responses_are_schema_valid() {
+        // Every status the wire can carry, with and without a statusInfo, satisfies
+        // the bundled OCPP 2.0.1 CustomerInformation response JSON Schema (including
+        // the unproduced `Rejected` seam).
+        let validator = SchemaValidator::v201();
+        for status in [
+            CustomerInformationStatusEnumType::Accepted,
+            CustomerInformationStatusEnumType::Rejected,
+            CustomerInformationStatusEnumType::Invalid,
+        ] {
+            for status_info in [
+                None,
+                Some(StatusInfoType {
+                    reason_code: "InvalidRequest".to_string(),
+                    additional_info: Some(
+                        "no usable customer selector, or neither report nor clear".to_string(),
+                    ),
+                    custom_data: None,
+                }),
+            ] {
+                let resp = v201_customer_information_response(status, status_info);
+                assert_eq!(resp.status, status);
+                validator
+                    .validate_call_result(
+                        "CustomerInformation",
+                        &serde_json::to_value(&resp).unwrap(),
+                    )
+                    .expect("built CustomerInformation response is schema-valid");
+            }
         }
     }
 }
