@@ -167,9 +167,9 @@ use ocpp_messages::v201::{
     DeleteCertificateResponse, FirmwareStatusNotificationRequest, GetChargingProfilesResponse,
     GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse,
     GetMonitoringReportResponse, GetTransactionStatusResponse, InstallCertificateResponse,
-    LogStatusNotificationRequest, NotifyDisplayMessagesRequest, ReportChargingProfilesRequest,
-    RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
-    ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
+    LogStatusNotificationRequest, NotifyCustomerInformationRequest, NotifyDisplayMessagesRequest,
+    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
+    ReserveNowResponse, ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
     SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
     SetNetworkProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
     UpdateFirmwareRequest, UpdateFirmwareResponse,
@@ -1631,6 +1631,72 @@ pub fn v201_notify_display_messages_pages(
             message_info: Some(vec![message.clone()]),
             // Every page but the last announces that more follow.
             tbc: (i < last).then_some(true),
+            custom_data: None,
+        })
+        .collect()
+}
+
+/// The deterministic, simulator-generated customer-data pages a
+/// `CustomerInformation(report: true)` report streams back.
+///
+/// The Charging Station *simulator* holds no real customer store — there is no
+/// PII to enumerate — so an accepted reporting request replies with a small,
+/// fixed set of human-readable lines that identify the report as simulated and
+/// stand in for the stored-data body a production station would emit. Split into
+/// more than one page so the `NotifyCustomerInformation` paging (`seqNo` / `tbc`)
+/// the flow exists to exercise is observable end-to-end. Each line is a short
+/// constant well under the schema's `maxLength: 512`, so no page can overflow.
+///
+/// Kept as a standalone `const` (rather than inlined into the page builder) so a
+/// test can assert the page bounds directly, and so the simulated body is a
+/// single documented seam a future "real customer store" slice would replace.
+pub const V201_SIMULATED_CUSTOMER_INFORMATION_PAGES: &[&str] = &[
+    "ocpp-rs charge point simulator: simulated CustomerInformation report. This \
+     station holds no real customer data store (no PII).",
+    "customerData: <none on record>. Emitted deterministically to exercise the \
+     NotifyCustomerInformation report/clear flow.",
+];
+
+/// Build the `NotifyCustomerInformation.req` pages a
+/// `CustomerInformation(report: true)` report streams back — the flat-text twin
+/// of [`v201_notify_display_messages_pages`] / [`v201_report_charging_profiles_pages`].
+///
+/// Ports the paged carrier of
+/// [`ocpp.v201.call.NotifyCustomerInformation`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py):
+/// one [`NotifyCustomerInformationRequest`] per `data` page, every page echoing
+/// the triggering `request_id` so the CSMS can correlate the stream. Pages are
+/// numbered by [`seq_no`](NotifyCustomerInformationRequest::seq_no) from 0 in
+/// input order, and every page but the last is flagged
+/// [`tbc`](NotifyCustomerInformationRequest::tbc) ("to be continued"); the final
+/// page leaves `tbc` absent (= `false`). The `generated_at` timestamp is taken
+/// as an input string (the wiring layer stamps it with the current time) so this
+/// builder stays pure over its inputs and unit-testable without a clock — the
+/// same split the `NotifyReport` emitter uses.
+///
+/// An empty `data_pages` slice builds no pages (nothing to stream); the caller
+/// only invokes this for an accepted reporting request, which always supplies at
+/// least one simulated page.
+///
+/// `request_id` is copied into every page and never parsed or indexed, so an
+/// extreme value (`i32::MIN`/`MAX`) cannot panic; each `data` page is
+/// caller-supplied simulated text, never attacker input.
+#[must_use]
+pub fn v201_notify_customer_information_pages(
+    request_id: i32,
+    generated_at: &str,
+    data_pages: &[&str],
+) -> Vec<NotifyCustomerInformationRequest> {
+    let last = data_pages.len().saturating_sub(1);
+    data_pages
+        .iter()
+        .enumerate()
+        .map(|(i, data)| NotifyCustomerInformationRequest {
+            data: (*data).to_string(),
+            // Every page but the last announces that more follow.
+            tbc: (i < last).then_some(true),
+            seq_no: i32::try_from(i).unwrap_or(i32::MAX),
+            generated_at: generated_at.to_string(),
+            request_id,
             custom_data: None,
         })
         .collect()
@@ -4836,6 +4902,95 @@ mod tests {
                     &serde_json::to_value(&page).unwrap(),
                 )
                 .expect("NotifyDisplayMessages CALL is schema-valid");
+        }
+    }
+
+    // --- NotifyCustomerInformation report pages (v201, #537) ----------------
+
+    #[test]
+    fn notify_customer_information_pages_number_and_flag_tbc() {
+        // seqNo runs from 0 in input order; tbc is set on every page but the
+        // last (which leaves it absent = false); requestId + generatedAt echo on
+        // every page.
+        let data = ["page A", "page B", "page C"];
+        let pages = v201_notify_customer_information_pages(42, "2022-01-01T10:00:00Z", &data);
+        assert_eq!(pages.len(), 3, "one page per data chunk");
+
+        let seq_nos: Vec<i32> = pages.iter().map(|p| p.seq_no).collect();
+        assert_eq!(seq_nos, vec![0, 1, 2], "seqNo runs from 0 in order");
+        assert!(pages.iter().all(|p| p.request_id == 42));
+        assert!(pages
+            .iter()
+            .all(|p| p.generated_at == "2022-01-01T10:00:00Z"));
+
+        assert_eq!(pages[0].tbc, Some(true));
+        assert_eq!(pages[1].tbc, Some(true));
+        assert_eq!(
+            pages[2].tbc, None,
+            "the final page leaves tbc absent (= false)"
+        );
+    }
+
+    #[test]
+    fn notify_customer_information_single_page_has_no_tbc() {
+        // A one-page report is its own terminal page — tbc absent, seqNo 0.
+        let pages = v201_notify_customer_information_pages(1, "2022-01-01T10:00:00Z", &["only"]);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(pages[0].seq_no, 0);
+        assert_eq!(pages[0].tbc, None, "a lone page is terminal");
+    }
+
+    #[test]
+    fn notify_customer_information_empty_input_builds_no_pages() {
+        assert!(v201_notify_customer_information_pages(1, "2022-01-01T10:00:00Z", &[]).is_empty());
+    }
+
+    #[test]
+    fn notify_customer_information_extreme_request_id_does_not_panic() {
+        // requestId is echoed, never parsed — extremes flow into every page safely.
+        for request_id in [i32::MIN, i32::MAX] {
+            let pages = v201_notify_customer_information_pages(
+                request_id,
+                "2022-01-01T10:00:00Z",
+                V201_SIMULATED_CUSTOMER_INFORMATION_PAGES,
+            );
+            assert!(pages.iter().all(|p| p.request_id == request_id));
+        }
+    }
+
+    #[test]
+    fn simulated_customer_information_pages_are_multi_page_and_within_schema_bounds() {
+        // The simulator body is >1 page (so paging is exercised) and every page
+        // is well under the schema's maxLength 512.
+        assert!(
+            V201_SIMULATED_CUSTOMER_INFORMATION_PAGES.len() >= 2,
+            "the simulated report is multi-page so tbc paging is observable"
+        );
+        assert!(
+            V201_SIMULATED_CUSTOMER_INFORMATION_PAGES
+                .iter()
+                .all(|page| page.chars().count() <= 512),
+            "each simulated page fits the NotifyCustomerInformation data maxLength"
+        );
+    }
+
+    #[test]
+    fn built_notify_customer_information_pages_are_schema_valid() {
+        // Every page of the simulated report — non-terminal (tbc: true) and
+        // terminal (tbc absent) alike — satisfies the bundled OCPP 2.0.1 schema.
+        let validator = SchemaValidator::v201();
+        let pages = v201_notify_customer_information_pages(
+            9,
+            "2022-01-01T10:00:00Z",
+            V201_SIMULATED_CUSTOMER_INFORMATION_PAGES,
+        );
+        for page in &pages {
+            validator
+                .validate_call(
+                    "NotifyCustomerInformation",
+                    &serde_json::to_value(page).unwrap(),
+                )
+                .expect("NotifyCustomerInformation CALL is schema-valid");
         }
     }
 
