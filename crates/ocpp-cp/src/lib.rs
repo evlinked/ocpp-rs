@@ -99,7 +99,9 @@ use ocpp_messages::v201::{
     ClearDisplayMessageRequest as V201ClearDisplayMessageRequest,
     ClearVariableMonitoringRequest as V201ClearVariableMonitoringRequest,
     ClearVariableMonitoringResponse as V201ClearVariableMonitoringResponse,
-    CostUpdatedRequest as V201CostUpdatedRequest, DataTransferRequest as V201DataTransferRequest,
+    CostUpdatedRequest as V201CostUpdatedRequest,
+    CustomerInformationRequest as V201CustomerInformationRequest,
+    DataTransferRequest as V201DataTransferRequest,
     DeleteCertificateRequest as V201DeleteCertificateRequest,
     GetBaseReportRequest as V201GetBaseReportRequest,
     GetBaseReportResponse as V201GetBaseReportResponse,
@@ -143,15 +145,16 @@ use ocpp_types::v201::{
     AttributeEnumType, AuthorizationStatusEnumType, CertificateSignedStatusEnumType,
     ChangeAvailabilityStatusEnumType, ChargingProfilePurposeEnumType,
     ChargingProfileStatusEnumType, ChargingProfileType, ConnectorStatusEnumType,
-    DeleteCertificateStatusEnumType, DisplayMessageStatusEnumType, FirmwareStatusEnumType,
-    GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetVariableResultType,
-    IdTokenType as V201IdTokenType, InstallCertificateStatusEnumType,
-    InstallCertificateUseEnumType, LogStatusEnumType, MessageInfoType, MessageTriggerEnumType,
-    MonitoringDataType, NetworkConnectionProfileType, OperationalStatusEnumType,
-    RegistrationStatusEnumType, ReportDataType, RequestStartStopStatusEnumType,
-    ReserveNowStatusEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType,
-    SetVariableResultType, StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
-    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
+    CustomerInformationStatusEnumType, DeleteCertificateStatusEnumType,
+    DisplayMessageStatusEnumType, FirmwareStatusEnumType, GenericDeviceModelStatusEnumType,
+    GenericStatusEnumType, GetVariableResultType, IdTokenType as V201IdTokenType,
+    InstallCertificateStatusEnumType, InstallCertificateUseEnumType, LogStatusEnumType,
+    MessageInfoType, MessageTriggerEnumType, MonitoringDataType, NetworkConnectionProfileType,
+    OperationalStatusEnumType, RegistrationStatusEnumType, ReportDataType,
+    RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
+    SetNetworkProfileStatusEnumType, SetVariableResultType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType, UpdateFirmwareStatusEnumType,
+    UploadLogStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -2279,6 +2282,56 @@ impl ChargePoint {
                     }),
                 };
                 Ok(v201_command::v201_certificate_signed_response(
+                    status,
+                    status_info,
+                ))
+            });
+        }
+
+        // CustomerInformation (OCPP 2.0.1 only) — the CSMS asks the station to
+        // report and/or clear the customer data it has stored, identifying the
+        // customer by up to three optional selectors: a hashed customer
+        // certificate, an idToken, or a free-form customerIdentifier (Part 2,
+        // N09/N10 — the privacy / GDPR command, Issue #530). Registered only on the
+        // V201 arm — 1.6J has no equivalent, so a 1.6J CP answers CALLERROR.
+        //
+        // A **stateless** pure decide-and-answer: no store side effect, no queued
+        // command. This slice wires only the synchronous accept/reject; when
+        // `report` is set a real station streams the stored data back
+        // asynchronously via `NotifyCustomerInformation`, which is a separate
+        // follow-up (the same sync-ack-first split GetLog used). The decision
+        // (`v201_command::v201_customer_information_decision`) is `Accepted` when the
+        // request names at least one selector and asks for at least one action
+        // (report or clear), and `Invalid` otherwise (no customer to act on, or
+        // nothing to do). The handler attaches a statusInfo reason to the `Invalid`
+        // arm. `Rejected` is a documented unproduced seam (the simulator models no
+        // authorization-refusal policy).
+        //
+        // Trust boundary: the three selectors are attacker-influenced CSMS input,
+        // inspected only for presence and never unwrapped/parsed/indexed, so no wire
+        // value can panic; `request_id` is not read by the decision, so extreme
+        // values (`i32::MIN`/`MAX`) are safe. Over-length selector fields (e.g.
+        // `customerIdentifier`, maxLength 64) are refused at the schema layer (→
+        // CALLERROR) before the handler runs. Ports
+        // `ocpp.v201.call.CustomerInformation` →
+        // `ocpp.v201.call_result.CustomerInformation`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            d.on(move |req: V201CustomerInformationRequest| async move {
+                let status = v201_command::v201_customer_information_decision(&req);
+                let status_info = match status {
+                    CustomerInformationStatusEnumType::Invalid => Some(StatusInfoType {
+                        reason_code: "InvalidRequest".to_string(),
+                        additional_info: Some(
+                            "CustomerInformation named no usable customer selector, or requested \
+                             neither report nor clear"
+                                .to_string(),
+                        ),
+                        custom_data: None,
+                    }),
+                    CustomerInformationStatusEnumType::Accepted
+                    | CustomerInformationStatusEnumType::Rejected => None,
+                };
+                Ok(v201_command::v201_customer_information_response(
                     status,
                     status_info,
                 ))
@@ -10563,6 +10616,208 @@ mod tests {
             validator
                 .validate_call_result("CertificateSigned", &serde_json::to_value(&resp).unwrap())
                 .expect("CertificateSigned response is schema-valid");
+        }
+    }
+
+    // --- OCPP 2.0.1 CustomerInformation (M7, issue #530) -------------------
+    // A `for_version(V201)` CP synchronously accepts/rejects the privacy/GDPR
+    // report-and/or-clear command. Stateless: it queues nothing (the async
+    // `NotifyCustomerInformation` report stream is a separate follow-up). These
+    // exercise the wired V201 arm end-to-end over `handle_message`: each selector
+    // kind with an action is Accepted, a request naming no selector or no action is
+    // Invalid, extreme request ids never panic, and the handler is V201-only.
+
+    fn sample_customer_hash() -> ocpp_types::v201::CertificateHashDataType {
+        ocpp_types::v201::CertificateHashDataType {
+            hash_algorithm: ocpp_types::v201::HashAlgorithmEnumType::Sha256,
+            issuer_name_hash: "a1".to_string(),
+            issuer_key_hash: "b2".to_string(),
+            serial_number: "c3".to_string(),
+            custom_data: None,
+        }
+    }
+
+    fn sample_customer_id_token() -> V201IdTokenType {
+        V201IdTokenType {
+            id_token: "RFID-1234".to_string(),
+            kind: ocpp_types::v201::IdTokenEnumType::Iso14443,
+            additional_info: None,
+            custom_data: None,
+        }
+    }
+
+    fn make_v201_customer_information(
+        report: bool,
+        clear: bool,
+        customer_certificate: Option<ocpp_types::v201::CertificateHashDataType>,
+        id_token: Option<V201IdTokenType>,
+        customer_identifier: Option<String>,
+    ) -> CallMessage {
+        make_call(V201CustomerInformationRequest {
+            request_id: 7,
+            report,
+            clear,
+            customer_certificate,
+            id_token,
+            customer_identifier,
+            custom_data: None,
+        })
+    }
+
+    /// Read the `CustomerInformation.conf` out of a `handle_message` reply,
+    /// asserting the reply is a CALLRESULT.
+    async fn customer_information_response(
+        cp: &ChargePoint,
+        call: CallMessage,
+    ) -> ocpp_messages::v201::CustomerInformationResponse {
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => r.payload_as().unwrap(),
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_customer_information_accepts_each_selector_with_an_action() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // Each selector kind (certificate hash / idToken / free-form identifier),
+        // asking to both report and clear, names a customer → Accepted, no statusInfo.
+        for selector_kind in 0..3 {
+            let (cert, token, ident) = match selector_kind {
+                0 => (Some(sample_customer_hash()), None, None),
+                1 => (None, Some(sample_customer_id_token()), None),
+                _ => (None, None, Some("customer-abc".to_string())),
+            };
+            let body = customer_information_response(
+                &cp,
+                make_v201_customer_information(true, true, cert, token, ident),
+            )
+            .await;
+            assert_eq!(body.status, CustomerInformationStatusEnumType::Accepted);
+            assert!(
+                body.status_info.is_none(),
+                "an accepted request carries no statusInfo (selector_kind={selector_kind})"
+            );
+        }
+        assert!(
+            v201_drain_commands(&cp).await.is_empty(),
+            "CustomerInformation is a stateless responder — it queues nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_customer_information_invalid_without_a_selector_or_action() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+
+        // No selector at all (even asking for both actions) → Invalid, with a reason.
+        let body = customer_information_response(
+            &cp,
+            make_v201_customer_information(true, true, None, None, None),
+        )
+        .await;
+        assert_eq!(body.status, CustomerInformationStatusEnumType::Invalid);
+        assert_eq!(
+            body.status_info
+                .expect("an Invalid answer carries a statusInfo reason")
+                .reason_code,
+            "InvalidRequest"
+        );
+
+        // A named customer but neither report nor clear → Invalid (nothing to do).
+        let body = customer_information_response(
+            &cp,
+            make_v201_customer_information(false, false, Some(sample_customer_hash()), None, None),
+        )
+        .await;
+        assert_eq!(body.status, CustomerInformationStatusEnumType::Invalid);
+
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_customer_information_extreme_request_id_never_panics() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // request_id is echoed only by the async follow-up, never read by the sync
+        // decision — an actionable request at every extreme is Accepted without panic.
+        for request_id in [0, 1, -1, i32::MIN, i32::MAX] {
+            let call = make_call(V201CustomerInformationRequest {
+                request_id,
+                report: true,
+                clear: false,
+                customer_certificate: None,
+                id_token: None,
+                customer_identifier: Some("c".to_string()),
+                custom_data: None,
+            });
+            let body = customer_information_response(&cp, call).await;
+            assert_eq!(
+                body.status,
+                CustomerInformationStatusEnumType::Accepted,
+                "request_id={request_id} is accepted without panic"
+            );
+        }
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_customer_information_is_v201_only() {
+        // A 1.6J CP has no CustomerInformation handler (no privacy command), so the
+        // v201-only action is unrouted → CallError, never a CallResult.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V16J)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_customer_information(
+                true,
+                false,
+                None,
+                None,
+                Some("c".to_string()),
+            )))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Some(Message::CallError(_))),
+            "a 1.6J CP does not answer CustomerInformation with a CallResult, got: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn v201_customer_information_request_and_response_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        // A request carrying all three selectors + both actions is schema-valid.
+        let req = V201CustomerInformationRequest {
+            request_id: 7,
+            report: true,
+            clear: true,
+            customer_certificate: Some(sample_customer_hash()),
+            id_token: Some(sample_customer_id_token()),
+            customer_identifier: Some("customer-abc".to_string()),
+            custom_data: None,
+        };
+        validator
+            .validate_call("CustomerInformation", &serde_json::to_value(&req).unwrap())
+            .expect("CustomerInformation request is schema-valid");
+
+        // Both answer shapes the handler emits — Accepted (no statusInfo) and Invalid
+        // (with a statusInfo reason) — serialize to a schema-valid response.
+        for (status, status_info) in [
+            (CustomerInformationStatusEnumType::Accepted, None),
+            (
+                CustomerInformationStatusEnumType::Invalid,
+                Some(StatusInfoType {
+                    reason_code: "InvalidRequest".to_string(),
+                    additional_info: None,
+                    custom_data: None,
+                }),
+            ),
+        ] {
+            let resp = ocpp_messages::v201::CustomerInformationResponse {
+                status,
+                status_info,
+                custom_data: None,
+            };
+            validator
+                .validate_call_result("CustomerInformation", &serde_json::to_value(&resp).unwrap())
+                .expect("CustomerInformation response is schema-valid");
         }
     }
 
