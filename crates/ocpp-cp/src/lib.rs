@@ -22,6 +22,7 @@ pub mod v201_certificate_store;
 pub mod v201_charging_profiles;
 pub mod v201_command;
 pub mod v201_cost;
+pub mod v201_customer_information;
 pub mod v201_data_transfer;
 pub mod v201_device_model;
 pub mod v201_display_message;
@@ -80,6 +81,7 @@ use ocpp_types::{
 use v201_certificate_store::V201CertificateStore;
 use v201_charging_profiles::V201TxProfileStore;
 use v201_cost::V201CostStore;
+use v201_customer_information::V201CustomerInformationStore;
 use v201_device_model::V201DeviceModel;
 use v201_display_message::V201DisplayMessageStore;
 use v201_firmware_update::V201FirmwareUpdateStore;
@@ -720,6 +722,20 @@ enum RemoteCommand {
     /// [`UpdateFirmware`](Self::UpdateFirmware) progress flow, and the firmware
     /// sibling of [`V201LogUpload`](Self::V201LogUpload).
     V201FirmwareUpdate { request_id: i32 },
+    /// Stream the simulated customer-data report an `Accepted`
+    /// `CustomerInformation(report: true)` asked for, as one or more
+    /// `NotifyCustomerInformation.req` pages (OCPP 2.0.1 Part 2, N-series — data
+    /// privacy / GDPR, Issue #537). The synchronous `CustomerInformation.conf`
+    /// only acks; when the request set `report: true` and was accepted, the
+    /// station then streams the stored data back asynchronously, correlated by
+    /// `request_id` — this drives that paged stream (`seqNo` from 0, `tbc` on
+    /// every page but the last) and, once it settles, clears the
+    /// `V201CustomerInformationStore` in-flight marker for `request_id`. Queued
+    /// off the inbound-CALL path for the same reason as the other side effects —
+    /// the outbound `NotifyCustomerInformation` CALLs must not re-enter the
+    /// receive loop mid-dispatch. The flat-text privacy twin of the
+    /// [`V201NotifyReport`](Self::V201NotifyReport) paged carrier.
+    V201CustomerInformationReport { request_id: i32 },
     /// Run the simulated diagnostics-upload state machine for an `Accepted`
     /// `GetDiagnostics` (OCPP 1.6J §4.x, firmware-management profile). Emits
     /// `DiagnosticsStatusNotification(Uploading)` then `Uploaded`.
@@ -1120,6 +1136,16 @@ pub struct ChargePoint {
     /// path (which keeps the empty-conf `UpdateFirmware` handler and its own
     /// firmware state machine). See [`V201FirmwareUpdateStore`].
     v201_firmware_updates: Arc<V201FirmwareUpdateStore>,
+    /// The set of in-flight `CustomerInformation` report streams the station is
+    /// serving (OCPP 2.0.1 Part 2, N-series — data privacy, Issue #537), by
+    /// `requestId`. The V201-only `CustomerInformation` handler records an
+    /// accepted *reporting* request here so a retry of the same `requestId` does
+    /// not launch a second, duplicate `NotifyCustomerInformation` stream; the
+    /// async consumer clears the marker once the stream settles. Unlike the
+    /// single-slot log/firmware trackers this holds a *set* — customer-info
+    /// reports are independent per id, with no supersede. Empty on the 1.6J path
+    /// (the handler is V201-only). See [`V201CustomerInformationStore`].
+    v201_customer_information_reports: Arc<V201CustomerInformationStore>,
     /// Latest running total cost the CSMS has pushed per transaction id via the
     /// 2.0.1 `CostUpdated` message (Issue #502), keyed by the wire
     /// `transactionId` string. Upserted by the V201-only `CostUpdated` handler
@@ -1322,6 +1348,12 @@ impl ChargePoint {
         // the CALL path; idle on the 1.6J path (which keeps the empty-conf handler).
         let v201_firmware_updates = Arc::new(V201FirmwareUpdateStore::new());
 
+        // The in-flight `CustomerInformation` report-stream tracker the V201
+        // `CustomerInformation` handler records into (Issue #537). Shared into the
+        // default dispatcher so the handler can dedup a retry straight from the
+        // CALL path; empty on the 1.6J path (the handler is V201-only).
+        let v201_customer_information_reports = Arc::new(V201CustomerInformationStore::new());
+
         // Issue #471: v201 `TxDefaultProfile` store, shared into the default
         // dispatcher (the `SetChargingProfile` command installs a default into it)
         // and kept on the CP (the metering sampler and `GetCompositeSchedule` read
@@ -1387,6 +1419,7 @@ impl ChargePoint {
             v201_network_profiles.clone(),
             v201_log_uploads.clone(),
             v201_firmware_updates.clone(),
+            v201_customer_information_reports.clone(),
             v201_costs.clone(),
             expiry_timers.clone(),
             config.unlock_connector_outcome,
@@ -1425,6 +1458,7 @@ impl ChargePoint {
             v201_network_profiles,
             v201_log_uploads,
             v201_firmware_updates,
+            v201_customer_information_reports,
             v201_costs,
             reservations,
             expiry_timers,
@@ -1471,6 +1505,7 @@ impl ChargePoint {
         v201_network_profiles: Arc<V201NetworkProfileStore>,
         v201_log_uploads: Arc<V201LogUploadStore>,
         v201_firmware_updates: Arc<V201FirmwareUpdateStore>,
+        v201_customer_information_reports: Arc<V201CustomerInformationStore>,
         v201_costs: Arc<V201CostStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
         unlock_outcome: UnlockConnectorOutcome,
@@ -2296,46 +2331,88 @@ impl ChargePoint {
         // N09/N10 — the privacy / GDPR command, Issue #530). Registered only on the
         // V201 arm — 1.6J has no equivalent, so a 1.6J CP answers CALLERROR.
         //
-        // A **stateless** pure decide-and-answer: no store side effect, no queued
-        // command. This slice wires only the synchronous accept/reject; when
-        // `report` is set a real station streams the stored data back
-        // asynchronously via `NotifyCustomerInformation`, which is a separate
-        // follow-up (the same sync-ack-first split GetLog used). The decision
-        // (`v201_command::v201_customer_information_decision`) is `Accepted` when the
-        // request names at least one selector and asks for at least one action
-        // (report or clear), and `Invalid` otherwise (no customer to act on, or
-        // nothing to do). The handler attaches a statusInfo reason to the `Invalid`
-        // arm. `Rejected` is a documented unproduced seam (the simulator models no
-        // authorization-refusal policy).
+        // The decision (`v201_command::v201_customer_information_decision`) is
+        // `Accepted` when the request names at least one selector and asks for at
+        // least one action (report or clear), and `Invalid` otherwise (no
+        // customer to act on, or nothing to do). The handler attaches a statusInfo
+        // reason to the `Invalid` arm. `Rejected` is a documented unproduced seam
+        // (the simulator models no authorization-refusal policy).
+        //
+        // The synchronous ack is followed by an asynchronous report stream only
+        // when the request was `Accepted` **and** set `report: true` (Issue #537).
+        // Then the handler records the request in the `V201CustomerInformationStore`
+        // and queues a `RemoteCommand::V201CustomerInformationReport` to drive the
+        // paged `NotifyCustomerInformation` stream off the inbound-CALL path (so
+        // the `CustomerInformation` CALLRESULT flushes before the first
+        // notification — no receive-loop re-entrancy, the same discipline as
+        // GetLog / the firmware handlers). A `clear`-only accept queues nothing
+        // (there is no data to report). A retry of a `requestId` whose stream is
+        // still in flight queues no second stream — `begin` returning `false` is
+        // exactly that case — so the CSMS is not double-reported. If the consumer
+        // is gone (CP shutting down) the queue fails; the ack is still honest, and
+        // the in-flight marker is rolled back so a later retry can report afresh.
         //
         // Trust boundary: the three selectors are attacker-influenced CSMS input,
         // inspected only for presence and never unwrapped/parsed/indexed, so no wire
-        // value can panic; `request_id` is not read by the decision, so extreme
-        // values (`i32::MIN`/`MAX`) are safe. Over-length selector fields (e.g.
+        // value can panic; `request_id` is only echoed/compared (into the store and
+        // the queued command), never parsed or indexed, so extreme values
+        // (`i32::MIN`/`MAX`) are safe. Over-length selector fields (e.g.
         // `customerIdentifier`, maxLength 64) are refused at the schema layer (→
         // CALLERROR) before the handler runs. Ports
         // `ocpp.v201.call.CustomerInformation` →
         // `ocpp.v201.call_result.CustomerInformation`.
         if matches!(protocol_version, OcppVersion::V201) {
-            d.on(move |req: V201CustomerInformationRequest| async move {
-                let status = v201_command::v201_customer_information_decision(&req);
-                let status_info = match status {
-                    CustomerInformationStatusEnumType::Invalid => Some(StatusInfoType {
-                        reason_code: "InvalidRequest".to_string(),
-                        additional_info: Some(
-                            "CustomerInformation named no usable customer selector, or requested \
-                             neither report nor clear"
-                                .to_string(),
-                        ),
-                        custom_data: None,
-                    }),
-                    CustomerInformationStatusEnumType::Accepted
-                    | CustomerInformationStatusEnumType::Rejected => None,
-                };
-                Ok(v201_command::v201_customer_information_response(
-                    status,
-                    status_info,
-                ))
+            let customer_information_reports = v201_customer_information_reports.clone();
+            let command_sender = command_sender.clone();
+            d.on(move |req: V201CustomerInformationRequest| {
+                let customer_information_reports = customer_information_reports.clone();
+                let command_sender = command_sender.clone();
+                async move {
+                    let status = v201_command::v201_customer_information_decision(&req);
+                    let status_info = match status {
+                        CustomerInformationStatusEnumType::Invalid => Some(StatusInfoType {
+                            reason_code: "InvalidRequest".to_string(),
+                            additional_info: Some(
+                                "CustomerInformation named no usable customer selector, or \
+                                 requested neither report nor clear"
+                                    .to_string(),
+                            ),
+                            custom_data: None,
+                        }),
+                        CustomerInformationStatusEnumType::Accepted
+                        | CustomerInformationStatusEnumType::Rejected => None,
+                    };
+
+                    // Drive the async report stream only for an accepted *reporting*
+                    // request, and only if this `requestId` is not already
+                    // streaming (dedup a retry). `begin` returns `true` exactly when
+                    // it newly recorded the id; the send then runs off the CALL path.
+                    if status == CustomerInformationStatusEnumType::Accepted
+                        && req.report
+                        && customer_information_reports.begin(req.request_id).await
+                        && command_sender
+                            .send(RemoteCommand::V201CustomerInformationReport {
+                                request_id: req.request_id,
+                            })
+                            .is_err()
+                    {
+                        // Consumer gone (CP shutting down): the ack is still honest
+                        // — the request was accepted — but the stream cannot run.
+                        // Roll back the in-flight marker so a later retry can report
+                        // afresh, and surface the drop.
+                        customer_information_reports.complete(req.request_id).await;
+                        warn!(
+                            "v201 CustomerInformation: consumer gone, cannot stream \
+                             NotifyCustomerInformation for request {}",
+                            req.request_id
+                        );
+                    }
+
+                    Ok(v201_command::v201_customer_information_response(
+                        status,
+                        status_info,
+                    ))
+                }
             });
         }
 
@@ -4985,6 +5062,9 @@ impl ChargePoint {
                         RemoteCommand::V201FirmwareUpdate { request_id } => {
                             cp.run_v201_firmware_update(request_id).await;
                         }
+                        RemoteCommand::V201CustomerInformationReport { request_id } => {
+                            cp.run_v201_customer_information_report(request_id).await;
+                        }
                         RemoteCommand::V201ApplyAvailability {
                             connector_id,
                             target,
@@ -7248,6 +7328,54 @@ impl ChargePoint {
                  request {request_id}: {e}"
             );
         }
+    }
+
+    /// Stream the simulated customer-data report an `Accepted`
+    /// `CustomerInformation(report: true)` asked for, as one or more
+    /// `NotifyCustomerInformation` CALLs (`ocpp.v201.call.NotifyCustomerInformation`,
+    /// OCPP 2.0.1 Part 2, N-series — data privacy, Issue #537).
+    ///
+    /// Invoked only from the command-consumer task (see [`connect`](Self::connect)),
+    /// never inline in the inbound-CALL handler, so the `CustomerInformation`
+    /// CALLRESULT is flushed before the first `NotifyCustomerInformation` and there
+    /// is no receive-loop re-entrancy — the same discipline as
+    /// [`send_v201_notify_report`](Self::send_v201_notify_report) and the
+    /// [`run_v201_log_upload`](Self::run_v201_log_upload) / firmware siblings.
+    ///
+    /// The simulator holds no real customer store, so it streams a small
+    /// deterministic body ([`v201_command::V201_SIMULATED_CUSTOMER_INFORMATION_PAGES`]) paged by
+    /// the pure
+    /// [`v201_notify_customer_information_pages`](crate::v201_command::v201_notify_customer_information_pages)
+    /// builder (`seqNo` from 0, `tbc` on every page but the last), each page
+    /// correlated by `request_id` and stamped with the current time; every page is
+    /// sent in order so the CSMS observes the paging flags in sequence. Once the
+    /// stream settles — whether every page sent cleanly or a send failed midway —
+    /// the in-flight marker is cleared via
+    /// [`complete`](crate::v201_customer_information::V201CustomerInformationStore::complete)
+    /// so a later `CustomerInformation` with the same `requestId` can report
+    /// afresh. `request_id` is only echoed/compared, never parsed or indexed, so
+    /// no wire value (including `i32::MIN`/`MAX`) can panic.
+    async fn run_v201_customer_information_report(&self, request_id: i32) {
+        let generated_at = v201_now();
+        let pages = v201_command::v201_notify_customer_information_pages(
+            request_id,
+            &generated_at,
+            v201_command::V201_SIMULATED_CUSTOMER_INFORMATION_PAGES,
+        );
+        for page in pages {
+            let seq_no = page.seq_no;
+            if let Err(e) = self.call(page).await {
+                warn!(
+                    "v201 CustomerInformation: NotifyCustomerInformation (seqNo {seq_no}) for \
+                     request {request_id}: {e}"
+                );
+            }
+        }
+        // Settle the report: the id is no longer streaming, so a later request
+        // with the same `requestId` reports afresh rather than being deduped.
+        self.v201_customer_information_reports
+            .complete(request_id)
+            .await;
     }
 
     /// Emit a 2.0.1 `StatusNotification` for the EVSE(s) a `TriggerMessage`
@@ -10670,13 +10798,15 @@ mod tests {
         }
     }
 
-    // --- OCPP 2.0.1 CustomerInformation (M7, issue #530) -------------------
+    // --- OCPP 2.0.1 CustomerInformation (M7, issues #530 / #537) -----------
     // A `for_version(V201)` CP synchronously accepts/rejects the privacy/GDPR
-    // report-and/or-clear command. Stateless: it queues nothing (the async
-    // `NotifyCustomerInformation` report stream is a separate follow-up). These
-    // exercise the wired V201 arm end-to-end over `handle_message`: each selector
-    // kind with an action is Accepted, a request naming no selector or no action is
-    // Invalid, extreme request ids never panic, and the handler is V201-only.
+    // report-and/or-clear command, and — when an accepted request set
+    // `report: true` — queues an async `NotifyCustomerInformation` report stream
+    // (#537). These exercise the wired V201 arm end-to-end over `handle_message`:
+    // each selector kind with an action is Accepted, a request naming no selector
+    // or no action is Invalid, a reporting accept queues exactly one stream, a
+    // clear-only accept queues none, a retry of an in-flight id queues no second
+    // stream, extreme request ids never panic, and the handler is V201-only.
 
     fn sample_customer_hash() -> ocpp_types::v201::CertificateHashDataType {
         ocpp_types::v201::CertificateHashDataType {
@@ -10732,7 +10862,9 @@ mod tests {
     async fn v201_customer_information_accepts_each_selector_with_an_action() {
         let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
         // Each selector kind (certificate hash / idToken / free-form identifier),
-        // asking to both report and clear, names a customer → Accepted, no statusInfo.
+        // asking to clear (an action, but not report), names a customer →
+        // Accepted, no statusInfo. A clear-only accept has no data to stream, so
+        // it queues no report — the queue is exercised by the reporting tests.
         for selector_kind in 0..3 {
             let (cert, token, ident) = match selector_kind {
                 0 => (Some(sample_customer_hash()), None, None),
@@ -10741,7 +10873,7 @@ mod tests {
             };
             let body = customer_information_response(
                 &cp,
-                make_v201_customer_information(true, true, cert, token, ident),
+                make_v201_customer_information(false, true, cert, token, ident),
             )
             .await;
             assert_eq!(body.status, CustomerInformationStatusEnumType::Accepted);
@@ -10752,7 +10884,7 @@ mod tests {
         }
         assert!(
             v201_drain_commands(&cp).await.is_empty(),
-            "CustomerInformation is a stateless responder — it queues nothing"
+            "a clear-only accept queues no NotifyCustomerInformation report stream"
         );
     }
 
@@ -10788,9 +10920,11 @@ mod tests {
     #[tokio::test]
     async fn v201_customer_information_extreme_request_id_never_panics() {
         let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
-        // request_id is echoed only by the async follow-up, never read by the sync
-        // decision — an actionable request at every extreme is Accepted without panic.
-        for request_id in [0, 1, -1, i32::MIN, i32::MAX] {
+        // request_id is echoed into the store and the queued command, never parsed
+        // — an actionable reporting request at every extreme is Accepted, queues a
+        // correlated report stream, and never panics.
+        let ids = [0, 1, -1, i32::MIN, i32::MAX];
+        for request_id in ids {
             let call = make_call(V201CustomerInformationRequest {
                 request_id,
                 report: true,
@@ -10807,7 +10941,20 @@ mod tests {
                 "request_id={request_id} is accepted without panic"
             );
         }
-        assert!(v201_drain_commands(&cp).await.is_empty());
+        // Each distinct id queued its own report stream, correlated by requestId.
+        let queued: Vec<i32> = v201_drain_commands(&cp)
+            .await
+            .into_iter()
+            .filter_map(|c| match c {
+                RemoteCommand::V201CustomerInformationReport { request_id } => Some(request_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            queued,
+            ids.to_vec(),
+            "every extreme reporting request queues a correlated stream, in order"
+        );
     }
 
     #[tokio::test]
@@ -10828,6 +10975,56 @@ mod tests {
         assert!(
             matches!(resp, Some(Message::CallError(_))),
             "a 1.6J CP does not answer CustomerInformation with a CallResult, got: {resp:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_customer_information_reporting_accept_queues_one_report_stream() {
+        // An accepted request that set `report: true` queues exactly one
+        // V201CustomerInformationReport correlated by requestId (make_* uses 7).
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let body = customer_information_response(
+            &cp,
+            make_v201_customer_information(true, false, None, None, Some("cust".to_string())),
+        )
+        .await;
+        assert_eq!(body.status, CustomerInformationStatusEnumType::Accepted);
+
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(
+            commands.len(),
+            1,
+            "a reporting accept queues exactly one report stream"
+        );
+        assert!(
+            matches!(
+                &commands[0],
+                RemoteCommand::V201CustomerInformationReport { request_id } if *request_id == 7
+            ),
+            "the queued report is correlated by requestId, got: {:?}",
+            commands[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_customer_information_retry_of_in_flight_queues_no_second_stream() {
+        // Two reporting requests carrying the same requestId (7): the first queues
+        // a stream, the retry — while the first is still in flight (no consumer
+        // drains it) — queues none, so the CSMS is not double-reported.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        for _ in 0..2 {
+            let body = customer_information_response(
+                &cp,
+                make_v201_customer_information(true, false, None, None, Some("cust".to_string())),
+            )
+            .await;
+            assert_eq!(body.status, CustomerInformationStatusEnumType::Accepted);
+        }
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(
+            commands.len(),
+            1,
+            "a retry of an in-flight requestId queues no second stream"
         );
     }
 
