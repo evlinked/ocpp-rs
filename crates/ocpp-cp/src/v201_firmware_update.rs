@@ -30,10 +30,10 @@
 //! [`v201_update_firmware_decision`](crate::v201_command::v201_update_firmware_decision),
 //! and the handler calls [`begin`](V201FirmwareUpdateStore::begin) only once it has
 //! decided to accept. [`complete`](V201FirmwareUpdateStore::complete) is the
-//! completion seam a future async `FirmwareStatusNotification(Installed)` slice
-//! (the analogue of the `GetLog` → `LogStatusNotification` async split, #526) will
-//! call when the update finishes (or permanently fails), returning the station to
-//! idle.
+//! completion seam the async `FirmwareStatusNotification(Downloading → … →
+//! Installed)` flow (the analogue of the `GetLog` → `LogStatusNotification` async
+//! split, #534) calls when the update finishes (or permanently fails), returning
+//! the station to idle.
 //!
 //! Interior-mutable behind an [`RwLock`] so a single `Arc<V201FirmwareUpdateStore>`
 //! can be shared across the charge point's tasks, exactly like the
@@ -106,9 +106,9 @@ impl V201FirmwareUpdateStore {
     /// Compare-and-clear the in-flight slot: return the station to idle **only if**
     /// `request_id` is still the update in flight, reporting whether it was.
     ///
-    /// The completion seam a future async
-    /// `FirmwareStatusNotification(Downloading→…→Installed)` flow will call when an
-    /// update settles. A station runs one firmware update at a time, but the
+    /// The completion seam the async
+    /// `FirmwareStatusNotification(Downloading→…→Installed)` flow (#534) calls when
+    /// an update settles. A station runs one firmware update at a time, but the
     /// CALL-path handler that records a supersede ([`begin`](Self::begin)) runs
     /// *concurrently* with the previous update's async task: while that task
     /// works, a second `UpdateFirmware` can install a new `requestId`. An

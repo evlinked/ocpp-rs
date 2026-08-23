@@ -148,7 +148,7 @@ use ocpp_types::v201::{
     ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
     ChargingProfileType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
     ClearChargingProfileType, ClearMessageStatusEnumType, CustomerInformationStatusEnumType,
-    DeleteCertificateStatusEnumType, DisplayMessageStatusEnumType,
+    DeleteCertificateStatusEnumType, DisplayMessageStatusEnumType, FirmwareStatusEnumType,
     GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetCertificateIdUseEnumType,
     GetChargingProfileStatusEnumType, GetDisplayMessagesStatusEnumType,
     GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType, InstallCertificateStatusEnumType,
@@ -164,14 +164,15 @@ use ocpp_messages::v201::{
     CancelReservationResponse, CertificateSignedResponse, ChangeAvailabilityResponse,
     ClearCacheResponse, ClearChargingProfileResponse, ClearDisplayMessageResponse,
     CostUpdatedResponse, CustomerInformationRequest, CustomerInformationResponse,
-    DeleteCertificateResponse, GetChargingProfilesResponse, GetDisplayMessagesResponse,
-    GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse, GetMonitoringReportResponse,
-    GetTransactionStatusResponse, InstallCertificateResponse, LogStatusNotificationRequest,
-    NotifyDisplayMessagesRequest, ReportChargingProfilesRequest, RequestStartTransactionResponse,
-    RequestStopTransactionResponse, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
-    SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
-    SetNetworkProfileRequest, SetNetworkProfileResponse, TriggerMessageResponse,
-    UnlockConnectorResponse, UpdateFirmwareRequest, UpdateFirmwareResponse,
+    DeleteCertificateResponse, FirmwareStatusNotificationRequest, GetChargingProfilesResponse,
+    GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse,
+    GetMonitoringReportResponse, GetTransactionStatusResponse, InstallCertificateResponse,
+    LogStatusNotificationRequest, NotifyDisplayMessagesRequest, ReportChargingProfilesRequest,
+    RequestStartTransactionResponse, RequestStopTransactionResponse, ReserveNowResponse,
+    ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
+    SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
+    SetNetworkProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
+    UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -2061,6 +2062,29 @@ pub fn v201_log_status_notification(
     request_id: i32,
 ) -> LogStatusNotificationRequest {
     LogStatusNotificationRequest {
+        status,
+        request_id: Some(request_id),
+        custom_data: None,
+    }
+}
+
+/// Build a schema-valid `FirmwareStatusNotification.req`
+/// ([`FirmwareStatusNotificationRequest`]) reporting `status` for the rollout
+/// started by the `UpdateFirmware` carrying `request_id` (OCPP 2.0.1 Part 2,
+/// firmware management, Issue #534).
+///
+/// The `requestId` is always carried here (it correlates the async progress
+/// report back to the triggering `UpdateFirmwareRequest`); it is only absent
+/// when a `TriggerMessage` asks for a `FirmwareStatusNotification` with no update
+/// ongoing, which this `UpdateFirmware`-driven flow never is. The firmware twin
+/// of [`v201_log_status_notification`]. Ports
+/// `ocpp.v201.call.FirmwareStatusNotification`.
+#[must_use]
+pub fn v201_firmware_status_notification(
+    status: FirmwareStatusEnumType,
+    request_id: i32,
+) -> FirmwareStatusNotificationRequest {
+    FirmwareStatusNotificationRequest {
         status,
         request_id: Some(request_id),
         custom_data: None,
@@ -5382,6 +5406,58 @@ mod tests {
                         .validate_call("LogStatusNotification", &payload)
                         .is_ok(),
                     "built {status:?} LogStatusNotification.req (requestId {request_id}) \
+                     should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    // --- FirmwareStatusNotification (v201) async update flow (#534) -------------
+
+    #[test]
+    fn firmware_status_notification_carries_the_request_id() {
+        let req = v201_firmware_status_notification(FirmwareStatusEnumType::Downloading, 42);
+        assert_eq!(req.status, FirmwareStatusEnumType::Downloading);
+        assert_eq!(
+            req.request_id,
+            Some(42),
+            "the async report is correlated by the UpdateFirmware requestId"
+        );
+        assert!(req.custom_data.is_none());
+    }
+
+    #[test]
+    fn built_firmware_status_notifications_are_schema_valid() {
+        // Every status this flow can emit — the Downloading/Downloaded/Installing
+        // progression, the Installed terminal, the DownloadFailed/InstallationFailed
+        // fault terminals, and every remaining ported FirmwareStatusEnumType value —
+        // is schema-valid as a FirmwareStatusNotification.req, including at extreme
+        // requestIds (no wire value can produce an invalid payload).
+        let validator = SchemaValidator::v201();
+        for status in [
+            FirmwareStatusEnumType::Downloading,
+            FirmwareStatusEnumType::Downloaded,
+            FirmwareStatusEnumType::Installing,
+            FirmwareStatusEnumType::Installed,
+            FirmwareStatusEnumType::DownloadFailed,
+            FirmwareStatusEnumType::InstallationFailed,
+            FirmwareStatusEnumType::DownloadScheduled,
+            FirmwareStatusEnumType::DownloadPaused,
+            FirmwareStatusEnumType::Idle,
+            FirmwareStatusEnumType::InstallRebooting,
+            FirmwareStatusEnumType::InstallScheduled,
+            FirmwareStatusEnumType::InstallVerificationFailed,
+            FirmwareStatusEnumType::InvalidSignature,
+            FirmwareStatusEnumType::SignatureVerified,
+        ] {
+            for request_id in [0, 1, -1, i32::MIN, i32::MAX] {
+                let req = v201_firmware_status_notification(status, request_id);
+                let payload = serde_json::to_value(&req).unwrap();
+                assert!(
+                    validator
+                        .validate_call("FirmwareStatusNotification", &payload)
+                        .is_ok(),
+                    "built {status:?} FirmwareStatusNotification.req (requestId {request_id}) \
                      should be schema-valid, got: {payload}"
                 );
             }
