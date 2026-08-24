@@ -155,9 +155,9 @@ use ocpp_types::v201::{
     InstallCertificateUseEnumType, LogEnumType, LogStatusEnumType, MessageInfoType,
     MessagePriorityEnumType, MessageStateEnumType, MessageTriggerEnumType,
     OperationalStatusEnumType, PublishFirmwareStatusEnumType, RequestStartStopStatusEnumType,
-    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType,
-    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
-    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
+    ReservationUpdateStatusEnumType, ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType,
+    SetNetworkProfileStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
+    UnlockStatusEnumType, UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
 };
 
 use ocpp_messages::v201::{
@@ -170,10 +170,10 @@ use ocpp_messages::v201::{
     LogStatusNotificationRequest, NotifyCustomerInformationRequest, NotifyDisplayMessagesRequest,
     PublishFirmwareRequest, PublishFirmwareResponse, PublishFirmwareStatusNotificationRequest,
     ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
-    ReserveNowResponse, ResetResponse, SetChargingProfileResponse, SetDisplayMessageResponse,
-    SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
-    SetNetworkProfileResponse, TriggerMessageResponse, UnlockConnectorResponse,
-    UpdateFirmwareRequest, UpdateFirmwareResponse,
+    ReservationStatusUpdateRequest, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
+    SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
+    SetNetworkProfileRequest, SetNetworkProfileResponse, TriggerMessageResponse,
+    UnlockConnectorResponse, UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -1223,6 +1223,35 @@ pub fn v201_cancel_reservation_response(
     CancelReservationResponse {
         status,
         status_info,
+        custom_data: None,
+    }
+}
+
+/// Build a `ReservationStatusUpdate.req` ([`ReservationStatusUpdateRequest`])
+/// reporting that reservation `reservation_id` is no longer valid because it
+/// [`Expired`](ReservationUpdateStatusEnumType::Expired) (its `expiryDateTime`
+/// passed) or was [`Removed`](ReservationUpdateStatusEnumType::Removed) (a
+/// CSMS-initiated `CancelReservation` tore down a still-held reservation).
+///
+/// The CP→CSMS half that closes the reservation loop opened by
+/// [`v201_reserve_now_response`] / [`v201_cancel_reservation_response`]: those
+/// answer an inbound CALL, this *originates* a CALL when the station itself
+/// frees a slot. Ports the request half of
+/// [`ocpp.v201.call.ReservationStatusUpdate`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py)
+/// (the response is empty, so there is no `.conf` builder — the sender only
+/// awaits the ack).
+///
+/// `reservation_id` is copied into the message and never parsed or indexed, so
+/// an extreme value (`i32::MIN`/`MAX`) cannot panic; `status` is
+/// simulator-decided from the reservation lifecycle, never attacker input.
+#[must_use]
+pub fn v201_reservation_status_update(
+    reservation_id: i32,
+    status: ReservationUpdateStatusEnumType,
+) -> ReservationStatusUpdateRequest {
+    ReservationStatusUpdateRequest {
+        reservation_id,
+        reservation_update_status: status,
         custom_data: None,
     }
 }
@@ -4380,6 +4409,44 @@ mod tests {
                         .validate_call_result("CancelReservation", &payload)
                         .is_ok(),
                     "built {status:?} CancelReservationResponse should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reservation_status_update_carries_id_and_status() {
+        // The builder forwards the reservationId and the decided status verbatim,
+        // and leaves the vendor extension unset.
+        let req = v201_reservation_status_update(42, ReservationUpdateStatusEnumType::Expired);
+        assert_eq!(req.reservation_id, 42);
+        assert_eq!(
+            req.reservation_update_status,
+            ReservationUpdateStatusEnumType::Expired
+        );
+        assert!(req.custom_data.is_none());
+    }
+
+    /// Wire fidelity: a built `ReservationStatusUpdate.req` satisfies the bundled
+    /// OCPP 2.0.1 schema for both status values and for extreme `reservationId`s
+    /// (the id is only echoed, never parsed — `i32::MIN`/`MAX` must not panic and
+    /// must still serialize to a schema-valid CALL).
+    #[test]
+    fn built_reservation_status_updates_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        for status in [
+            ReservationUpdateStatusEnumType::Expired,
+            ReservationUpdateStatusEnumType::Removed,
+        ] {
+            for id in [0, 1, -1, i32::MIN, i32::MAX] {
+                let req = v201_reservation_status_update(id, status);
+                let payload = serde_json::to_value(&req).unwrap();
+                assert!(
+                    validator
+                        .validate_call("ReservationStatusUpdate", &payload)
+                        .is_ok(),
+                    "built {status:?} ReservationStatusUpdate (id {id}) should be schema-valid, \
+                     got: {payload}"
                 );
             }
         }
