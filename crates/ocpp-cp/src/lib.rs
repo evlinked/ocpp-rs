@@ -29,6 +29,7 @@ pub mod v201_display_message;
 pub mod v201_firmware_update;
 pub mod v201_log_upload;
 pub mod v201_network_profile;
+pub mod v201_publish_firmware;
 pub mod v201_station_ceiling;
 pub mod v201_transaction;
 pub mod v201_tx_default_profile;
@@ -87,6 +88,7 @@ use v201_display_message::V201DisplayMessageStore;
 use v201_firmware_update::V201FirmwareUpdateStore;
 use v201_log_upload::V201LogUploadStore;
 use v201_network_profile::V201NetworkProfileStore;
+use v201_publish_firmware::V201PublishFirmwareStore;
 use v201_station_ceiling::{CeilingKind, V201StationCeilingStore};
 use v201_tx_default_profile::V201TxDefaultProfileStore;
 // 2.0.1 provisioning message + enum types used by the version-aware runtime
@@ -153,8 +155,8 @@ use ocpp_types::v201::{
     GenericStatusEnumType, GetVariableResultType, IdTokenType as V201IdTokenType,
     InstallCertificateStatusEnumType, InstallCertificateUseEnumType, LogStatusEnumType,
     MessageInfoType, MessageTriggerEnumType, MonitoringDataType, NetworkConnectionProfileType,
-    OperationalStatusEnumType, RegistrationStatusEnumType, ReportDataType,
-    RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
+    OperationalStatusEnumType, PublishFirmwareStatusEnumType, RegistrationStatusEnumType,
+    ReportDataType, RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
     SetNetworkProfileStatusEnumType, SetVariableResultType, StatusInfoType,
     TriggerMessageStatusEnumType, UnlockStatusEnumType, UpdateFirmwareStatusEnumType,
     UploadLogStatusEnumType,
@@ -736,6 +738,21 @@ enum RemoteCommand {
     /// receive loop mid-dispatch. The flat-text privacy twin of the
     /// [`V201NotifyReport`](Self::V201NotifyReport) paged carrier.
     V201CustomerInformationReport { request_id: i32 },
+    /// Run the simulated async firmware-publish progress stream for an
+    /// `Accepted` OCPP 2.0.1 `PublishFirmware` (Part 2, firmware management —
+    /// the Local-Controller firmware-cache trigger, Issue #540). The synchronous
+    /// `PublishFirmware.conf` only acks; the station then reports
+    /// download/publish progress asynchronously via
+    /// `PublishFirmwareStatusNotification.req`, correlated by `request_id` — this
+    /// drives that stream (`Idle` → `DownloadScheduled` → `Downloading` →
+    /// `Downloaded` → a terminal `Published` carrying the cached image's download
+    /// `location` URIs) and, once it settles, clears the
+    /// `V201PublishFirmwareStore` in-flight marker for `request_id`. Queued off
+    /// the inbound-CALL path for the same reason as the other side effects — the
+    /// outbound `PublishFirmwareStatusNotification` CALLs must not re-enter the
+    /// receive loop mid-dispatch. The firmware-publish sibling of
+    /// [`V201FirmwareUpdate`](Self::V201FirmwareUpdate).
+    V201PublishFirmwareStatus { request_id: i32 },
     /// Run the simulated diagnostics-upload state machine for an `Accepted`
     /// `GetDiagnostics` (OCPP 1.6J §4.x, firmware-management profile). Emits
     /// `DiagnosticsStatusNotification(Uploading)` then `Uploaded`.
@@ -1146,6 +1163,17 @@ pub struct ChargePoint {
     /// reports are independent per id, with no supersede. Empty on the 1.6J path
     /// (the handler is V201-only). See [`V201CustomerInformationStore`].
     v201_customer_information_reports: Arc<V201CustomerInformationStore>,
+    /// The set of in-flight `PublishFirmware` progress streams the station is
+    /// driving as a Local Controller (OCPP 2.0.1 Part 2, firmware management,
+    /// Issue #540), by `requestId`. The V201-only `PublishFirmware` handler
+    /// records an accepted request here so a retry of the same `requestId` does
+    /// not launch a second, duplicate `PublishFirmwareStatusNotification` stream;
+    /// the async consumer clears the marker once the stream settles. Like the
+    /// customer-information tracker (and unlike the single-slot log/firmware-
+    /// update trackers) this holds a *set* — firmware publishes are independent
+    /// per id, with no supersede. Empty on the 1.6J path (the handler is
+    /// V201-only). See [`V201PublishFirmwareStore`].
+    v201_publish_firmwares: Arc<V201PublishFirmwareStore>,
     /// Latest running total cost the CSMS has pushed per transaction id via the
     /// 2.0.1 `CostUpdated` message (Issue #502), keyed by the wire
     /// `transactionId` string. Upserted by the V201-only `CostUpdated` handler
@@ -1354,6 +1382,12 @@ impl ChargePoint {
         // CALL path; empty on the 1.6J path (the handler is V201-only).
         let v201_customer_information_reports = Arc::new(V201CustomerInformationStore::new());
 
+        // The in-flight `PublishFirmware` progress-stream tracker the V201
+        // `PublishFirmware` handler records into (Issue #540). Shared into the
+        // default dispatcher so the handler can dedup a retry straight from the
+        // CALL path; empty on the 1.6J path (the handler is V201-only).
+        let v201_publish_firmwares = Arc::new(V201PublishFirmwareStore::new());
+
         // Issue #471: v201 `TxDefaultProfile` store, shared into the default
         // dispatcher (the `SetChargingProfile` command installs a default into it)
         // and kept on the CP (the metering sampler and `GetCompositeSchedule` read
@@ -1420,6 +1454,7 @@ impl ChargePoint {
             v201_log_uploads.clone(),
             v201_firmware_updates.clone(),
             v201_customer_information_reports.clone(),
+            v201_publish_firmwares.clone(),
             v201_costs.clone(),
             expiry_timers.clone(),
             config.unlock_connector_outcome,
@@ -1459,6 +1494,7 @@ impl ChargePoint {
             v201_log_uploads,
             v201_firmware_updates,
             v201_customer_information_reports,
+            v201_publish_firmwares,
             v201_costs,
             reservations,
             expiry_timers,
@@ -1506,6 +1542,7 @@ impl ChargePoint {
         v201_log_uploads: Arc<V201LogUploadStore>,
         v201_firmware_updates: Arc<V201FirmwareUpdateStore>,
         v201_customer_information_reports: Arc<V201CustomerInformationStore>,
+        v201_publish_firmwares: Arc<V201PublishFirmwareStore>,
         v201_costs: Arc<V201CostStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
         unlock_outcome: UnlockConnectorOutcome,
@@ -2423,46 +2460,87 @@ impl ChargePoint {
         // trigger, Issue #538). Registered only on the V201 arm — 1.6J has no
         // `PublishFirmware`, so a 1.6J CP answers CALLERROR.
         //
-        // A **stateless** pure decide-and-answer: no store side effect, no queued
-        // command. This slice wires only the synchronous accept/reject; when
-        // `Accepted` a real Local Controller drives the download and reports
-        // progress asynchronously via `PublishFirmwareStatusNotification`, which is
-        // a separate follow-up (the same sync-ack-first split GetLog / UpdateFirmware
-        // used). The decision (`v201_command::v201_publish_firmware_decision`) is a
-        // lightweight shape predicate — **no URL is opened/followed** (the same
-        // documented simulator boundary as `CertificateSigned`'s no-PKI arm): a
-        // non-empty `location` plus a well-shaped 32-char hex `checksum` → `Accepted`;
-        // an empty `location` or a mis-shaped `checksum` → `Rejected` with a
-        // `statusInfo` reason. `GenericStatusEnumType` is binary, so there is no
-        // third arm.
+        // A pure decide-and-answer synchronous ack, followed by an asynchronous
+        // progress stream when the request is `Accepted` (Issue #540). The decision
+        // (`v201_command::v201_publish_firmware_decision`) is a lightweight shape
+        // predicate — **no URL is opened/followed** (the same documented simulator
+        // boundary as `CertificateSigned`'s no-PKI arm): a non-empty `location`
+        // plus a well-shaped 32-char hex `checksum` → `Accepted`; an empty
+        // `location` or a mis-shaped `checksum` → `Rejected` with a `statusInfo`
+        // reason. `GenericStatusEnumType` is binary, so there is no third arm.
+        //
+        // On an `Accepted` request the handler records it in the
+        // `V201PublishFirmwareStore` and queues a
+        // `RemoteCommand::V201PublishFirmwareStatus` to drive the
+        // `PublishFirmwareStatusNotification` progress stream off the inbound-CALL
+        // path (so the `PublishFirmware` CALLRESULT flushes before the first
+        // notification — no receive-loop re-entrancy, the same discipline as
+        // GetLog / the firmware-update handler). A `Rejected` request queues
+        // nothing. A retry of a `requestId` whose stream is still in flight queues
+        // no second stream — `begin` returning `false` is exactly that case — so
+        // the CSMS is not double-reported. If the consumer is gone (CP shutting
+        // down) the queue fails; the ack is still honest, and the in-flight marker
+        // is rolled back so a later retry can publish afresh.
         //
         // Trust boundary: `location` and `checksum` are attacker-influenced CSMS
         // input, inspected only for shape and never opened/followed/parsed/indexed,
         // so no wire value (empty, garbage, very long, control chars) can panic;
-        // `request_id` is not read by the decision, so extreme values
-        // (`i32::MIN`/`MAX`) are safe. Over-length fields (`location` maxLength 512,
-        // `checksum` maxLength 32) are refused at the schema layer (→ CALLERROR)
-        // before the handler runs. Ports `ocpp.v201.call.PublishFirmware` →
+        // `request_id` is only echoed/compared (into the store and the queued
+        // command), never parsed or indexed, so extreme values (`i32::MIN`/`MAX`)
+        // are safe. Over-length fields (`location` maxLength 512, `checksum`
+        // maxLength 32) are refused at the schema layer (→ CALLERROR) before the
+        // handler runs. Ports `ocpp.v201.call.PublishFirmware` →
         // `ocpp.v201.call_result.PublishFirmware`.
         if matches!(protocol_version, OcppVersion::V201) {
-            d.on(move |req: V201PublishFirmwareRequest| async move {
-                let status = v201_command::v201_publish_firmware_decision(&req);
-                let status_info = match status {
-                    GenericStatusEnumType::Accepted => None,
-                    GenericStatusEnumType::Rejected => Some(StatusInfoType {
-                        reason_code: "InvalidRequest".to_string(),
-                        additional_info: Some(
-                            "PublishFirmware requires a non-empty location and a 32-char hex \
-                             checksum"
-                                .to_string(),
-                        ),
-                        custom_data: None,
-                    }),
-                };
-                Ok(v201_command::v201_publish_firmware_response(
-                    status,
-                    status_info,
-                ))
+            let publish_firmwares = v201_publish_firmwares.clone();
+            let command_sender = command_sender.clone();
+            d.on(move |req: V201PublishFirmwareRequest| {
+                let publish_firmwares = publish_firmwares.clone();
+                let command_sender = command_sender.clone();
+                async move {
+                    let status = v201_command::v201_publish_firmware_decision(&req);
+                    let status_info = match status {
+                        GenericStatusEnumType::Accepted => None,
+                        GenericStatusEnumType::Rejected => Some(StatusInfoType {
+                            reason_code: "InvalidRequest".to_string(),
+                            additional_info: Some(
+                                "PublishFirmware requires a non-empty location and a 32-char hex \
+                                 checksum"
+                                    .to_string(),
+                            ),
+                            custom_data: None,
+                        }),
+                    };
+
+                    // Drive the async progress stream only for an accepted request,
+                    // and only if this `requestId` is not already streaming (dedup a
+                    // retry). `begin` returns `true` exactly when it newly recorded
+                    // the id; the send then runs off the CALL path.
+                    if status == GenericStatusEnumType::Accepted
+                        && publish_firmwares.begin(req.request_id).await
+                        && command_sender
+                            .send(RemoteCommand::V201PublishFirmwareStatus {
+                                request_id: req.request_id,
+                            })
+                            .is_err()
+                    {
+                        // Consumer gone (CP shutting down): the ack is still honest
+                        // — the request was accepted — but the stream cannot run.
+                        // Roll back the in-flight marker so a later retry can publish
+                        // afresh, and surface the drop.
+                        publish_firmwares.complete(req.request_id).await;
+                        warn!(
+                            "v201 PublishFirmware: consumer gone, cannot stream \
+                             PublishFirmwareStatusNotification for request {}",
+                            req.request_id
+                        );
+                    }
+
+                    Ok(v201_command::v201_publish_firmware_response(
+                        status,
+                        status_info,
+                    ))
+                }
             });
         }
 
@@ -5065,6 +5143,9 @@ impl ChargePoint {
                         RemoteCommand::V201CustomerInformationReport { request_id } => {
                             cp.run_v201_customer_information_report(request_id).await;
                         }
+                        RemoteCommand::V201PublishFirmwareStatus { request_id } => {
+                            cp.run_v201_publish_firmware_status(request_id).await;
+                        }
                         RemoteCommand::V201ApplyAvailability {
                             connector_id,
                             target,
@@ -6239,6 +6320,20 @@ impl ChargePoint {
         self.v201_firmware_updates.in_flight().await
     }
 
+    /// Whether the station is currently driving a `PublishFirmware` progress
+    /// stream for `request_id` (OCPP 2.0.1 Part 2, firmware management, Issue #540).
+    ///
+    /// The read path making an in-flight firmware publish observable: an operator
+    /// (or a test) can confirm a `PublishFirmware` the station answered `Accepted`
+    /// was recorded as streaming — so a retry of the same `requestId` is deduped
+    /// rather than starting a second concurrent stream — and that the marker is
+    /// cleared once the stream settles. Always `false` on the 1.6J path (which has
+    /// no v201 publish tracker), whenever the id is not streaming, and after a
+    /// `Rejected` request (which records nothing).
+    pub async fn is_publishing_firmware(&self, request_id: i32) -> bool {
+        self.v201_publish_firmwares.is_publishing(request_id).await
+    }
+
     /// The latest running total cost the CSMS has pushed for `transaction_id`
     /// via the 2.0.1 `CostUpdated` message, if any (Issue #502).
     ///
@@ -7376,6 +7471,97 @@ impl ChargePoint {
         self.v201_customer_information_reports
             .complete(request_id)
             .await;
+    }
+
+    /// Stream the simulated firmware-publish progress an `Accepted`
+    /// `PublishFirmware` triggers, as a sequence of `PublishFirmwareStatusNotification`
+    /// CALLs (`ocpp.v201.call.PublishFirmwareStatusNotification`, OCPP 2.0.1 Part 2,
+    /// firmware management — the Local-Controller firmware-cache trigger, Issue #540).
+    ///
+    /// Invoked only from the command-consumer task (see [`connect`](Self::connect)),
+    /// never inline in the inbound-CALL handler, so the `PublishFirmware` CALLRESULT
+    /// is flushed before the first `PublishFirmwareStatusNotification` and there is
+    /// no receive-loop re-entrancy — the same discipline as the
+    /// [`run_v201_firmware_update`](Self::run_v201_firmware_update) /
+    /// [`run_v201_customer_information_report`](Self::run_v201_customer_information_report)
+    /// siblings.
+    ///
+    /// The simulator caches no real image, so it emits the deterministic happy-path
+    /// progression `Idle → DownloadScheduled → Downloading → Downloaded → Published`
+    /// on a short timer, each `PublishFirmwareStatusNotification.req` correlated by
+    /// `request_id`, with the simulator-supplied download `location` URIs
+    /// ([`v201_command::V201_SIMULATED_PUBLISH_FIRMWARE_LOCATIONS`]) on the terminal
+    /// `Published` (and absent on the intermediate states, per the spec). The
+    /// failure states (`DownloadFailed` / `InvalidChecksum` / `PublishFailed`) stay
+    /// documented unproduced seams — reachable on the wire and in the schema, but
+    /// not driven by the simulator (the `UpdateFirmware` convention). Once the
+    /// stream settles the in-flight marker is cleared via
+    /// [`complete`](crate::v201_publish_firmware::V201PublishFirmwareStore::complete)
+    /// so a later `PublishFirmware` with the same `requestId` can publish afresh —
+    /// unconditionally, since (unlike the single-slot firmware-update rollout) a
+    /// firmware publish is independent per id with no supersede to hand the marker
+    /// off to. `request_id` is only echoed/compared, never parsed or indexed, so no
+    /// wire value (including `i32::MIN`/`MAX`) can panic. Ports the
+    /// `PublishFirmwareStatusNotification` progress flow from
+    /// [`ocpp/v201/enums.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/enums.py)'s
+    /// `PublishFirmwareStatusEnumType`.
+    async fn run_v201_publish_firmware_status(&self, request_id: i32) {
+        // The deterministic happy-path progression. Intermediate states carry no
+        // location; only the terminal `Published` advertises the cached image's
+        // download URIs.
+        let progression = [
+            PublishFirmwareStatusEnumType::Idle,
+            PublishFirmwareStatusEnumType::DownloadScheduled,
+            PublishFirmwareStatusEnumType::Downloading,
+            PublishFirmwareStatusEnumType::Downloaded,
+            PublishFirmwareStatusEnumType::Published,
+        ];
+        let last = progression.len() - 1;
+        for (i, status) in progression.into_iter().enumerate() {
+            let location = (status == PublishFirmwareStatusEnumType::Published).then(|| {
+                v201_command::V201_SIMULATED_PUBLISH_FIRMWARE_LOCATIONS
+                    .iter()
+                    .map(|s| (*s).to_string())
+                    .collect()
+            });
+            self.send_v201_publish_firmware_status(status, location, request_id)
+                .await;
+            // Pace the intermediate steps; no trailing wait after the terminal one.
+            if i < last {
+                tokio::time::sleep(FIRMWARE_UPDATE_STEP_DURATION).await;
+            }
+        }
+        // Settle the publish: the id is no longer streaming, so a later
+        // `PublishFirmware` with the same `requestId` publishes afresh rather than
+        // being deduped.
+        self.v201_publish_firmwares.complete(request_id).await;
+    }
+
+    /// Send a single `PublishFirmwareStatusNotification(status)` CALL correlated by
+    /// `request_id`, carrying `location` only on the terminal `Published` state
+    /// (OCPP 2.0.1 Part 2). A best-effort progress report: a send failure is
+    /// logged, not propagated (the publish state machine continues). The
+    /// firmware-publish twin of
+    /// [`send_v201_firmware_status`](Self::send_v201_firmware_status), routed
+    /// through the [`v201_command`] constructor so the v201 wire type stays out of
+    /// this module's imports.
+    async fn send_v201_publish_firmware_status(
+        &self,
+        status: PublishFirmwareStatusEnumType,
+        location: Option<Vec<String>>,
+        request_id: i32,
+    ) {
+        if let Err(e) = self
+            .call(v201_command::v201_publish_firmware_status_notification(
+                status, location, request_id,
+            ))
+            .await
+        {
+            warn!(
+                "v201 PublishFirmware: PublishFirmwareStatusNotification({status:?}) for \
+                 request {request_id}: {e}"
+            );
+        }
     }
 
     /// Emit a 2.0.1 `StatusNotification` for the EVSE(s) a `TriggerMessage`
@@ -11116,9 +11302,25 @@ mod tests {
             body.status_info.is_none(),
             "an accepted publish request carries no statusInfo"
         );
+        // An accepted publish records the request in flight and queues exactly one
+        // progress stream correlated by requestId (make_* uses 7).
         assert!(
-            v201_drain_commands(&cp).await.is_empty(),
-            "PublishFirmware is a stateless responder in this slice — it queues nothing"
+            cp.is_publishing_firmware(7).await,
+            "an accepted publish is recorded as in flight"
+        );
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(
+            commands.len(),
+            1,
+            "an accepted publish queues exactly one progress stream"
+        );
+        assert!(
+            matches!(
+                &commands[0],
+                RemoteCommand::V201PublishFirmwareStatus { request_id } if *request_id == 7
+            ),
+            "the queued stream is correlated by requestId, got: {:?}",
+            commands[0]
         );
     }
 
@@ -11151,9 +11353,11 @@ mod tests {
     #[tokio::test]
     async fn v201_publish_firmware_extreme_request_id_never_panics() {
         let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
-        // request_id is echoed only by the async follow-up, never read by the sync
-        // decision — an actionable request at every extreme is Accepted without panic.
-        for request_id in [0, 1, -1, i32::MIN, i32::MAX] {
+        // request_id is echoed into the store and the queued command, never parsed
+        // — an actionable request at every extreme is Accepted, queues a correlated
+        // progress stream, and never panics.
+        let ids = [0, 1, -1, i32::MIN, i32::MAX];
+        for request_id in ids {
             let body = publish_firmware_response(
                 &cp,
                 make_v201_publish_firmware("https://fw.example/img.bin", SAMPLE_FW_MD5, request_id),
@@ -11165,7 +11369,20 @@ mod tests {
                 "request_id={request_id} is accepted without panic"
             );
         }
-        assert!(v201_drain_commands(&cp).await.is_empty());
+        // Each distinct id queued its own progress stream, correlated by requestId.
+        let queued: Vec<i32> = v201_drain_commands(&cp)
+            .await
+            .into_iter()
+            .filter_map(|c| match c {
+                RemoteCommand::V201PublishFirmwareStatus { request_id } => Some(request_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            queued,
+            ids.to_vec(),
+            "every extreme accepted publish queues a correlated stream, in order"
+        );
     }
 
     #[tokio::test]
@@ -11225,6 +11442,123 @@ mod tests {
                 .validate_call_result("PublishFirmware", &serde_json::to_value(&resp).unwrap())
                 .expect("PublishFirmware response is schema-valid");
         }
+    }
+
+    #[tokio::test]
+    async fn v201_publish_firmware_rejected_queues_no_stream_and_records_nothing() {
+        // AC #540: a Rejected publish drives no async stream and records nothing —
+        // so it cannot be observed as in flight and dedups nothing later.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let body =
+            publish_firmware_response(&cp, make_v201_publish_firmware("", SAMPLE_FW_MD5, 7)).await;
+        assert_eq!(body.status, GenericStatusEnumType::Rejected);
+        assert!(
+            !cp.is_publishing_firmware(7).await,
+            "a rejected publish records no in-flight marker"
+        );
+        assert!(
+            v201_drain_commands(&cp).await.is_empty(),
+            "a rejected publish queues no progress stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_publish_firmware_retry_of_in_flight_queues_no_second_stream() {
+        // Two accepted publishes carrying the same requestId (7): the first records
+        // the id and queues a stream; the retry — while the first is still in flight
+        // (no consumer drains it) — records nothing new and queues none, so the CSMS
+        // is not double-reported.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        for _ in 0..2 {
+            let body = publish_firmware_response(
+                &cp,
+                make_v201_publish_firmware("https://fw.example/img.bin", SAMPLE_FW_MD5, 7),
+            )
+            .await;
+            assert_eq!(body.status, GenericStatusEnumType::Accepted);
+        }
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(
+            commands.len(),
+            1,
+            "a retry of an in-flight requestId queues no second stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_publish_firmware_completes_and_clears_the_in_flight_marker() {
+        // AC #540: after the async progress stream settles, the in-flight marker is
+        // cleared, so a subsequent PublishFirmware with the same requestId publishes
+        // afresh (queues a new stream) rather than being deduped. Drive the state
+        // machine directly (the CP is not connected, so the
+        // PublishFirmwareStatusNotification CALLs fail-and-warn, but the store
+        // transition is what this asserts).
+        // `v201_drain_commands` destructively takes the command receiver (closing
+        // the channel), so this test never drains mid-way — both publishes' queued
+        // streams accumulate in the still-open channel and are drained once at the
+        // end. The marker transitions are what this asserts.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+
+        // Accept a publish, then run its async stream to completion.
+        let first = publish_firmware_response(
+            &cp,
+            make_v201_publish_firmware("https://fw.example/img.bin", SAMPLE_FW_MD5, 5),
+        )
+        .await;
+        assert_eq!(first.status, GenericStatusEnumType::Accepted);
+        assert!(cp.is_publishing_firmware(5).await);
+
+        cp.run_v201_publish_firmware_status(5).await;
+        assert!(
+            !cp.is_publishing_firmware(5).await,
+            "a settled publish stream clears the in-flight marker"
+        );
+
+        // A subsequent publish of the same id now starts fresh — it records the id
+        // again and queues a new stream (it is not deduped against the settled one).
+        let next = publish_firmware_response(
+            &cp,
+            make_v201_publish_firmware("https://fw.example/img.bin", SAMPLE_FW_MD5, 5),
+        )
+        .await;
+        assert_eq!(next.status, GenericStatusEnumType::Accepted);
+        assert!(cp.is_publishing_firmware(5).await);
+
+        // Both publishes queued a stream correlated by requestId — the settle in
+        // between did not cause the re-publish to be deduped.
+        let queued: Vec<i32> = v201_drain_commands(&cp)
+            .await
+            .into_iter()
+            .filter_map(|c| match c {
+                RemoteCommand::V201PublishFirmwareStatus { request_id } => Some(request_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            queued,
+            vec![5, 5],
+            "the pre-settle publish and the fresh post-settle publish each queued a stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_publish_firmware_streams_are_independent_per_request_id() {
+        // Unlike the single-slot firmware-update rollout, two different requestIds
+        // each have a stream in flight with neither superseding the other (the
+        // set-based, customer-information model). Settling one leaves the other.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.v201_publish_firmwares.begin(1).await;
+        cp.v201_publish_firmwares.begin(2).await;
+
+        cp.run_v201_publish_firmware_status(1).await;
+        assert!(
+            !cp.is_publishing_firmware(1).await,
+            "the settled stream clears its own id"
+        );
+        assert!(
+            cp.is_publishing_firmware(2).await,
+            "the other id is untouched — no supersede"
+        );
     }
 
     // --- OCPP 2.0.1 DeleteCertificate (M7, issue #522) ---------------------
