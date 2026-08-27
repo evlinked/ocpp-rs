@@ -140,6 +140,8 @@
 //! the wire and a future capability knob, the way the monitor store (#494)
 //! documents its unproduced statuses.
 
+use std::collections::BTreeMap;
+
 use ocpp_types::common::Reason;
 use ocpp_types::v16j::ResetType;
 use ocpp_types::v201::{
@@ -865,22 +867,33 @@ pub fn v201_clear_charging_profile_response(matched: bool) -> ClearChargingProfi
 /// The query counterpart to [`v201_clear_charging_profile_matches`]: given the
 /// request's optional top-level `evse_id` and its
 /// [`ChargingProfileCriterionType`], plus a `(evse_id, profile)` snapshot of the
-/// [`V201TxProfileStore`](crate::v201_charging_profiles::V201TxProfileStore), it
-/// returns every installed slot that matches — the wiring layer then streams them
-/// as `ReportChargingProfiles` and answers
+/// installed v201 charging profiles, it returns every installed slot that matches
+/// — the wiring layer then streams them as `ReportChargingProfiles` and answers
 /// [`Accepted`](GetChargingProfileStatusEnumType::Accepted) when the returned
 /// slice is non-empty, [`NoProfiles`](GetChargingProfileStatusEnumType::NoProfiles)
 /// otherwise.
 ///
-/// Matching is faithful to OCPP 2.0.1 (Part 2, `GetChargingProfiles`) over the
-/// simulator's one-`TxProfile`-per-EVSE store:
+/// Since #519 the wiring layer feeds this the **combined** snapshot of all three
+/// v201 charging-profile stores — the per-EVSE
+/// [`V201TxProfileStore`](crate::v201_charging_profiles::V201TxProfileStore), the
+/// [`V201TxDefaultProfileStore`](crate::v201_tx_default_profile::V201TxDefaultProfileStore),
+/// and the
+/// [`V201StationCeilingStore`](crate::v201_station_ceiling::V201StationCeilingStore)
+/// — so a `GetChargingProfiles` reports the station's full installed configuration
+/// (transaction profiles, defaults, and ceilings), not just its `TxProfile`s. This
+/// function stays pure over whatever snapshot it is given; combining the stores is
+/// the wiring layer's job.
+///
+/// Matching is faithful to OCPP 2.0.1 (Part 2, `GetChargingProfiles`):
 ///
 /// - **top-level `evseId`** — restricts the report to that EVSE key; absent means
-///   "every EVSE". `evseId == 0` targets the station-wide profiles, which the
-///   transaction-scoped store never holds, so it matches nothing (faithful — no
-///   station-scoped install exists to report), as does any out-of-range id (it is
-///   simply absent from the snapshot). This is a trust boundary on CSMS-supplied
-///   input: a `0`, negative, or huge `evseId` never panics, it just misses.
+///   "every EVSE". `evseId == 0` targets the station-wide entries — the default
+///   and ceiling stores can hold an `evseId = 0` whole-station profile, so a
+///   `GetChargingProfiles(evseId = 0)` reports exactly those, and a specific-EVSE
+///   request (`>= 1`) never mis-scopes a whole-station `0` entry to itself. An
+///   `evseId` absent from every store's snapshot is simply not reported. This is a
+///   trust boundary on CSMS-supplied input: a `0`, negative, or huge `evseId`
+///   never panics, it just selects (or misses) by exact key.
 /// - **`chargingProfilePurpose`** — absent = any; present must equal the stored
 ///   profile's purpose.
 /// - **`stackLevel`** — absent = any; present must equal the stored profile's
@@ -963,17 +976,22 @@ pub fn v201_get_charging_profiles_response(matched: bool) -> GetChargingProfiles
 /// report, and this builds one [`ReportChargingProfilesRequest`] per **EVSE** —
 /// each echoing the triggering `request_id`, tagged with the
 /// [`Cso`](ChargingLimitSourceEnumType::Cso) source (every stored profile is
-/// CSMS-installed), and carrying that EVSE's profile. Pages are ordered by
-/// ascending `evse_id` (the store snapshot is an unordered `HashMap` walk, so
-/// sorting makes the paging deterministic), and every page but the last is
-/// flagged `tbc` ("to be continued"); the final page leaves `tbc` absent
-/// (= `false`). An empty match set builds no pages — there is nothing to stream.
+/// CSMS-installed), and carrying every matched profile on that EVSE. Pages are
+/// ordered by ascending `evse_id` and the profiles within a page by ascending
+/// `id` (the store snapshots are unordered `HashMap` walks, so both sorts make
+/// the stream deterministic), and every page but the last is flagged `tbc`
+/// ("to be continued"); the final page leaves `tbc` absent (= `false`). An
+/// empty match set builds no pages — there is nothing to stream.
 ///
-/// The simulator keys one `TxProfile` per EVSE, so each page carries a single
-/// profile and the page count equals the matched-EVSE count; every built
-/// `ReportChargingProfiles` therefore satisfies the schema's `minItems: 1` on
-/// `chargingProfile`. Multi-profile-per-page batching arrives if the store ever
-/// holds stacked profiles per EVSE (tracks with #471).
+/// Since #519 the match set is drawn from **three** stores — the per-EVSE
+/// `TxProfile` store, the `TxDefaultProfile` store, and the station-ceiling
+/// store — so one EVSE can now carry several profiles (e.g. a `TxProfile`, a
+/// `TxDefaultProfile`, and both `ChargingStationMaxProfile` /
+/// `ChargingStationExternalConstraints` ceilings). They are **grouped per EVSE**
+/// into a single page (`chargingProfile` array), which is how OCPP 2.0.1 reports
+/// them (per `chargingLimitSource` + `evseId`; every stored profile here shares
+/// the `CSO` source). Grouping keeps each page's `chargingProfile` non-empty, so
+/// every built `ReportChargingProfiles` satisfies the schema's `minItems: 1`.
 ///
 /// Pure over its inputs, so it is unit-testable without a runtime; sending the
 /// pages over the wire is the wiring layer's job.
@@ -982,23 +1000,32 @@ pub fn v201_report_charging_profiles_pages(
     request_id: i32,
     matched: &[(i32, ChargingProfileType)],
 ) -> Vec<ReportChargingProfilesRequest> {
-    // Deterministic paging order: the store snapshot is a HashMap walk.
-    let mut ordered: Vec<&(i32, ChargingProfileType)> = matched.iter().collect();
-    ordered.sort_by_key(|(evse_id, _)| *evse_id);
+    // Group the matched profiles by EVSE. A `BTreeMap` gives a deterministic
+    // ascending-`evse_id` page order despite the unordered store snapshots; the
+    // profiles within each page are sorted by `id` for the same determinism.
+    let mut by_evse: BTreeMap<i32, Vec<ChargingProfileType>> = BTreeMap::new();
+    for (evse_id, profile) in matched {
+        by_evse.entry(*evse_id).or_default().push(profile.clone());
+    }
+    for profiles in by_evse.values_mut() {
+        profiles.sort_by_key(|profile| profile.id);
+    }
 
-    let last = ordered.len().saturating_sub(1);
-    ordered
+    let last = by_evse.len().saturating_sub(1);
+    by_evse
         .into_iter()
         .enumerate()
-        .map(|(i, (evse_id, profile))| ReportChargingProfilesRequest {
-            request_id,
-            charging_limit_source: ChargingLimitSourceEnumType::Cso,
-            charging_profile: vec![profile.clone()],
-            evse_id: *evse_id,
-            // Every page but the last announces that more follow.
-            tbc: (i < last).then_some(true),
-            custom_data: None,
-        })
+        .map(
+            |(i, (evse_id, charging_profile))| ReportChargingProfilesRequest {
+                request_id,
+                charging_limit_source: ChargingLimitSourceEnumType::Cso,
+                charging_profile,
+                evse_id,
+                // Every page but the last announces that more follow.
+                tbc: (i < last).then_some(true),
+                custom_data: None,
+            },
+        )
         .collect()
 }
 
@@ -4269,6 +4296,222 @@ mod tests {
                 page.evse_id
             );
         }
+    }
+
+    // ---- GetChargingProfiles across all three stores (#519) ----
+
+    /// The combined `(evse_id, profile)` snapshot the #519 wiring layer feeds the
+    /// selector: a per-EVSE `TxProfile` and `TxDefaultProfile` on EVSE 1, plus the
+    /// two station ceilings on the whole-station key `0`. Deliberately unsorted to
+    /// mimic the stores' `HashMap`-walk snapshot order.
+    fn combined_profile_store() -> Vec<(i32, ChargingProfileType)> {
+        vec![
+            (
+                1,
+                clear_test_profile(10, 0, ChargingProfilePurposeEnumType::TxProfile),
+            ),
+            (
+                0,
+                clear_test_profile(
+                    50,
+                    0,
+                    ChargingProfilePurposeEnumType::ChargingStationExternalConstraints,
+                ),
+            ),
+            (
+                1,
+                clear_test_profile(30, 1, ChargingProfilePurposeEnumType::TxDefaultProfile),
+            ),
+            (
+                0,
+                clear_test_profile(
+                    40,
+                    0,
+                    ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
+                ),
+            ),
+        ]
+    }
+
+    /// The profile ids the selector returned, sorted — a store-order-independent
+    /// projection the #519 enumeration tests assert against.
+    fn matched_ids(matches: &[(i32, ChargingProfileType)]) -> Vec<i32> {
+        let mut ids: Vec<i32> = matches.iter().map(|(_, p)| p.id).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn get_empty_criterion_enumerates_tx_default_and_ceiling_profiles_too() {
+        // The #519 fix: with no criterion and no evseId, the report covers every
+        // installed profile across all three stores — not just the TxProfiles.
+        let store = combined_profile_store();
+        assert_eq!(
+            matched_ids(&v201_get_charging_profiles_matches(
+                None,
+                &any_criterion(),
+                &store
+            )),
+            vec![10, 30, 40, 50],
+            "TxProfile (10), TxDefaultProfile (30), and both ceilings (40, 50) are all reported"
+        );
+    }
+
+    #[test]
+    fn get_purpose_criterion_narrows_to_that_store_purpose() {
+        let store = combined_profile_store();
+        // Only the external-constraints ceiling.
+        let ext = ChargingProfileCriterionType {
+            charging_profile_purpose: Some(
+                ChargingProfilePurposeEnumType::ChargingStationExternalConstraints,
+            ),
+            ..any_criterion()
+        };
+        assert_eq!(
+            matched_ids(&v201_get_charging_profiles_matches(None, &ext, &store)),
+            vec![50],
+            "a ChargingStationExternalConstraints criterion returns only the ceiling"
+        );
+        // Only the TxDefaultProfile.
+        let def = ChargingProfileCriterionType {
+            charging_profile_purpose: Some(ChargingProfilePurposeEnumType::TxDefaultProfile),
+            ..any_criterion()
+        };
+        assert_eq!(
+            matched_ids(&v201_get_charging_profiles_matches(None, &def, &store)),
+            vec![30],
+            "a TxDefaultProfile criterion returns only the default, not the TxProfile or ceilings"
+        );
+    }
+
+    #[test]
+    fn get_evse_zero_selects_only_whole_station_entries() {
+        let store = combined_profile_store();
+        // evseId = 0 → the whole-station ceilings the default/ceiling stores hold
+        // there, and never the EVSE-1 transaction/default profiles.
+        assert_eq!(
+            matched_ids(&v201_get_charging_profiles_matches(
+                Some(0),
+                &any_criterion(),
+                &store
+            )),
+            vec![40, 50],
+            "a whole-station (evseId 0) request reports exactly the station-wide ceilings"
+        );
+        // A specific-EVSE request never mis-scopes a whole-station `0` entry to itself.
+        assert_eq!(
+            matched_ids(&v201_get_charging_profiles_matches(
+                Some(1),
+                &any_criterion(),
+                &store
+            )),
+            vec![10, 30],
+            "an evseId 1 request reports only EVSE-1 entries, not the whole-station ceilings"
+        );
+    }
+
+    #[test]
+    fn report_pages_group_multiple_profiles_on_one_evse() {
+        // An EVSE now carries several profiles (a TxProfile + a TxDefaultProfile);
+        // the pager groups them into one page, profiles sorted by id, EVSEs sorted
+        // ascending, tbc set on every page but the last. Ids are deliberately out
+        // of order in the input to prove the sort.
+        let matched = vec![
+            (
+                1,
+                clear_test_profile(30, 1, ChargingProfilePurposeEnumType::TxDefaultProfile),
+            ),
+            (
+                0,
+                clear_test_profile(
+                    50,
+                    0,
+                    ChargingProfilePurposeEnumType::ChargingStationExternalConstraints,
+                ),
+            ),
+            (
+                1,
+                clear_test_profile(10, 0, ChargingProfilePurposeEnumType::TxProfile),
+            ),
+            (
+                0,
+                clear_test_profile(
+                    40,
+                    0,
+                    ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
+                ),
+            ),
+        ];
+        let pages = v201_report_charging_profiles_pages(9, &matched);
+        assert_eq!(pages.len(), 2, "two EVSEs → two pages, one per EVSE");
+        // Page 0: whole-station EVSE 0, both ceilings, sorted by id, continues.
+        assert_eq!(pages[0].evse_id, 0);
+        assert_eq!(
+            pages[0]
+                .charging_profile
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            vec![40, 50],
+            "the EVSE-0 page groups both ceilings, sorted by id"
+        );
+        assert_eq!(pages[0].tbc, Some(true), "the first of two pages continues");
+        // Page 1: EVSE 1, TxProfile + TxDefaultProfile, sorted by id, terminal.
+        assert_eq!(pages[1].evse_id, 1);
+        assert_eq!(
+            pages[1]
+                .charging_profile
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            vec![10, 30],
+            "the EVSE-1 page groups the TxProfile and TxDefaultProfile, sorted by id"
+        );
+        assert!(
+            !pages[1].tbc.unwrap_or(false),
+            "the last page is not 'to be continued'"
+        );
+        assert!(pages.iter().all(|p| p.request_id == 9));
+    }
+
+    #[test]
+    fn built_multi_profile_report_page_is_schema_valid() {
+        // A single EVSE-0 page carrying both station ceilings must satisfy the
+        // bundled OCPP 2.0.1 ReportChargingProfiles schema (minItems: 1 on
+        // chargingProfile, multiple entries allowed).
+        let validator = SchemaValidator::v201();
+        let matched = vec![
+            (
+                0,
+                clear_test_profile(
+                    40,
+                    0,
+                    ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
+                ),
+            ),
+            (
+                0,
+                clear_test_profile(
+                    50,
+                    0,
+                    ChargingProfilePurposeEnumType::ChargingStationExternalConstraints,
+                ),
+            ),
+        ];
+        let pages = v201_report_charging_profiles_pages(1, &matched);
+        assert_eq!(
+            pages.len(),
+            1,
+            "both ceilings on EVSE 0 group into one page"
+        );
+        assert_eq!(pages[0].charging_profile.len(), 2);
+        let payload = serde_json::to_value(&pages[0]).unwrap();
+        assert!(
+            validator
+                .validate_call("ReportChargingProfiles", &payload)
+                .is_ok(),
+            "a multi-profile ReportChargingProfiles page should be schema-valid, got: {payload}"
+        );
     }
 
     // --- ReserveNow (v201) -------------------------------------------------
