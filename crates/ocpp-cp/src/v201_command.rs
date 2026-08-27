@@ -139,26 +139,45 @@
 //! simulated display can render any schema-valid format/priority/state — kept for
 //! the wire and a future capability knob, the way the monitor store (#494)
 //! documents its unproduced statuses.
+//!
+//! ## `SignCertificate`
+//!
+//! Ports `ocpp.v201.call.SignCertificate` /
+//! `ocpp.v201.call_result.SignCertificate` (OCPP 2.0.1 Part 2, A02). Unlike the
+//! rest of this module — CSMS→CP commands the station *answers* — `SignCertificate`
+//! is **CP-initiated**: the station originates the certificate-provisioning flow
+//! by submitting a PEM-encoded CSR, the CSMS acknowledges synchronously with a
+//! [`GenericStatusEnumType`] (`Accepted` / `Rejected`), and the CA-signed chain
+//! arrives later out-of-band via the paired `CertificateSigned` CALL (the
+//! delivery terminus this module already answers,
+//! [`v201_certificate_signed_status`]). Because it is originated rather than
+//! answered, the pure half here is a *request* builder
+//! ([`v201_sign_certificate_request`]) rather than a decision + response builder,
+//! and the wiring layer emits it as an outbound CALL and surfaces the
+//! acknowledgement ([`ChargePoint::request_sign_certificate`](crate::ChargePoint::request_sign_certificate)).
+//! The simulator does no crypto, so the CSR is an opaque, well-shaped placeholder
+//! ([`v201_placeholder_csr`]) — the same "no PKI" boundary the certificate
+//! decision predicates set.
 
 use ocpp_types::common::Reason;
 use ocpp_types::v16j::ResetType;
 use ocpp_types::v201::{
     CancelReservationStatusEnumType, CertificateHashDataChainType, CertificateHashDataType,
-    CertificateSignedStatusEnumType, ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType,
-    ChargingProfileCriterionType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
-    ChargingProfileType, ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType,
-    ClearChargingProfileType, ClearMessageStatusEnumType, CustomerInformationStatusEnumType,
-    DeleteCertificateStatusEnumType, DisplayMessageStatusEnumType, FirmwareStatusEnumType,
-    GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetCertificateIdUseEnumType,
-    GetChargingProfileStatusEnumType, GetDisplayMessagesStatusEnumType,
-    GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType, InstallCertificateStatusEnumType,
-    InstallCertificateUseEnumType, LogEnumType, LogStatusEnumType, MessageInfoType,
-    MessagePriorityEnumType, MessageStateEnumType, MessageTriggerEnumType,
-    OperationalStatusEnumType, PublishFirmwareStatusEnumType, RequestStartStopStatusEnumType,
-    ReservationUpdateStatusEnumType, ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType,
-    SetNetworkProfileStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType,
-    UnlockStatusEnumType, UnpublishFirmwareStatusEnumType, UpdateFirmwareStatusEnumType,
-    UploadLogStatusEnumType,
+    CertificateSignedStatusEnumType, CertificateSigningUseEnumType,
+    ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType, ChargingProfileCriterionType,
+    ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
+    ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType, ClearChargingProfileType,
+    ClearMessageStatusEnumType, CustomerInformationStatusEnumType, DeleteCertificateStatusEnumType,
+    DisplayMessageStatusEnumType, FirmwareStatusEnumType, GenericDeviceModelStatusEnumType,
+    GenericStatusEnumType, GetCertificateIdUseEnumType, GetChargingProfileStatusEnumType,
+    GetDisplayMessagesStatusEnumType, GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType,
+    InstallCertificateStatusEnumType, InstallCertificateUseEnumType, LogEnumType,
+    LogStatusEnumType, MessageInfoType, MessagePriorityEnumType, MessageStateEnumType,
+    MessageTriggerEnumType, OperationalStatusEnumType, PublishFirmwareStatusEnumType,
+    RequestStartStopStatusEnumType, ReservationUpdateStatusEnumType, ReserveNowStatusEnumType,
+    ResetEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType, UnpublishFirmwareStatusEnumType,
+    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
 };
 
 use ocpp_messages::v201::{
@@ -173,9 +192,9 @@ use ocpp_messages::v201::{
     ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
     ReservationStatusUpdateRequest, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
     SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
-    SetNetworkProfileRequest, SetNetworkProfileResponse, TriggerMessageResponse,
-    UnlockConnectorResponse, UnpublishFirmwareRequest, UnpublishFirmwareResponse,
-    UpdateFirmwareRequest, UpdateFirmwareResponse,
+    SetNetworkProfileRequest, SetNetworkProfileResponse, SignCertificateRequest,
+    TriggerMessageResponse, UnlockConnectorResponse, UnpublishFirmwareRequest,
+    UnpublishFirmwareResponse, UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -2365,6 +2384,70 @@ pub fn v201_certificate_signed_response(
     CertificateSignedResponse {
         status,
         status_info,
+        custom_data: None,
+    }
+}
+
+/// A well-shaped, **opaque** placeholder Certificate Signing Request the
+/// simulator submits in a `SignCertificate.req`.
+///
+/// The simulator does no crypto (the same "no PKI" boundary
+/// [`v201_certificate_signed_status`] / [`v201_install_certificate_status`] set):
+/// there is no key pair and no real RFC 2986 CSR to encode. This returns a
+/// PEM-armored, base64-body blob shaped like a `CERTIFICATE REQUEST` so it is
+/// well-formed on the wire and satisfies the `SignCertificate` schema (a plain
+/// `csr: string`, `maxLength` 5500) — it is **not** a cryptographically valid
+/// CSR and a real CSMS CA would reject it. It exists purely for wire/schema
+/// coverage of the CP-initiated provisioning entry point; substituting real key
+/// material is a follow-up gated on the simulator growing a crypto provider.
+///
+/// The body stays comfortably under the schema's 5500-char cap.
+#[must_use]
+pub fn v201_placeholder_csr() -> String {
+    // A fixed, deterministic base64-ish body between PEM `CERTIFICATE REQUEST`
+    // armor. Deterministic so tests can pin it and so successive requests are
+    // byte-identical (the simulator has no per-request key material to vary).
+    concat!(
+        "-----BEGIN CERTIFICATE REQUEST-----\n",
+        "MIIBVDCB+wIBADAVMRMwEQYDVQQDDApvY3BwLXJzLXNpbTBZMBMGByqGSM49AgEG\n",
+        "CCqGSM49AwEHA0IABE9vY3BwLXJzIHNpbXVsYXRvciBwbGFjZWhvbGRlciBDU1Ig\n",
+        "bm90IHJlYWwga2V5IG1hdGVyaWFsIG9wYXF1ZSBibG9ioAAwCgYIKoZIzj0EAwID\n",
+        "SQAwRgIhAJvc3BwLXJzLXNpbXVsYXRvci1wbGFjZWhvbGRlci1jc3ItYWIxYWIx\n",
+        "YWIxYWIxYWIxYWIxYWIxYWIxYWIxYWIxYWIx\n",
+        "-----END CERTIFICATE REQUEST-----"
+    )
+    .to_string()
+}
+
+/// Build a schema-valid `SignCertificate.req` ([`SignCertificateRequest`]) — the
+/// **CP-initiated entry point** of the OCPP 2.0.1 certificate-provisioning flow.
+///
+/// Ports [`ocpp.v201.call.SignCertificate`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+/// In 2.0.1 the station originates provisioning: it sends this request carrying a
+/// PEM-encoded CSR, the CSMS acknowledges synchronously with a
+/// [`GenericStatusEnumType`](ocpp_types::v201::GenericStatusEnumType)
+/// (`Accepted` / `Rejected`), and the operator's CA later returns the signed
+/// chain out-of-band via the paired `CertificateSigned` CALL (the delivery
+/// terminus this module already answers, [`v201_certificate_signed_status`]).
+///
+/// `certificate_type` selects which certificate the CSR is for
+/// ([`ChargingStationCertificate`](CertificateSigningUseEnumType::ChargingStationCertificate)
+/// or [`V2GCertificate`](CertificateSigningUseEnumType::V2GCertificate)); when
+/// `None` the request omits the field, which the spec reads as *both* the ISO
+/// 15118 connection and the Charging-Station-to-CSMS connection. The `csr` is the
+/// opaque simulator placeholder ([`v201_placeholder_csr`]) — no real key
+/// material; this slice provisions the wire/schema path, not a PKI.
+///
+/// Pure over its input, so it is unit- and schema-testable without a runtime or a
+/// socket; emitting it as a CALL and surfacing the response is the wiring layer's
+/// job ([`ChargePoint::request_sign_certificate`](crate::ChargePoint::request_sign_certificate)).
+#[must_use]
+pub fn v201_sign_certificate_request(
+    certificate_type: Option<CertificateSigningUseEnumType>,
+) -> SignCertificateRequest {
+    SignCertificateRequest {
+        csr: v201_placeholder_csr(),
+        certificate_type,
         custom_data: None,
     }
 }
@@ -5516,6 +5599,87 @@ mod tests {
             validator
                 .validate_call_result("InstallCertificate", &serde_json::to_value(&resp).unwrap())
                 .expect("built InstallCertificate response is schema-valid");
+        }
+    }
+
+    // --- SignCertificate (v201) CP-initiated request builder (Issue #547) ---
+
+    #[test]
+    fn placeholder_csr_is_pem_certificate_request_shaped_and_within_the_schema_cap() {
+        let csr = v201_placeholder_csr();
+        assert!(
+            csr.contains("-----BEGIN CERTIFICATE REQUEST-----"),
+            "the placeholder CSR is PEM `CERTIFICATE REQUEST`-armored"
+        );
+        assert!(csr.contains("-----END CERTIFICATE REQUEST-----"));
+        // A non-empty base64 body between the armor lines.
+        let has_body = csr
+            .lines()
+            .map(str::trim)
+            .any(|line| !line.is_empty() && !line.starts_with("-----"));
+        assert!(
+            has_body,
+            "the placeholder CSR carries a body between the armor"
+        );
+        // The `SignCertificate` schema caps `csr` at 5500 chars.
+        assert!(
+            csr.len() <= 5500,
+            "placeholder CSR ({} chars) stays under the schema's 5500 cap",
+            csr.len()
+        );
+        // Deterministic: the simulator has no per-request key material to vary, so
+        // successive requests are byte-identical.
+        assert_eq!(csr, v201_placeholder_csr());
+    }
+
+    #[test]
+    fn sign_certificate_request_carries_the_selected_certificate_type() {
+        // Each explicit `certificateType` round-trips onto the request.
+        for ct in [
+            CertificateSigningUseEnumType::ChargingStationCertificate,
+            CertificateSigningUseEnumType::V2GCertificate,
+        ] {
+            let req = v201_sign_certificate_request(Some(ct));
+            assert_eq!(req.certificate_type, Some(ct));
+            assert_eq!(req.csr, v201_placeholder_csr());
+        }
+    }
+
+    #[test]
+    fn sign_certificate_request_omits_certificate_type_when_none() {
+        let req = v201_sign_certificate_request(None);
+        assert_eq!(
+            req.certificate_type, None,
+            "a None certificate_type is omitted — the spec reads that as both connections"
+        );
+        // `skip_serializing_if = Option::is_none` drops the key from the wire.
+        let wire = serde_json::to_value(&req).expect("serialize SignCertificate.req");
+        assert!(
+            wire.get("certificateType").is_none(),
+            "the omitted certificateType is absent on the wire, not null: {wire}"
+        );
+        assert!(
+            wire.get("csr").is_some(),
+            "csr is always present (required)"
+        );
+    }
+
+    #[test]
+    fn built_sign_certificate_requests_are_schema_valid() {
+        // Both explicit certificate types and the omitted case satisfy the bundled
+        // OCPP 2.0.1 SignCertificate request JSON Schema.
+        let validator = SchemaValidator::v201();
+        for ct in [
+            Some(CertificateSigningUseEnumType::ChargingStationCertificate),
+            Some(CertificateSigningUseEnumType::V2GCertificate),
+            None,
+        ] {
+            let req = v201_sign_certificate_request(ct);
+            validator
+                .validate_call("SignCertificate", &serde_json::to_value(&req).unwrap())
+                .unwrap_or_else(|e| {
+                    panic!("built SignCertificate request (certificate_type={ct:?}) is schema-valid, got: {e}")
+                });
         }
     }
 
