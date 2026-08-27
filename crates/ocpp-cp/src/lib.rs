@@ -157,10 +157,10 @@ use ocpp_types::v201::{
     InstallCertificateStatusEnumType, InstallCertificateUseEnumType, LogStatusEnumType,
     MessageInfoType, MessageTriggerEnumType, MonitoringDataType, NetworkConnectionProfileType,
     OperationalStatusEnumType, PublishFirmwareStatusEnumType, RegistrationStatusEnumType,
-    ReportDataType, RequestStartStopStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
-    SetNetworkProfileStatusEnumType, SetVariableResultType, StatusInfoType,
-    TriggerMessageStatusEnumType, UnlockStatusEnumType, UpdateFirmwareStatusEnumType,
-    UploadLogStatusEnumType,
+    ReportDataType, RequestStartStopStatusEnumType, ReservationUpdateStatusEnumType,
+    ReserveNowStatusEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType,
+    SetVariableResultType, StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -754,6 +754,27 @@ enum RemoteCommand {
     /// receive loop mid-dispatch. The firmware-publish sibling of
     /// [`V201FirmwareUpdate`](Self::V201FirmwareUpdate).
     V201PublishFirmwareStatus { request_id: i32 },
+    /// Report to the CSMS that a previously-held OCPP 2.0.1 reservation is no
+    /// longer valid, via a `ReservationStatusUpdate.req` CALL (Part 2,
+    /// reservation — the CP→CSMS half that closes the loop `ReserveNow` /
+    /// `CancelReservation` open, Issue #546). Queued — never sent inline — for the
+    /// same reason as the other side effects: the outbound CALL must not re-enter
+    /// the receive loop mid-dispatch (`CancelReservation`) and must run off the
+    /// auto-expiry timer task rather than blocking it (`Expired`).
+    ///
+    /// `status` is [`Expired`](ReservationUpdateStatusEnumType::Expired) when the
+    /// reservation's `expiryDateTime` passed and the auto-expiry timer freed the
+    /// slot, or [`Removed`](ReservationUpdateStatusEnumType::Removed) when a
+    /// CSMS-initiated `CancelReservation` tore down a still-held reservation. Only
+    /// ever queued on the `V201` arms — the message does not exist in 1.6J, so a
+    /// 1.6J CP's reservation teardown queues none. There is no in-flight store to
+    /// clear (a single fire-and-forget notification, not a stream), so a
+    /// consumer-gone send simply drops best-effort like
+    /// [`EmitConnectorStatus`](Self::EmitConnectorStatus).
+    V201ReservationStatusUpdate {
+        reservation_id: i32,
+        status: ReservationUpdateStatusEnumType,
+    },
     /// Run the simulated diagnostics-upload state machine for an `Accepted`
     /// `GetDiagnostics` (OCPP 1.6J §4.x, firmware-management profile). Emits
     /// `DiagnosticsStatusNotification(Uploading)` then `Uploaded`.
@@ -4036,6 +4057,7 @@ impl ChargePoint {
                                                     &reservations,
                                                     &expiry_timers,
                                                     &command_sender,
+                                                    OcppVersion::V16J,
                                                 )
                                                 .await;
                                                 ReservationStatus::Accepted
@@ -4167,6 +4189,7 @@ impl ChargePoint {
                                             &reservations,
                                             &expiry_timers,
                                             &command_sender,
+                                            OcppVersion::V201,
                                         )
                                         .await;
                                     }
@@ -4331,6 +4354,22 @@ impl ChargePoint {
                                         });
                                 }
                             }
+                            // Report the CSMS-initiated teardown of a still-held
+                            // reservation to the CSMS as `Removed` (Issue #546),
+                            // the 2.0.1 counterpart to the auto-expiry `Expired`.
+                            // Queued off the CALL path so the `CancelReservation`
+                            // CALLRESULT flushes before this outbound CALL (no
+                            // receive-loop re-entrancy). Only reached when `freed`
+                            // was `Some` — i.e. the reservation was actually held —
+                            // so a cancel of an unknown id (already `Rejected`
+                            // above) reports nothing. Best-effort like the
+                            // connector notification: the cancel is already
+                            // Accepted, so a dropped update must not undo it.
+                            let _ =
+                                command_sender.send(RemoteCommand::V201ReservationStatusUpdate {
+                                    reservation_id: req.reservation_id,
+                                    status: ReservationUpdateStatusEnumType::Removed,
+                                });
                         }
                         Ok(v201_command::v201_cancel_reservation_response(status, None))
                     }
@@ -4917,6 +4956,7 @@ impl ChargePoint {
     /// write-lock, so a racing `CancelReservation` / start-consume can never
     /// double-free. Finished handles are pruned and any prior timer for the same
     /// `reservationId` is aborted, keeping the timer map bounded.
+    #[allow(clippy::too_many_arguments)]
     async fn arm_reservation_expiry(
         reservation_id: i32,
         connector_id: ConnectorId,
@@ -4925,6 +4965,13 @@ impl ChargePoint {
         reservations: &Arc<RwLock<HashMap<i32, ConnectorId>>>,
         expiry_timers: &Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
         command_sender: &mpsc::UnboundedSender<RemoteCommand>,
+        // The dialect this reservation was made on. A 2.0.1 station additionally
+        // reports the auto-expiry to the CSMS via `ReservationStatusUpdate(Expired)`
+        // (Issue #546); 1.6J has no such message, so a 1.6J expiry only frees the
+        // connector. The reservation/expiry machinery is otherwise shared verbatim
+        // between the two `ReserveNow` arms, so the version is threaded in here
+        // rather than duplicating the timer body.
+        protocol_version: OcppVersion,
     ) {
         // `expiry_date` is in the future here (the handler rejects past-dated
         // reservations before arming); `unwrap_or(ZERO)` is purely defensive
@@ -4962,6 +5009,20 @@ impl ChargePoint {
                             status: ChargePointStatus::Available,
                         });
                     }
+                }
+                // Report the auto-expiry to the CSMS on the 2.0.1 dialect only
+                // (Issue #546). Gated on `still_held` (this task actually claimed
+                // and freed the reservation), so a reservation already gone — a
+                // race-losing cancel or a start that consumed it — emits nothing,
+                // and a `CancelReservation` that already reported `Removed` can
+                // never be double-reported here (it removed the map entry, making
+                // `still_held` false, and aborted this timer besides). Best-effort
+                // like the connector notification above.
+                if protocol_version == OcppVersion::V201 {
+                    let _ = command_sender.send(RemoteCommand::V201ReservationStatusUpdate {
+                        reservation_id,
+                        status: ReservationUpdateStatusEnumType::Expired,
+                    });
                 }
             }
             // A fired timer's handle is left in the map; it is reclaimed by the
@@ -5177,6 +5238,13 @@ impl ChargePoint {
                         }
                         RemoteCommand::V201PublishFirmwareStatus { request_id } => {
                             cp.run_v201_publish_firmware_status(request_id).await;
+                        }
+                        RemoteCommand::V201ReservationStatusUpdate {
+                            reservation_id,
+                            status,
+                        } => {
+                            cp.send_v201_reservation_status_update(reservation_id, status)
+                                .await;
                         }
                         RemoteCommand::V201ApplyAvailability {
                             connector_id,
@@ -7596,6 +7664,34 @@ impl ChargePoint {
         }
     }
 
+    /// Send a single `ReservationStatusUpdate(status)` CALL telling the CSMS that
+    /// reservation `reservation_id` is no longer valid (OCPP 2.0.1 Part 2 —
+    /// `Expired` off the auto-expiry timer, `Removed` off an accepted
+    /// `CancelReservation`). A best-effort notification: a send failure is logged,
+    /// not propagated — the reservation is already freed locally, so a dropped
+    /// update must not undo it (the same discipline the reservation
+    /// [`EmitConnectorStatus`](RemoteCommand::EmitConnectorStatus) side effect
+    /// uses). Routed through the [`v201_command`] constructor so the v201 wire type
+    /// stays out of this module's imports.
+    async fn send_v201_reservation_status_update(
+        &self,
+        reservation_id: i32,
+        status: ReservationUpdateStatusEnumType,
+    ) {
+        if let Err(e) = self
+            .call(v201_command::v201_reservation_status_update(
+                reservation_id,
+                status,
+            ))
+            .await
+        {
+            warn!(
+                "v201 reservation: ReservationStatusUpdate({status:?}) for reservation \
+                 {reservation_id}: {e}"
+            );
+        }
+    }
+
     /// Emit a 2.0.1 `StatusNotification` for the EVSE(s) a `TriggerMessage`
     /// targets (`requestedMessage = StatusNotification`).
     ///
@@ -9150,6 +9246,238 @@ mod tests {
             cp.test_connector_status(cid).await,
             ChargePointStatus::Reserved,
             "a rejected cancel leaves the held reservation untouched"
+        );
+    }
+
+    // --- ReservationStatusUpdate (OCPP 2.0.1, #546) ------------------------
+    // The CP→CSMS half that closes the reservation loop: a 2.0.1 station reports
+    // an accepted CancelReservation as `Removed` and an auto-expiry as `Expired`.
+
+    /// How many `ReservationStatusUpdate(status)` commands a drained command list
+    /// carries for `reservation_id` — the assertion primitive these tests share.
+    fn count_reservation_status_updates(
+        commands: &[RemoteCommand],
+        reservation_id: i32,
+        status: ReservationUpdateStatusEnumType,
+    ) -> usize {
+        commands
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    RemoteCommand::V201ReservationStatusUpdate { reservation_id: id, status: s }
+                        if *id == reservation_id && *s == status
+                )
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn v201_cancel_reservation_queues_removed_status_update() {
+        // An accepted 2.0.1 CancelReservation of a still-held reservation queues
+        // exactly one `ReservationStatusUpdate(Removed)` correlated by
+        // reservationId — the CP→CSMS report that the slot is free again.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let cid = ConnectorId::new(1).unwrap();
+        cp.test_reserve(77, cid).await;
+
+        let call = make_call(V201CancelReservationRequest {
+            reservation_id: 77,
+            custom_data: None,
+        });
+        cp.handle_message(Message::Call(call)).await.unwrap();
+
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(
+            count_reservation_status_updates(
+                &commands,
+                77,
+                ReservationUpdateStatusEnumType::Removed
+            ),
+            1,
+            "an accepted cancel queues exactly one Removed update, got: {commands:?}"
+        );
+        // And none reported Expired — a CSMS teardown is Removed, not an expiry.
+        assert_eq!(
+            count_reservation_status_updates(
+                &commands,
+                77,
+                ReservationUpdateStatusEnumType::Expired
+            ),
+            0,
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_cancel_reservation_unknown_id_queues_no_status_update() {
+        // Cancelling an id the station is not holding is Rejected and queues no
+        // ReservationStatusUpdate — there is no reservation whose removal to report.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let cid = ConnectorId::new(1).unwrap();
+        cp.test_reserve(77, cid).await;
+
+        let call = make_call(V201CancelReservationRequest {
+            reservation_id: 88, // not the held id
+            custom_data: None,
+        });
+        cp.handle_message(Message::Call(call)).await.unwrap();
+
+        let commands = v201_drain_commands(&cp).await;
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, RemoteCommand::V201ReservationStatusUpdate { .. })),
+            "a rejected cancel queues no ReservationStatusUpdate, got: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_reservation_expiry_queues_expired_status_update() {
+        // When the auto-expiry timer fires on a V201 station it frees the
+        // connector AND reports `Expired` to the CSMS. Armed with a past
+        // expiryDate (ttl 0) and driven to completion by awaiting the spawned
+        // timer handle, so the assertion is deterministic — no wall-clock wait.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let cid = ConnectorId::new(1).unwrap();
+        cp.test_reserve(77, cid).await;
+
+        let past = chrono::Utc::now() - chrono::Duration::seconds(1);
+        ChargePoint::arm_reservation_expiry(
+            77,
+            cid,
+            past,
+            &cp.connectors,
+            &cp.reservations,
+            &cp.expiry_timers,
+            &cp.command_sender,
+            OcppVersion::V201,
+        )
+        .await;
+        let handle = cp
+            .expiry_timers
+            .write()
+            .await
+            .remove(&77)
+            .expect("the expiry timer was armed");
+        handle.await.expect("the expiry task runs to completion");
+
+        assert_eq!(
+            cp.test_connector_status(cid).await,
+            ChargePointStatus::Available,
+            "an expiry frees the connector"
+        );
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(
+            count_reservation_status_updates(
+                &commands,
+                77,
+                ReservationUpdateStatusEnumType::Expired
+            ),
+            1,
+            "an expiry queues exactly one Expired update, got: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v16_reservation_expiry_queues_no_status_update() {
+        // ReservationStatusUpdate does not exist in 1.6J: an auto-expiry on a
+        // 1.6J station frees the connector (EmitConnectorStatus) but never queues
+        // a ReservationStatusUpdate — the version gate holds even though the
+        // expiry machinery is shared between the two dialects.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        let cid = ConnectorId::new(1).unwrap();
+        cp.test_reserve(55, cid).await;
+
+        let past = chrono::Utc::now() - chrono::Duration::seconds(1);
+        ChargePoint::arm_reservation_expiry(
+            55,
+            cid,
+            past,
+            &cp.connectors,
+            &cp.reservations,
+            &cp.expiry_timers,
+            &cp.command_sender,
+            OcppVersion::V16J,
+        )
+        .await;
+        let handle = cp
+            .expiry_timers
+            .write()
+            .await
+            .remove(&55)
+            .expect("the expiry timer was armed");
+        handle.await.expect("the expiry task runs to completion");
+
+        let commands = v201_drain_commands(&cp).await;
+        assert!(
+            commands
+                .iter()
+                .any(|c| matches!(c, RemoteCommand::EmitConnectorStatus { .. })),
+            "the 1.6J expiry still frees the connector, got: {commands:?}"
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|c| matches!(c, RemoteCommand::V201ReservationStatusUpdate { .. })),
+            "a 1.6J expiry queues no ReservationStatusUpdate, got: {commands:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_cancel_tears_down_expiry_timer_so_it_cannot_double_report() {
+        // A cancel of a held reservation both reports Removed and disarms the
+        // pending auto-expiry timer, so the same reservation can never also be
+        // reported Expired later. Arm a far-future timer (it must not fire during
+        // the test), cancel, and assert: exactly one Removed, no Expired, and the
+        // timer is gone from the store.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let cid = ConnectorId::new(1).unwrap();
+        cp.test_reserve(77, cid).await;
+        let far_future = chrono::Utc::now() + chrono::Duration::hours(1);
+        ChargePoint::arm_reservation_expiry(
+            77,
+            cid,
+            far_future,
+            &cp.connectors,
+            &cp.reservations,
+            &cp.expiry_timers,
+            &cp.command_sender,
+            OcppVersion::V201,
+        )
+        .await;
+        assert!(
+            cp.expiry_timers.read().await.contains_key(&77),
+            "precondition: the expiry timer is armed"
+        );
+
+        let call = make_call(V201CancelReservationRequest {
+            reservation_id: 77,
+            custom_data: None,
+        });
+        cp.handle_message(Message::Call(call)).await.unwrap();
+
+        assert!(
+            !cp.expiry_timers.read().await.contains_key(&77),
+            "the cancel disarms the auto-expiry timer"
+        );
+        let commands = v201_drain_commands(&cp).await;
+        assert_eq!(
+            count_reservation_status_updates(
+                &commands,
+                77,
+                ReservationUpdateStatusEnumType::Removed
+            ),
+            1,
+            "the cancel reports Removed exactly once, got: {commands:?}"
+        );
+        assert_eq!(
+            count_reservation_status_updates(
+                &commands,
+                77,
+                ReservationUpdateStatusEnumType::Expired
+            ),
+            0,
+            "the disarmed timer never reports Expired"
         );
     }
 
