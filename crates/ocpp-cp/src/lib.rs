@@ -144,6 +144,7 @@ use ocpp_messages::v201::{
     StatusNotificationRequest as V201StatusNotificationRequest,
     TriggerMessageRequest as V201TriggerMessageRequest,
     UnlockConnectorRequest as V201UnlockConnectorRequest,
+    UnpublishFirmwareRequest as V201UnpublishFirmwareRequest,
     UpdateFirmwareRequest as V201UpdateFirmwareRequest,
 };
 use ocpp_types::v201::{
@@ -2562,6 +2563,37 @@ impl ChargePoint {
                         status_info,
                     ))
                 }
+            });
+        }
+
+        // UnpublishFirmware (OCPP 2.0.1 only) — the CSMS tells a station acting as
+        // a Local Controller to drop a previously-published firmware image from its
+        // local cache, identified by the same 32-char MD5 `checksum` used to publish
+        // it (Part 2, the firmware-cache teardown, Issue #542). The **remove** side
+        // of the firmware-publish family whose **add** side is `PublishFirmware`
+        // above. Registered only on the V201 arm — 1.6J has no `UnpublishFirmware`,
+        // so a 1.6J CP answers CALLERROR.
+        //
+        // A **stateless**, sync-only pure decide-and-answer: no store side effect,
+        // no queued command — unlike `PublishFirmware` there is no async progress
+        // stream, so the single terminal status is the whole answer. The decision
+        // (`v201_command::v201_unpublish_firmware_decision`) is a lightweight shape
+        // predicate — the same 32-char-hex `checksum` predicate `PublishFirmware`
+        // uses — a well-shaped checksum → `Unpublished`; a mis-shaped one →
+        // `NoFirmware` (the stateless simulator holds no publish store, so a
+        // mis-shaped checksum can never match a cached image). `DownloadOngoing`
+        // stays a documented unproduced seam until a real publish-cache store lands.
+        //
+        // Trust boundary: `checksum` is attacker-influenced CSMS input, inspected
+        // only for shape and never opened/followed/parsed/indexed, so no wire value
+        // (empty, garbage, control chars, non-ASCII) can panic. Over-length
+        // (`checksum` maxLength 32) is refused at the schema layer (→ CALLERROR)
+        // before the handler runs. Ports `ocpp.v201.call.UnpublishFirmware` →
+        // `ocpp.v201.call_result.UnpublishFirmware`.
+        if matches!(protocol_version, OcppVersion::V201) {
+            d.on(move |req: V201UnpublishFirmwareRequest| async move {
+                let status = v201_command::v201_unpublish_firmware_decision(&req);
+                Ok(v201_command::v201_unpublish_firmware_response(status))
             });
         }
 
@@ -8249,6 +8281,7 @@ mod tests {
     use ocpp_messages::{CallMessage, Message, MessageType};
     use ocpp_types::common::AvailabilityType;
     use ocpp_types::v16j::{ConfigurationStatus, RemoteStartStopStatus, ResetType};
+    use ocpp_types::v201::UnpublishFirmwareStatusEnumType;
     use ocpp_types::CallResultMessage;
 
     // Helper: build a CallMessage from an action struct
@@ -11772,6 +11805,45 @@ mod tests {
         }
     }
 
+    // --- OCPP 2.0.1 UnpublishFirmware (M7, issue #542) ---------------------
+    // A `for_version(V201)` CP synchronously answers the Local-Controller
+    // firmware-cache teardown: a 32-char hex `checksum` → Unpublished; a
+    // mis-shaped checksum → NoFirmware. Stateless (queues nothing) and V201-only,
+    // the remove side of the PublishFirmware family. These exercise the wired V201
+    // arm end-to-end over `handle_message`.
+
+    fn make_v201_unpublish_firmware(checksum: &str) -> CallMessage {
+        make_call(V201UnpublishFirmwareRequest {
+            checksum: checksum.to_string(),
+            custom_data: None,
+        })
+    }
+
+    /// Read the `UnpublishFirmware.conf` out of a `handle_message` reply,
+    /// asserting the reply is a CALLRESULT.
+    async fn unpublish_firmware_response(
+        cp: &ChargePoint,
+        call: CallMessage,
+    ) -> ocpp_messages::v201::UnpublishFirmwareResponse {
+        let resp = cp.handle_message(Message::Call(call)).await.unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => r.payload_as().unwrap(),
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_unpublish_firmware_unpublishes_a_hex_checksum() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let body =
+            unpublish_firmware_response(&cp, make_v201_unpublish_firmware(SAMPLE_FW_MD5)).await;
+        assert_eq!(body.status, UnpublishFirmwareStatusEnumType::Unpublished);
+        assert!(
+            v201_drain_commands(&cp).await.is_empty(),
+            "UnpublishFirmware is a stateless, sync-only responder — it queues nothing"
+        );
+    }
+
     #[tokio::test]
     async fn v201_publish_firmware_rejected_queues_no_stream_and_records_nothing() {
         // AC #540: a Rejected publish drives no async stream and records nothing —
@@ -11788,6 +11860,65 @@ mod tests {
             v201_drain_commands(&cp).await.is_empty(),
             "a rejected publish queues no progress stream"
         );
+    }
+
+    #[tokio::test]
+    async fn v201_unpublish_firmware_reports_no_firmware_for_a_bad_checksum() {
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        // A mis-shaped checksum (empty and non-hex) names no cached image.
+        for checksum in ["", "not-a-hex-digest"] {
+            let body =
+                unpublish_firmware_response(&cp, make_v201_unpublish_firmware(checksum)).await;
+            assert_eq!(
+                body.status,
+                UnpublishFirmwareStatusEnumType::NoFirmware,
+                "checksum {checksum:?} reports NoFirmware"
+            );
+        }
+        assert!(v201_drain_commands(&cp).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn v201_unpublish_firmware_is_v201_only() {
+        // A 1.6J CP has no UnpublishFirmware handler (1.6J has no such command), so
+        // the v201-only action is unrouted → CallError, never a CallResult.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V16J)).unwrap();
+        let resp = cp
+            .handle_message(Message::Call(make_v201_unpublish_firmware(SAMPLE_FW_MD5)))
+            .await
+            .unwrap();
+        assert!(
+            matches!(resp, Some(Message::CallError(_))),
+            "a 1.6J CP does not answer UnpublishFirmware with a CallResult, got: {resp:?}"
+        );
+    }
+
+    #[test]
+    fn v201_unpublish_firmware_request_and_response_are_schema_valid() {
+        let validator = SchemaValidator::v201();
+        let req = V201UnpublishFirmwareRequest {
+            checksum: SAMPLE_FW_MD5.to_string(),
+            custom_data: None,
+        };
+        validator
+            .validate_call("UnpublishFirmware", &serde_json::to_value(&req).unwrap())
+            .expect("UnpublishFirmware request is schema-valid");
+
+        // Every status arm the handler can emit — plus the documented unproduced
+        // `DownloadOngoing` seam — serializes to a schema-valid response.
+        for status in [
+            UnpublishFirmwareStatusEnumType::DownloadOngoing,
+            UnpublishFirmwareStatusEnumType::NoFirmware,
+            UnpublishFirmwareStatusEnumType::Unpublished,
+        ] {
+            let resp = ocpp_messages::v201::UnpublishFirmwareResponse {
+                status,
+                custom_data: None,
+            };
+            validator
+                .validate_call_result("UnpublishFirmware", &serde_json::to_value(&resp).unwrap())
+                .expect("UnpublishFirmware response is schema-valid");
+        }
     }
 
     #[tokio::test]
