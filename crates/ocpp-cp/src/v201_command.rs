@@ -2425,7 +2425,7 @@ pub fn v201_placeholder_csr() -> String {
 /// Ports [`ocpp.v201.call.SignCertificate`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
 /// In 2.0.1 the station originates provisioning: it sends this request carrying a
 /// PEM-encoded CSR, the CSMS acknowledges synchronously with a
-/// [`GenericStatusEnumType`](ocpp_types::v201::GenericStatusEnumType)
+/// [`GenericStatusEnumType`]
 /// (`Accepted` / `Rejected`), and the operator's CA later returns the signed
 /// chain out-of-band via the paired `CertificateSigned` CALL (the delivery
 /// terminus this module already answers, [`v201_certificate_signed_status`]).
