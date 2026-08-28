@@ -3037,9 +3037,14 @@ impl ChargePoint {
         // as one or more `ReportChargingProfiles` CALL(s), correlated by
         // `requestId`.
         //
-        // The match set is resolved here off a snapshot of the `v201_tx_profiles`
-        // store (taken under its read lock on the CALL path), so the queued side
-        // effect carries owned data and touches no shared state when it runs.
+        // The match set is resolved here off a combined snapshot of all three
+        // v201 charging-profile stores — the per-EVSE `v201_tx_profiles`, the
+        // `v201_tx_default_profiles` defaults, and the `v201_station_ceilings`
+        // ceilings (#519) — each taken under its read lock on the CALL path, so
+        // the queued side effect carries owned data and touches no shared state
+        // when it runs. A station that has installed a `TxDefaultProfile` or a
+        // station ceiling therefore reports its full configuration, not just its
+        // `TxProfile`s (the pre-#519 gap that under-reported installed profiles).
         // Status:
         // - ≥1 matching profile → `Accepted`, and a `V201ReportChargingProfiles`
         //   is queued on the command channel (sent after this CALLRESULT is
@@ -3062,16 +3067,33 @@ impl ChargePoint {
         // `ocpp.v201.call.ReportChargingProfiles`.
         if matches!(protocol_version, OcppVersion::V201) {
             let v201_tx_profiles = v201_tx_profiles.clone();
+            let v201_tx_default_profiles = v201_tx_default_profiles.clone();
+            let v201_station_ceilings = v201_station_ceilings.clone();
             let command_sender = command_sender.clone();
             d.on(move |req: V201GetChargingProfilesRequest| {
                 let v201_tx_profiles = v201_tx_profiles.clone();
+                let v201_tx_default_profiles = v201_tx_default_profiles.clone();
+                let v201_station_ceilings = v201_station_ceilings.clone();
                 let command_sender = command_sender.clone();
                 async move {
-                    // Snapshot off the store lock, then resolve the match set with
-                    // the pure selector. In the simulator the CSMS's CALLs are
-                    // serialized through the single dispatcher, so the snapshot
-                    // cannot be raced by a concurrent install/clear.
-                    let installed = v201_tx_profiles.snapshot().await;
+                    // Snapshot every v201 charging-profile store off its own lock,
+                    // then resolve the match set with the pure selector over the
+                    // combined set. In the simulator the CSMS's CALLs are
+                    // serialized through the single dispatcher, so no snapshot can
+                    // be raced by a concurrent install/clear. The ceiling store is
+                    // keyed by `(CeilingKind, evseId)`; its `CeilingKind` is
+                    // dropped here — the selector and report page on `evseId`, and
+                    // each ceiling profile already carries its own
+                    // `chargingProfilePurpose` for the criterion filter.
+                    let mut installed = v201_tx_profiles.snapshot().await;
+                    installed.extend(v201_tx_default_profiles.snapshot().await);
+                    installed.extend(
+                        v201_station_ceilings
+                            .snapshot()
+                            .await
+                            .into_iter()
+                            .map(|(_kind, evse_id, profile)| (evse_id, profile)),
+                    );
                     let matches = v201_command::v201_get_charging_profiles_matches(
                         req.evse_id,
                         &req.charging_profile,
