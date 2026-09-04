@@ -42,6 +42,8 @@ use ocpp_messages::v201::{
     ResetRequest as V201ResetRequest, SetChargingProfileRequest as V201SetChargingProfileRequest,
     SetVariablesRequest as V201SetVariablesRequest,
     SetVariablesResponse as V201SetVariablesResponse,
+    SignCertificateRequest as V201SignCertificateRequest,
+    SignCertificateResponse as V201SignCertificateResponse,
     StatusNotificationRequest as V201StatusNotificationRequest,
     StatusNotificationResponse as V201StatusNotificationResponse, TransactionEventRequest,
     TransactionEventResponse, TriggerMessageRequest as V201TriggerMessageRequest,
@@ -55,12 +57,13 @@ use ocpp_transport::{
 };
 use ocpp_types::common::Reason;
 use ocpp_types::v201::{
-    AttributeEnumType, BootReasonEnumType, ChangeAvailabilityStatusEnumType,
-    ChargingProfileCriterionType, ChargingProfileKindEnumType, ChargingProfilePurposeEnumType,
-    ChargingProfileStatusEnumType, ChargingProfileType, ChargingRateUnitEnumType,
-    ChargingSchedulePeriodType, ChargingScheduleType, ClearChargingProfileStatusEnumType,
-    ClearChargingProfileType, ComponentType, ConnectorStatusEnumType, DataTransferStatusEnumType,
-    EvseType, GenericDeviceModelStatusEnumType, GetChargingProfileStatusEnumType,
+    AttributeEnumType, BootReasonEnumType, CertificateSigningUseEnumType,
+    ChangeAvailabilityStatusEnumType, ChargingProfileCriterionType, ChargingProfileKindEnumType,
+    ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
+    ChargingRateUnitEnumType, ChargingSchedulePeriodType, ChargingScheduleType,
+    ClearChargingProfileStatusEnumType, ClearChargingProfileType, ComponentType,
+    ConnectorStatusEnumType, DataTransferStatusEnumType, EvseType,
+    GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetChargingProfileStatusEnumType,
     GetVariableDataType, GetVariableStatusEnumType, IdTokenEnumType, IdTokenType,
     MeasurandEnumType, MessageTriggerEnumType, MutabilityEnumType, OperationalStatusEnumType,
     ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType, ReportBaseEnumType,
@@ -3618,6 +3621,106 @@ async fn v201_get_charging_profiles_accepts_and_streams_report_then_no_profiles_
     server.stop().await.expect("server stop");
 }
 
+// ---------------------------------------------------------------------------
+// OCPP 2.0.1 CP -> CSMS `SignCertificate` (Issue #547): the station *originates*
+// the certificate-provisioning flow. Unlike every other v201 command test in
+// this file (CSMS -> CP CALLs the station answers), here the CP drives the
+// outbound `SignCertificate.req` and the in-process CSMS answers a
+// `GenericStatusEnumType` acknowledgement, which `request_sign_certificate`
+// surfaces. A green run proves the request reaches the CSMS with the placeholder
+// CSR and the selected `certificateType`, having passed the server's inbound
+// `SchemaValidator::v201()`, and that both `Accepted` and `Rejected`
+// acknowledgements are parsed without panic.
+// ---------------------------------------------------------------------------
+
+/// Start a v201 CSMS that captures each `SignCertificate.req` it receives and
+/// answers every one with `status`. Returns the server, its address, and the
+/// shared capture log (one entry per request, in arrival order).
+async fn start_v201_csms_recording_sign_certificate(
+    status: GenericStatusEnumType,
+) -> (
+    OcppServer,
+    SocketAddr,
+    Arc<Mutex<Vec<V201SignCertificateRequest>>>,
+) {
+    let received: Arc<Mutex<Vec<V201SignCertificateRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let received_for_handler = received.clone();
+    let (server, addr) = start_v201_csms(move |dispatcher| {
+        let received = received_for_handler;
+        dispatcher.on(move |req: V201SignCertificateRequest| {
+            let received = received.clone();
+            async move {
+                received
+                    .lock()
+                    .expect("sign-certificate capture mutex not poisoned")
+                    .push(req);
+                Ok(V201SignCertificateResponse {
+                    status,
+                    status_info: None,
+                    custom_data: None,
+                })
+            }
+        });
+    })
+    .await;
+    (server, addr, received)
+}
+
+#[tokio::test]
+async fn v201_sign_certificate_originates_with_placeholder_csr_over_the_wire() {
+    let (mut server, addr, received) =
+        start_v201_csms_recording_sign_certificate(GenericStatusEnumType::Accepted).await;
+
+    let cp =
+        ChargePoint::new(v201_cp_config(addr, "CP201_SIGNCERT")).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // Originate a SignCertificate for the Charging-Station certificate.
+    let status = cp
+        .request_sign_certificate(Some(
+            CertificateSigningUseEnumType::ChargingStationCertificate,
+        ))
+        .await
+        .expect("SignCertificate call round-trips");
+    assert_eq!(
+        status,
+        GenericStatusEnumType::Accepted,
+        "the CSMS acknowledged the CSR, and the ack is surfaced verbatim"
+    );
+
+    // Originate a second one with the certificateType omitted (both connections).
+    let status2 = cp
+        .request_sign_certificate(None)
+        .await
+        .expect("second SignCertificate call round-trips");
+    assert_eq!(status2, GenericStatusEnumType::Accepted);
+
+    let calls = received
+        .lock()
+        .expect("sign-certificate capture mutex not poisoned")
+        .clone();
+    assert_eq!(calls.len(), 2, "the CSMS received exactly the two CSRs");
+
+    // The first carried the selected certificateType; both carry a non-empty,
+    // PEM `CERTIFICATE REQUEST`-shaped CSR (the request already passed the
+    // server's inbound v201 schema validation to reach the handler).
+    assert_eq!(
+        calls[0].certificate_type,
+        Some(CertificateSigningUseEnumType::ChargingStationCertificate)
+    );
+    assert!(calls[0].csr.contains("-----BEGIN CERTIFICATE REQUEST-----"));
+    assert!(!calls[0].csr.is_empty());
+    // The omitted-type request arrived with certificateType absent.
+    assert_eq!(
+        calls[1].certificate_type, None,
+        "an omitted certificateType stays absent end to end"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+// ---------------------------------------------------------------------------
 // OCPP 2.0.1 CSMS -> CP `GetChargingProfiles` enumerates *all three* charging-
 // profile stores (Issue #519): the report must cover installed `TxDefaultProfile`
 // and station-ceiling (`ChargingStationMaxProfile` /
@@ -4052,4 +4155,51 @@ async fn v201_clear_charging_profile_clears_default_and_ceiling_stores_over_the_
 
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_sign_certificate_surfaces_a_rejected_acknowledgement() {
+    // A CSMS that cannot process the CSR answers `Rejected` — a valid *protocol*
+    // outcome, surfaced as `Ok(Rejected)`, never an error or a panic.
+    let (mut server, addr, _received) =
+        start_v201_csms_recording_sign_certificate(GenericStatusEnumType::Rejected).await;
+
+    let cp = ChargePoint::new(v201_cp_config(addr, "CP201_SIGNCERT_REJ"))
+        .expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    let status = cp
+        .request_sign_certificate(Some(CertificateSigningUseEnumType::V2GCertificate))
+        .await
+        .expect("a Rejected acknowledgement is still a successful round-trip");
+    assert_eq!(status, GenericStatusEnumType::Rejected);
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_sign_certificate_is_refused_on_a_1_6j_station() {
+    // `SignCertificate` is an OCPP 2.0.1 message with no 1.6J twin on this path,
+    // so originating it on a `V16J` station is refused up front (NotSupported),
+    // never put on the wire. No CSMS is needed — the guard short-circuits before
+    // any connection check.
+    let cp = ChargePoint::new(ChargePointConfig {
+        charge_point_id: "CP16_SIGNCERT".to_string(),
+        central_system_url: "ws://127.0.0.1:1".to_string(),
+        auto_reconnect: false,
+        ..ChargePointConfig::for_version(OcppVersion::V16J)
+    })
+    .expect("build 1.6J charge point");
+
+    let err = cp
+        .request_sign_certificate(Some(
+            CertificateSigningUseEnumType::ChargingStationCertificate,
+        ))
+        .await
+        .expect_err("SignCertificate is refused on a 1.6J station");
+    assert!(
+        matches!(err, ocpp_types::OcppError::NotSupported { .. }),
+        "the 1.6J guard reports NotSupported, got: {err:?}"
+    );
 }
