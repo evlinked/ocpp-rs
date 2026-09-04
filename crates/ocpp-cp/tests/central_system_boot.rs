@@ -27,6 +27,8 @@ use ocpp_messages::v201::{
     ChangeAvailabilityRequest as V201ChangeAvailabilityRequest,
     ClearChargingProfileRequest as V201ClearChargingProfileRequest,
     DataTransferRequest as V201DataTransferRequest,
+    Get15118EVCertificateRequest as V201Get15118EVCertificateRequest,
+    Get15118EVCertificateResponse as V201Get15118EVCertificateResponse,
     GetBaseReportRequest as V201GetBaseReportRequest,
     GetBaseReportResponse as V201GetBaseReportResponse,
     GetChargingProfilesRequest as V201GetChargingProfilesRequest,
@@ -57,19 +59,19 @@ use ocpp_transport::{
 };
 use ocpp_types::common::Reason;
 use ocpp_types::v201::{
-    AttributeEnumType, BootReasonEnumType, CertificateSigningUseEnumType,
-    ChangeAvailabilityStatusEnumType, ChargingProfileCriterionType, ChargingProfileKindEnumType,
-    ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
-    ChargingRateUnitEnumType, ChargingSchedulePeriodType, ChargingScheduleType,
-    ClearChargingProfileStatusEnumType, ClearChargingProfileType, ComponentType,
-    ConnectorStatusEnumType, DataTransferStatusEnumType, EvseType,
+    AttributeEnumType, BootReasonEnumType, CertificateActionEnumType,
+    CertificateSigningUseEnumType, ChangeAvailabilityStatusEnumType, ChargingProfileCriterionType,
+    ChargingProfileKindEnumType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
+    ChargingProfileType, ChargingRateUnitEnumType, ChargingSchedulePeriodType,
+    ChargingScheduleType, ClearChargingProfileStatusEnumType, ClearChargingProfileType,
+    ComponentType, ConnectorStatusEnumType, DataTransferStatusEnumType, EvseType,
     GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetChargingProfileStatusEnumType,
     GetVariableDataType, GetVariableStatusEnumType, IdTokenEnumType, IdTokenType,
-    MeasurandEnumType, MessageTriggerEnumType, MutabilityEnumType, OperationalStatusEnumType,
-    ReadingContextEnumType, ReasonEnumType, RegistrationStatusEnumType, ReportBaseEnumType,
-    RequestStartStopStatusEnumType, ResetEnumType, ResetStatusEnumType, SetVariableDataType,
-    SetVariableStatusEnumType, TransactionEventEnumType, TriggerMessageStatusEnumType,
-    TriggerReasonEnumType, UnlockStatusEnumType, VariableType,
+    Iso15118EVCertificateStatusEnumType, MeasurandEnumType, MessageTriggerEnumType,
+    MutabilityEnumType, OperationalStatusEnumType, ReadingContextEnumType, ReasonEnumType,
+    RegistrationStatusEnumType, ReportBaseEnumType, RequestStartStopStatusEnumType, ResetEnumType,
+    ResetStatusEnumType, SetVariableDataType, SetVariableStatusEnumType, TransactionEventEnumType,
+    TriggerMessageStatusEnumType, TriggerReasonEnumType, UnlockStatusEnumType, VariableType,
 };
 use ocpp_types::{ConnectorId, OcppVersion};
 
@@ -4198,6 +4200,174 @@ async fn v201_sign_certificate_is_refused_on_a_1_6j_station() {
         ))
         .await
         .expect_err("SignCertificate is refused on a 1.6J station");
+    assert!(
+        matches!(err, ocpp_types::OcppError::NotSupported { .. }),
+        "the 1.6J guard reports NotSupported, got: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// OCPP 2.0.1 CP -> CSMS `Get15118EVCertificate` (Issue #558): the station
+// *originates* the ISO 15118 Plug-and-Charge certificate-exchange relay. Like
+// `SignCertificate` above (and unlike the CSMS -> CP command tests), the CP
+// drives the outbound `Get15118EVCertificate.req` carrying the EV's opaque EXI
+// request; the in-process CSMS answers a status + `exiResponse`, which
+// `request_get_15118_ev_certificate` surfaces in full. A green run proves the
+// request reaches the CSMS having passed the server's inbound
+// `SchemaValidator::v201()`, and that both `Accepted` (with a non-empty
+// `exiResponse`) and `Failed` outcomes are parsed without panic.
+// ---------------------------------------------------------------------------
+
+/// Start a v201 CSMS that captures each `Get15118EVCertificate.req` it receives
+/// and answers every one with `status` + `exi_response`. Returns the server, its
+/// address, and the shared capture log (one entry per request, in arrival order).
+async fn start_v201_csms_recording_get_15118_ev_certificate(
+    status: Iso15118EVCertificateStatusEnumType,
+    exi_response: &'static str,
+) -> (
+    OcppServer,
+    SocketAddr,
+    Arc<Mutex<Vec<V201Get15118EVCertificateRequest>>>,
+) {
+    let received: Arc<Mutex<Vec<V201Get15118EVCertificateRequest>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let received_for_handler = received.clone();
+    let (server, addr) = start_v201_csms(move |dispatcher| {
+        let received = received_for_handler;
+        dispatcher.on(move |req: V201Get15118EVCertificateRequest| {
+            let received = received.clone();
+            async move {
+                received
+                    .lock()
+                    .expect("get-15118-ev-certificate capture mutex not poisoned")
+                    .push(req);
+                Ok(V201Get15118EVCertificateResponse {
+                    status,
+                    exi_response: exi_response.to_string(),
+                    status_info: None,
+                    custom_data: None,
+                })
+            }
+        });
+    })
+    .await;
+    (server, addr, received)
+}
+
+#[tokio::test]
+async fn v201_get_15118_ev_certificate_originates_for_install_and_update() {
+    let (mut server, addr, received) = start_v201_csms_recording_get_15118_ev_certificate(
+        Iso15118EVCertificateStatusEnumType::Accepted,
+        "b64-exi-CertificateInstallationRes",
+    )
+    .await;
+
+    let cp = ChargePoint::new(v201_cp_config(addr, "CP201_15118EVCERT"))
+        .expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    // Originate an Install relay.
+    let resp = cp
+        .request_get_15118_ev_certificate(
+            "urn:iso:15118:2:2013:MsgDef",
+            CertificateActionEnumType::Install,
+            "b64-exi-install-req",
+        )
+        .await
+        .expect("Get15118EVCertificate call round-trips");
+    assert_eq!(resp.status, Iso15118EVCertificateStatusEnumType::Accepted);
+    assert_eq!(
+        resp.exi_response, "b64-exi-CertificateInstallationRes",
+        "the CSMS's opaque exiResponse is surfaced verbatim for the station to relay to the EV"
+    );
+
+    // Originate an Update relay.
+    let resp2 = cp
+        .request_get_15118_ev_certificate(
+            "urn:iso:15118:2:2013:MsgDef",
+            CertificateActionEnumType::Update,
+            "b64-exi-update-req",
+        )
+        .await
+        .expect("second Get15118EVCertificate call round-trips");
+    assert_eq!(resp2.status, Iso15118EVCertificateStatusEnumType::Accepted);
+
+    let calls = received
+        .lock()
+        .expect("get-15118-ev-certificate capture mutex not poisoned")
+        .clone();
+    assert_eq!(calls.len(), 2, "the CSMS received exactly the two relays");
+    // Each request reached the handler having passed the server's inbound v201
+    // schema validation, carrying its action and the EV's EXI request verbatim.
+    assert_eq!(calls[0].action, CertificateActionEnumType::Install);
+    assert_eq!(calls[0].exi_request, "b64-exi-install-req");
+    assert_eq!(
+        calls[0].iso15118_schema_version,
+        "urn:iso:15118:2:2013:MsgDef"
+    );
+    assert_eq!(calls[1].action, CertificateActionEnumType::Update);
+    assert_eq!(calls[1].exi_request, "b64-exi-update-req");
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_get_15118_ev_certificate_surfaces_a_failed_outcome_without_panic() {
+    // A CSMS that could not process the relay answers `Failed` — a valid
+    // *protocol* outcome, surfaced as `Ok(Failed)`, never an error or a panic.
+    // The schema still requires an `exiResponse` string; the CSMS uses an empty
+    // one when it produced no response.
+    let (mut server, addr, _received) = start_v201_csms_recording_get_15118_ev_certificate(
+        Iso15118EVCertificateStatusEnumType::Failed,
+        "",
+    )
+    .await;
+
+    let cp = ChargePoint::new(v201_cp_config(addr, "CP201_15118EVCERT_FAIL"))
+        .expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+
+    let resp = cp
+        .request_get_15118_ev_certificate(
+            "urn:iso:15118:2:2013:MsgDef",
+            CertificateActionEnumType::Install,
+            "b64-exi-install-req",
+        )
+        .await
+        .expect("a Failed outcome is still a successful round-trip");
+    assert_eq!(resp.status, Iso15118EVCertificateStatusEnumType::Failed);
+    assert_eq!(
+        resp.exi_response, "",
+        "a Failed outcome may carry an empty exiResponse, surfaced without panic"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
+#[tokio::test]
+async fn v201_get_15118_ev_certificate_is_refused_on_a_1_6j_station() {
+    // `Get15118EVCertificate` is an OCPP 2.0.1 message with no 1.6J twin, so
+    // originating it on a `V16J` station is refused up front (NotSupported),
+    // never put on the wire. No CSMS is needed — the guard short-circuits before
+    // any connection check.
+    let cp = ChargePoint::new(ChargePointConfig {
+        charge_point_id: "CP16_15118EVCERT".to_string(),
+        central_system_url: "ws://127.0.0.1:1".to_string(),
+        auto_reconnect: false,
+        ..ChargePointConfig::for_version(OcppVersion::V16J)
+    })
+    .expect("build 1.6J charge point");
+
+    let err = cp
+        .request_get_15118_ev_certificate(
+            "urn:iso:15118:2:2013:MsgDef",
+            CertificateActionEnumType::Install,
+            "b64-exi-install-req",
+        )
+        .await
+        .expect_err("Get15118EVCertificate is refused on a 1.6J station");
     assert!(
         matches!(err, ocpp_types::OcppError::NotSupported { .. }),
         "the 1.6J guard reports NotSupported, got: {err:?}"
