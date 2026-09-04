@@ -29,6 +29,7 @@ pub mod v201_display_message;
 pub mod v201_firmware_update;
 pub mod v201_log_upload;
 pub mod v201_network_profile;
+pub mod v201_pending_csr;
 pub mod v201_publish_firmware;
 pub mod v201_station_ceiling;
 pub mod v201_transaction;
@@ -88,6 +89,7 @@ use v201_display_message::V201DisplayMessageStore;
 use v201_firmware_update::V201FirmwareUpdateStore;
 use v201_log_upload::V201LogUploadStore;
 use v201_network_profile::V201NetworkProfileStore;
+use v201_pending_csr::{CsrCorrelation, V201PendingCsrStore};
 use v201_publish_firmware::V201PublishFirmwareStore;
 use v201_station_ceiling::{CeilingKind, V201StationCeilingStore};
 use v201_tx_default_profile::V201TxDefaultProfileStore;
@@ -1196,6 +1198,16 @@ pub struct ChargePoint {
     /// per id, with no supersede. Empty on the 1.6J path (the handler is
     /// V201-only). See [`V201PublishFirmwareStore`].
     v201_publish_firmwares: Arc<V201PublishFirmwareStore>,
+    /// The single outstanding `SignCertificate` (CSR) request the station has
+    /// originated but not yet seen answered (OCPP 2.0.1 Part 2, A02, Issue #553).
+    /// Recorded by [`request_sign_certificate`](Self::request_sign_certificate)
+    /// when the CSMS accepts the CSR, and correlated/cleared by the inbound
+    /// `CertificateSigned` handler when the CA-signed chain is accepted — the
+    /// marker that lets the delivery recognize itself as *this* request's answer
+    /// (solicited) versus an unsolicited chain. Idle on the 1.6J path (the
+    /// CP-initiated `SignCertificate` hook is V201-only). See
+    /// [`V201PendingCsrStore`].
+    v201_pending_csr: Arc<V201PendingCsrStore>,
     /// Latest running total cost the CSMS has pushed per transaction id via the
     /// 2.0.1 `CostUpdated` message (Issue #502), keyed by the wire
     /// `transactionId` string. Upserted by the V201-only `CostUpdated` handler
@@ -1410,6 +1422,13 @@ impl ChargePoint {
         // CALL path; empty on the 1.6J path (the handler is V201-only).
         let v201_publish_firmwares = Arc::new(V201PublishFirmwareStore::new());
 
+        // The pending-CSR marker the CP-initiated `SignCertificate` flow records
+        // into (Issue #553). Shared into the default dispatcher so the inbound
+        // `CertificateSigned` handler can correlate an accepted chain back to the
+        // outstanding request straight from the CALL path; idle on the 1.6J path
+        // (the `SignCertificate` hook is V201-only).
+        let v201_pending_csr = Arc::new(V201PendingCsrStore::new());
+
         // Issue #471: v201 `TxDefaultProfile` store, shared into the default
         // dispatcher (the `SetChargingProfile` command installs a default into it)
         // and kept on the CP (the metering sampler and `GetCompositeSchedule` read
@@ -1477,6 +1496,7 @@ impl ChargePoint {
             v201_firmware_updates.clone(),
             v201_customer_information_reports.clone(),
             v201_publish_firmwares.clone(),
+            v201_pending_csr.clone(),
             v201_costs.clone(),
             expiry_timers.clone(),
             config.unlock_connector_outcome,
@@ -1517,6 +1537,7 @@ impl ChargePoint {
             v201_firmware_updates,
             v201_customer_information_reports,
             v201_publish_firmwares,
+            v201_pending_csr,
             v201_costs,
             reservations,
             expiry_timers,
@@ -1565,6 +1586,7 @@ impl ChargePoint {
         v201_firmware_updates: Arc<V201FirmwareUpdateStore>,
         v201_customer_information_reports: Arc<V201CustomerInformationStore>,
         v201_publish_firmwares: Arc<V201PublishFirmwareStore>,
+        v201_pending_csr: Arc<V201PendingCsrStore>,
         v201_costs: Arc<V201CostStore>,
         expiry_timers: Arc<RwLock<HashMap<i32, tokio::task::JoinHandle<()>>>>,
         unlock_outcome: UnlockConnectorOutcome,
@@ -2343,16 +2365,29 @@ impl ChargePoint {
         // `GetInstalledCertificateIds` — trust anchors). Registered only on the
         // V201 arm — 1.6 has no such provisioning message here.
         //
-        // A **stateless** pure decide-and-answer: no store side effect, no queued
-        // command. The decision (`v201_command::v201_certificate_signed_status`) is
-        // a lightweight predicate on the PEM string — **no X.509 parse** (the same
-        // documented simulator boundary as `InstallCertificate`): a PEM-armored
-        // chain with a non-empty body → `Accepted`; an empty / blank / non-PEM /
-        // empty-bodied chain → `Rejected` with a `statusInfo` reason. Unlike
-        // `InstallCertificate`'s three-value enum, `CertificateSignedStatusEnumType`
-        // is binary, so the "recognized but unusable" arm collapses into `Rejected`.
-        // A future station-certificate store could persist an accepted chain; for
-        // this slice a stateless responder is sufficient and keeps the diff small.
+        // The acceptance decision (`v201_command::v201_certificate_signed_status`)
+        // is a lightweight, stateless predicate on the PEM string — **no X.509
+        // parse** (the same documented simulator boundary as `InstallCertificate`):
+        // a PEM-armored chain with a non-empty body → `Accepted`; an empty / blank
+        // / non-PEM / empty-bodied chain → `Rejected` with a `statusInfo` reason.
+        // Unlike `InstallCertificate`'s three-value enum,
+        // `CertificateSignedStatusEnumType` is binary, so the "recognized but
+        // unusable" arm collapses into `Rejected`.
+        //
+        // Beyond that decision the handler carries one small side effect (Issue
+        // #553): it **correlates** an accepted delivery back to the outstanding CSR
+        // the station itself submitted via `SignCertificate` (recorded in
+        // `v201_pending_csr` by `request_sign_certificate`). An accepted chain
+        // installs the station's own certificate, completing the provisioning loop,
+        // so it clears the pending marker and logs whether the delivery was
+        // *solicited* (it answered a tracked request) or *unsolicited* (no CSR was
+        // outstanding). Unsolicited deliveries are still accepted on chain shape
+        // alone — the backward-compatible behavior, since a station may legitimately
+        // receive a chain it did not track in memory (e.g. after a restart) — the
+        // correlation only observes, it does not gate the wire answer. A *rejected*
+        // (unusable) delivery leaves the marker in place: the CSR is still awaiting
+        // a usable chain. The correlation compares only the closed `certificate_type`
+        // enum and an internal sequence; the opaque chain is never parsed (no PKI).
         //
         // Trust boundary: `certificate_chain` is attacker-influenced CSMS input,
         // treated as an opaque bounded string — inspected, never parsed/unwrapped,
@@ -2363,23 +2398,60 @@ impl ChargePoint {
         // `ocpp.v201.call.CertificateSigned` →
         // `ocpp.v201.call_result.CertificateSigned`.
         if matches!(protocol_version, OcppVersion::V201) {
-            d.on(move |req: V201CertificateSignedRequest| async move {
-                let status = v201_command::v201_certificate_signed_status(&req.certificate_chain);
-                let status_info = match status {
-                    CertificateSignedStatusEnumType::Accepted => None,
-                    CertificateSignedStatusEnumType::Rejected => Some(StatusInfoType {
-                        reason_code: "InvalidChain".to_string(),
-                        additional_info: Some(
-                            "certificate chain is empty or not a usable PEM-encoded certificate"
-                                .to_string(),
-                        ),
-                        custom_data: None,
-                    }),
-                };
-                Ok(v201_command::v201_certificate_signed_response(
-                    status,
-                    status_info,
-                ))
+            let pending_csr = v201_pending_csr.clone();
+            d.on(move |req: V201CertificateSignedRequest| {
+                let pending_csr = pending_csr.clone();
+                async move {
+                    let status =
+                        v201_command::v201_certificate_signed_status(&req.certificate_chain);
+                    let status_info = match status {
+                        CertificateSignedStatusEnumType::Accepted => {
+                            // Provisioning loop complete: clear the pending CSR and
+                            // observe whether this delivery answered it.
+                            match pending_csr.correlate_accepted().await {
+                                CsrCorrelation::Solicited(marker) => {
+                                    if req.certificate_type == marker.certificate_type {
+                                        info!(
+                                            csr_seq = marker.seq,
+                                            certificate_type = ?marker.certificate_type,
+                                            "accepted CertificateSigned correlated to the pending SignCertificate (CSR) request"
+                                        );
+                                    } else {
+                                        // The chain still installs (certificateType
+                                        // is advisory), but the mismatch is worth a
+                                        // warning: the CA answered for a different
+                                        // certificate than the CSR requested.
+                                        warn!(
+                                            csr_seq = marker.seq,
+                                            requested = ?marker.certificate_type,
+                                            delivered = ?req.certificate_type,
+                                            "accepted CertificateSigned whose certificateType differs from the pending CSR"
+                                        );
+                                    }
+                                }
+                                CsrCorrelation::Unsolicited => {
+                                    info!(
+                                        certificate_type = ?req.certificate_type,
+                                        "accepted an unsolicited CertificateSigned (no pending SignCertificate request outstanding)"
+                                    );
+                                }
+                            }
+                            None
+                        }
+                        CertificateSignedStatusEnumType::Rejected => Some(StatusInfoType {
+                            reason_code: "InvalidChain".to_string(),
+                            additional_info: Some(
+                                "certificate chain is empty or not a usable PEM-encoded certificate"
+                                    .to_string(),
+                            ),
+                            custom_data: None,
+                        }),
+                    };
+                    Ok(v201_command::v201_certificate_signed_response(
+                        status,
+                        status_info,
+                    ))
+                }
             });
         }
 
@@ -6198,7 +6270,39 @@ impl ChargePoint {
 
         let request = v201_command::v201_sign_certificate_request(certificate_type);
         let response = self.call(request).await?;
+
+        // Record a pending-CSR marker only when the CSMS *accepts* the request
+        // (Issue #553): the CA will later deliver the signed chain out-of-band via
+        // `CertificateSigned`, and the marker lets that inbound handler recognize
+        // the delivery as this request's answer. A `Rejected` ack starts no such
+        // wait, so it records nothing. A new accepted request supersedes any prior
+        // unanswered marker (the store keeps one outstanding CSR at a time).
+        if matches!(response.status, GenericStatusEnumType::Accepted) {
+            let marker = self.v201_pending_csr.record(certificate_type).await;
+            info!(
+                csr_seq = marker.seq,
+                certificate_type = ?certificate_type,
+                "originated SignCertificate accepted; awaiting the paired CertificateSigned delivery"
+            );
+        }
+
         Ok(response.status)
+    }
+
+    /// The pending `SignCertificate` (CSR) request the station has originated but
+    /// not yet seen answered by a `CertificateSigned` delivery, if any (OCPP 2.0.1
+    /// Part 2, A02, Issue #553).
+    ///
+    /// The read path making the certificate-provisioning loop observable: an
+    /// operator (or a test) can confirm a `SignCertificate` the CSMS answered
+    /// `Accepted` was recorded as outstanding — and that the paired, accepted
+    /// `CertificateSigned` delivery later cleared it (correlated as *solicited*),
+    /// returning the station to idle. Always `None` on the 1.6J path (which has no
+    /// CP-initiated `SignCertificate` hook), whenever the station has originated no
+    /// CSR, after a `Rejected` request (which records nothing), and once an
+    /// accepted `CertificateSigned` has correlated and cleared the marker.
+    pub async fn pending_csr(&self) -> Option<v201_pending_csr::PendingCsr> {
+        self.v201_pending_csr.pending().await
     }
 
     /// The version-specific half of [`start_transaction`](Self::start_transaction):
@@ -11220,7 +11324,7 @@ mod tests {
         }
         assert!(
             v201_drain_commands(&cp).await.is_empty(),
-            "CertificateSigned is a stateless responder — it queues nothing"
+            "CertificateSigned queues no RemoteCommand (correlation clears a marker, never queues)"
         );
     }
 
@@ -11421,6 +11525,237 @@ mod tests {
                 .validate_call_result("CertificateSigned", &serde_json::to_value(&resp).unwrap())
                 .expect("CertificateSigned response is schema-valid");
         }
+    }
+
+    // --- OCPP 2.0.1 SignCertificate ↔ CertificateSigned correlation (M7, #553) ---
+    // The certificate-provisioning loop is CP-initiated: `request_sign_certificate`
+    // records a pending-CSR marker when the CSMS accepts the CSR, and the inbound
+    // `CertificateSigned` handler correlates an accepted chain back to it —
+    // clearing it as *solicited*, or logging an *unsolicited* delivery when nothing
+    // was outstanding. A rejected (unusable) chain leaves the marker in place. These
+    // exercise the store seam through the wired handler and the driver hook.
+
+    #[tokio::test]
+    async fn v201_certificate_signed_correlates_and_clears_a_pending_csr() {
+        use ocpp_types::v201::CertificateSigningUseEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+
+        // A CSR is outstanding (as if `request_sign_certificate` had been accepted).
+        let marker = cp
+            .v201_pending_csr
+            .record(Some(
+                CertificateSigningUseEnumType::ChargingStationCertificate,
+            ))
+            .await;
+        assert_eq!(cp.pending_csr().await, Some(marker));
+
+        // The paired, well-formed delivery is accepted AND clears the marker.
+        let body = certificate_signed_response(
+            &cp,
+            SAMPLE_SIGNED_PEM,
+            Some(CertificateSigningUseEnumType::ChargingStationCertificate),
+        )
+        .await;
+        assert_eq!(body.status, CertificateSignedStatusEnumType::Accepted);
+        assert_eq!(
+            cp.pending_csr().await,
+            None,
+            "an accepted CertificateSigned correlates to and clears the pending CSR"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_certificate_signed_correlates_even_on_a_certificate_type_mismatch() {
+        // certificateType on CertificateSigned is advisory: an accepted chain still
+        // installs and clears the outstanding CSR even if it names a different type
+        // than the CSR requested (the handler logs the mismatch but does not gate).
+        use ocpp_types::v201::CertificateSigningUseEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.v201_pending_csr
+            .record(Some(
+                CertificateSigningUseEnumType::ChargingStationCertificate,
+            ))
+            .await;
+
+        let body = certificate_signed_response(
+            &cp,
+            SAMPLE_SIGNED_PEM,
+            Some(CertificateSigningUseEnumType::V2GCertificate),
+        )
+        .await;
+        assert_eq!(body.status, CertificateSignedStatusEnumType::Accepted);
+        assert_eq!(
+            cp.pending_csr().await,
+            None,
+            "a type mismatch still clears the outstanding CSR"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_rejected_certificate_signed_leaves_the_pending_csr_outstanding() {
+        // An unusable chain is refused; the CSR is still awaiting a usable delivery,
+        // so its marker must survive.
+        use ocpp_types::v201::CertificateSigningUseEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        let marker = cp
+            .v201_pending_csr
+            .record(Some(CertificateSigningUseEnumType::V2GCertificate))
+            .await;
+
+        let body = certificate_signed_response(
+            &cp,
+            "not a certificate",
+            Some(CertificateSigningUseEnumType::V2GCertificate),
+        )
+        .await;
+        assert_eq!(body.status, CertificateSignedStatusEnumType::Rejected);
+        assert_eq!(
+            cp.pending_csr().await,
+            Some(marker),
+            "a rejected delivery leaves the outstanding CSR untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_unsolicited_certificate_signed_is_accepted_and_leaves_the_station_idle() {
+        // No CSR was originated: the delivery is still accepted on chain shape
+        // (the backward-compatible behavior) and the station stays idle.
+        use ocpp_types::v201::CertificateSigningUseEnumType;
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        assert!(cp.pending_csr().await.is_none());
+
+        let body = certificate_signed_response(
+            &cp,
+            SAMPLE_SIGNED_PEM,
+            Some(CertificateSigningUseEnumType::ChargingStationCertificate),
+        )
+        .await;
+        assert_eq!(body.status, CertificateSignedStatusEnumType::Accepted);
+        assert!(
+            cp.pending_csr().await.is_none(),
+            "an unsolicited delivery records no marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_sign_certificate_records_a_pending_csr_on_accept() {
+        use ocpp_types::v201::CertificateSigningUseEnumType;
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert(
+            "SignCertificate".to_string(),
+            serde_json::json!({"status": "Accepted"}),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let status = cp
+            .request_sign_certificate(Some(
+                CertificateSigningUseEnumType::ChargingStationCertificate,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(status, GenericStatusEnumType::Accepted);
+
+        let pending = cp
+            .pending_csr()
+            .await
+            .expect("an accepted SignCertificate records a pending CSR");
+        assert_eq!(
+            pending.certificate_type,
+            Some(CertificateSigningUseEnumType::ChargingStationCertificate),
+            "the marker remembers which certificate the CSR was for"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_sign_certificate_records_nothing_on_reject() {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert(
+            "SignCertificate".to_string(),
+            serde_json::json!({"status": "Rejected"}),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let status = cp.request_sign_certificate(None).await.unwrap();
+        assert_eq!(status, GenericStatusEnumType::Rejected);
+        assert!(
+            cp.pending_csr().await.is_none(),
+            "a rejected SignCertificate starts no wait — nothing is recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_sign_certificate_then_certificate_signed_completes_the_loop() {
+        // End-to-end: originate the CSR (recorded), then deliver the signed chain
+        // over the inbound handler (correlated + cleared), returning to idle.
+        use ocpp_types::v201::CertificateSigningUseEnumType;
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert(
+            "SignCertificate".to_string(),
+            serde_json::json!({"status": "Accepted"}),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        cp.request_sign_certificate(Some(CertificateSigningUseEnumType::V2GCertificate))
+            .await
+            .unwrap();
+        assert!(
+            cp.pending_csr().await.is_some(),
+            "the originated CSR is outstanding after an accepted request"
+        );
+
+        let body = certificate_signed_response(
+            &cp,
+            SAMPLE_SIGNED_PEM,
+            Some(CertificateSigningUseEnumType::V2GCertificate),
+        )
+        .await;
+        assert_eq!(body.status, CertificateSignedStatusEnumType::Accepted);
+        assert!(
+            cp.pending_csr().await.is_none(),
+            "the paired delivery closes the provisioning loop"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_sign_certificate_is_v201_only() {
+        // A 1.6J station has no CP-initiated SignCertificate path: refuse rather
+        // than put a 2.0.1 message on a 1.6J link, and record no marker.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        assert!(matches!(
+            cp.request_sign_certificate(None).await,
+            Err(OcppError::NotSupported { .. })
+        ));
+        assert!(cp.pending_csr().await.is_none());
     }
 
     // --- OCPP 2.0.1 CustomerInformation (M7, issues #530 / #537) -----------
