@@ -3829,3 +3829,227 @@ async fn v201_get_charging_profiles_enumerates_default_and_ceiling_stores() {
     cp.disconnect().await.expect("disconnect");
     server.stop().await.expect("server stop");
 }
+
+// ---------------------------------------------------------------------------
+// ClearChargingProfile — Issue #550: the teardown inverse of #519. The v201
+// handler now resolves its selector against the *combined* snapshot of all three
+// charging-profile stores (TxProfile, TxDefaultProfile, station ceilings) and
+// removes each match from whichever store holds it, so a CSMS can retract an
+// installed default or ceiling — not just a TxProfile. This proves the combined
+// clear, per-purpose store routing, whole-station (`evseId = 0`) scoping, and the
+// install → clear → report round-trip (a following GetChargingProfiles no longer
+// reports the removed profiles), all over the wire. No live transaction is
+// needed — defaults and ceilings are station configuration installed
+// synchronously by SetChargingProfile.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn v201_clear_charging_profile_clears_default_and_ceiling_stores_over_the_wire() {
+    let (mut server, addr, reports) = start_v201_csms_recording_charging_profile_reports().await;
+
+    let config = ChargePointConfig {
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_CLEARPROFILE_ALL")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+    assert!(server.is_cp_connected("CP201_CLEARPROFILE_ALL"));
+
+    // Install one profile in each non-Tx store: a TxDefaultProfile on EVSE 1 (id
+    // 30), a ChargingStationMaxProfile on the whole-station key 0 (id 40), and a
+    // ChargingStationExternalConstraints ceiling on EVSE 2 (id 50). Distinct ids
+    // and EVSEs let each clear step below be pinned exactly.
+    let mut default_1 = charging_profile(ChargingProfilePurposeEnumType::TxDefaultProfile);
+    default_1.id = 30;
+    let mut max_0 = charging_profile(ChargingProfilePurposeEnumType::ChargingStationMaxProfile);
+    max_0.id = 40;
+    let mut external_2 =
+        charging_profile(ChargingProfilePurposeEnumType::ChargingStationExternalConstraints);
+    external_2.id = 50;
+
+    for (evse_id, profile) in [
+        (1, default_1.clone()),
+        (0, max_0.clone()),
+        (2, external_2.clone()),
+    ] {
+        let resp = server
+            .call::<V201SetChargingProfileRequest>(
+                "CP201_CLEARPROFILE_ALL",
+                V201SetChargingProfileRequest {
+                    evse_id,
+                    charging_profile: profile,
+                    custom_data: None,
+                },
+            )
+            .await
+            .expect("CSMS SetChargingProfile call round-trips");
+        assert_eq!(
+            resp.status,
+            ChargingProfileStatusEnumType::Accepted,
+            "each default/ceiling install is Accepted"
+        );
+    }
+    assert_eq!(
+        cp.installed_tx_default_profile(1).await,
+        Some(default_1),
+        "the TxDefaultProfile is installed and ready to be cleared"
+    );
+    assert_eq!(
+        cp.installed_station_ceiling(CeilingKind::Max, 0).await,
+        Some(max_0),
+        "the ChargingStationMaxProfile ceiling is installed on the whole-station key"
+    );
+    assert_eq!(
+        cp.installed_station_ceiling(CeilingKind::External, 2).await,
+        Some(external_2.clone()),
+        "the ChargingStationExternalConstraints ceiling is installed on EVSE 2"
+    );
+
+    // (1) A chargingProfilePurpose = TxDefaultProfile criterion removes the
+    // default — proving Clear now reaches the default store — and leaves both
+    // ceilings in force (a purpose selector routes to exactly one store).
+    let cleared_default = server
+        .call::<V201ClearChargingProfileRequest>(
+            "CP201_CLEARPROFILE_ALL",
+            V201ClearChargingProfileRequest {
+                charging_profile_id: None,
+                charging_profile_criteria: Some(ClearChargingProfileType {
+                    evse_id: None,
+                    charging_profile_purpose: Some(
+                        ChargingProfilePurposeEnumType::TxDefaultProfile,
+                    ),
+                    stack_level: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS ClearChargingProfile(default) call round-trips");
+    assert_eq!(
+        cleared_default.status,
+        ClearChargingProfileStatusEnumType::Accepted,
+        "clearing by the TxDefaultProfile purpose is Accepted"
+    );
+    assert_eq!(
+        cp.installed_tx_default_profile(1).await,
+        None,
+        "the TxDefaultProfile is gone after the purpose-scoped clear"
+    );
+    assert!(
+        cp.installed_station_ceiling(CeilingKind::Max, 0)
+            .await
+            .is_some()
+            && cp
+                .installed_station_ceiling(CeilingKind::External, 2)
+                .await
+                .is_some(),
+        "the purpose-scoped default clear left both ceilings untouched"
+    );
+
+    // (2) An evseId = 0 (purpose-less) clear removes the whole-station Max ceiling
+    // and does not touch the EVSE-2 external ceiling (a real-EVSE key ≠ 0).
+    let cleared_station = server
+        .call::<V201ClearChargingProfileRequest>(
+            "CP201_CLEARPROFILE_ALL",
+            V201ClearChargingProfileRequest {
+                charging_profile_id: None,
+                charging_profile_criteria: Some(ClearChargingProfileType {
+                    evse_id: Some(0),
+                    charging_profile_purpose: None,
+                    stack_level: None,
+                    custom_data: None,
+                }),
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS ClearChargingProfile(evse0) call round-trips");
+    assert_eq!(
+        cleared_station.status,
+        ClearChargingProfileStatusEnumType::Accepted,
+        "clearing the whole-station key is Accepted"
+    );
+    assert_eq!(
+        cp.installed_station_ceiling(CeilingKind::Max, 0).await,
+        None,
+        "the whole-station Max ceiling is gone after the evseId=0 clear"
+    );
+    assert_eq!(
+        cp.installed_station_ceiling(CeilingKind::External, 2).await,
+        Some(external_2),
+        "the evseId=0 clear did not touch the EVSE-2 external ceiling"
+    );
+
+    // (3) A wildcard (empty) clear sweeps whatever remains — here the EVSE-2
+    // external ceiling — leaving all three stores empty.
+    let cleared_all = server
+        .call::<V201ClearChargingProfileRequest>(
+            "CP201_CLEARPROFILE_ALL",
+            V201ClearChargingProfileRequest::default(),
+        )
+        .await
+        .expect("CSMS ClearChargingProfile(all) call round-trips");
+    assert_eq!(
+        cleared_all.status,
+        ClearChargingProfileStatusEnumType::Accepted,
+        "the wildcard clear removed the remaining external ceiling"
+    );
+    assert_eq!(
+        cp.installed_station_ceiling(CeilingKind::External, 2).await,
+        None,
+        "no ceiling survives the wildcard clear"
+    );
+
+    // (4) Round-trip: a GetChargingProfiles across the (now empty) combined set
+    // reports nothing — NoProfiles, and no ReportChargingProfiles streams — proving
+    // the install → clear → report loop closes.
+    let report_after: V201GetChargingProfilesResponse = server
+        .call::<V201GetChargingProfilesRequest>(
+            "CP201_CLEARPROFILE_ALL",
+            V201GetChargingProfilesRequest {
+                request_id: 70,
+                evse_id: None,
+                charging_profile: ChargingProfileCriterionType {
+                    charging_profile_purpose: None,
+                    stack_level: None,
+                    charging_profile_id: None,
+                    charging_limit_source: None,
+                    custom_data: None,
+                },
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS GetChargingProfiles(after clear) call round-trips");
+    assert_eq!(
+        report_after.status,
+        GetChargingProfileStatusEnumType::NoProfiles,
+        "after the install→clear round-trip the station reports no installed profiles"
+    );
+
+    // (5) No #474 regression: a further clear of the empty stores is Unknown.
+    let empty_again = server
+        .call::<V201ClearChargingProfileRequest>(
+            "CP201_CLEARPROFILE_ALL",
+            V201ClearChargingProfileRequest::default(),
+        )
+        .await
+        .expect("CSMS ClearChargingProfile(empty) call round-trips");
+    assert_eq!(
+        empty_again.status,
+        ClearChargingProfileStatusEnumType::Unknown,
+        "a clear that matches nothing installed is Unknown"
+    );
+
+    // No report ever streamed for the post-clear query (NoProfiles → nothing).
+    assert!(
+        reports
+            .lock()
+            .expect("profile report log mutex not poisoned")
+            .is_empty(),
+        "a NoProfiles GetChargingProfiles streams no ReportChargingProfiles"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
