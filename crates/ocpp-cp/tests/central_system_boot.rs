@@ -3720,6 +3720,219 @@ async fn v201_sign_certificate_originates_with_placeholder_csr_over_the_wire() {
     server.stop().await.expect("server stop");
 }
 
+// ---------------------------------------------------------------------------
+// OCPP 2.0.1 CSMS -> CP `GetChargingProfiles` enumerates *all three* charging-
+// profile stores (Issue #519): the report must cover installed `TxDefaultProfile`
+// and station-ceiling (`ChargingStationMaxProfile` /
+// `ChargingStationExternalConstraints`) profiles, not only per-EVSE `TxProfile`s.
+// A CSMS that installs a default or a ceiling and then queries `GetChargingProfiles`
+// previously saw the station under-report its configuration. This proves the
+// combined snapshot, the per-EVSE report grouping, the `chargingProfilePurpose`
+// filter over the combined set, and the whole-station (`evseId = 0`) scoping end
+// to end. No live transaction is needed — defaults and ceilings are station
+// configuration, `Accepted` and installed synchronously by `SetChargingProfile`.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn v201_get_charging_profiles_enumerates_default_and_ceiling_stores() {
+    let (mut server, addr, reports) = start_v201_csms_recording_charging_profile_reports().await;
+
+    let config = ChargePointConfig {
+        meter_values_interval: 3600,
+        ..v201_cp_config(addr, "CP201_GETPROFILES_ALL")
+    };
+    let cp = ChargePoint::new(config).expect("build v201 charge point");
+    cp.connect().await.expect("v201 connect + boot sequence");
+    assert!(server.is_cp_connected("CP201_GETPROFILES_ALL"));
+
+    // Install, via SetChargingProfile, one profile in each of the two non-Tx
+    // stores: a TxDefaultProfile on EVSE 1 and both station ceilings on the
+    // whole-station key 0. Distinct ids let the report identify each. The installs
+    // are synchronous (the store is written before the CALLRESULT), so the query
+    // that follows sees them without waiting.
+    let mut default_1 = charging_profile(ChargingProfilePurposeEnumType::TxDefaultProfile);
+    default_1.id = 30;
+    let mut max_0 = charging_profile(ChargingProfilePurposeEnumType::ChargingStationMaxProfile);
+    max_0.id = 40;
+    let mut external_0 =
+        charging_profile(ChargingProfilePurposeEnumType::ChargingStationExternalConstraints);
+    external_0.id = 50;
+
+    for (evse_id, profile) in [
+        (1, default_1.clone()),
+        (0, max_0.clone()),
+        (0, external_0.clone()),
+    ] {
+        let resp = server
+            .call::<V201SetChargingProfileRequest>(
+                "CP201_GETPROFILES_ALL",
+                V201SetChargingProfileRequest {
+                    evse_id,
+                    charging_profile: profile,
+                    custom_data: None,
+                },
+            )
+            .await
+            .expect("CSMS SetChargingProfile call round-trips");
+        assert_eq!(
+            resp.status,
+            ChargingProfileStatusEnumType::Accepted,
+            "each default/ceiling install is Accepted"
+        );
+    }
+    // Confirm the ceilings landed in the ceiling store (read-back accessor).
+    assert_eq!(
+        cp.installed_station_ceiling(CeilingKind::Max, 0).await,
+        Some(max_0.clone()),
+        "the ChargingStationMaxProfile is installed at the whole-station key 0"
+    );
+
+    // Query A: no criterion, no evseId → the report enumerates the default and
+    // both ceilings, grouped per EVSE (EVSE 0 carries both ceilings, EVSE 1 the
+    // default), so two ReportChargingProfiles pages stream.
+    let resp: V201GetChargingProfilesResponse = server
+        .call::<V201GetChargingProfilesRequest>(
+            "CP201_GETPROFILES_ALL",
+            V201GetChargingProfilesRequest {
+                request_id: 60,
+                evse_id: None,
+                charging_profile: ChargingProfileCriterionType {
+                    charging_profile_purpose: None,
+                    stack_level: None,
+                    charging_profile_id: None,
+                    charging_limit_source: None,
+                    custom_data: None,
+                },
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS GetChargingProfiles(all) call round-trips");
+    assert_eq!(
+        resp.status,
+        GetChargingProfileStatusEnumType::Accepted,
+        "a query matching the installed default + ceilings is Accepted"
+    );
+    wait_for_profile_reports(&reports, 2).await;
+    let query_a: Vec<V201ReportChargingProfilesRequest> = reports
+        .lock()
+        .expect("profile report log mutex not poisoned")
+        .iter()
+        .filter(|r| r.request_id == 60)
+        .cloned()
+        .collect();
+    assert_eq!(query_a.len(), 2, "two EVSEs (0 and 1) → two pages");
+    let evse0 = query_a
+        .iter()
+        .find(|r| r.evse_id == 0)
+        .expect("a whole-station (evse 0) page");
+    let mut evse0_ids: Vec<i32> = evse0.charging_profile.iter().map(|p| p.id).collect();
+    evse0_ids.sort_unstable();
+    assert_eq!(
+        evse0_ids,
+        vec![40, 50],
+        "the EVSE-0 page groups both station ceilings"
+    );
+    let evse1 = query_a
+        .iter()
+        .find(|r| r.evse_id == 1)
+        .expect("an EVSE-1 page");
+    assert_eq!(
+        evse1
+            .charging_profile
+            .iter()
+            .map(|p| p.id)
+            .collect::<Vec<_>>(),
+        vec![30],
+        "the EVSE-1 page carries the TxDefaultProfile"
+    );
+
+    // Query B: a chargingProfilePurpose criterion narrows the combined set to a
+    // single store's purpose — only the ChargingStationMaxProfile ceiling (id 40).
+    let resp: V201GetChargingProfilesResponse = server
+        .call::<V201GetChargingProfilesRequest>(
+            "CP201_GETPROFILES_ALL",
+            V201GetChargingProfilesRequest {
+                request_id: 61,
+                evse_id: None,
+                charging_profile: ChargingProfileCriterionType {
+                    charging_profile_purpose: Some(
+                        ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
+                    ),
+                    stack_level: None,
+                    charging_profile_id: None,
+                    charging_limit_source: None,
+                    custom_data: None,
+                },
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS GetChargingProfiles(purpose) call round-trips");
+    assert_eq!(resp.status, GetChargingProfileStatusEnumType::Accepted);
+    wait_for_profile_reports(&reports, 3).await;
+    let query_b: Vec<V201ReportChargingProfilesRequest> = reports
+        .lock()
+        .expect("profile report log mutex not poisoned")
+        .iter()
+        .filter(|r| r.request_id == 61)
+        .cloned()
+        .collect();
+    assert_eq!(query_b.len(), 1, "only the Max ceiling matches its purpose");
+    assert_eq!(query_b[0].evse_id, 0);
+    assert_eq!(
+        query_b[0]
+            .charging_profile
+            .iter()
+            .map(|p| p.id)
+            .collect::<Vec<_>>(),
+        vec![40],
+        "the purpose filter returns only the ChargingStationMaxProfile"
+    );
+
+    // Query C: evseId = 0 scopes the report to the whole-station entries — both
+    // ceilings — and never mis-scopes them to a specific EVSE nor pulls in the
+    // EVSE-1 default.
+    let resp: V201GetChargingProfilesResponse = server
+        .call::<V201GetChargingProfilesRequest>(
+            "CP201_GETPROFILES_ALL",
+            V201GetChargingProfilesRequest {
+                request_id: 62,
+                evse_id: Some(0),
+                charging_profile: ChargingProfileCriterionType {
+                    charging_profile_purpose: None,
+                    stack_level: None,
+                    charging_profile_id: None,
+                    charging_limit_source: None,
+                    custom_data: None,
+                },
+                custom_data: None,
+            },
+        )
+        .await
+        .expect("CSMS GetChargingProfiles(evse0) call round-trips");
+    assert_eq!(resp.status, GetChargingProfileStatusEnumType::Accepted);
+    wait_for_profile_reports(&reports, 4).await;
+    let query_c: Vec<V201ReportChargingProfilesRequest> = reports
+        .lock()
+        .expect("profile report log mutex not poisoned")
+        .iter()
+        .filter(|r| r.request_id == 62)
+        .cloned()
+        .collect();
+    assert_eq!(query_c.len(), 1, "evseId 0 → a single whole-station page");
+    assert_eq!(query_c[0].evse_id, 0);
+    let mut evse0_ids: Vec<i32> = query_c[0].charging_profile.iter().map(|p| p.id).collect();
+    evse0_ids.sort_unstable();
+    assert_eq!(
+        evse0_ids,
+        vec![40, 50],
+        "an evseId 0 request reports exactly the two whole-station ceilings, not the EVSE-1 default"
+    );
+
+    cp.disconnect().await.expect("disconnect");
+    server.stop().await.expect("server stop");
+}
+
 #[tokio::test]
 async fn v201_sign_certificate_surfaces_a_rejected_acknowledgement() {
     // A CSMS that cannot process the CSR answers `Rejected` — a valid *protocol*
