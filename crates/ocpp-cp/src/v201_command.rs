@@ -797,20 +797,35 @@ pub fn v201_set_charging_profile_response(
     }
 }
 
-/// Decide which installed `TxProfile` slots an inbound `ClearChargingProfile.req`
-/// removes, returning the EVSE keys to clear.
+/// Decide which installed charging-profile slots an inbound
+/// `ClearChargingProfile.req` removes, returning the matched `(evse_id, profile)`
+/// pairs to clear.
 ///
-/// The teardown counterpart to [`v201_set_charging_profile_status`]: given the
-/// request's selector and a `(evse_id, profile)` snapshot of the
-/// [`V201TxProfileStore`](crate::v201_charging_profiles::V201TxProfileStore), it
-/// returns every EVSE key whose installed profile matches — the wiring layer
-/// then [`clear`](crate::v201_charging_profiles::V201TxProfileStore::clear)s each
-/// and reports [`Accepted`](ClearChargingProfileStatusEnumType::Accepted) when
-/// the returned slice is non-empty,
-/// [`Unknown`](ClearChargingProfileStatusEnumType::Unknown) otherwise.
+/// The teardown counterpart to [`v201_set_charging_profile_status`], and the
+/// removal twin of [`v201_get_charging_profiles_matches`]: given the request's
+/// selector and a `(evse_id, profile)` snapshot of the installed profiles, it
+/// returns every slot that matches — the wiring layer then clears each from
+/// whichever store holds it and reports
+/// [`Accepted`](ClearChargingProfileStatusEnumType::Accepted) when the returned
+/// slice is non-empty, [`Unknown`](ClearChargingProfileStatusEnumType::Unknown)
+/// otherwise.
 ///
-/// Matching is faithful to OCPP 2.0.1 (Part 2, `ClearChargingProfile`) over the
-/// simulator's one-`TxProfile`-per-EVSE store:
+/// Since #550 the wiring layer feeds this the **combined** snapshot of all three
+/// v201 charging-profile stores — the per-EVSE
+/// [`V201TxProfileStore`](crate::v201_charging_profiles::V201TxProfileStore), the
+/// [`V201TxDefaultProfileStore`](crate::v201_tx_default_profile::V201TxDefaultProfileStore),
+/// and the
+/// [`V201StationCeilingStore`](crate::v201_station_ceiling::V201StationCeilingStore)
+/// — so a `ClearChargingProfile` can now retract an installed default or ceiling,
+/// not just a `TxProfile` (the mirror of the #519 reporting fix). Each returned
+/// pair carries the full profile so the wiring layer can route the removal to the
+/// right store by the profile's
+/// [`charging_profile_purpose`](ChargingProfileType::charging_profile_purpose) —
+/// exactly as the `SetChargingProfile` install path routes each purpose to its
+/// own store. This function stays pure over whatever snapshot it is given;
+/// combining the stores and performing the removals is the wiring layer's job.
+///
+/// Matching is faithful to OCPP 2.0.1 (Part 2, `ClearChargingProfile`):
 ///
 /// - **`chargingProfileId` present** — an exclusive selector (spec J01 note): the
 ///   `chargingProfileCriteria` are ignored and a slot matches iff its stored
@@ -820,21 +835,26 @@ pub fn v201_set_charging_profile_response(
 ///   independently narrowing: `evseId` against the slot's EVSE key,
 ///   `chargingProfilePurpose` and `stackLevel` against the stored profile. An
 ///   absent field means "any", so it does not exclude. `evseId == 0` targets the
-///   station-wide profile, which the transaction-scoped store never holds, so it
-///   matches nothing here (faithful — no station-scoped install exists to clear).
+///   whole-station entries — over the combined set the default and ceiling stores
+///   *do* hold `evseId = 0` profiles, so a `ClearChargingProfile(evseId = 0)` now
+///   retracts exactly those and never a specific EVSE's `TxProfile`.
 /// - **Neither present** (an empty `{}` request) — matches *every* installed
-///   profile, clearing the whole store (the "clear all" wildcard the message
+///   profile across all three stores (the "clear all" wildcard the message
 ///   documents).
 ///
+/// Trust boundary: every selector field is compared by exact value against owned
+/// snapshot data — a `0`, negative, or huge `evseId`/`stackLevel`/`profileId`
+/// from the CSMS simply selects (or misses) by key and never panics.
+///
 /// Pure over its inputs (the selector plus an owned snapshot), so it is
-/// unit-testable without a runtime or the store lock; taking the snapshot and
+/// unit-testable without a runtime or the store locks; taking the snapshot and
 /// performing the removals is the wiring layer's job.
 #[must_use]
 pub fn v201_clear_charging_profile_matches(
     charging_profile_id: Option<i32>,
     criteria: Option<&ClearChargingProfileType>,
     installed: &[(i32, ChargingProfileType)],
-) -> Vec<i32> {
+) -> Vec<(i32, ChargingProfileType)> {
     installed
         .iter()
         .filter(|(evse_id, profile)| {
@@ -854,7 +874,7 @@ pub fn v201_clear_charging_profile_matches(
                 true
             }
         })
-        .map(|(evse_id, _)| *evse_id)
+        .cloned()
         .collect()
 }
 
@@ -3913,7 +3933,7 @@ mod tests {
         let store = clear_test_store();
         // The id names the profile installed on EVSE 2.
         assert_eq!(
-            v201_clear_charging_profile_matches(Some(20), None, &store),
+            matched_evses(&v201_clear_charging_profile_matches(Some(20), None, &store)),
             vec![2]
         );
         // A profile id nothing holds matches nothing.
@@ -3933,7 +3953,11 @@ mod tests {
             custom_data: None,
         };
         assert_eq!(
-            v201_clear_charging_profile_matches(Some(20), Some(&criteria), &store),
+            matched_evses(&v201_clear_charging_profile_matches(
+                Some(20),
+                Some(&criteria),
+                &store
+            )),
             vec![2]
         );
     }
@@ -3948,7 +3972,11 @@ mod tests {
             custom_data: None,
         };
         assert_eq!(
-            v201_clear_charging_profile_matches(None, Some(&criteria), &store),
+            matched_evses(&v201_clear_charging_profile_matches(
+                None,
+                Some(&criteria),
+                &store
+            )),
             vec![1]
         );
     }
@@ -3964,7 +3992,11 @@ mod tests {
         };
         // Only EVSE 2's profile is at stack level 3.
         assert_eq!(
-            v201_clear_charging_profile_matches(None, Some(&criteria), &store),
+            matched_evses(&v201_clear_charging_profile_matches(
+                None,
+                Some(&criteria),
+                &store
+            )),
             vec![2]
         );
     }
@@ -3981,7 +4013,11 @@ mod tests {
             custom_data: None,
         };
         assert_eq!(
-            v201_clear_charging_profile_matches(None, Some(&tx), &store),
+            matched_evses(&v201_clear_charging_profile_matches(
+                None,
+                Some(&tx),
+                &store
+            )),
             vec![1, 2]
         );
         // ...and a non-TxProfile purpose matches nothing installed.
@@ -4011,8 +4047,10 @@ mod tests {
     #[test]
     fn clear_evse_id_zero_matches_nothing_in_the_txprofile_store() {
         let store = clear_test_store();
-        // evseId 0 targets the station-wide profile the transaction-scoped store
-        // never holds (its keys are real EVSEs ≥ 1).
+        // evseId 0 targets the station-wide entries the transaction-scoped store
+        // never holds (its keys are real EVSEs ≥ 1); the whole-station default /
+        // ceiling matches are covered by `clear_evse_id_zero_matches_station_wide_
+        // default_and_ceiling` over the combined store below.
         let criteria = ClearChargingProfileType {
             evse_id: Some(0),
             charging_profile_purpose: None,
@@ -4027,11 +4065,179 @@ mod tests {
         let store = clear_test_store();
         // Neither id nor criteria: the "clear all" wildcard.
         assert_eq!(
-            v201_clear_charging_profile_matches(None, None, &store),
+            matched_evses(&v201_clear_charging_profile_matches(None, None, &store)),
             vec![1, 2]
         );
         // An empty request against an empty store matches nothing (→ Unknown).
         assert!(v201_clear_charging_profile_matches(None, None, &[]).is_empty());
+    }
+
+    /// A combined three-store snapshot for the ClearChargingProfile selector: a
+    /// `TxProfile` on EVSE 1 (id 10), a `TxDefaultProfile` on EVSE 1 (id 30) and
+    /// the whole-station key 0 (id 31), a `ChargingStationMaxProfile` ceiling on
+    /// key 0 (id 40), and a `ChargingStationExternalConstraints` ceiling on EVSE 2
+    /// (id 50). Mirrors the shape the wiring layer builds by concatenating the
+    /// three store snapshots (the ceiling store's `CeilingKind` dropped, recovered
+    /// downstream from each profile's `chargingProfilePurpose`).
+    fn combined_clear_store() -> Vec<(i32, ChargingProfileType)> {
+        vec![
+            (
+                1,
+                clear_test_profile(10, 0, ChargingProfilePurposeEnumType::TxProfile),
+            ),
+            (
+                1,
+                clear_test_profile(30, 0, ChargingProfilePurposeEnumType::TxDefaultProfile),
+            ),
+            (
+                0,
+                clear_test_profile(31, 0, ChargingProfilePurposeEnumType::TxDefaultProfile),
+            ),
+            (
+                0,
+                clear_test_profile(
+                    40,
+                    0,
+                    ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
+                ),
+            ),
+            (
+                2,
+                clear_test_profile(
+                    50,
+                    0,
+                    ChargingProfilePurposeEnumType::ChargingStationExternalConstraints,
+                ),
+            ),
+        ]
+    }
+
+    /// The `(id, purpose)` projection of a match set — the readable form the
+    /// combined-store tests assert store routing against (the wiring layer routes
+    /// each removal to its store by the matched profile's purpose).
+    fn matched_id_purposes(
+        matches: &[(i32, ChargingProfileType)],
+    ) -> Vec<(i32, ChargingProfilePurposeEnumType)> {
+        matches
+            .iter()
+            .map(|(_, p)| (p.id, p.charging_profile_purpose))
+            .collect()
+    }
+
+    #[test]
+    fn clear_purpose_criterion_selects_only_the_matching_store_over_the_combined_set() {
+        let store = combined_clear_store();
+        // A TxDefaultProfile purpose filter narrows the combined set to the two
+        // defaults (ids 30, 31) — never the TxProfile or either ceiling.
+        let default = ClearChargingProfileType {
+            evse_id: None,
+            charging_profile_purpose: Some(ChargingProfilePurposeEnumType::TxDefaultProfile),
+            stack_level: None,
+            custom_data: None,
+        };
+        let mut got = matched_id_purposes(&v201_clear_charging_profile_matches(
+            None,
+            Some(&default),
+            &store,
+        ));
+        got.sort_unstable_by_key(|(id, _)| *id);
+        assert_eq!(
+            got,
+            vec![
+                (30, ChargingProfilePurposeEnumType::TxDefaultProfile),
+                (31, ChargingProfilePurposeEnumType::TxDefaultProfile),
+            ]
+        );
+        // A ceiling purpose filter selects only that one ceiling — the two ceiling
+        // purposes are distinct stores' keys, so a Max filter never hits External.
+        let max = ClearChargingProfileType {
+            evse_id: None,
+            charging_profile_purpose: Some(
+                ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
+            ),
+            stack_level: None,
+            custom_data: None,
+        };
+        assert_eq!(
+            matched_id_purposes(&v201_clear_charging_profile_matches(
+                None,
+                Some(&max),
+                &store
+            )),
+            vec![(
+                40,
+                ChargingProfilePurposeEnumType::ChargingStationMaxProfile
+            )]
+        );
+    }
+
+    #[test]
+    fn clear_purposeless_request_spans_all_three_stores() {
+        let store = combined_clear_store();
+        // An empty request is the "clear all" wildcard across the combined set —
+        // every installed profile in all three stores.
+        let mut got = matched_id_purposes(&v201_clear_charging_profile_matches(None, None, &store));
+        got.sort_unstable_by_key(|(id, _)| *id);
+        assert_eq!(
+            got,
+            vec![
+                (10, ChargingProfilePurposeEnumType::TxProfile),
+                (30, ChargingProfilePurposeEnumType::TxDefaultProfile),
+                (31, ChargingProfilePurposeEnumType::TxDefaultProfile),
+                (
+                    40,
+                    ChargingProfilePurposeEnumType::ChargingStationMaxProfile
+                ),
+                (
+                    50,
+                    ChargingProfilePurposeEnumType::ChargingStationExternalConstraints
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn clear_evse_id_zero_matches_station_wide_default_and_ceiling() {
+        let store = combined_clear_store();
+        // evseId 0 now targets the whole-station entries the default/ceiling stores
+        // hold (ids 31, 40) and never a specific EVSE's TxProfile (id 10 on EVSE 1)
+        // or the EVSE-2 external ceiling (id 50).
+        let criteria = ClearChargingProfileType {
+            evse_id: Some(0),
+            charging_profile_purpose: None,
+            stack_level: None,
+            custom_data: None,
+        };
+        let mut got = matched_id_purposes(&v201_clear_charging_profile_matches(
+            None,
+            Some(&criteria),
+            &store,
+        ));
+        got.sort_unstable_by_key(|(id, _)| *id);
+        assert_eq!(
+            got,
+            vec![
+                (31, ChargingProfilePurposeEnumType::TxDefaultProfile),
+                (
+                    40,
+                    ChargingProfilePurposeEnumType::ChargingStationMaxProfile
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn clear_by_profile_id_selects_a_default_or_ceiling_over_the_combined_set() {
+        let store = combined_clear_store();
+        // The exclusive id selector reaches into any store — here the whole-station
+        // ceiling (id 40), proving Clear can retract a ceiling, not just a TxProfile.
+        assert_eq!(
+            matched_id_purposes(&v201_clear_charging_profile_matches(Some(40), None, &store)),
+            vec![(
+                40,
+                ChargingProfilePurposeEnumType::ChargingStationMaxProfile
+            )]
+        );
     }
 
     #[test]

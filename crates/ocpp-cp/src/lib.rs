@@ -4663,32 +4663,73 @@ impl ChargePoint {
                 });
             }
             // OCPP 2.0.1 (Part 2, `ClearChargingProfile`) — the inverse of the
-            // V201 `SetChargingProfile` arm above: resolve the request's selector
-            // against the `v201_tx_profiles` store and remove every matching
-            // slot, so the next periodic `TransactionEvent(Updated)` metering
-            // reading reports the unbounded power. The pure match decision +
-            // response builder live in `v201_command` (#474); this is the runtime
-            // wiring. `chargingProfileId` selects exclusively; otherwise the
+            // V201 `SetChargingProfile` arm above, and the teardown twin of the
+            // #519 `GetChargingProfiles` reporting fix: resolve the request's
+            // selector against the **combined** snapshot of all three v201
+            // charging-profile stores — the per-EVSE `v201_tx_profiles`, the
+            // `v201_tx_default_profiles`, and the `v201_station_ceilings` — and
+            // remove every matching entry from whichever store holds it, so a CSMS
+            // can retract an installed default or ceiling and not only a
+            // `TxProfile` (#550). The pure match decision + response builder live
+            // in `v201_command` (#474); this is the runtime wiring.
+            // `chargingProfileId` selects exclusively; otherwise the
             // `evseId`/`chargingProfilePurpose`/`stackLevel` criteria filter, and
-            // an empty request clears every installed profile.
+            // an empty request clears every installed profile across all three
+            // stores.
             OcppVersion::V201 => {
                 let v201_tx_profiles = v201_tx_profiles.clone();
+                let v201_tx_default_profiles = v201_tx_default_profiles.clone();
+                let v201_station_ceilings = v201_station_ceilings.clone();
                 d.on(move |req: V201ClearChargingProfileRequest| {
                     let v201_tx_profiles = v201_tx_profiles.clone();
+                    let v201_tx_default_profiles = v201_tx_default_profiles.clone();
+                    let v201_station_ceilings = v201_station_ceilings.clone();
                     async move {
-                        // Snapshot off the store lock, decide, then remove the
-                        // matched EVSE slots. In the simulator the CSMS's CALLs
-                        // are serialized through the single dispatcher, so no
-                        // profile can be swapped underneath the snapshot→clear
-                        // gap.
-                        let installed = v201_tx_profiles.snapshot().await;
+                        // Build the combined snapshot the same way the
+                        // `GetChargingProfiles` arm (#519) does: concatenate all
+                        // three stores, dropping the ceiling store's `CeilingKind`
+                        // (recovered below from each profile's purpose). In the
+                        // simulator the CSMS's CALLs are serialized through the
+                        // single dispatcher, so no profile can be swapped
+                        // underneath the snapshot→clear gap.
+                        let mut installed = v201_tx_profiles.snapshot().await;
+                        installed.extend(v201_tx_default_profiles.snapshot().await);
+                        installed.extend(
+                            v201_station_ceilings
+                                .snapshot()
+                                .await
+                                .into_iter()
+                                .map(|(_kind, evse_id, profile)| (evse_id, profile)),
+                        );
                         let matches = v201_command::v201_clear_charging_profile_matches(
                             req.charging_profile_id,
                             req.charging_profile_criteria.as_ref(),
                             &installed,
                         );
-                        for evse_id in &matches {
-                            v201_tx_profiles.clear(*evse_id).await;
+                        // Route each removal to the store that holds it by the
+                        // matched profile's `chargingProfilePurpose` — the exact
+                        // inverse of the `SetChargingProfile` install routing, so a
+                        // profile is always cleared from the store it was installed
+                        // into. The tx/default stores key by `evseId`; the ceiling
+                        // store keys by `(CeilingKind, evseId)`, and `from_purpose`
+                        // is `Some` for exactly the two ceiling purposes.
+                        for (evse_id, profile) in &matches {
+                            match profile.charging_profile_purpose {
+                                ChargingProfilePurposeEnumType::TxProfile => {
+                                    v201_tx_profiles.clear(*evse_id).await;
+                                }
+                                ChargingProfilePurposeEnumType::TxDefaultProfile => {
+                                    v201_tx_default_profiles.clear(*evse_id).await;
+                                }
+                                ChargingProfilePurposeEnumType::ChargingStationMaxProfile
+                                | ChargingProfilePurposeEnumType::ChargingStationExternalConstraints => {
+                                    if let Some(kind) = CeilingKind::from_purpose(
+                                        profile.charging_profile_purpose,
+                                    ) {
+                                        v201_station_ceilings.clear(kind, *evse_id).await;
+                                    }
+                                }
+                            }
                         }
                         Ok(v201_command::v201_clear_charging_profile_response(
                             !matches.is_empty(),
