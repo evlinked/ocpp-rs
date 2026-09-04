@@ -149,9 +149,9 @@ use ocpp_messages::v201::{
 };
 use ocpp_types::v201::{
     AttributeEnumType, AuthorizationStatusEnumType, CertificateSignedStatusEnumType,
-    ChangeAvailabilityStatusEnumType, ChargingProfilePurposeEnumType,
-    ChargingProfileStatusEnumType, ChargingProfileType, ConnectorStatusEnumType,
-    CustomerInformationStatusEnumType, DeleteCertificateStatusEnumType,
+    CertificateSigningUseEnumType, ChangeAvailabilityStatusEnumType,
+    ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
+    ConnectorStatusEnumType, CustomerInformationStatusEnumType, DeleteCertificateStatusEnumType,
     DisplayMessageStatusEnumType, FirmwareStatusEnumType, GenericDeviceModelStatusEnumType,
     GenericStatusEnumType, GetVariableResultType, IdTokenType as V201IdTokenType,
     InstallCertificateStatusEnumType, InstallCertificateUseEnumType, LogStatusEnumType,
@@ -6143,6 +6143,62 @@ impl ChargePoint {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Originate an OCPP 2.0.1 `SignCertificate` request — the **CP-initiated**
+    /// entry point of the certificate-provisioning flow (Part 2, A02, Issue #547).
+    ///
+    /// Ports the request half of
+    /// [`ocpp.v201.call.SignCertificate`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+    /// Where the CSMS→CP certificate messages the station already *answers*
+    /// (`CertificateSigned`, `InstallCertificate`, `GetInstalledCertificateIds`,
+    /// `DeleteCertificate`) are inbound, provisioning is *originated* by the
+    /// station: it submits a PEM-encoded CSR here, the CSMS acknowledges
+    /// synchronously with a [`GenericStatusEnumType`] (`Accepted` / `Rejected`),
+    /// and the operator's CA later delivers the signed chain out-of-band via the
+    /// paired `CertificateSigned` CALL (which the CP already handles, #524). This
+    /// completes that loop by giving the simulator the ability to *start* it.
+    ///
+    /// `certificate_type` selects which certificate the CSR is for
+    /// ([`ChargingStationCertificate`](CertificateSigningUseEnumType::ChargingStationCertificate)
+    /// / [`V2GCertificate`](CertificateSigningUseEnumType::V2GCertificate)); `None`
+    /// omits the field, which the spec reads as *both* the ISO 15118 and the
+    /// Charging-Station-to-CSMS connections. The CSR itself is the opaque
+    /// simulator placeholder ([`v201_command::v201_placeholder_csr`]) — the
+    /// simulator does no crypto (the same "no PKI" boundary the certificate
+    /// decision predicates set), so this provisions the wire/schema path, not real
+    /// key material; a real CSMS CA would reject the placeholder.
+    ///
+    /// This is a **driver/sim hook**, called from application or test code rather
+    /// than from inside the inbound-CALL dispatch loop, so — unlike the queued
+    /// `RemoteCommand` side effects triggered *by* an inbound CALL — it emits the
+    /// CALL inline via [`call`](Self::call) with no receive-loop re-entrancy
+    /// concern, exactly as [`authorize`](Self::authorize) and the boot handshake
+    /// do. `call()` schema-validates both the outgoing request and the incoming
+    /// `SignCertificate.conf` against the CP's 2.0.1 validator.
+    ///
+    /// V201-only: `SignCertificate` has no 1.6J twin on this path, so a call on a
+    /// `V16J` station is refused with [`OcppError::NotSupported`] rather than
+    /// putting a 2.0.1 message on a 1.6J link. The CSMS's `Rejected` is a valid
+    /// *protocol* outcome, returned as `Ok(Rejected)` (not an `Err`); any
+    /// `statusInfo` the CSMS attaches is treated as opaque data (it rides on the
+    /// schema-validated response and is never parsed as a path or executed).
+    /// Transport/timeout/CALLERROR failures propagate as [`OcppError`].
+    pub async fn request_sign_certificate(
+        &self,
+        certificate_type: Option<CertificateSigningUseEnumType>,
+    ) -> OcppResult<GenericStatusEnumType> {
+        if self.config.protocol_version != OcppVersion::V201 {
+            return Err(OcppError::NotSupported {
+                feature:
+                    "SignCertificate is an OCPP 2.0.1 message; not available on a 1.6J station"
+                        .to_string(),
+            });
+        }
+
+        let request = v201_command::v201_sign_certificate_request(certificate_type);
+        let response = self.call(request).await?;
+        Ok(response.status)
     }
 
     /// The version-specific half of [`start_transaction`](Self::start_transaction):
