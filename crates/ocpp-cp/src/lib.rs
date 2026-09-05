@@ -6420,6 +6420,81 @@ impl ChargePoint {
         Ok(response)
     }
 
+    /// Originate an OCPP 2.0.1 `SecurityEventNotification` — the **CP-initiated**
+    /// security-audit report the station pushes to the CSMS (Part 2, message A0x
+    /// and the OCPP Security Whitepaper; Issue #562).
+    ///
+    /// Ports the request half of
+    /// [`ocpp.v201.call.SecurityEventNotification`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+    /// A charging station proactively reports a security-relevant occurrence —
+    /// `FirmwareUpdated`, `InvalidFirmwareSignature`, `TamperDetectionActivated`,
+    /// `SettingSystemTime`, `ResetOrReboot`, `StartupOfTheDevice`, … — so the CSMS
+    /// can record it (a SIEM, an alert, a compliance log). This is the station's
+    /// audit/alerting channel, not a reply to an inbound CALL: it emits an outbound
+    /// `SecurityEventNotification.req` and the CSMS answers with an **empty** ack
+    /// (`SecurityEventNotification.conf` carries no fields), so a successful report
+    /// returns `Ok(())`.
+    ///
+    /// `event_type` is an **open** wire string: the recommended names are a
+    /// recommendation, not a closed schema `enum`, so a station may report a
+    /// vendor-specific event. Callers who want a standardized name without a
+    /// stringly-typed typo pass
+    /// [`SecurityEventType::as_wire_str`](ocpp_types::v201::SecurityEventType::as_wire_str);
+    /// `tech_info` is the optional vendor-specific detail, omitted from the wire
+    /// when `None`.
+    ///
+    /// This is a **driver/sim hook**, called from application or test code rather
+    /// than from inside the inbound-CALL dispatch loop, so — unlike the queued
+    /// `RemoteCommand` side effects triggered *by* an inbound CALL — it emits the
+    /// CALL inline via [`call`](Self::call) with no receive-loop re-entrancy
+    /// concern, exactly as [`request_sign_certificate`](Self::request_sign_certificate)
+    /// does. `call()` schema-validates both the outgoing request and the incoming
+    /// (empty) `SecurityEventNotification.conf` against the CP's 2.0.1 validator.
+    ///
+    /// V201-only: `SecurityEventNotification` is defined on both 1.6J and 2.0.1,
+    /// but this hook drives only the 2.0.1 path, so a call on a `V16J` station is
+    /// refused with [`OcppError::NotSupported`] rather than putting a 2.0.1 message
+    /// on a 1.6J link (the same guard as `request_sign_certificate`). A 1.6J
+    /// CP-initiated emitter is a possible sibling follow-up.
+    ///
+    /// Trust boundary: `tech_info` is caller-supplied **opaque** text — threaded to
+    /// the wire verbatim, never parsed as a path, decoded, or executed. The
+    /// schema's `maxLength: 255` is enforced by `call()`'s outbound validation (an
+    /// over-long value surfaces as an [`OcppError`], never a panic or a silent
+    /// truncation). The observability log records the event `type` but only
+    /// *whether* `tech_info` was present, never its contents.
+    /// Transport/timeout/CALLERROR failures propagate as [`OcppError`].
+    pub async fn request_security_event_notification(
+        &self,
+        event_type: &str,
+        timestamp: &str,
+        tech_info: Option<&str>,
+    ) -> OcppResult<()> {
+        if self.config.protocol_version != OcppVersion::V201 {
+            return Err(OcppError::NotSupported {
+                feature:
+                    "SecurityEventNotification is driven on the OCPP 2.0.1 path; not available on a 1.6J station"
+                        .to_string(),
+            });
+        }
+
+        let request = v201_command::v201_security_event_notification_request(
+            event_type, timestamp, tech_info,
+        );
+        // The `.conf` is empty (ack only); `call()` still schema-validates it. We
+        // discard it and surface a bare `Ok(())` on a successful report.
+        let _ack = self.call(request).await?;
+
+        info!(
+            event_type = %event_type,
+            // Presence only — `tech_info` is opaque and is never logged.
+            tech_info_present = tech_info.is_some(),
+            "originated SecurityEventNotification; CSMS acknowledged the security-event report"
+        );
+
+        Ok(())
+    }
+
     /// The version-specific half of [`start_transaction`](Self::start_transaction):
     /// send the protocol's "transaction opened" CALL and return the
     /// `transactionId` the rest of the flow keys its bookkeeping on.
@@ -11871,6 +11946,90 @@ mod tests {
             Err(OcppError::NotSupported { .. })
         ));
         assert!(cp.pending_csr().await.is_none());
+    }
+
+    // --- OCPP 2.0.1 SecurityEventNotification CP-initiated report (M7, #562) ---
+    // The station pushes a security-audit event to the CSMS, which replies with an
+    // empty ack. These exercise the driver hook against a mock CSMS returning `{}`.
+
+    #[tokio::test]
+    async fn request_security_event_notification_reports_and_returns_ok() {
+        // A recommended event with techInfo: the empty `.conf` is parsed and
+        // surfaced as `Ok(())` without panic.
+        use ocpp_types::v201::SecurityEventType;
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        // SecurityEventNotification.conf carries no fields: an empty object.
+        routes.insert(
+            "SecurityEventNotification".to_string(),
+            serde_json::json!({}),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        cp.request_security_event_notification(
+            SecurityEventType::TamperDetectionActivated.as_wire_str(),
+            "2026-09-05T12:00:00Z",
+            Some("enclosure switch opened"),
+        )
+        .await
+        .expect("the empty SecurityEventNotification ack surfaces as Ok(())");
+    }
+
+    #[tokio::test]
+    async fn request_security_event_notification_without_tech_info_reports() {
+        // The optional techInfo may be omitted; a vendor-specific event name
+        // (outside the recommendation vocabulary) is equally valid on the open
+        // wire field.
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert(
+            "SecurityEventNotification".to_string(),
+            serde_json::json!({}),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        cp.request_security_event_notification(
+            "VendorSpecific.CoolantLeak",
+            "2026-09-05T12:00:00Z",
+            None,
+        )
+        .await
+        .expect("a vendor-specific event without techInfo reports successfully");
+    }
+
+    #[tokio::test]
+    async fn request_security_event_notification_is_v201_only() {
+        // SecurityEventNotification is defined on 1.6J too, but this hook drives
+        // only the 2.0.1 path: a 1.6J station is refused rather than putting a
+        // 2.0.1 message on a 1.6J link.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        assert!(matches!(
+            cp.request_security_event_notification(
+                "StartupOfTheDevice",
+                "2026-09-05T12:00:00Z",
+                None
+            )
+            .await,
+            Err(OcppError::NotSupported { .. })
+        ));
     }
 
     // --- OCPP 2.0.1 CustomerInformation (M7, issues #530 / #537) -----------
