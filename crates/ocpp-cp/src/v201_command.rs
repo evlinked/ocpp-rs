@@ -193,11 +193,12 @@ use ocpp_messages::v201::{
     NotifyDisplayMessagesRequest, PublishFirmwareRequest, PublishFirmwareResponse,
     PublishFirmwareStatusNotificationRequest, ReportChargingProfilesRequest,
     RequestStartTransactionResponse, RequestStopTransactionResponse,
-    ReservationStatusUpdateRequest, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
-    SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
-    SetNetworkProfileRequest, SetNetworkProfileResponse, SignCertificateRequest,
-    TriggerMessageResponse, UnlockConnectorResponse, UnpublishFirmwareRequest,
-    UnpublishFirmwareResponse, UpdateFirmwareRequest, UpdateFirmwareResponse,
+    ReservationStatusUpdateRequest, ReserveNowResponse, ResetResponse,
+    SecurityEventNotificationRequest, SetChargingProfileResponse, SetDisplayMessageResponse,
+    SetMonitoringBaseResponse, SetMonitoringLevelResponse, SetNetworkProfileRequest,
+    SetNetworkProfileResponse, SignCertificateRequest, TriggerMessageResponse,
+    UnlockConnectorResponse, UnpublishFirmwareRequest, UnpublishFirmwareResponse,
+    UpdateFirmwareRequest, UpdateFirmwareResponse,
 };
 
 use crate::UnlockConnectorOutcome;
@@ -2535,6 +2536,52 @@ pub fn v201_get_15118_ev_certificate_request(
         iso15118_schema_version: iso15118_schema_version.to_string(),
         action,
         exi_request: exi_request.to_string(),
+        custom_data: None,
+    }
+}
+
+/// Build a schema-valid `SecurityEventNotification.req`
+/// ([`SecurityEventNotificationRequest`]) — the **CP-initiated** security-audit
+/// report the Charging Station pushes to the CSMS (Part 2, message A0x and the
+/// OCPP Security Whitepaper; Issue #562).
+///
+/// Ports [`ocpp.v201.call.SecurityEventNotification`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+/// The station proactively reports a security-relevant occurrence — a firmware
+/// update, an invalid firmware signature, tamper detection, a reboot, … — for
+/// the CSMS to record (a SIEM, an alert, a compliance log); the CSMS answers
+/// with an empty ack. The three request fields are threaded through
+/// **verbatim** — the builder adds no policy.
+///
+/// `event_type` is an **open** wire string, not a closed `enum`: the schema
+/// types it as `string` (`maxLength: 50`) and the standardized names are only a
+/// recommendation, so a station may report a vendor-specific event. Callers who
+/// want a standardized name without a stringly-typed typo pass
+/// [`SecurityEventType::as_wire_str`](ocpp_types::v201::SecurityEventType::as_wire_str);
+/// the field stays a `&str` here so both are accepted. `tech_info` is the
+/// optional vendor-specific detail (`maxLength: 255`), omitted from the wire
+/// when `None`.
+///
+/// `tech_info` is opaque caller-supplied text: it is copied into the request
+/// untouched — never parsed as a path, decoded, or executed. An over-long value
+/// is not truncated here (silently corrupting opaque text is worse than
+/// rejecting it); the wire-level `maxLength` bound is enforced by the outbound
+/// schema validation in [`ChargePoint::call`](crate::ChargePoint::call), which
+/// surfaces an over-long field as an `Err`, never a panic.
+///
+/// Pure over its input, so it is unit- and schema-testable without a runtime or
+/// a socket; emitting it as a CALL and surfacing the empty ack is the wiring
+/// layer's job
+/// ([`ChargePoint::request_security_event_notification`](crate::ChargePoint::request_security_event_notification)).
+#[must_use]
+pub fn v201_security_event_notification_request(
+    event_type: &str,
+    timestamp: &str,
+    tech_info: Option<&str>,
+) -> SecurityEventNotificationRequest {
+    SecurityEventNotificationRequest {
+        event_type: event_type.to_string(),
+        timestamp: timestamp.to_string(),
+        tech_info: tech_info.map(str::to_string),
         custom_data: None,
     }
 }
@@ -6226,6 +6273,161 @@ mod tests {
             assert!(payload.get("action").is_some());
             assert!(payload.get("exiRequest").is_some());
         }
+    }
+
+    // --- SecurityEventNotification (v201) CP-initiated request builder (Issue #562) ---
+
+    #[test]
+    fn security_event_notification_request_threads_its_fields_verbatim() {
+        // The builder is a pure pass-through: the event type, timestamp, and the
+        // optional techInfo land on the request unchanged, with no vendor
+        // extension added. Present and omitted techInfo both round-trip.
+        let with = v201_security_event_notification_request(
+            "TamperDetectionActivated",
+            "2026-09-05T12:00:00Z",
+            Some("enclosure switch opened"),
+        );
+        assert_eq!(with.event_type, "TamperDetectionActivated");
+        assert_eq!(with.timestamp, "2026-09-05T12:00:00Z");
+        assert_eq!(with.tech_info.as_deref(), Some("enclosure switch opened"));
+        assert_eq!(
+            with.custom_data, None,
+            "the builder adds no vendor extension"
+        );
+
+        let without = v201_security_event_notification_request(
+            "StartupOfTheDevice",
+            "2026-09-05T12:00:01Z",
+            None,
+        );
+        assert_eq!(without.tech_info, None, "an omitted techInfo stays absent");
+    }
+
+    #[test]
+    fn security_event_notification_omitted_tech_info_is_absent_not_null() {
+        // techInfo is optional: when omitted it must not appear on the wire at
+        // all (not serialize to `null`), matching the schema's optional field.
+        let req =
+            v201_security_event_notification_request("ResetOrReboot", "2026-09-05T12:00:02Z", None);
+        let wire = serde_json::to_value(&req).expect("serialize SecurityEventNotification.req");
+        assert!(
+            wire.get("techInfo").is_none(),
+            "the omitted techInfo is absent on the wire, not null: {wire}"
+        );
+        assert!(
+            wire.get("type").is_some(),
+            "type is always present (required)"
+        );
+        assert!(
+            wire.get("timestamp").is_some(),
+            "timestamp is always present (required)"
+        );
+    }
+
+    #[test]
+    fn built_security_event_notification_requests_are_schema_valid() {
+        use ocpp_types::v201::SecurityEventType;
+
+        // The type field is an open string, so both a recommended
+        // `SecurityEventType` (threaded via its wire string) and a
+        // vendor-specific name satisfy the bundled OCPP 2.0.1
+        // SecurityEventNotification request JSON Schema, with techInfo present
+        // and omitted.
+        let validator = SchemaValidator::v201();
+        let cases: [(&str, Option<&str>); 4] = [
+            // A recommended event name, via the typed vocabulary (no typo risk).
+            (
+                SecurityEventType::InvalidFirmwareSignature.as_wire_str(),
+                Some("signature check failed at boot"),
+            ),
+            // Same recommended name, techInfo omitted.
+            (SecurityEventType::FirmwareUpdated.as_wire_str(), None),
+            // A vendor-specific event name outside the recommendation vocabulary.
+            ("VendorSpecific.CoolantLeak", Some("bay 3")),
+            // techInfo omitted on a vendor-specific name.
+            ("VendorSpecific.DoorAjar", None),
+        ];
+        for (event_type, tech_info) in cases {
+            let req = v201_security_event_notification_request(
+                event_type,
+                "2026-09-05T12:00:00Z",
+                tech_info,
+            );
+            let payload = serde_json::to_value(&req).unwrap();
+            validator
+                .validate_call("SecurityEventNotification", &payload)
+                .unwrap_or_else(|e| {
+                    panic!("built SecurityEventNotification request (type={event_type:?}, tech_info={tech_info:?}) is schema-valid, got: {e}")
+                });
+            assert!(payload.get("type").is_some());
+            assert!(payload.get("timestamp").is_some());
+        }
+    }
+
+    #[test]
+    fn security_event_type_as_wire_str_matches_serde() {
+        use ocpp_types::v201::SecurityEventType;
+
+        // `as_wire_str` must produce exactly the string serde emits for the
+        // variant, so the two paths (typed vocabulary vs. serialization) are
+        // interchangeable on the wire. Round-tripping the returned string back
+        // through serde to the same variant proves the literal is correct
+        // without hard-coding the expected strings a second time.
+        let all = [
+            SecurityEventType::FirmwareUpdated,
+            SecurityEventType::FailedToAuthenticateAtCsms,
+            SecurityEventType::CsmsFailedToAuthenticate,
+            SecurityEventType::SettingSystemTime,
+            SecurityEventType::StartupOfTheDevice,
+            SecurityEventType::ResetOrReboot,
+            SecurityEventType::SecurityLogWasCleared,
+            SecurityEventType::ReconfigurationOfSecurityParameters,
+            SecurityEventType::MemoryExhaustion,
+            SecurityEventType::InvalidMessages,
+            SecurityEventType::AttemptedReplayAttacks,
+            SecurityEventType::TamperDetectionActivated,
+            SecurityEventType::InvalidFirmwareSignature,
+            SecurityEventType::InvalidFirmwareSigningCertificate,
+            SecurityEventType::InvalidCsmsCertificate,
+            SecurityEventType::InvalidChargingStationCertificate,
+            SecurityEventType::InvalidTLSVersion,
+            SecurityEventType::InvalidTLSCipherSuite,
+            SecurityEventType::MaintenanceLoginAccepted,
+            SecurityEventType::MaintenanceLoginFailed,
+        ];
+        for evt in all {
+            let wire = evt.as_wire_str();
+            assert_eq!(
+                serde_json::to_value(evt).unwrap(),
+                serde_json::Value::String(wire.to_string()),
+                "as_wire_str disagrees with serde for {evt:?}"
+            );
+            let back: SecurityEventType =
+                serde_json::from_value(serde_json::Value::String(wire.to_string())).unwrap();
+            assert_eq!(
+                back, evt,
+                "wire string {wire:?} does not round-trip to {evt:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn security_event_notification_builder_does_not_parse_hostile_tech_info() {
+        // Trust boundary: techInfo is opaque caller text. An oversized / hostile
+        // value is copied through verbatim without panic or interpretation (no
+        // path handling, no decoding). The wire-level maxLength is a schema
+        // concern enforced by `call()`'s outbound validation, not the builder's.
+        let hostile = "../../etc/passwd\0${jndi:ldap://x}".repeat(1000);
+        let req = v201_security_event_notification_request(
+            "VendorSpecific.Probe",
+            "2026-09-05T12:00:00Z",
+            Some(&hostile),
+        );
+        assert_eq!(
+            req.tech_info.as_deref(),
+            Some(hostile.as_str()),
+            "the builder relays techInfo byte-for-byte and never interprets it"
+        );
     }
 
     // --- SetNetworkProfile (v201) decision + response builder (Issue #528) ---

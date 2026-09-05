@@ -1667,6 +1667,47 @@ pub enum SecurityEventType {
     MaintenanceLoginFailed,
 }
 
+impl SecurityEventType {
+    /// The exact wire string for this standardized security-event name.
+    ///
+    /// Every variant name *is* its verbatim wire value (the enum carries no
+    /// `#[serde(rename)]`), so this is the serialized string without the JSON
+    /// quoting — a `const fn` alternative to routing through `serde` when a
+    /// caller only needs the `&str`.
+    ///
+    /// The intended use is to thread a recommended event name into the *open*
+    /// [`String`] `type` field of `SecurityEventNotification` without a
+    /// stringly-typed typo, e.g.
+    /// `request_security_event_notification(SecurityEventType::TamperDetectionActivated.as_wire_str(), …)`.
+    /// The field itself stays a `String`, so vendor-specific names outside this
+    /// recommendation vocabulary remain expressible (see the type-level docs).
+    #[must_use]
+    pub const fn as_wire_str(self) -> &'static str {
+        match self {
+            Self::FirmwareUpdated => "FirmwareUpdated",
+            Self::FailedToAuthenticateAtCsms => "FailedToAuthenticateAtCsms",
+            Self::CsmsFailedToAuthenticate => "CsmsFailedToAuthenticate",
+            Self::SettingSystemTime => "SettingSystemTime",
+            Self::StartupOfTheDevice => "StartupOfTheDevice",
+            Self::ResetOrReboot => "ResetOrReboot",
+            Self::SecurityLogWasCleared => "SecurityLogWasCleared",
+            Self::ReconfigurationOfSecurityParameters => "ReconfigurationOfSecurityParameters",
+            Self::MemoryExhaustion => "MemoryExhaustion",
+            Self::InvalidMessages => "InvalidMessages",
+            Self::AttemptedReplayAttacks => "AttemptedReplayAttacks",
+            Self::TamperDetectionActivated => "TamperDetectionActivated",
+            Self::InvalidFirmwareSignature => "InvalidFirmwareSignature",
+            Self::InvalidFirmwareSigningCertificate => "InvalidFirmwareSigningCertificate",
+            Self::InvalidCsmsCertificate => "InvalidCsmsCertificate",
+            Self::InvalidChargingStationCertificate => "InvalidChargingStationCertificate",
+            Self::InvalidTLSVersion => "InvalidTLSVersion",
+            Self::InvalidTLSCipherSuite => "InvalidTLSCipherSuite",
+            Self::MaintenanceLoginAccepted => "MaintenanceLoginAccepted",
+            Self::MaintenanceLoginFailed => "MaintenanceLoginFailed",
+        }
+    }
+}
+
 // ===========================================================================
 // Device-model controller variable-/instance-name catalogs (Appendix 3)
 // ===========================================================================
