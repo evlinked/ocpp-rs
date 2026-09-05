@@ -109,6 +109,7 @@ use ocpp_messages::v201::{
     CustomerInformationRequest as V201CustomerInformationRequest,
     DataTransferRequest as V201DataTransferRequest,
     DeleteCertificateRequest as V201DeleteCertificateRequest,
+    Get15118EVCertificateResponse as V201Get15118EVCertificateResponse,
     GetBaseReportRequest as V201GetBaseReportRequest,
     GetBaseReportResponse as V201GetBaseReportResponse,
     GetCertificateStatusResponse as V201GetCertificateStatusResponse,
@@ -151,10 +152,11 @@ use ocpp_messages::v201::{
     UpdateFirmwareRequest as V201UpdateFirmwareRequest,
 };
 use ocpp_types::v201::{
-    AttributeEnumType, AuthorizationStatusEnumType, CertificateSignedStatusEnumType,
-    CertificateSigningUseEnumType, ChangeAvailabilityStatusEnumType,
-    ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
-    ConnectorStatusEnumType, CustomerInformationStatusEnumType, DeleteCertificateStatusEnumType,
+    AttributeEnumType, AuthorizationStatusEnumType, CertificateActionEnumType,
+    CertificateSignedStatusEnumType, CertificateSigningUseEnumType,
+    ChangeAvailabilityStatusEnumType, ChargingProfilePurposeEnumType,
+    ChargingProfileStatusEnumType, ChargingProfileType, ConnectorStatusEnumType,
+    CustomerInformationStatusEnumType, DeleteCertificateStatusEnumType,
     DisplayMessageStatusEnumType, FirmwareStatusEnumType, GenericDeviceModelStatusEnumType,
     GenericStatusEnumType, GetVariableResultType, IdTokenType as V201IdTokenType,
     InstallCertificateStatusEnumType, InstallCertificateUseEnumType, LogStatusEnumType,
@@ -6405,6 +6407,78 @@ impl ChargePoint {
             status = ?response.status,
             has_ocsp_result = response.ocsp_result.is_some(),
             "GetCertificateStatus answered by the CSMS"
+        );
+
+        Ok(response)
+    }
+
+    /// Originate an OCPP 2.0.1 `Get15118EVCertificate` request — the
+    /// **CP-initiated** relay leg of the ISO 15118 Plug-and-Charge certificate
+    /// exchange (Part 2, A01/A02, Issue #558).
+    ///
+    /// Ports the request half of
+    /// [`ocpp.v201.call.Get15118EVCertificate`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+    /// During a 15118 session the EV emits a raw EXI `CertificateInstallationReq`
+    /// that the Charging Station cannot interpret; it forwards the opaque blob up
+    /// to the CSMS here, carrying the negotiated `iso15118_schema_version` and a
+    /// [`CertificateActionEnumType`] (`Install` / `Update`). The CSMS relays it to
+    /// the contract-certificate backend and answers with an
+    /// [`Iso15118EVCertificateStatusEnumType`](ocpp_types::v201::Iso15118EVCertificateStatusEnumType)
+    /// plus the EXI `CertificateInstallationRes` (`exiResponse`), which the station
+    /// passes back down to the EV untouched. Unlike `SignCertificate` — whose only
+    /// synchronous datum is the ack status — the payload of interest here is the
+    /// `exiResponse`, so this returns the **full**
+    /// [`Get15118EVCertificateResponse`](V201Get15118EVCertificateResponse)
+    /// (`status` + `exi_response` + optional `status_info`), like
+    /// `request_get_certificate_status` surfaces its `ocspResult`.
+    ///
+    /// This is a **driver/sim hook**, called from application or test code rather
+    /// than from inside the inbound-CALL dispatch loop, so — unlike the queued
+    /// `RemoteCommand` side effects triggered *by* an inbound CALL — it emits the
+    /// CALL inline via [`call`](Self::call) with no receive-loop re-entrancy
+    /// concern, exactly as [`request_sign_certificate`](Self::request_sign_certificate)
+    /// does. `call()` schema-validates both the outgoing request and the incoming
+    /// `Get15118EVCertificate.conf` against the CP's 2.0.1 validator.
+    ///
+    /// V201-only: `Get15118EVCertificate` has no 1.6J twin, so a call on a `V16J`
+    /// station is refused with [`OcppError::NotSupported`] rather than putting a
+    /// 2.0.1 message on a 1.6J link (the same guard as `request_sign_certificate`).
+    /// A `Failed` status is a valid *protocol* outcome, returned as `Ok(..)` (not
+    /// an `Err`); on either arm the response is surfaced without panic.
+    /// Transport/timeout/CALLERROR failures propagate as [`OcppError`].
+    ///
+    /// Trust boundary (the simulator's "no PKI / no EXI codec" line): `exi_request`,
+    /// the returned `exi_response`, and any `status_info` are treated as **opaque**
+    /// data — never decoded as EXI, parsed as a path, or executed. The
+    /// observability log records only the `status` and *whether* an `exiResponse`
+    /// blob was present, never the blob's contents nor the outgoing request body.
+    pub async fn request_get_15118_ev_certificate(
+        &self,
+        iso15118_schema_version: &str,
+        action: CertificateActionEnumType,
+        exi_request: &str,
+    ) -> OcppResult<V201Get15118EVCertificateResponse> {
+        if self.config.protocol_version != OcppVersion::V201 {
+            return Err(OcppError::NotSupported {
+                feature:
+                    "Get15118EVCertificate is an OCPP 2.0.1 message; not available on a 1.6J station"
+                        .to_string(),
+            });
+        }
+
+        let request = v201_command::v201_get_15118_ev_certificate_request(
+            iso15118_schema_version,
+            action,
+            exi_request,
+        );
+        let response = self.call(request).await?;
+
+        info!(
+            action = ?action,
+            status = ?response.status,
+            // Presence only — the EXI blob stays opaque and is never logged.
+            exi_response_present = !response.exi_response.is_empty(),
+            "originated Get15118EVCertificate; CSMS answered the 15118 certificate relay"
         );
 
         Ok(response)
