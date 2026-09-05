@@ -164,8 +164,8 @@ use std::collections::BTreeMap;
 use ocpp_types::common::Reason;
 use ocpp_types::v16j::ResetType;
 use ocpp_types::v201::{
-    CancelReservationStatusEnumType, CertificateHashDataChainType, CertificateHashDataType,
-    CertificateSignedStatusEnumType, CertificateSigningUseEnumType,
+    CancelReservationStatusEnumType, CertificateActionEnumType, CertificateHashDataChainType,
+    CertificateHashDataType, CertificateSignedStatusEnumType, CertificateSigningUseEnumType,
     ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType, ChargingProfileCriterionType,
     ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType, ChargingProfileType,
     ClearCacheStatusEnumType, ClearChargingProfileStatusEnumType, ClearChargingProfileType,
@@ -186,12 +186,13 @@ use ocpp_messages::v201::{
     CancelReservationResponse, CertificateSignedResponse, ChangeAvailabilityResponse,
     ClearCacheResponse, ClearChargingProfileResponse, ClearDisplayMessageResponse,
     CostUpdatedResponse, CustomerInformationRequest, CustomerInformationResponse,
-    DeleteCertificateResponse, FirmwareStatusNotificationRequest, GetChargingProfilesResponse,
-    GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse,
-    GetMonitoringReportResponse, GetTransactionStatusResponse, InstallCertificateResponse,
-    LogStatusNotificationRequest, NotifyCustomerInformationRequest, NotifyDisplayMessagesRequest,
-    PublishFirmwareRequest, PublishFirmwareResponse, PublishFirmwareStatusNotificationRequest,
-    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
+    DeleteCertificateResponse, FirmwareStatusNotificationRequest, Get15118EVCertificateRequest,
+    GetChargingProfilesResponse, GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse,
+    GetLogRequest, GetLogResponse, GetMonitoringReportResponse, GetTransactionStatusResponse,
+    InstallCertificateResponse, LogStatusNotificationRequest, NotifyCustomerInformationRequest,
+    NotifyDisplayMessagesRequest, PublishFirmwareRequest, PublishFirmwareResponse,
+    PublishFirmwareStatusNotificationRequest, ReportChargingProfilesRequest,
+    RequestStartTransactionResponse, RequestStopTransactionResponse,
     ReservationStatusUpdateRequest, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
     SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
     SetNetworkProfileRequest, SetNetworkProfileResponse, SignCertificateRequest,
@@ -2495,6 +2496,45 @@ pub fn v201_sign_certificate_request(
     SignCertificateRequest {
         csr: v201_placeholder_csr(),
         certificate_type,
+        custom_data: None,
+    }
+}
+
+/// Build a schema-valid `Get15118EVCertificate.req`
+/// ([`Get15118EVCertificateRequest`]) — the **CP-initiated** relay leg of the ISO
+/// 15118 Plug-and-Charge certificate exchange (Part 2, A01/A02, Issue #558).
+///
+/// Ports [`ocpp.v201.call.Get15118EVCertificate`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+/// During a 15118 session the EV emits a raw EXI `CertificateInstallationReq`
+/// that the Charging Station cannot interpret; it forwards the opaque blob up to
+/// the CSMS carrying the `iso15118SchemaVersion` the session negotiated and a
+/// [`CertificateActionEnumType`] (`Install` / `Update`). The CSMS relays it to the
+/// contract-certificate backend and answers with an
+/// [`Iso15118EVCertificateStatusEnumType`](ocpp_types::v201::Iso15118EVCertificateStatusEnumType)
+/// plus the EXI `CertificateInstallationRes` the station passes back to the EV.
+///
+/// All three request fields are required and threaded through **verbatim** — the
+/// builder adds no policy. `exi_request` is the EV's base64-EXI request, relayed
+/// opaquely: the station is a transparent relay and never decodes it (the same
+/// "no PKI / no EXI codec" boundary the certificate decision predicates set). The
+/// schema caps `iso15118SchemaVersion` at 50 chars and `exiRequest` at 5600; the
+/// caller supplies values within those bounds (the simulator uses a small, fixed
+/// placeholder EXI blob in its tests).
+///
+/// Pure over its input, so it is unit- and schema-testable without a runtime or a
+/// socket; emitting it as a CALL and surfacing the full response is the wiring
+/// layer's job
+/// ([`ChargePoint::request_get_15118_ev_certificate`](crate::ChargePoint::request_get_15118_ev_certificate)).
+#[must_use]
+pub fn v201_get_15118_ev_certificate_request(
+    iso15118_schema_version: &str,
+    action: CertificateActionEnumType,
+    exi_request: &str,
+) -> Get15118EVCertificateRequest {
+    Get15118EVCertificateRequest {
+        iso15118_schema_version: iso15118_schema_version.to_string(),
+        action,
+        exi_request: exi_request.to_string(),
         custom_data: None,
     }
 }
@@ -6129,6 +6169,62 @@ mod tests {
                 .unwrap_or_else(|e| {
                     panic!("built SignCertificate request (certificate_type={ct:?}) is schema-valid, got: {e}")
                 });
+        }
+    }
+
+    // --- Get15118EVCertificate (v201) CP-initiated request builder (Issue #558) ---
+
+    #[test]
+    fn get_15118_ev_certificate_request_threads_its_fields_verbatim() {
+        // The builder is a pure pass-through: schema version, action, and the
+        // opaque EXI request land on the request unchanged, with no vendor
+        // extension added.
+        for action in [
+            CertificateActionEnumType::Install,
+            CertificateActionEnumType::Update,
+        ] {
+            let req = v201_get_15118_ev_certificate_request(
+                "urn:iso:15118:2:2013:MsgDef",
+                action,
+                "b64-exi-blob",
+            );
+            assert_eq!(req.iso15118_schema_version, "urn:iso:15118:2:2013:MsgDef");
+            assert_eq!(req.action, action);
+            assert_eq!(
+                req.exi_request, "b64-exi-blob",
+                "the EXI request is relayed verbatim — the station does not decode it"
+            );
+            assert_eq!(
+                req.custom_data, None,
+                "the builder adds no vendor extension"
+            );
+        }
+    }
+
+    #[test]
+    fn built_get_15118_ev_certificate_requests_are_schema_valid() {
+        // Both the Install and Update actions satisfy the bundled OCPP 2.0.1
+        // Get15118EVCertificate request JSON Schema.
+        let validator = SchemaValidator::v201();
+        for action in [
+            CertificateActionEnumType::Install,
+            CertificateActionEnumType::Update,
+        ] {
+            let req = v201_get_15118_ev_certificate_request(
+                "urn:iso:15118:2:2013:MsgDef",
+                action,
+                "b64-exi-CertificateInstallationReq",
+            );
+            let payload = serde_json::to_value(&req).unwrap();
+            validator
+                .validate_call("Get15118EVCertificate", &payload)
+                .unwrap_or_else(|e| {
+                    panic!("built Get15118EVCertificate request (action={action:?}) is schema-valid, got: {e}")
+                });
+            // All three fields are required, so each must be present on the wire.
+            assert!(payload.get("iso15118SchemaVersion").is_some());
+            assert!(payload.get("action").is_some());
+            assert!(payload.get("exiRequest").is_some());
         }
     }
 
