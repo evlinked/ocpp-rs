@@ -875,7 +875,12 @@ pub enum ReservationUpdateStatusEnumType {
 /// Station Operator). The acronym variants carry a `#[serde(rename)]` so the
 /// Rust identifier stays idiomatic while the wire value matches the OCPP 2.0.1
 /// FINAL JSON Schema verbatim.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `PartialOrd`/`Ord` derive a deterministic (declaration-order) total order —
+/// not spec-significant, but it lets the CP's `ReportChargingProfiles` pager key
+/// its per-`(evseId, chargingLimitSource)` grouping on a `BTreeMap` and emit
+/// pages in a stable order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ChargingLimitSourceEnumType {
     #[serde(rename = "EMS")]
     Ems,

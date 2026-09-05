@@ -7603,10 +7603,13 @@ impl ChargePoint {
     /// report back to the triggering query; `profiles` is the `(evse_id, profile)`
     /// match set the handler already resolved. The pure
     /// [`v201_report_charging_profiles_pages`](crate::v201_command::v201_report_charging_profiles_pages)
-    /// builder pages it into one CSO-sourced CALL per EVSE (ascending `evseId`,
-    /// `tbc` set on every page but the last); each is sent in order so the CSMS
-    /// sees the paging flags in sequence. An empty match set builds no pages and
-    /// sends nothing (the handler only queues this for a non-empty match).
+    /// builder pages it into one CALL per `(evseId, chargingLimitSource)`
+    /// (ascending `evseId` then source, `tbc` set on every page but the last) —
+    /// so an EVSE holding both an operator profile (`CSO`) and an external
+    /// ceiling (`SO`) emits two pages with distinct sources (#551); each is sent
+    /// in order so the CSMS sees the paging flags in sequence. An empty match set
+    /// builds no pages and sends nothing (the handler only queues this for a
+    /// non-empty match).
     async fn send_v201_report_charging_profiles(
         &self,
         request_id: i32,

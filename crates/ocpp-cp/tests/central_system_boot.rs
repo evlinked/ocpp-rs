@@ -60,18 +60,19 @@ use ocpp_transport::{
 use ocpp_types::common::Reason;
 use ocpp_types::v201::{
     AttributeEnumType, BootReasonEnumType, CertificateActionEnumType,
-    CertificateSigningUseEnumType, ChangeAvailabilityStatusEnumType, ChargingProfileCriterionType,
-    ChargingProfileKindEnumType, ChargingProfilePurposeEnumType, ChargingProfileStatusEnumType,
-    ChargingProfileType, ChargingRateUnitEnumType, ChargingSchedulePeriodType,
-    ChargingScheduleType, ClearChargingProfileStatusEnumType, ClearChargingProfileType,
-    ComponentType, ConnectorStatusEnumType, DataTransferStatusEnumType, EvseType,
-    GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetChargingProfileStatusEnumType,
-    GetVariableDataType, GetVariableStatusEnumType, IdTokenEnumType, IdTokenType,
-    Iso15118EVCertificateStatusEnumType, MeasurandEnumType, MessageTriggerEnumType,
-    MutabilityEnumType, OperationalStatusEnumType, ReadingContextEnumType, ReasonEnumType,
-    RegistrationStatusEnumType, ReportBaseEnumType, RequestStartStopStatusEnumType, ResetEnumType,
-    ResetStatusEnumType, SetVariableDataType, SetVariableStatusEnumType, TransactionEventEnumType,
-    TriggerMessageStatusEnumType, TriggerReasonEnumType, UnlockStatusEnumType, VariableType,
+    CertificateSigningUseEnumType, ChangeAvailabilityStatusEnumType, ChargingLimitSourceEnumType,
+    ChargingProfileCriterionType, ChargingProfileKindEnumType, ChargingProfilePurposeEnumType,
+    ChargingProfileStatusEnumType, ChargingProfileType, ChargingRateUnitEnumType,
+    ChargingSchedulePeriodType, ChargingScheduleType, ClearChargingProfileStatusEnumType,
+    ClearChargingProfileType, ComponentType, ConnectorStatusEnumType, DataTransferStatusEnumType,
+    EvseType, GenericDeviceModelStatusEnumType, GenericStatusEnumType,
+    GetChargingProfileStatusEnumType, GetVariableDataType, GetVariableStatusEnumType,
+    IdTokenEnumType, IdTokenType, Iso15118EVCertificateStatusEnumType, MeasurandEnumType,
+    MessageTriggerEnumType, MutabilityEnumType, OperationalStatusEnumType, ReadingContextEnumType,
+    ReasonEnumType, RegistrationStatusEnumType, ReportBaseEnumType, RequestStartStopStatusEnumType,
+    ResetEnumType, ResetStatusEnumType, SetVariableDataType, SetVariableStatusEnumType,
+    TransactionEventEnumType, TriggerMessageStatusEnumType, TriggerReasonEnumType,
+    UnlockStatusEnumType, VariableType,
 };
 use ocpp_types::{ConnectorId, OcppVersion};
 
@@ -3789,8 +3790,10 @@ async fn v201_get_charging_profiles_enumerates_default_and_ceiling_stores() {
     );
 
     // Query A: no criterion, no evseId → the report enumerates the default and
-    // both ceilings, grouped per EVSE (EVSE 0 carries both ceilings, EVSE 1 the
-    // default), so two ReportChargingProfiles pages stream.
+    // both ceilings, paged per (evseId, chargingLimitSource). EVSE 0 carries an
+    // operator ChargingStationMaxProfile (CSO) and an external-constraints ceiling
+    // (SO), which report under distinct sources and so split into two pages (#551);
+    // EVSE 1 carries the TxDefaultProfile (CSO) → one page. Three pages stream.
     let resp: V201GetChargingProfilesResponse = server
         .call::<V201GetChargingProfilesRequest>(
             "CP201_GETPROFILES_ALL",
@@ -3814,7 +3817,7 @@ async fn v201_get_charging_profiles_enumerates_default_and_ceiling_stores() {
         GetChargingProfileStatusEnumType::Accepted,
         "a query matching the installed default + ceilings is Accepted"
     );
-    wait_for_profile_reports(&reports, 2).await;
+    wait_for_profile_reports(&reports, 3).await;
     let query_a: Vec<V201ReportChargingProfilesRequest> = reports
         .lock()
         .expect("profile report log mutex not poisoned")
@@ -3822,22 +3825,49 @@ async fn v201_get_charging_profiles_enumerates_default_and_ceiling_stores() {
         .filter(|r| r.request_id == 60)
         .cloned()
         .collect();
-    assert_eq!(query_a.len(), 2, "two EVSEs (0 and 1) → two pages");
-    let evse0 = query_a
-        .iter()
-        .find(|r| r.evse_id == 0)
-        .expect("a whole-station (evse 0) page");
-    let mut evse0_ids: Vec<i32> = evse0.charging_profile.iter().map(|p| p.id).collect();
-    evse0_ids.sort_unstable();
     assert_eq!(
-        evse0_ids,
-        vec![40, 50],
-        "the EVSE-0 page groups both station ceilings"
+        query_a.len(),
+        3,
+        "EVSE 0 splits into a CSO + an SO page; EVSE 1 contributes one CSO page"
     );
+    // EVSE 0, the operator max-profile ceiling under CSO.
+    let evse0_cso = query_a
+        .iter()
+        .find(|r| r.evse_id == 0 && r.charging_limit_source == ChargingLimitSourceEnumType::Cso)
+        .expect("a whole-station (evse 0) CSO page");
+    assert_eq!(
+        evse0_cso
+            .charging_profile
+            .iter()
+            .map(|p| p.id)
+            .collect::<Vec<_>>(),
+        vec![40],
+        "the EVSE-0 CSO page carries the operator ChargingStationMaxProfile"
+    );
+    // EVSE 0, the external-constraints ceiling under SO.
+    let evse0_so = query_a
+        .iter()
+        .find(|r| r.evse_id == 0 && r.charging_limit_source == ChargingLimitSourceEnumType::So)
+        .expect("a whole-station (evse 0) SO page");
+    assert_eq!(
+        evse0_so
+            .charging_profile
+            .iter()
+            .map(|p| p.id)
+            .collect::<Vec<_>>(),
+        vec![50],
+        "the EVSE-0 SO page carries the external-constraints ceiling"
+    );
+    // EVSE 1, the TxDefaultProfile under CSO.
     let evse1 = query_a
         .iter()
         .find(|r| r.evse_id == 1)
         .expect("an EVSE-1 page");
+    assert_eq!(
+        evse1.charging_limit_source,
+        ChargingLimitSourceEnumType::Cso,
+        "the TxDefaultProfile reports under the operator CSO source"
+    );
     assert_eq!(
         evse1
             .charging_profile
@@ -3871,7 +3901,7 @@ async fn v201_get_charging_profiles_enumerates_default_and_ceiling_stores() {
         .await
         .expect("CSMS GetChargingProfiles(purpose) call round-trips");
     assert_eq!(resp.status, GetChargingProfileStatusEnumType::Accepted);
-    wait_for_profile_reports(&reports, 3).await;
+    wait_for_profile_reports(&reports, 4).await;
     let query_b: Vec<V201ReportChargingProfilesRequest> = reports
         .lock()
         .expect("profile report log mutex not poisoned")
@@ -3881,6 +3911,11 @@ async fn v201_get_charging_profiles_enumerates_default_and_ceiling_stores() {
         .collect();
     assert_eq!(query_b.len(), 1, "only the Max ceiling matches its purpose");
     assert_eq!(query_b[0].evse_id, 0);
+    assert_eq!(
+        query_b[0].charging_limit_source,
+        ChargingLimitSourceEnumType::Cso,
+        "the operator ChargingStationMaxProfile reports under CSO"
+    );
     assert_eq!(
         query_b[0]
             .charging_profile
@@ -3893,7 +3928,8 @@ async fn v201_get_charging_profiles_enumerates_default_and_ceiling_stores() {
 
     // Query C: evseId = 0 scopes the report to the whole-station entries — both
     // ceilings — and never mis-scopes them to a specific EVSE nor pulls in the
-    // EVSE-1 default.
+    // EVSE-1 default. The two ceilings differ in source (operator CSO vs external
+    // SO), so they page separately (#551) → two whole-station pages.
     let resp: V201GetChargingProfilesResponse = server
         .call::<V201GetChargingProfilesRequest>(
             "CP201_GETPROFILES_ALL",
@@ -3913,7 +3949,7 @@ async fn v201_get_charging_profiles_enumerates_default_and_ceiling_stores() {
         .await
         .expect("CSMS GetChargingProfiles(evse0) call round-trips");
     assert_eq!(resp.status, GetChargingProfileStatusEnumType::Accepted);
-    wait_for_profile_reports(&reports, 4).await;
+    wait_for_profile_reports(&reports, 6).await;
     let query_c: Vec<V201ReportChargingProfilesRequest> = reports
         .lock()
         .expect("profile report log mutex not poisoned")
@@ -3921,14 +3957,40 @@ async fn v201_get_charging_profiles_enumerates_default_and_ceiling_stores() {
         .filter(|r| r.request_id == 62)
         .cloned()
         .collect();
-    assert_eq!(query_c.len(), 1, "evseId 0 → a single whole-station page");
-    assert_eq!(query_c[0].evse_id, 0);
-    let mut evse0_ids: Vec<i32> = query_c[0].charging_profile.iter().map(|p| p.id).collect();
-    evse0_ids.sort_unstable();
     assert_eq!(
-        evse0_ids,
-        vec![40, 50],
-        "an evseId 0 request reports exactly the two whole-station ceilings, not the EVSE-1 default"
+        query_c.len(),
+        2,
+        "evseId 0 → two whole-station pages, one per source"
+    );
+    assert!(
+        query_c.iter().all(|r| r.evse_id == 0),
+        "both pages are whole-station (evse 0)"
+    );
+    // The CSO page carries the operator ceiling; the SO page the external one.
+    let c_cso = query_c
+        .iter()
+        .find(|r| r.charging_limit_source == ChargingLimitSourceEnumType::Cso)
+        .expect("a whole-station CSO page");
+    assert_eq!(
+        c_cso
+            .charging_profile
+            .iter()
+            .map(|p| p.id)
+            .collect::<Vec<_>>(),
+        vec![40],
+        "the CSO page carries the operator ChargingStationMaxProfile"
+    );
+    let c_so = query_c
+        .iter()
+        .find(|r| r.charging_limit_source == ChargingLimitSourceEnumType::So)
+        .expect("a whole-station SO page");
+    assert_eq!(
+        c_so.charging_profile
+            .iter()
+            .map(|p| p.id)
+            .collect::<Vec<_>>(),
+        vec![50],
+        "the SO page carries the external-constraints ceiling, never the EVSE-1 default"
     );
 
     cp.disconnect().await.expect("disconnect");

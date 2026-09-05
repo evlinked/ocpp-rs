@@ -901,6 +901,55 @@ pub fn v201_clear_charging_profile_response(matched: bool) -> ClearChargingProfi
     }
 }
 
+/// Map a stored charging profile's
+/// [`purpose`](ChargingProfilePurposeEnumType) to the
+/// [`ChargingLimitSourceEnumType`] the station reports it under in
+/// `ReportChargingProfiles` (and filters it by in a `GetChargingProfiles`
+/// `chargingLimitSource` criterion).
+///
+/// OCPP 2.0.1 (Part 2) reports a charging limit's *origin*, not merely the API
+/// that installed it. Every profile the simulator holds was installed by the
+/// CSMS over `SetChargingProfile`, but the purpose records **whose constraint**
+/// it represents:
+///
+/// - **`TxProfile` / `TxDefaultProfile` / `ChargingStationMaxProfile`** →
+///   [`Cso`](ChargingLimitSourceEnumType::Cso). These are Charging Station
+///   Operator configuration — the transaction schedule, the per-EVSE default,
+///   and the operator's station ceiling — all authored by the CSO / back office.
+/// - **`ChargingStationExternalConstraints`** →
+///   [`So`](ChargingLimitSourceEnumType::So). This purpose models a ceiling
+///   imposed by an actor *external* to the CSO — a distribution/grid System
+///   Operator or an energy-management signal relayed through the CSMS. Of the
+///   non-CSO sources (`EMS` / `Other` / `SO`), `SO` is the canonical mapping for
+///   the grid/DSO external-constraint signal OCPP 2.0.1 Part 2 describes, so a
+///   CSMS filtering `GetChargingProfiles` by source can tell an external ceiling
+///   apart from operator configuration. (`EMS` would assert an
+///   energy-management origin the simulator cannot substantiate; `SO` is the
+///   faithful, least-surprising choice for the external-constraints purpose.)
+///
+/// Pure and total over the four-variant purpose enum, so it is the single source
+/// of truth both the reporting pager and the query filter derive the wire source
+/// from.
+#[must_use]
+pub fn v201_charging_limit_source(
+    purpose: ChargingProfilePurposeEnumType,
+) -> ChargingLimitSourceEnumType {
+    match purpose {
+        // An externally-imposed ceiling (grid / System Operator signal), distinct
+        // from the operator's own configuration.
+        ChargingProfilePurposeEnumType::ChargingStationExternalConstraints => {
+            ChargingLimitSourceEnumType::So
+        }
+        // CSO (Charging Station Operator) configuration: the transaction schedule,
+        // the per-EVSE default, and the operator's own station ceiling.
+        ChargingProfilePurposeEnumType::TxProfile
+        | ChargingProfilePurposeEnumType::TxDefaultProfile
+        | ChargingProfilePurposeEnumType::ChargingStationMaxProfile => {
+            ChargingLimitSourceEnumType::Cso
+        }
+    }
+}
+
 /// Select the installed `TxProfile` slots an inbound `GetChargingProfiles.req`
 /// asks the station to report, returning the matching `(evse_id, profile)` pairs.
 ///
@@ -941,11 +990,16 @@ pub fn v201_clear_charging_profile_response(matched: bool) -> ClearChargingProfi
 /// - **`chargingProfileId`** — absent = any; present = the stored profile's `id`
 ///   must be one of the listed ids (an id list naming nothing installed matches
 ///   nothing).
-/// - **`chargingLimitSource`** — absent = any; present must contain
-///   [`Cso`](ChargingLimitSourceEnumType::Cso). Every profile the simulator
-///   installs (via `RequestStartTransaction` / `SetChargingProfile`) originates
-///   from the CSMS — the `CSO` source — so a criterion that excludes `CSO`
-///   matches nothing here, faithful to the store's provenance.
+/// - **`chargingLimitSource`** — absent = any; present must contain the profile's
+///   own source, derived from its purpose by
+///   [`v201_charging_limit_source`]: `TxProfile` / `TxDefaultProfile` /
+///   `ChargingStationMaxProfile` report as
+///   [`Cso`](ChargingLimitSourceEnumType::Cso) (operator configuration) while a
+///   `ChargingStationExternalConstraints` ceiling reports as
+///   [`So`](ChargingLimitSourceEnumType::So) (an external grid/DSO signal). So a
+///   CSMS asking for `[Cso]` gets the operator profiles and not the external
+///   ceiling, and `[SO]` gets only the external ceiling (#551) — the filter is no
+///   longer a no-op across the combined store.
 ///
 /// An empty criterion `{}` with no `evseId` matches every installed profile. Each
 /// criterion field is an independent, conjunctive filter and an absent field is a
@@ -975,10 +1029,11 @@ pub fn v201_get_charging_profiles_matches(
                     .charging_profile_id
                     .as_ref()
                     .is_none_or(|ids| ids.contains(&profile.id))
-                && criterion
-                    .charging_limit_source
-                    .as_ref()
-                    .is_none_or(|srcs| srcs.contains(&ChargingLimitSourceEnumType::Cso))
+                && criterion.charging_limit_source.as_ref().is_none_or(|srcs| {
+                    srcs.contains(&v201_charging_limit_source(
+                        profile.charging_profile_purpose,
+                    ))
+                })
         })
         .cloned()
         .collect()
@@ -1013,25 +1068,29 @@ pub fn v201_get_charging_profiles_response(matched: bool) -> GetChargingProfiles
 ///
 /// The asynchronous data half of the report flow:
 /// [`v201_get_charging_profiles_matches`] resolves which installed slots to
-/// report, and this builds one [`ReportChargingProfilesRequest`] per **EVSE** —
-/// each echoing the triggering `request_id`, tagged with the
-/// [`Cso`](ChargingLimitSourceEnumType::Cso) source (every stored profile is
-/// CSMS-installed), and carrying every matched profile on that EVSE. Pages are
-/// ordered by ascending `evse_id` and the profiles within a page by ascending
-/// `id` (the store snapshots are unordered `HashMap` walks, so both sorts make
-/// the stream deterministic), and every page but the last is flagged `tbc`
-/// ("to be continued"); the final page leaves `tbc` absent (= `false`). An
-/// empty match set builds no pages — there is nothing to stream.
+/// report, and this builds one [`ReportChargingProfilesRequest`] per
+/// **`(evseId, chargingLimitSource)`** — each echoing the triggering
+/// `request_id`, tagged with that group's source (derived per profile by
+/// [`v201_charging_limit_source`]), and carrying every matched profile of that
+/// source on that EVSE. Pages are ordered by ascending `evse_id` then source,
+/// and the profiles within a page by ascending `id` (the store snapshots are
+/// unordered `HashMap` walks, so all sorts make the stream deterministic), and
+/// every page but the last is flagged `tbc` ("to be continued"); the final page
+/// leaves `tbc` absent (= `false`). An empty match set builds no pages — there
+/// is nothing to stream.
 ///
 /// Since #519 the match set is drawn from **three** stores — the per-EVSE
 /// `TxProfile` store, the `TxDefaultProfile` store, and the station-ceiling
-/// store — so one EVSE can now carry several profiles (e.g. a `TxProfile`, a
+/// store — so one EVSE can carry several profiles (a `TxProfile`, a
 /// `TxDefaultProfile`, and both `ChargingStationMaxProfile` /
-/// `ChargingStationExternalConstraints` ceilings). They are **grouped per EVSE**
-/// into a single page (`chargingProfile` array), which is how OCPP 2.0.1 reports
-/// them (per `chargingLimitSource` + `evseId`; every stored profile here shares
-/// the `CSO` source). Grouping keeps each page's `chargingProfile` non-empty, so
-/// every built `ReportChargingProfiles` satisfies the schema's `minItems: 1`.
+/// `ChargingStationExternalConstraints` ceilings). OCPP 2.0.1 reports profiles
+/// per `(chargingLimitSource, evseId)`, and a `ChargingStationExternalConstraints`
+/// ceiling reports under the external [`So`](ChargingLimitSourceEnumType::So)
+/// source while the operator profiles report under
+/// [`Cso`](ChargingLimitSourceEnumType::Cso) (#551) — so an EVSE holding both an
+/// operator profile and an external ceiling **splits into two pages with
+/// distinct sources**. Grouping keeps each page's `chargingProfile` non-empty,
+/// so every built `ReportChargingProfiles` satisfies the schema's `minItems: 1`.
 ///
 /// Pure over its inputs, so it is unit-testable without a runtime; sending the
 /// pages over the wire is the wiring layer's job.
@@ -1040,30 +1099,39 @@ pub fn v201_report_charging_profiles_pages(
     request_id: i32,
     matched: &[(i32, ChargingProfileType)],
 ) -> Vec<ReportChargingProfilesRequest> {
-    // Group the matched profiles by EVSE. A `BTreeMap` gives a deterministic
-    // ascending-`evse_id` page order despite the unordered store snapshots; the
-    // profiles within each page are sorted by `id` for the same determinism.
-    let mut by_evse: BTreeMap<i32, Vec<ChargingProfileType>> = BTreeMap::new();
+    // Group the matched profiles per `(evse_id, chargingLimitSource)` — the unit
+    // OCPP 2.0.1 reports a profile page under. A `BTreeMap` gives a deterministic
+    // ascending-`(evse_id, source)` page order despite the unordered store
+    // snapshots; the profiles within each page are sorted by `id` for the same
+    // determinism.
+    let mut by_key: BTreeMap<(i32, ChargingLimitSourceEnumType), Vec<ChargingProfileType>> =
+        BTreeMap::new();
     for (evse_id, profile) in matched {
-        by_evse.entry(*evse_id).or_default().push(profile.clone());
+        let source = v201_charging_limit_source(profile.charging_profile_purpose);
+        by_key
+            .entry((*evse_id, source))
+            .or_default()
+            .push(profile.clone());
     }
-    for profiles in by_evse.values_mut() {
+    for profiles in by_key.values_mut() {
         profiles.sort_by_key(|profile| profile.id);
     }
 
-    let last = by_evse.len().saturating_sub(1);
-    by_evse
+    let last = by_key.len().saturating_sub(1);
+    by_key
         .into_iter()
         .enumerate()
         .map(
-            |(i, (evse_id, charging_profile))| ReportChargingProfilesRequest {
-                request_id,
-                charging_limit_source: ChargingLimitSourceEnumType::Cso,
-                charging_profile,
-                evse_id,
-                // Every page but the last announces that more follow.
-                tbc: (i < last).then_some(true),
-                custom_data: None,
+            |(i, ((evse_id, charging_limit_source), charging_profile))| {
+                ReportChargingProfilesRequest {
+                    request_id,
+                    charging_limit_source,
+                    charging_profile,
+                    evse_id,
+                    // Every page but the last announces that more follow.
+                    tbc: (i < last).then_some(true),
+                    custom_data: None,
+                }
             },
         )
         .collect()
@@ -4480,6 +4548,29 @@ mod tests {
     }
 
     #[test]
+    fn charging_limit_source_maps_purpose_to_provenance() {
+        // Operator configuration → CSO; an external-constraints ceiling → SO (#551).
+        for purpose in [
+            ChargingProfilePurposeEnumType::TxProfile,
+            ChargingProfilePurposeEnumType::TxDefaultProfile,
+            ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
+        ] {
+            assert_eq!(
+                v201_charging_limit_source(purpose),
+                ChargingLimitSourceEnumType::Cso,
+                "{purpose:?} is CSO operator configuration"
+            );
+        }
+        assert_eq!(
+            v201_charging_limit_source(
+                ChargingProfilePurposeEnumType::ChargingStationExternalConstraints
+            ),
+            ChargingLimitSourceEnumType::So,
+            "an external-constraints ceiling reports under the external SO source"
+        );
+    }
+
+    #[test]
     fn get_criteria_and_evse_id_are_conjunctive() {
         let store = clear_test_store();
         // evseId 1 AND stackLevel 3 — EVSE 1's profile is at stack 0, so the two
@@ -4740,11 +4831,65 @@ mod tests {
     }
 
     #[test]
-    fn report_pages_group_multiple_profiles_on_one_evse() {
-        // An EVSE now carries several profiles (a TxProfile + a TxDefaultProfile);
-        // the pager groups them into one page, profiles sorted by id, EVSEs sorted
-        // ascending, tbc set on every page but the last. Ids are deliberately out
-        // of order in the input to prove the sort.
+    fn get_charging_limit_source_criterion_distinguishes_cso_from_external() {
+        // The combined store holds three CSO profiles (TxProfile 10, TxDefault 30,
+        // Max ceiling 40) and one external-constraints ceiling (50) that reports
+        // under SO. A source criterion now filters by each profile's derived
+        // source, not a blanket CSO (#551).
+        let store = combined_profile_store();
+        // `[Cso]` selects the operator profiles and never the external ceiling.
+        let cso = ChargingProfileCriterionType {
+            charging_limit_source: Some(vec![ChargingLimitSourceEnumType::Cso]),
+            ..any_criterion()
+        };
+        assert_eq!(
+            matched_ids(&v201_get_charging_profiles_matches(None, &cso, &store)),
+            vec![10, 30, 40],
+            "a [Cso] criterion returns the operator profiles, excluding the external ceiling"
+        );
+        // `[SO]` selects only the external-constraints ceiling.
+        let so = ChargingProfileCriterionType {
+            charging_limit_source: Some(vec![ChargingLimitSourceEnumType::So]),
+            ..any_criterion()
+        };
+        assert_eq!(
+            matched_ids(&v201_get_charging_profiles_matches(None, &so, &store)),
+            vec![50],
+            "an [SO] criterion returns only the external-constraints ceiling"
+        );
+        // A source present in neither (`Other`) matches nothing.
+        let other = ChargingProfileCriterionType {
+            charging_limit_source: Some(vec![ChargingLimitSourceEnumType::Other]),
+            ..any_criterion()
+        };
+        assert!(
+            v201_get_charging_profiles_matches(None, &other, &store).is_empty(),
+            "an [Other] criterion matches nothing installed"
+        );
+        // A union of both sources reports the whole combined set.
+        let both = ChargingProfileCriterionType {
+            charging_limit_source: Some(vec![
+                ChargingLimitSourceEnumType::Cso,
+                ChargingLimitSourceEnumType::So,
+            ]),
+            ..any_criterion()
+        };
+        assert_eq!(
+            matched_ids(&v201_get_charging_profiles_matches(None, &both, &store)),
+            vec![10, 30, 40, 50],
+            "a [Cso, SO] criterion reports every installed profile"
+        );
+    }
+
+    #[test]
+    fn report_pages_group_same_source_profiles_and_split_cross_source() {
+        // EVSE 1 holds a TxProfile + a TxDefaultProfile (both CSO source): they
+        // share a source, so they group into one page. EVSE 0 holds a
+        // ChargingStationMaxProfile (CSO) and a ChargingStationExternalConstraints
+        // ceiling (SO): distinct sources, so they split into two pages (#551).
+        // Profiles within a page are sorted by id, pages ordered by (evseId,
+        // source), tbc set on every page but the last. Ids/inputs deliberately out
+        // of order to prove the sorts.
         let matched = vec![
             (
                 1,
@@ -4772,32 +4917,62 @@ mod tests {
             ),
         ];
         let pages = v201_report_charging_profiles_pages(9, &matched);
-        assert_eq!(pages.len(), 2, "two EVSEs → two pages, one per EVSE");
-        // Page 0: whole-station EVSE 0, both ceilings, sorted by id, continues.
+        assert_eq!(
+            pages.len(),
+            3,
+            "EVSE 0 splits into an SO + a CSO page; EVSE 1's two CSO profiles group into one"
+        );
+        // Ordered by (evseId, source); on EVSE 0 the SO page precedes the CSO page
+        // (declaration order EMS < Other < SO < CSO).
+        // Page 0: EVSE 0, the external ceiling under SO.
         assert_eq!(pages[0].evse_id, 0);
+        assert_eq!(
+            pages[0].charging_limit_source,
+            ChargingLimitSourceEnumType::So
+        );
         assert_eq!(
             pages[0]
                 .charging_profile
                 .iter()
                 .map(|p| p.id)
                 .collect::<Vec<_>>(),
-            vec![40, 50],
-            "the EVSE-0 page groups both ceilings, sorted by id"
+            vec![50],
+            "the external-constraints ceiling reports alone under SO"
         );
-        assert_eq!(pages[0].tbc, Some(true), "the first of two pages continues");
-        // Page 1: EVSE 1, TxProfile + TxDefaultProfile, sorted by id, terminal.
-        assert_eq!(pages[1].evse_id, 1);
+        assert_eq!(pages[0].tbc, Some(true), "not the last page");
+        // Page 1: EVSE 0, the operator max-profile ceiling under CSO.
+        assert_eq!(pages[1].evse_id, 0);
+        assert_eq!(
+            pages[1].charging_limit_source,
+            ChargingLimitSourceEnumType::Cso
+        );
         assert_eq!(
             pages[1]
                 .charging_profile
                 .iter()
                 .map(|p| p.id)
                 .collect::<Vec<_>>(),
+            vec![40],
+            "the operator ceiling reports alone under CSO"
+        );
+        assert_eq!(pages[1].tbc, Some(true), "not the last page");
+        // Page 2: EVSE 1, the TxProfile + TxDefaultProfile grouped under CSO.
+        assert_eq!(pages[2].evse_id, 1);
+        assert_eq!(
+            pages[2].charging_limit_source,
+            ChargingLimitSourceEnumType::Cso
+        );
+        assert_eq!(
+            pages[2]
+                .charging_profile
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
             vec![10, 30],
-            "the EVSE-1 page groups the TxProfile and TxDefaultProfile, sorted by id"
+            "same-source profiles on one EVSE group into a single page, sorted by id"
         );
         assert!(
-            !pages[1].tbc.unwrap_or(false),
+            !pages[2].tbc.unwrap_or(false),
             "the last page is not 'to be continued'"
         );
         assert!(pages.iter().all(|p| p.request_id == 9));
@@ -4805,33 +4980,26 @@ mod tests {
 
     #[test]
     fn built_multi_profile_report_page_is_schema_valid() {
-        // A single EVSE-0 page carrying both station ceilings must satisfy the
-        // bundled OCPP 2.0.1 ReportChargingProfiles schema (minItems: 1 on
-        // chargingProfile, multiple entries allowed).
+        // A single EVSE-1 page carrying two same-source (CSO) profiles — a
+        // TxProfile and a TxDefaultProfile — must satisfy the bundled OCPP 2.0.1
+        // ReportChargingProfiles schema (minItems: 1 on chargingProfile, multiple
+        // entries allowed).
         let validator = SchemaValidator::v201();
         let matched = vec![
             (
-                0,
-                clear_test_profile(
-                    40,
-                    0,
-                    ChargingProfilePurposeEnumType::ChargingStationMaxProfile,
-                ),
+                1,
+                clear_test_profile(10, 0, ChargingProfilePurposeEnumType::TxProfile),
             ),
             (
-                0,
-                clear_test_profile(
-                    50,
-                    0,
-                    ChargingProfilePurposeEnumType::ChargingStationExternalConstraints,
-                ),
+                1,
+                clear_test_profile(30, 1, ChargingProfilePurposeEnumType::TxDefaultProfile),
             ),
         ];
         let pages = v201_report_charging_profiles_pages(1, &matched);
         assert_eq!(
             pages.len(),
             1,
-            "both ceilings on EVSE 0 group into one page"
+            "two CSO profiles on EVSE 1 group into one page"
         );
         assert_eq!(pages[0].charging_profile.len(), 2);
         let payload = serde_json::to_value(&pages[0]).unwrap();
@@ -4840,6 +5008,35 @@ mod tests {
                 .validate_call("ReportChargingProfiles", &payload)
                 .is_ok(),
             "a multi-profile ReportChargingProfiles page should be schema-valid, got: {payload}"
+        );
+    }
+
+    /// Wire fidelity: an SO-sourced `ReportChargingProfiles` page (an external
+    /// `ChargingStationExternalConstraints` ceiling) satisfies the bundled OCPP
+    /// 2.0.1 schema — the `chargingLimitSource` enum accepts `SO`, not just `CSO`.
+    #[test]
+    fn built_external_constraint_report_page_reports_so_and_is_schema_valid() {
+        let validator = SchemaValidator::v201();
+        let matched = vec![(
+            0,
+            clear_test_profile(
+                50,
+                0,
+                ChargingProfilePurposeEnumType::ChargingStationExternalConstraints,
+            ),
+        )];
+        let pages = v201_report_charging_profiles_pages(7, &matched);
+        assert_eq!(pages.len(), 1);
+        assert_eq!(
+            pages[0].charging_limit_source,
+            ChargingLimitSourceEnumType::So
+        );
+        let payload = serde_json::to_value(&pages[0]).unwrap();
+        assert!(
+            validator
+                .validate_call("ReportChargingProfiles", &payload)
+                .is_ok(),
+            "an SO-sourced ReportChargingProfiles page should be schema-valid, got: {payload}"
         );
     }
 
