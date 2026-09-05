@@ -112,6 +112,7 @@ use ocpp_messages::v201::{
     Get15118EVCertificateResponse as V201Get15118EVCertificateResponse,
     GetBaseReportRequest as V201GetBaseReportRequest,
     GetBaseReportResponse as V201GetBaseReportResponse,
+    GetCertificateStatusResponse as V201GetCertificateStatusResponse,
     GetChargingProfilesRequest as V201GetChargingProfilesRequest,
     GetCompositeScheduleRequest as V201GetCompositeScheduleRequest,
     GetCompositeScheduleResponse as V201GetCompositeScheduleResponse,
@@ -160,11 +161,12 @@ use ocpp_types::v201::{
     GenericStatusEnumType, GetVariableResultType, IdTokenType as V201IdTokenType,
     InstallCertificateStatusEnumType, InstallCertificateUseEnumType, LogStatusEnumType,
     MessageInfoType, MessageTriggerEnumType, MonitoringDataType, NetworkConnectionProfileType,
-    OperationalStatusEnumType, PublishFirmwareStatusEnumType, RegistrationStatusEnumType,
-    ReportDataType, RequestStartStopStatusEnumType, ReservationUpdateStatusEnumType,
-    ReserveNowStatusEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType,
-    SetVariableResultType, StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
-    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
+    OCSPRequestDataType, OperationalStatusEnumType, PublishFirmwareStatusEnumType,
+    RegistrationStatusEnumType, ReportDataType, RequestStartStopStatusEnumType,
+    ReservationUpdateStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
+    SetNetworkProfileStatusEnumType, SetVariableResultType, StatusInfoType,
+    TriggerMessageStatusEnumType, UnlockStatusEnumType, UpdateFirmwareStatusEnumType,
+    UploadLogStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -6348,6 +6350,68 @@ impl ChargePoint {
         self.v201_pending_csr.pending().await
     }
 
+    /// Originate an OCPP 2.0.1 `GetCertificateStatus.req` — ask the CSMS to fetch
+    /// and relay the OCSP responder's status for a certificate (Issue #556).
+    ///
+    /// Ports the CP→CSMS side of
+    /// [`ocpp.v201.call.GetCertificateStatus`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+    /// During ISO 15118 plug-and-charge (Part 2, A04) a station that must validate
+    /// a contract/sub-CA certificate cannot (or should not) reach the OCSP
+    /// responder itself: it hands the CSMS the certificate's identifying
+    /// [`OCSPRequestDataType`] and the CSMS performs the lookup, replying with a
+    /// [`GetCertificateStatusEnumType`](ocpp_types::v201::GetCertificateStatusEnumType)
+    /// (`Accepted` / `Failed`) plus, on success,
+    /// an opaque `ocspResult` blob. This is the next CP-initiated certificate hook
+    /// after [`request_sign_certificate`](Self::request_sign_certificate), and
+    /// completes the OCSP-query side of the certificate family.
+    ///
+    /// The full [`GetCertificateStatusResponse`](V201GetCertificateStatusResponse)
+    /// is returned so the caller sees both the `status` and the `ocspResult` — the
+    /// payload of interest for this message, unlike `SignCertificate` whose only
+    /// synchronous datum is the ack `status`. `ocspResult` and any `statusInfo`
+    /// are treated as **opaque data**: they ride on the schema-validated response
+    /// and are never parsed as a path, decoded, or executed (the simulator's "no
+    /// PKI" boundary — no OCSP/X.509 crypto). A `Failed` status is a valid
+    /// *protocol* outcome, returned as `Ok(..)` (not an `Err`), and may omit
+    /// `ocspResult`; the response is surfaced without panic on either arm.
+    ///
+    /// Like `request_sign_certificate`, this is a **driver/sim hook** — called from
+    /// application or test code, not from inside the inbound-CALL dispatch loop — so
+    /// it emits the CALL inline via [`call`](Self::call), which schema-validates
+    /// both the outgoing request and the incoming `GetCertificateStatus.conf`
+    /// against the CP's 2.0.1 validator.
+    ///
+    /// V201-only: `GetCertificateStatus` has no 1.6J twin, so a call on a `V16J`
+    /// station is refused with [`OcppError::NotSupported`] rather than putting a
+    /// 2.0.1 message on a 1.6J link. Transport/timeout/CALLERROR failures propagate
+    /// as [`OcppError`].
+    pub async fn request_get_certificate_status(
+        &self,
+        ocsp_request_data: OCSPRequestDataType,
+    ) -> OcppResult<V201GetCertificateStatusResponse> {
+        if self.config.protocol_version != OcppVersion::V201 {
+            return Err(OcppError::NotSupported {
+                feature:
+                    "GetCertificateStatus is an OCPP 2.0.1 message; not available on a 1.6J station"
+                        .to_string(),
+            });
+        }
+
+        let request = v201_command::v201_get_certificate_status_request(ocsp_request_data);
+        let response = self.call(request).await?;
+
+        // Surface the outcome for observability without ever inspecting the opaque
+        // `ocspResult` payload (the "no PKI" trust boundary): log only the status
+        // and whether a result blob was present, never its contents.
+        info!(
+            status = ?response.status,
+            has_ocsp_result = response.ocsp_result.is_some(),
+            "GetCertificateStatus answered by the CSMS"
+        );
+
+        Ok(response)
+    }
+
     /// Originate an OCPP 2.0.1 `Get15118EVCertificate` request — the
     /// **CP-initiated** relay leg of the ISO 15118 Plug-and-Charge certificate
     /// exchange (Part 2, A01/A02, Issue #558).
@@ -11871,6 +11935,102 @@ mod tests {
             Err(OcppError::NotSupported { .. })
         ));
         assert!(cp.pending_csr().await.is_none());
+    }
+
+    // --- OCPP 2.0.1 GetCertificateStatus CP-initiated driver hook (M7, #556) ---
+    // The station originates an OCSP status query: `request_get_certificate_status`
+    // emits `GetCertificateStatus.req` carrying an `OCSPRequestDataType` and threads
+    // the CSMS's `GetCertificateStatus.conf` (`Accepted` with an opaque `ocspResult`,
+    // or `Failed`) back through the outbound-request/response plumbing. V201-only.
+
+    /// A well-formed sample `OCSPRequestDataType` for the driver-hook tests.
+    fn sample_ocsp_request_data() -> OCSPRequestDataType {
+        use ocpp_types::v201::HashAlgorithmEnumType;
+        OCSPRequestDataType {
+            hash_algorithm: HashAlgorithmEnumType::Sha256,
+            issuer_name_hash: "a1b2c3d4e5f60718293a4b5c6d7e8f90".to_string(),
+            issuer_key_hash: "0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_string(),
+            serial_number: "0A1B2C3D4E5F".to_string(),
+            responder_url: "https://ocsp.example.com/status".to_string(),
+            custom_data: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn request_get_certificate_status_surfaces_an_accepted_conf_with_ocsp_result() {
+        use ocpp_types::v201::GetCertificateStatusEnumType;
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        // Accepted lookups carry the DER-then-base64 OCSP response in `ocspResult`.
+        routes.insert(
+            "GetCertificateStatus".to_string(),
+            serde_json::json!({"status": "Accepted", "ocspResult": "T0NTUC1yZXNwb25zZS1ibG9i"}),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let resp = cp
+            .request_get_certificate_status(sample_ocsp_request_data())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, GetCertificateStatusEnumType::Accepted);
+        assert_eq!(
+            resp.ocsp_result.as_deref(),
+            Some("T0NTUC1yZXNwb25zZS1ibG9i"),
+            "the opaque ocspResult is surfaced verbatim, never parsed"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_get_certificate_status_surfaces_a_failed_conf_without_panic() {
+        use ocpp_types::v201::GetCertificateStatusEnumType;
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        // A `Failed` lookup is a valid protocol outcome and may omit `ocspResult`.
+        routes.insert(
+            "GetCertificateStatus".to_string(),
+            serde_json::json!({"status": "Failed"}),
+        );
+        let addr = spawn_mock_csms_routing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let resp = cp
+            .request_get_certificate_status(sample_ocsp_request_data())
+            .await
+            .unwrap();
+        assert_eq!(resp.status, GetCertificateStatusEnumType::Failed);
+        assert!(
+            resp.ocsp_result.is_none(),
+            "a Failed lookup carries no ocspResult"
+        );
+    }
+
+    #[tokio::test]
+    async fn request_get_certificate_status_is_v201_only() {
+        // A 1.6J station has no GetCertificateStatus path: refuse rather than put a
+        // 2.0.1 message on a 1.6J link.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        assert!(matches!(
+            cp.request_get_certificate_status(sample_ocsp_request_data())
+                .await,
+            Err(OcppError::NotSupported { .. })
+        ));
     }
 
     // --- OCPP 2.0.1 CustomerInformation (M7, issues #530 / #537) -----------

@@ -175,11 +175,11 @@ use ocpp_types::v201::{
     GetDisplayMessagesStatusEnumType, GetInstalledCertificateStatusEnumType, HashAlgorithmEnumType,
     InstallCertificateStatusEnumType, InstallCertificateUseEnumType, LogEnumType,
     LogStatusEnumType, MessageInfoType, MessagePriorityEnumType, MessageStateEnumType,
-    MessageTriggerEnumType, OperationalStatusEnumType, PublishFirmwareStatusEnumType,
-    RequestStartStopStatusEnumType, ReservationUpdateStatusEnumType, ReserveNowStatusEnumType,
-    ResetEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType, StatusInfoType,
-    TriggerMessageStatusEnumType, UnlockStatusEnumType, UnpublishFirmwareStatusEnumType,
-    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
+    MessageTriggerEnumType, OCSPRequestDataType, OperationalStatusEnumType,
+    PublishFirmwareStatusEnumType, RequestStartStopStatusEnumType, ReservationUpdateStatusEnumType,
+    ReserveNowStatusEnumType, ResetEnumType, ResetStatusEnumType, SetNetworkProfileStatusEnumType,
+    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    UnpublishFirmwareStatusEnumType, UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
 };
 
 use ocpp_messages::v201::{
@@ -187,12 +187,12 @@ use ocpp_messages::v201::{
     ClearCacheResponse, ClearChargingProfileResponse, ClearDisplayMessageResponse,
     CostUpdatedResponse, CustomerInformationRequest, CustomerInformationResponse,
     DeleteCertificateResponse, FirmwareStatusNotificationRequest, Get15118EVCertificateRequest,
-    GetChargingProfilesResponse, GetDisplayMessagesResponse, GetInstalledCertificateIdsResponse,
-    GetLogRequest, GetLogResponse, GetMonitoringReportResponse, GetTransactionStatusResponse,
-    InstallCertificateResponse, LogStatusNotificationRequest, NotifyCustomerInformationRequest,
-    NotifyDisplayMessagesRequest, PublishFirmwareRequest, PublishFirmwareResponse,
-    PublishFirmwareStatusNotificationRequest, ReportChargingProfilesRequest,
-    RequestStartTransactionResponse, RequestStopTransactionResponse,
+    GetCertificateStatusRequest, GetChargingProfilesResponse, GetDisplayMessagesResponse,
+    GetInstalledCertificateIdsResponse, GetLogRequest, GetLogResponse, GetMonitoringReportResponse,
+    GetTransactionStatusResponse, InstallCertificateResponse, LogStatusNotificationRequest,
+    NotifyCustomerInformationRequest, NotifyDisplayMessagesRequest, PublishFirmwareRequest,
+    PublishFirmwareResponse, PublishFirmwareStatusNotificationRequest,
+    ReportChargingProfilesRequest, RequestStartTransactionResponse, RequestStopTransactionResponse,
     ReservationStatusUpdateRequest, ReserveNowResponse, ResetResponse, SetChargingProfileResponse,
     SetDisplayMessageResponse, SetMonitoringBaseResponse, SetMonitoringLevelResponse,
     SetNetworkProfileRequest, SetNetworkProfileResponse, SignCertificateRequest,
@@ -2496,6 +2496,42 @@ pub fn v201_sign_certificate_request(
     SignCertificateRequest {
         csr: v201_placeholder_csr(),
         certificate_type,
+        custom_data: None,
+    }
+}
+
+/// Build a schema-valid `GetCertificateStatus.req`
+/// ([`GetCertificateStatusRequest`]) — the **CP-initiated** OCSP status query of
+/// the OCPP 2.0.1 certificate family.
+///
+/// Ports [`ocpp.v201.call.GetCertificateStatus`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+/// During ISO 15118 plug-and-charge (Part 2, A04) a station that must validate a
+/// contract/sub-CA certificate cannot (or should not) reach the OCSP responder
+/// itself: it hands the CSMS the certificate's identifying
+/// [`OCSPRequestDataType`] — the issuer-name / issuer-key hash pair, the
+/// serial number, the hash algorithm, and the responder URL — and the CSMS
+/// performs the OCSP lookup on its behalf, replying with a
+/// [`GetCertificateStatusEnumType`](ocpp_types::v201::GetCertificateStatusEnumType)
+/// (`Accepted` / `Failed`) plus, on success, an opaque `ocspResult` blob.
+///
+/// `ocsp_request_data` is threaded through verbatim — the builder adds no policy.
+/// The bundled 2.0.1 schema requires every `OCSPRequestDataType` field including
+/// `responderURL`, so there is no omitted-`responderURL` case to build (the
+/// [`OCSPRequestDataType`] Rust type makes `responder_url` non-optional to match).
+/// The station does no OCSP/X.509 crypto (the simulator's "no PKI" boundary, the
+/// same one [`v201_placeholder_csr`] / [`v201_certificate_signed_status`] set):
+/// it provisions the wire/schema path, not a validating OCSP client.
+///
+/// Pure over its input, so it is unit- and schema-testable without a runtime or a
+/// socket; emitting it as a CALL and surfacing the response is the wiring layer's
+/// job
+/// ([`ChargePoint::request_get_certificate_status`](crate::ChargePoint::request_get_certificate_status)).
+#[must_use]
+pub fn v201_get_certificate_status_request(
+    ocsp_request_data: OCSPRequestDataType,
+) -> GetCertificateStatusRequest {
+    GetCertificateStatusRequest {
+        ocsp_request_data,
         custom_data: None,
     }
 }
@@ -6168,6 +6204,60 @@ mod tests {
                 .validate_call("SignCertificate", &serde_json::to_value(&req).unwrap())
                 .unwrap_or_else(|e| {
                     panic!("built SignCertificate request (certificate_type={ct:?}) is schema-valid, got: {e}")
+                });
+        }
+    }
+
+    // --- GetCertificateStatus (v201) CP-initiated request builder (Issue #556) ---
+
+    /// A well-formed sample [`OCSPRequestDataType`] for the builder tests, with a
+    /// selectable hash algorithm so a test can cover more than one.
+    fn sample_ocsp_request_data(hash_algorithm: HashAlgorithmEnumType) -> OCSPRequestDataType {
+        OCSPRequestDataType {
+            hash_algorithm,
+            issuer_name_hash: "a1b2c3d4e5f60718293a4b5c6d7e8f90".to_string(),
+            issuer_key_hash: "0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_string(),
+            serial_number: "0A1B2C3D4E5F".to_string(),
+            responder_url: "https://ocsp.example.com/status".to_string(),
+            custom_data: None,
+        }
+    }
+
+    #[test]
+    fn get_certificate_status_request_carries_the_ocsp_request_data() {
+        // The OCSPRequestData is threaded through verbatim — the builder adds no
+        // policy of its own.
+        let ocsp = sample_ocsp_request_data(HashAlgorithmEnumType::Sha256);
+        let req = v201_get_certificate_status_request(ocsp.clone());
+        assert_eq!(req.ocsp_request_data, ocsp);
+        assert!(
+            req.custom_data.is_none(),
+            "the builder attaches no vendor extension"
+        );
+    }
+
+    #[test]
+    fn built_get_certificate_status_requests_are_schema_valid() {
+        // Every hash algorithm the schema admits yields a request that satisfies
+        // the bundled OCPP 2.0.1 GetCertificateStatus request JSON Schema. The
+        // schema requires responderURL on every OCSPRequestData, so there is no
+        // omitted-responderURL case to cover here.
+        let validator = SchemaValidator::v201();
+        for algo in [
+            HashAlgorithmEnumType::Sha256,
+            HashAlgorithmEnumType::Sha384,
+            HashAlgorithmEnumType::Sha512,
+        ] {
+            let req = v201_get_certificate_status_request(sample_ocsp_request_data(algo));
+            let wire = serde_json::to_value(&req).unwrap();
+            assert!(
+                wire["ocspRequestData"].get("responderURL").is_some(),
+                "responderURL is required by the schema and always present on the wire: {wire}"
+            );
+            validator
+                .validate_call("GetCertificateStatus", &wire)
+                .unwrap_or_else(|e| {
+                    panic!("built GetCertificateStatus request (hash={algo:?}) is schema-valid, got: {e}")
                 });
         }
     }
