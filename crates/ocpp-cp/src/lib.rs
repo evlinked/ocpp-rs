@@ -8648,12 +8648,15 @@ impl ChargePoint {
             StatusNotification => self.trigger_v201_status_notification(evse_id).await,
             MeterValues => self.trigger_v201_meter_values(evse_id).await,
             TransactionEvent => self.trigger_v201_transaction_event(evse_id).await,
-            // Firmware-, diagnostics-log-, and certificate-signing triggers the
-            // simulator does not implement. `v201_trigger_message_status` reports
-            // these `NotImplemented`, so the handler never enqueues them; this arm
-            // keeps the match exhaustive and aligned with that policy.
+            FirmwareStatusNotification => self.trigger_v201_firmware_status_notification().await,
+            // Diagnostics-log-, publish-firmware-, and certificate-signing triggers
+            // the simulator does not yet originate. `v201_trigger_message_status`
+            // reports these `NotImplemented`, so the handler never enqueues them;
+            // this arm keeps the match exhaustive and aligned with that policy.
+            // (LogStatusNotification → #584, PublishFirmwareStatusNotification →
+            // #585 will re-report their latest status as FirmwareStatusNotification
+            // does; the Sign* certificate triggers are a separate, heavier slice.)
             other @ (LogStatusNotification
-            | FirmwareStatusNotification
             | SignChargingStationCertificate
             | SignV2GCertificate
             | SignCombinedCertificate
@@ -8960,6 +8963,15 @@ impl ChargePoint {
     /// routed through the [`v201_command`] constructor so the v201 wire type stays
     /// out of this module's imports.
     async fn send_v201_firmware_status(&self, status: FirmwareStatusEnumType, request_id: i32) {
+        // Retain this as the station's latest firmware status *before* sending, so
+        // a later `TriggerMessage(FirmwareStatusNotification)` re-reports the
+        // current status even if this progress CALL failed to transmit — the CP's
+        // notion of "where the rollout is" has advanced regardless. Kept across the
+        // in-flight slot's clear (see `V201FirmwareUpdateStore::record_reported`),
+        // so a settled `Installed` (or terminal failure) stays reportable.
+        self.v201_firmware_updates
+            .record_reported(status, request_id)
+            .await;
         if let Err(e) = self
             .call(v201_command::v201_firmware_status_notification(
                 status, request_id,
@@ -9136,6 +9148,48 @@ impl ChargePoint {
             warn!(
                 "v201 reservation: ReservationStatusUpdate({status:?}) for reservation \
                  {reservation_id}: {e}"
+            );
+        }
+    }
+
+    /// Re-report the station's latest firmware status for a `TriggerMessage`
+    /// (`requestedMessage = FirmwareStatusNotification`, Issue #583).
+    ///
+    /// The 2.0.1 twin of the 1.6J `TriggerMessage(FirmwareStatusNotification)`
+    /// arm: a CSMS asks for the *current* firmware status, and the station answers
+    /// with a single `FirmwareStatusNotification` carrying the latest status it has
+    /// reported — without re-running the update. The snapshot comes from
+    /// [`V201FirmwareUpdateStore::last_reported`](crate::v201_firmware_update::V201FirmwareUpdateStore::last_reported),
+    /// which every `send_v201_firmware_status` step records:
+    ///
+    /// - a station that has never run an `UpdateFirmware` reports
+    ///   [`Idle`](FirmwareStatusEnumType::Idle) with `requestId` omitted;
+    /// - a rollout in progress reports its most recent interim step
+    ///   (`Downloading` / `Downloaded` / `Installing`) with the correlating
+    ///   `requestId`;
+    /// - a settled rollout reports its terminal `Installed` (or a `DownloadFailed`
+    ///   / `InstallationFailed`) with that `requestId` — retained past the
+    ///   in-flight slot's clear.
+    ///
+    /// This is a pure snapshot re-report: it starts no update and leaves the
+    /// in-flight store untouched. `TriggerMessage` carries no EVSE scope for this
+    /// station-wide message, so `evse_id` is not a parameter (mirroring the
+    /// `BootNotification` / `Heartbeat` arms). Runs on the command-consumer task
+    /// (off the inbound-CALL path), so the `TriggerMessage` CALLRESULT is flushed
+    /// before this CALL and the receive loop never re-enters itself.
+    async fn trigger_v201_firmware_status_notification(&self) {
+        let report = self.v201_firmware_updates.last_reported().await;
+        if let Err(e) = self
+            .call(v201_command::v201_firmware_status_report(
+                report.status,
+                report.request_id,
+            ))
+            .await
+        {
+            warn!(
+                "v201 TriggerMessage(FirmwareStatusNotification): re-report of \
+                 {:?} (request {:?}) failed: {e}",
+                report.status, report.request_id
             );
         }
     }
@@ -16060,6 +16114,134 @@ mod tests {
                 "a {outcome:?} rollout still settles the store back to idle"
             );
         }
+    }
+
+    // --- OCPP 2.0.1 TriggerMessage(FirmwareStatusNotification) (M7, Issue #583) ---
+    // A CSMS asking `TriggerMessage(requestedMessage = FirmwareStatusNotification)`
+    // gets the station's latest firmware status re-reported as one
+    // FirmwareStatusNotification — the v201 twin of the 1.6J behavior. The status
+    // is recorded at the `send_v201_firmware_status` choke point across the whole
+    // rollout lifecycle, and retained past the in-flight slot's clear.
+
+    fn firmware_status_notification_routes() -> std::collections::HashMap<String, serde_json::Value>
+    {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        // FirmwareStatusNotification.conf is an empty ack.
+        routes.insert(
+            "FirmwareStatusNotification".to_string(),
+            serde_json::json!({}),
+        );
+        routes
+    }
+
+    /// Drain the capturing channel for the next `FirmwareStatusNotification` CALL,
+    /// deserialized into the typed 2.0.1 request. Skips the boot/status chatter a
+    /// freshly-connected CP emits; bounded by a timeout so a missing CALL fails fast.
+    async fn recv_one_firmware_status(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    ) -> ocpp_messages::v201::FirmwareStatusNotificationRequest {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+                Ok(Some((action, payload))) if action == "FirmwareStatusNotification" => {
+                    return serde_json::from_value(payload)
+                        .expect("captured FirmwareStatusNotification is typed");
+                }
+                Ok(Some(_)) => continue, // BootNotification / StatusNotification, etc.
+                Ok(None) | Err(_) => panic!("expected a FirmwareStatusNotification CALL"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_trigger_firmware_status_reports_idle_when_no_update_ran() {
+        // A station that has never run an UpdateFirmware answers the trigger with
+        // FirmwareStatusNotification(Idle), requestId omitted.
+        let (addr, mut rx) = spawn_mock_csms_capturing(firmware_status_notification_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        cp.send_v201_triggered_message(MessageTriggerEnumType::FirmwareStatusNotification, None)
+            .await;
+
+        let report = recv_one_firmware_status(&mut rx).await;
+        assert_eq!(report.status, FirmwareStatusEnumType::Idle);
+        assert_eq!(
+            report.request_id, None,
+            "an Idle re-report carries no requestId"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_trigger_firmware_status_reports_the_latest_recorded_status() {
+        // With a status recorded (as the rollout's emit path does), the trigger
+        // re-reports exactly that status + its correlating requestId — a pure
+        // snapshot that starts no update and leaves the in-flight store untouched.
+        let (addr, mut rx) = spawn_mock_csms_capturing(firmware_status_notification_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        cp.v201_firmware_updates
+            .record_reported(FirmwareStatusEnumType::Installed, 55)
+            .await;
+
+        cp.send_v201_triggered_message(MessageTriggerEnumType::FirmwareStatusNotification, None)
+            .await;
+
+        let report = recv_one_firmware_status(&mut rx).await;
+        assert_eq!(report.status, FirmwareStatusEnumType::Installed);
+        assert_eq!(report.request_id, Some(55));
+        // The re-report is a snapshot: no update started, in-flight slot untouched.
+        assert!(
+            cp.in_flight_firmware_update().await.is_none(),
+            "re-report must not open a rollout"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_firmware_rollout_records_its_terminal_status_for_re_report() {
+        // The recording is wired through the real state machine (unconnected, so
+        // the progress CALLs fail-and-warn — record_reported runs before the send).
+        // The happy path leaves the latest status at the Installed terminal.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.v201_firmware_updates.begin(55).await;
+        cp.run_v201_firmware_update(55).await;
+        assert_eq!(
+            cp.v201_firmware_updates.last_reported().await,
+            crate::v201_firmware_update::V201FirmwareStatusReport {
+                status: FirmwareStatusEnumType::Installed,
+                request_id: Some(55),
+            },
+            "a completed rollout leaves Installed as the re-reportable status"
+        );
+
+        // A fault-injected rollout records its failure terminal instead.
+        let cp = ChargePoint::new(ChargePointConfig {
+            firmware_update_outcome: FirmwareUpdateOutcome::DownloadFailed,
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.v201_firmware_updates.begin(56).await;
+        cp.run_v201_firmware_update(56).await;
+        assert_eq!(
+            cp.v201_firmware_updates.last_reported().await,
+            crate::v201_firmware_update::V201FirmwareStatusReport {
+                status: FirmwareStatusEnumType::DownloadFailed,
+                request_id: Some(56),
+            },
+            "a failed rollout leaves its failure terminal as the re-reportable status"
+        );
     }
 
     // --- OCPP 2.0.1 GetDisplayMessages (M7, issue #508) --------------------
