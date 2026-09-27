@@ -330,6 +330,62 @@ pub fn transaction_event_ended(
     }
 }
 
+/// Build a `TransactionEvent(Updated)` reporting a **charging-state transition**
+/// — the EV pausing draw ([`SuspendedEV`](ChargingStateEnumType::SuspendedEV)),
+/// the EVSE/CSMS pausing delivery
+/// ([`SuspendedEVSE`](ChargingStateEnumType::SuspendedEVSE)), or charging
+/// resuming ([`Charging`](ChargingStateEnumType::Charging)) — mid-transaction
+/// (Issue #577).
+///
+/// `triggerReason = ChargingStateChanged` and `transactionInfo.chargingState =
+/// new_state`. Unlike [`transaction_event_updated`], a pure state-change event
+/// carries **no** `meterValue`: the energy reading stays on the
+/// `MeterValuePeriodic` path, so a downstream CSMS/CDR reads this event as "the
+/// charging state changed" rather than as a periodic sample. No `idToken` (the
+/// session is already authorized), and `seq_no` continues the transaction's
+/// monotonic stream — strictly between the `Started` and `Ended` events.
+///
+/// mobilityhouse/ocpp is protocol-only and models each message independently, so
+/// the wire semantics are pinned by the ported
+/// [`ChargingStateEnumType`] / [`TriggerReasonEnumType::ChargingStateChanged`]
+/// ([`ocpp/v201/enums.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/enums.py))
+/// and the [`TransactionEvent`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py)
+/// payload; emitting the interim suspend/resume transition is the simulator's own
+/// responsibility.
+#[must_use]
+pub fn transaction_event_charging_state_changed(
+    session: &SessionRef,
+    seq_no: i32,
+    new_state: ChargingStateEnumType,
+    timestamp: &str,
+) -> TransactionEventRequest {
+    TransactionEventRequest {
+        event_type: TransactionEventEnumType::Updated,
+        timestamp: timestamp.to_string(),
+        trigger_reason: TriggerReasonEnumType::ChargingStateChanged,
+        seq_no,
+        transaction_info: TransactionType {
+            transaction_id: session.transaction_id.to_string(),
+            charging_state: Some(new_state),
+            time_spent_charging: None,
+            stopped_reason: None,
+            remote_start_id: None,
+            custom_data: None,
+        },
+        offline: None,
+        number_of_phases_used: None,
+        cable_max_current: None,
+        reservation_id: None,
+        evse: Some(evse_of(session)),
+        // A pure state-change event carries the new `chargingState`, not a
+        // `Sample.Periodic` reading — meter samples ride the `MeterValuePeriodic`
+        // path. `meterValue` is optional in the 2.0.1 `TransactionEvent` schema.
+        meter_value: None,
+        id_token: None,
+        custom_data: None,
+    }
+}
+
 /// A single-sample `meterValue` array carrying one active-import energy reading
 /// tagged `ReadingContext::Trigger` — the reading a station reports for an
 /// on-demand `TriggerMessage(MeterValues)`.
@@ -610,6 +666,53 @@ mod tests {
     }
 
     #[test]
+    fn charging_state_changed_event_carries_transition_shape() {
+        let s = session();
+        // The EV pauses draw mid-transaction: SuspendedEV, ChargingStateChanged.
+        let req =
+            transaction_event_charging_state_changed(&s, 5, ChargingStateEnumType::SuspendedEV, TS);
+
+        // An interim Updated flagged as a state change, not a periodic sample.
+        assert_eq!(req.event_type, TransactionEventEnumType::Updated);
+        assert_eq!(
+            req.trigger_reason,
+            TriggerReasonEnumType::ChargingStateChanged
+        );
+        assert_eq!(req.seq_no, 5);
+        assert_eq!(
+            req.transaction_info.charging_state,
+            Some(ChargingStateEnumType::SuspendedEV)
+        );
+        assert!(req.transaction_info.stopped_reason.is_none());
+        // Not an authorization event, and a pure state change carries no reading.
+        assert!(req.id_token.is_none());
+        assert!(
+            req.meter_value.is_none(),
+            "a state-change event carries no Sample.Periodic reading"
+        );
+        // The evse binding is still present so the CSMS knows which EVSE changed.
+        let evse = req.evse.as_ref().expect("state change carries evse");
+        assert_eq!(evse.id, 1);
+    }
+
+    #[test]
+    fn charging_state_changed_round_trips_the_exact_wire_tokens() {
+        // `SuspendedEV` / `SuspendedEVSE` serialize as their exact PascalCase wire
+        // tokens (not snake/camel-cased), so a CSMS reads the state faithfully.
+        let s = session();
+        for (state, token) in [
+            (ChargingStateEnumType::SuspendedEV, "SuspendedEV"),
+            (ChargingStateEnumType::SuspendedEVSE, "SuspendedEVSE"),
+            (ChargingStateEnumType::Charging, "Charging"),
+        ] {
+            let req = transaction_event_charging_state_changed(&s, 1, state, TS);
+            let payload = serde_json::to_value(&req).unwrap();
+            assert_eq!(payload["triggerReason"], "ChargingStateChanged");
+            assert_eq!(payload["transactionInfo"]["chargingState"], token);
+        }
+    }
+
+    #[test]
     fn triggered_event_carries_trigger_reason_and_context() {
         let s = session();
         let req = transaction_event_triggered(&s, 7, 1750.0, TS);
@@ -682,6 +785,15 @@ mod tests {
             transaction_event_updated(&s, 2, 1500.0, Some(3_680.0), TS),
             transaction_event_ended(&s, 3, "RFID-CAFE", 2000.0, Reason::Remote, TS),
             transaction_event_triggered(&s, 4, 1750.0, TS),
+            // Each interim charging-state transition must also satisfy the schema.
+            transaction_event_charging_state_changed(&s, 5, ChargingStateEnumType::SuspendedEV, TS),
+            transaction_event_charging_state_changed(
+                &s,
+                6,
+                ChargingStateEnumType::SuspendedEVSE,
+                TS,
+            ),
+            transaction_event_charging_state_changed(&s, 7, ChargingStateEnumType::Charging, TS),
         ] {
             let payload = serde_json::to_value(&req).unwrap();
             assert!(

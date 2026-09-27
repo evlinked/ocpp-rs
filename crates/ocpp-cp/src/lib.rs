@@ -155,16 +155,17 @@ use ocpp_types::v201::{
     CertificateSignedStatusEnumType, CertificateSigningUseEnumType,
     ChangeAvailabilityStatusEnumType, ChargingNeedsType, ChargingProfilePurposeEnumType,
     ChargingProfileStatusEnumType, ChargingProfileType, ChargingScheduleType,
-    ConnectorStatusEnumType, CustomerInformationStatusEnumType, DeleteCertificateStatusEnumType,
-    DisplayMessageStatusEnumType, FirmwareStatusEnumType, GenericDeviceModelStatusEnumType,
-    GenericStatusEnumType, GetVariableResultType, IdTokenType as V201IdTokenType,
-    InstallCertificateStatusEnumType, InstallCertificateUseEnumType, LogStatusEnumType,
-    MessageInfoType, MessageTriggerEnumType, MonitoringDataType, NetworkConnectionProfileType,
-    NotifyEVChargingNeedsStatusEnumType, OCSPRequestDataType, OperationalStatusEnumType,
-    PublishFirmwareStatusEnumType, RegistrationStatusEnumType, ReportDataType,
-    RequestStartStopStatusEnumType, ReservationUpdateStatusEnumType, ReserveNowStatusEnumType,
-    ResetStatusEnumType, SetNetworkProfileStatusEnumType, SetVariableResultType,
-    SetVariableStatusEnumType, StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    ChargingStateEnumType, ConnectorStatusEnumType, CustomerInformationStatusEnumType,
+    DeleteCertificateStatusEnumType, DisplayMessageStatusEnumType, FirmwareStatusEnumType,
+    GenericDeviceModelStatusEnumType, GenericStatusEnumType, GetVariableResultType,
+    IdTokenType as V201IdTokenType, InstallCertificateStatusEnumType,
+    InstallCertificateUseEnumType, LogStatusEnumType, MessageInfoType, MessageTriggerEnumType,
+    MonitoringDataType, NetworkConnectionProfileType, NotifyEVChargingNeedsStatusEnumType,
+    OCSPRequestDataType, OperationalStatusEnumType, PublishFirmwareStatusEnumType,
+    RegistrationStatusEnumType, ReportDataType, RequestStartStopStatusEnumType,
+    ReservationUpdateStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
+    SetNetworkProfileStatusEnumType, SetVariableResultType, SetVariableStatusEnumType,
+    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
     UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
@@ -173,7 +174,7 @@ use std::future::Future;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{error, info, warn};
 use uuid::Uuid;
 use v201_command::ConnectorReservState;
@@ -245,6 +246,33 @@ pub enum MonitorTripOutcome {
         /// How many monitor events the emitted `NotifyEvent` carried (≥ 1).
         events: usize,
         /// The `seqNo` stamped on the emitted `NotifyEvent`.
+        seq_no: i32,
+    },
+}
+
+/// The result of driving a live 2.0.1 transaction across a charging-state
+/// transition via [`ChargePoint::transition_charging_state`] (Issue #577).
+///
+/// A transition either advanced a real change — emitting one
+/// `TransactionEvent(Updated, triggerReason = ChargingStateChanged)` — or was a
+/// benign no-op (the connector was already in the target state, or no
+/// transaction is running on the EVSE). The outcome is returned (never
+/// panicked) so a caller or test can assert exactly what the injection did
+/// without inspecting the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargingStateChangeOutcome {
+    /// No transaction is active on the target EVSE, so the suspend/resume was
+    /// inert — no event emitted, no `seqNo` burned. The benign case a caller
+    /// uses to tell "nothing was charging here" from a real transition.
+    NoTransaction,
+    /// The connector was already in the requested state, so the transition is a
+    /// silent no-op — no event, no `seqNo` burned (the hysteresis guarantee).
+    Redundant,
+    /// One `TransactionEvent(Updated, triggerReason = ChargingStateChanged)` was
+    /// emitted and acknowledged, carrying the transitioned `chargingState` at
+    /// this `seq_no` (drawn from the transaction's monotonic stream).
+    Emitted {
+        /// The `seqNo` stamped on the emitted `TransactionEvent`.
         seq_no: i32,
     },
 }
@@ -1105,6 +1133,21 @@ struct V201Session {
     /// the request omitted it. Read back via
     /// [`ChargePoint::transaction_group_id_token`].
     group_id_token: Option<V201IdTokenType>,
+    /// The session's current 2.0.1 `chargingState` (Issue #577). A transaction
+    /// opens `Charging` (the `Started` event reports it), and the
+    /// [`transition_charging_state`](ChargePoint::transition_charging_state)
+    /// driver hook advances it across the interim `Charging ↔ SuspendedEV ↔
+    /// SuspendedEVSE` suspend/resume transitions, emitting one
+    /// `TransactionEvent(Updated, triggerReason = ChargingStateChanged)` per
+    /// *real* change.
+    ///
+    /// Held behind its own [`Mutex`] (rather than gated by the outer
+    /// `v201_sessions` lock) so the hook can compare-and-set the state and claim
+    /// the transition's `seqNo` atomically without holding the map lock across
+    /// the outbound send. This is the hysteresis bit a redundant transition
+    /// consults: a request to enter the state already in force is a silent no-op
+    /// that emits no event and burns no `seqNo`.
+    charging_state: Arc<Mutex<ChargingStateEnumType>>,
 }
 
 /// Main charge point implementation
@@ -7156,6 +7199,169 @@ impl ChargePoint {
         Ok(MonitorTripOutcome::Emitted { events, seq_no })
     }
 
+    /// Drive a live 2.0.1 transaction across an interim **charging-state
+    /// transition** — the EV pausing draw
+    /// ([`SuspendedEV`](ChargingStateEnumType::SuspendedEV)), the EVSE/CSMS
+    /// pausing delivery
+    /// ([`SuspendedEVSE`](ChargingStateEnumType::SuspendedEVSE)), or charging
+    /// resuming ([`Charging`](ChargingStateEnumType::Charging)) — emitting one
+    /// `TransactionEvent(Updated, triggerReason = ChargingStateChanged)` per
+    /// *real* change (OCPP 2.0.1 Part 2; Issue #577).
+    ///
+    /// Until now the v201 transaction loop reported only two charging states
+    /// across a whole session — `Charging` on `Started`/`Updated` and `Idle` on
+    /// `Ended` — so a downstream CSMS/CDR saw a session that was "always
+    /// charging" until it abruptly ended. This is the runtime emitter that closes
+    /// that gap: a real station emits an interim `TransactionEvent(Updated)` with
+    /// `triggerReason = ChargingStateChanged` and the new
+    /// `transactionInfo.chargingState` whenever the EV pauses draw, the EVSE/CSMS
+    /// pauses delivery (e.g. a 0 A profile / load management), or charging
+    /// resumes.
+    ///
+    /// # Deterministic injection
+    ///
+    /// A pure simulator has no real EV to pause draw, so the transition is
+    /// **injected** by the caller (application or test code), matching the
+    /// existing opt-in behavior-injection seams
+    /// ([`trip_variable_monitor`](Self::trip_variable_monitor),
+    /// [`request_notify_charging_limit`](Self::request_notify_charging_limit)).
+    /// `new_state` names which state to enter; only the mid-transaction
+    /// suspend/resume states are driver-controllable here.
+    ///
+    /// # Outcome (never a panic on any arm)
+    ///
+    /// - **No transaction on `evse_id`** → [`ChargingStateChangeOutcome::NoTransaction`],
+    ///   inert — no CALL, no `seqNo` burned. A non-positive / out-of-range
+    ///   `evse_id` matches nothing and lands here.
+    /// - **Already in the target state** → [`ChargingStateChangeOutcome::Redundant`],
+    ///   a silent no-op — no CALL, no `seqNo` burned (the hysteresis guarantee).
+    /// - **A real transition** → one `TransactionEvent(Updated,
+    ///   ChargingStateChanged)` is emitted and, on the CSMS's ack,
+    ///   [`ChargingStateChangeOutcome::Emitted`] reports the `seqNo` used. The
+    ///   `seqNo` is drawn from the transaction's shared monotonic `next_seq_no`
+    ///   counter, so it interleaves cleanly with the periodic sampler's
+    ///   `Updated` events and stays strictly between `Started` and `Ended`.
+    ///
+    /// The compare-and-emit runs under the session's own `charging_state`
+    /// [`Mutex`], not the
+    /// `v201_sessions` map lock, so a redundant transition is a true no-op and
+    /// two concurrent transitions can't both emit; holding it across the send
+    /// serializes only this connector's state changes (inherently sequential),
+    /// never the whole station. On a transport/timeout/CALLERROR failure the
+    /// modeled state is left unchanged (the `seqNo` is spent, as on any emitted
+    /// event) and the error propagates as an [`OcppError`].
+    ///
+    /// # Scope
+    ///
+    /// Only the interim `Charging ↔ SuspendedEV ↔ SuspendedEVSE` transitions are
+    /// accepted. [`Idle`](ChargingStateEnumType::Idle) is the terminal state the
+    /// `Ended` event reports, and the pre-authorization
+    /// [`EVConnected`](ChargingStateEnumType::EVConnected) plug-in state is the
+    /// companion #579 follow-up; either is rejected with
+    /// [`OcppError::ValidationError`] before anything reaches the wire.
+    ///
+    /// V201-only: `TransactionEvent` and its `chargingState` are 2.0.1
+    /// constructs, so a call on a `V16J` station is refused with
+    /// [`OcppError::NotSupported`].
+    pub async fn transition_charging_state(
+        &self,
+        evse_id: i32,
+        new_state: ChargingStateEnumType,
+    ) -> OcppResult<ChargingStateChangeOutcome> {
+        if self.config.protocol_version != OcppVersion::V201 {
+            return Err(OcppError::NotSupported {
+                feature:
+                    "TransactionEvent(ChargingStateChanged) is an OCPP 2.0.1 message; not available on a 1.6J station"
+                        .to_string(),
+            });
+        }
+
+        // Only the mid-transaction suspend/resume states are driver-controllable
+        // here; `Idle` is terminal (the `Ended` event) and `EVConnected` is the
+        // #579 pre-authorization follow-up. Reject either before the wire.
+        match new_state {
+            ChargingStateEnumType::Charging
+            | ChargingStateEnumType::SuspendedEV
+            | ChargingStateEnumType::SuspendedEVSE => {}
+            other => {
+                return Err(OcppError::ValidationError {
+                    message: format!(
+                        "transition_charging_state drives only the mid-transaction Charging/SuspendedEV/SuspendedEVSE states, got {other:?}"
+                    ),
+                });
+            }
+        }
+
+        // Resolve the live transaction on this EVSE. `active_transactions` maps
+        // transactionId → ConnectorId, and the v201 store keys by EVSE id
+        // (= connector value) in the simulator's flat topology, so the EVSE is
+        // busy iff a live transaction's connector matches it. A non-positive /
+        // out-of-range `evse_id` simply matches nothing (never panics) → inert.
+        let transaction_id = {
+            let active = self.active_transactions.read().await;
+            active.iter().find_map(|(tid, cid)| {
+                (i64::from(cid.value()) == i64::from(evse_id)).then_some(*tid)
+            })
+        };
+        let transaction_id = match transaction_id {
+            Some(id) => id,
+            None => return Ok(ChargingStateChangeOutcome::NoTransaction),
+        };
+
+        // Snapshot the session's shared state/seqNo handles, then drop the map
+        // read lock so it is never held across the outbound send.
+        let (charging_state, next_seq_no) = {
+            let sessions = self.v201_sessions.read().await;
+            match sessions.get(&transaction_id) {
+                Some(session) => (session.charging_state.clone(), session.next_seq_no.clone()),
+                // A stop raced us and tore the session down between the reads.
+                None => return Ok(ChargingStateChangeOutcome::NoTransaction),
+            }
+        };
+
+        // Compare-and-emit under the per-session state lock (not the map lock):
+        // a redundant transition is a true no-op, and two concurrent transitions
+        // can't both emit.
+        let mut state = charging_state.lock().await;
+        if *state == new_state {
+            info!(
+                evse_id,
+                state = ?new_state,
+                "charging-state transition is redundant (already in state); no TransactionEvent emitted"
+            );
+            return Ok(ChargingStateChangeOutcome::Redundant);
+        }
+
+        let seq_no = next_seq_no.fetch_add(1, Ordering::SeqCst);
+        let txid_str = transaction_id.to_string();
+        let session_ref = v201_transaction::SessionRef {
+            transaction_id: &txid_str,
+            evse_id,
+            connector_id: 1,
+        };
+        let request = v201_transaction::transaction_event_charging_state_changed(
+            &session_ref,
+            seq_no,
+            new_state,
+            &v201_now(),
+        );
+        // `call()` schema-validates both the outbound request and the `.conf`; a
+        // transport/timeout/CALLERROR failure propagates as an `OcppError`,
+        // leaving the modeled state unchanged. Only a successful report advances
+        // it, so a failed emit can be retried without a spurious redundant no-op.
+        let _ack = self.call(request).await?;
+        *state = new_state;
+
+        info!(
+            evse_id,
+            state = ?new_state,
+            seq_no,
+            "originated TransactionEvent(ChargingStateChanged); CSMS acknowledged the charging-state transition"
+        );
+
+        Ok(ChargingStateChangeOutcome::Emitted { seq_no })
+    }
+
     /// Originate a 2.0.1 `NotifyChargingLimit.req` — the station's **unsolicited**
     /// report that an *external* actor (a DSO/grid signal, an energy-management
     /// system, or the CSO) has imposed a charging limit on it or a connected
@@ -7448,6 +7654,9 @@ impl ChargePoint {
                         next_seq_no: Arc::new(AtomicI32::new(1)),
                         authorized: Arc::new(AtomicBool::new(true)),
                         group_id_token,
+                        // A transaction opens Charging — the `Started` event just
+                        // reported `chargingState = Charging` (Issue #577).
+                        charging_state: Arc::new(Mutex::new(ChargingStateEnumType::Charging)),
                     },
                 );
 
@@ -13342,6 +13551,225 @@ mod tests {
         let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
         assert!(matches!(
             cp.trip_variable_monitor("OCPPCommCtrlr", "HeartbeatInterval", "900")
+                .await,
+            Err(OcppError::NotSupported { .. })
+        ));
+    }
+
+    // --- transition_charging_state() → TransactionEvent(ChargingStateChanged)
+    //     (Issue #577) ---
+    // The station drives a live transaction across Charging ↔ SuspendedEV ↔
+    // SuspendedEVSE, emitting one Updated event per real transition. Redundant /
+    // no-transaction cases are inert; V201-only. These exercise the driver hook
+    // against a capturing mock CSMS.
+
+    fn transaction_event_routes() -> std::collections::HashMap<String, serde_json::Value> {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        // TransactionEvent.conf is an empty ack (no required fields).
+        routes.insert("TransactionEvent".to_string(), serde_json::json!({}));
+        routes
+    }
+
+    /// Insert a live v201 session on `evse_id` directly, bypassing the start
+    /// flow. The hook reads only the `active_transactions` + `v201_sessions`
+    /// records that a real `start_transaction` populates, so a direct insert is a
+    /// faithful — and fully deterministic — setup (no periodic sampler racing the
+    /// hook for `seqNo`s). `seqNo` starts at 1 (the `Started` event took 0), and
+    /// the session opens `Charging`, both matching `open_transaction`. Returns the
+    /// transaction id.
+    async fn insert_live_v201_session(cp: &ChargePoint, evse_id: i32) -> i32 {
+        let transaction_id = 700 + evse_id;
+        let connector_id = ConnectorId::new(evse_id as u32).unwrap();
+        cp.active_transactions
+            .write()
+            .await
+            .insert(transaction_id, connector_id);
+        cp.v201_sessions.write().await.insert(
+            transaction_id,
+            V201Session {
+                id_tag: "RFID-CAFE".to_string(),
+                next_seq_no: Arc::new(AtomicI32::new(1)),
+                authorized: Arc::new(AtomicBool::new(true)),
+                group_id_token: None,
+                charging_state: Arc::new(Mutex::new(ChargingStateEnumType::Charging)),
+            },
+        );
+        transaction_id
+    }
+
+    /// Drain the capturing channel until the first `TransactionEvent` CALL,
+    /// returning its payload. Bounded by a timeout so a missing emission fails
+    /// fast; skips the connect-time `BootNotification` / `StatusNotification`.
+    async fn recv_transaction_event(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    ) -> serde_json::Value {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+                Ok(Some((action, payload))) if action == "TransactionEvent" => return payload,
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => panic!("no TransactionEvent CALL was emitted"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn transition_charging_state_emits_one_event_on_suspend() {
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+        insert_live_v201_session(&cp, 1).await;
+
+        // Charging → SuspendedEV: one Updated event at the next seqNo (1).
+        let outcome = cp
+            .transition_charging_state(1, ChargingStateEnumType::SuspendedEV)
+            .await
+            .unwrap();
+        assert_eq!(outcome, ChargingStateChangeOutcome::Emitted { seq_no: 1 });
+
+        let payload = recv_transaction_event(&mut rx).await;
+        assert_eq!(payload["eventType"], "Updated");
+        assert_eq!(payload["triggerReason"], "ChargingStateChanged");
+        assert_eq!(payload["seqNo"], 1);
+        assert_eq!(payload["transactionInfo"]["chargingState"], "SuspendedEV");
+        // A pure state change carries no meter reading and is not an auth event.
+        assert!(
+            payload.get("meterValue").is_none(),
+            "a ChargingStateChanged event carries no meterValue"
+        );
+        assert!(payload.get("idToken").is_none());
+    }
+
+    #[tokio::test]
+    async fn transition_charging_state_suspends_evse_then_resumes_in_order() {
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+        insert_live_v201_session(&cp, 1).await;
+
+        // Charging → SuspendedEVSE → Charging: two events, seqNos 1 then 2.
+        let first = cp
+            .transition_charging_state(1, ChargingStateEnumType::SuspendedEVSE)
+            .await
+            .unwrap();
+        let second = cp
+            .transition_charging_state(1, ChargingStateEnumType::Charging)
+            .await
+            .unwrap();
+        assert_eq!(first, ChargingStateChangeOutcome::Emitted { seq_no: 1 });
+        assert_eq!(second, ChargingStateChangeOutcome::Emitted { seq_no: 2 });
+
+        let first_payload = recv_transaction_event(&mut rx).await;
+        let second_payload = recv_transaction_event(&mut rx).await;
+        assert_eq!(first_payload["seqNo"], 1);
+        assert_eq!(
+            first_payload["transactionInfo"]["chargingState"],
+            "SuspendedEVSE"
+        );
+        assert_eq!(second_payload["seqNo"], 2);
+        assert_eq!(
+            second_payload["transactionInfo"]["chargingState"],
+            "Charging"
+        );
+        assert_eq!(second_payload["triggerReason"], "ChargingStateChanged");
+    }
+
+    #[tokio::test]
+    async fn transition_charging_state_redundant_transition_is_a_noop() {
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+        insert_live_v201_session(&cp, 1).await;
+
+        // Already Charging: a request to enter Charging emits nothing and burns
+        // no seqNo.
+        assert_eq!(
+            cp.transition_charging_state(1, ChargingStateEnumType::Charging)
+                .await
+                .unwrap(),
+            ChargingStateChangeOutcome::Redundant
+        );
+        // A following real transition still claims seqNo 1 — proof the redundant
+        // no-op left the counter untouched.
+        assert_eq!(
+            cp.transition_charging_state(1, ChargingStateEnumType::SuspendedEV)
+                .await
+                .unwrap(),
+            ChargingStateChangeOutcome::Emitted { seq_no: 1 }
+        );
+        // A repeat of the now-current SuspendedEV is likewise a no-op.
+        assert_eq!(
+            cp.transition_charging_state(1, ChargingStateEnumType::SuspendedEV)
+                .await
+                .unwrap(),
+            ChargingStateChangeOutcome::Redundant
+        );
+
+        // Exactly one TransactionEvent reached the wire (the SuspendedEV one).
+        let payload = recv_transaction_event(&mut rx).await;
+        assert_eq!(payload["seqNo"], 1);
+        assert_eq!(payload["transactionInfo"]["chargingState"], "SuspendedEV");
+    }
+
+    #[tokio::test]
+    async fn transition_charging_state_with_no_active_transaction_is_inert() {
+        // No session on the EVSE (and an out-of-range evse_id) both land on the
+        // inert NoTransaction outcome — no panic, no CALL. No socket needed since
+        // the hook returns before any send.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        assert_eq!(
+            cp.transition_charging_state(1, ChargingStateEnumType::SuspendedEV)
+                .await
+                .unwrap(),
+            ChargingStateChangeOutcome::NoTransaction
+        );
+        assert_eq!(
+            cp.transition_charging_state(0, ChargingStateEnumType::SuspendedEV)
+                .await
+                .unwrap(),
+            ChargingStateChangeOutcome::NoTransaction
+        );
+    }
+
+    #[tokio::test]
+    async fn transition_charging_state_rejects_terminal_and_preauth_states() {
+        // `Idle` is the terminal state the `Ended` event reports; `EVConnected`
+        // is the pre-authorization plug-in state (the #579 follow-up). Both are
+        // rejected before any wire I/O, so no session or socket is needed.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        assert!(matches!(
+            cp.transition_charging_state(1, ChargingStateEnumType::Idle)
+                .await,
+            Err(OcppError::ValidationError { .. })
+        ));
+        assert!(matches!(
+            cp.transition_charging_state(1, ChargingStateEnumType::EVConnected)
+                .await,
+            Err(OcppError::ValidationError { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn transition_charging_state_is_v201_only() {
+        // A 1.6J station has no TransactionEvent / chargingState path.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        assert!(matches!(
+            cp.transition_charging_state(1, ChargingStateEnumType::SuspendedEV)
                 .await,
             Err(OcppError::NotSupported { .. })
         ));
