@@ -7313,7 +7313,7 @@ impl ChargePoint {
     /// whose `TxStartPoint` includes `EVConnected` — the "cable in, not yet
     /// authorized/charging" phase plug-and-charge and delayed-authorization
     /// conformance exercises. Both share the same behavior-injection contract and
-    /// the same [`emit_transaction_state_change`](Self::emit_transaction_state_change)
+    /// the same `emit_transaction_state_change`
     /// core, differing only in the trigger reason and target state.
     ///
     /// # Outcome

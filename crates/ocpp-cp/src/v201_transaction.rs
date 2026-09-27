@@ -377,7 +377,7 @@ pub fn transaction_event_charging_state_changed(
 /// before the `Charging` state today's `Started`/`Updated` path reports — the
 /// phase plug-and-charge and delayed-authorization conformance exercises. This
 /// is the exact companion #577 deferred; it shares #577's state-transition
-/// machinery ([`transaction_event_state_transition`]) rather than adding a
+/// machinery (`transaction_event_state_transition`) rather than adding a
 /// parallel builder, differing only in the trigger reason and target state.
 ///
 /// Like the suspend/resume transitions it carries **no** `meterValue` (a pure
