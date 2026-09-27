@@ -249,6 +249,37 @@ pub enum MonitorTripOutcome {
     },
 }
 
+/// Terminal outcome of the chained ISO 15118 smart-charging negotiation driven
+/// by [`ChargePoint::negotiate_ev_charging`] (OCPP 2.0.1 Part 2, smart charging;
+/// Issue #569).
+///
+/// The driver runs the two CP-initiated legs in sequence — `NotifyEVChargingNeeds`
+/// then, only if the CSMS accepts the needs, `NotifyEVChargingSchedule` — and this
+/// enum captures **which legs ran and the terminal status**, so a caller or test
+/// can assert the whole sequence deterministically without inspecting the wire.
+/// The schedule leg is emitted **only** on [`Accepted`](Self::Accepted); the other
+/// two arms mean the needs leg alone ran and the schedule was never sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvChargingNegotiationOutcome {
+    /// The CSMS answered the needs leg `Rejected` (smart-charging service not
+    /// available). The negotiation stopped; the schedule leg was **not** emitted.
+    NeedsRejected,
+    /// The CSMS answered the needs leg `Processing` (still gathering information
+    /// to build a schedule). The station would await a `SetChargingProfile` (or
+    /// retry) rather than push a schedule now, so the schedule leg was **not**
+    /// emitted — the caller decides whether to re-drive the negotiation later.
+    NeedsProcessing,
+    /// The CSMS `Accepted` the needs, so the schedule leg ran. `schedule_status`
+    /// is the [`GenericStatusEnumType`] the CSMS returned for
+    /// `NotifyEVChargingSchedule` — whether it could *process* the schedule
+    /// message, **not** approval of the schedule itself (approval, if any, arrives
+    /// later as a `SetChargingProfile`).
+    Accepted {
+        /// The `NotifyEVChargingSchedule.conf` status (`Accepted` / `Rejected`).
+        schedule_status: GenericStatusEnumType,
+    },
+}
+
 /// Default OCPP version for a Charge Point config — 1.6J, the version the
 /// simulator's runtime speaks today. Used by `#[serde(default)]` on
 /// [`ChargePointConfig::protocol_version`] so older serialized configs load.
@@ -6795,6 +6826,94 @@ impl ChargePoint {
         );
 
         Ok(response.status)
+    }
+
+    /// Drive the full ISO 15118 smart-charging negotiation as a station performs
+    /// it when an EV plugs in — report the EV's declared needs, then, gated on the
+    /// CSMS's response, report the schedule the EV intends to follow (OCPP 2.0.1
+    /// Part 2, smart charging; Issue #569).
+    ///
+    /// This is the chaining driver over the two independent legs
+    /// [`request_notify_ev_charging_needs`](Self::request_notify_ev_charging_needs)
+    /// and
+    /// [`request_notify_ev_charging_schedule`](Self::request_notify_ev_charging_schedule):
+    /// mobilityhouse/ocpp models each message on its own (no chained driver), so
+    /// the *sequencing* is the simulator's responsibility while the message
+    /// semantics are ported faithfully from
+    /// [`ocpp.v201.call`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py).
+    /// A pure simulator has no real EV, so the EV's [`ChargingNeedsType`] and the
+    /// [`ChargingScheduleType`] it intends to follow are **injected
+    /// deterministically** by the caller (the same opt-in behavior-injection
+    /// pattern as `unlock_outcome`, firmware fault injection, and
+    /// [`trip_variable_monitor`](Self::trip_variable_monitor)).
+    ///
+    /// Flow, gated on the needs status:
+    ///
+    /// ```text
+    ///   NotifyEVChargingNeeds(needs, evse_id, max_schedule_tuples)
+    ///        │
+    ///        ├─ Rejected   → EvChargingNegotiationOutcome::NeedsRejected   (schedule NOT emitted)
+    ///        ├─ Processing → EvChargingNegotiationOutcome::NeedsProcessing (schedule NOT emitted)
+    ///        └─ Accepted   → NotifyEVChargingSchedule(time_base, schedule, evse_id)
+    ///                            → EvChargingNegotiationOutcome::Accepted { schedule_status }
+    /// ```
+    ///
+    /// The typed [`EvChargingNegotiationOutcome`] is **returned** so the sequence
+    /// is assertable — the variant alone records which legs ran (only `Accepted`
+    /// emits the schedule leg). Each status arm is handled explicitly, so no arm
+    /// panics; a `Rejected`/`Processing` needs status is a valid *protocol*
+    /// outcome, not an `Err`.
+    ///
+    /// This composes the two existing hooks with **no new wire message** and reuses
+    /// their guarantees rather than duplicating them: the needs leg runs first and
+    /// enforces the V201-only and `evse_id > 0` invariants before anything reaches
+    /// the wire, so an unsupported version surfaces as [`OcppError::NotSupported`]
+    /// and a non-positive `evse_id` as [`OcppError::ValidationError`] with nothing
+    /// emitted. Transport / timeout / CALLERROR failures on either leg propagate as
+    /// [`OcppError`]; the injected needs/schedule values ride to the wire verbatim
+    /// through the legs' `call()` schema validation.
+    pub async fn negotiate_ev_charging(
+        &self,
+        evse_id: i32,
+        charging_needs: ChargingNeedsType,
+        max_schedule_tuples: Option<i32>,
+        time_base: &str,
+        charging_schedule: ChargingScheduleType,
+    ) -> OcppResult<EvChargingNegotiationOutcome> {
+        // Leg 1 — report the EV's declared needs. The needs hook owns the
+        // V201-only + `evse_id > 0` guards, so a spec-violating call is rejected
+        // here before any CALL is emitted (no partial negotiation).
+        let needs_status = self
+            .request_notify_ev_charging_needs(charging_needs, evse_id, max_schedule_tuples)
+            .await?;
+
+        let outcome = match needs_status {
+            // Service unavailable / still computing — the station does not push a
+            // schedule; surface the state and stop the sequence.
+            NotifyEVChargingNeedsStatusEnumType::Rejected => {
+                EvChargingNegotiationOutcome::NeedsRejected
+            }
+            NotifyEVChargingNeedsStatusEnumType::Processing => {
+                EvChargingNegotiationOutcome::NeedsProcessing
+            }
+            // Leg 2 — the CSMS accepted the needs, so report the intended schedule
+            // and surface its process-only status.
+            NotifyEVChargingNeedsStatusEnumType::Accepted => {
+                let schedule_status = self
+                    .request_notify_ev_charging_schedule(time_base, charging_schedule, evse_id)
+                    .await?;
+                EvChargingNegotiationOutcome::Accepted { schedule_status }
+            }
+        };
+
+        info!(
+            evse_id,
+            needs_status = ?needs_status,
+            outcome = ?outcome,
+            "EV charging negotiation completed"
+        );
+
+        Ok(outcome)
     }
 
     /// Originate an OCPP 2.0.1 `SecurityEventNotification` — the **CP-initiated**
@@ -13815,6 +13934,225 @@ mod tests {
                 "2022-01-01T10:00:00Z",
                 sample_ev_charging_schedule(),
                 1,
+            )
+            .await,
+            Err(OcppError::NotSupported { .. })
+        ));
+    }
+
+    // --- negotiate_ev_charging() chained ISO 15118 negotiation (M7, #569) ---
+    // Drives needs → schedule against a mock CSMS, gating the schedule leg on the
+    // needs status. The capturing mock lets each test assert which legs actually
+    // reached the wire, and in what order.
+
+    /// Build the routing table for a negotiation test: a boot ack plus the two
+    /// negotiation legs' CSMS statuses.
+    fn negotiation_routes(
+        needs_status: &str,
+        schedule_status: &str,
+    ) -> std::collections::HashMap<String, serde_json::Value> {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        routes.insert(
+            "NotifyEVChargingNeeds".to_string(),
+            serde_json::json!({ "status": needs_status }),
+        );
+        routes.insert(
+            "NotifyEVChargingSchedule".to_string(),
+            serde_json::json!({ "status": schedule_status }),
+        );
+        routes
+    }
+
+    /// Drain the capturing channel until it goes idle, keeping only the two
+    /// negotiation-leg actions (filtering boot / status / heartbeat noise) in the
+    /// order the CP put them on the wire.
+    async fn drain_negotiation_actions(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    ) -> Vec<String> {
+        let mut actions = Vec::new();
+        while let Ok(Some((action, _))) =
+            tokio::time::timeout(std::time::Duration::from_millis(250), rx.recv()).await
+        {
+            if action == "NotifyEVChargingNeeds" || action == "NotifyEVChargingSchedule" {
+                actions.push(action);
+            }
+        }
+        actions
+    }
+
+    #[tokio::test]
+    async fn negotiate_ev_charging_accepted_runs_both_legs_in_order() {
+        // Needs Accepted → the schedule leg runs; the outcome carries the
+        // schedule's process-only status, and both legs hit the wire needs-first.
+        let (addr, mut rx) =
+            spawn_mock_csms_capturing(negotiation_routes("Accepted", "Accepted")).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let outcome = cp
+            .negotiate_ev_charging(
+                1,
+                sample_ev_charging_needs(),
+                Some(4),
+                "2022-01-01T10:00:00Z",
+                sample_ev_charging_schedule(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            EvChargingNegotiationOutcome::Accepted {
+                schedule_status: GenericStatusEnumType::Accepted
+            }
+        );
+        assert_eq!(
+            drain_negotiation_actions(&mut rx).await,
+            vec![
+                "NotifyEVChargingNeeds".to_string(),
+                "NotifyEVChargingSchedule".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn negotiate_ev_charging_accepted_surfaces_rejected_schedule() {
+        // The schedule leg's `Rejected` is a valid process-only status, surfaced
+        // in the outcome (not an error) — the schedule leg still ran.
+        let (addr, mut rx) =
+            spawn_mock_csms_capturing(negotiation_routes("Accepted", "Rejected")).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let outcome = cp
+            .negotiate_ev_charging(
+                1,
+                sample_ev_charging_needs(),
+                None,
+                "2022-01-01T10:00:00Z",
+                sample_ev_charging_schedule(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            EvChargingNegotiationOutcome::Accepted {
+                schedule_status: GenericStatusEnumType::Rejected
+            }
+        );
+        assert_eq!(
+            drain_negotiation_actions(&mut rx).await,
+            vec![
+                "NotifyEVChargingNeeds".to_string(),
+                "NotifyEVChargingSchedule".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn negotiate_ev_charging_rejected_needs_skips_schedule_leg() {
+        // Needs Rejected → the negotiation stops; the schedule leg never reaches
+        // the wire.
+        let (addr, mut rx) =
+            spawn_mock_csms_capturing(negotiation_routes("Rejected", "Accepted")).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let outcome = cp
+            .negotiate_ev_charging(
+                1,
+                sample_ev_charging_needs(),
+                None,
+                "2022-01-01T10:00:00Z",
+                sample_ev_charging_schedule(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, EvChargingNegotiationOutcome::NeedsRejected);
+        assert_eq!(
+            drain_negotiation_actions(&mut rx).await,
+            vec!["NotifyEVChargingNeeds".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn negotiate_ev_charging_processing_needs_skips_schedule_leg() {
+        // Needs Processing → the CSMS is still computing; the station holds off on
+        // the schedule leg and surfaces the state for the caller to re-drive later.
+        let (addr, mut rx) =
+            spawn_mock_csms_capturing(negotiation_routes("Processing", "Accepted")).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let outcome = cp
+            .negotiate_ev_charging(
+                1,
+                sample_ev_charging_needs(),
+                None,
+                "2022-01-01T10:00:00Z",
+                sample_ev_charging_schedule(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, EvChargingNegotiationOutcome::NeedsProcessing);
+        assert_eq!(
+            drain_negotiation_actions(&mut rx).await,
+            vec!["NotifyEVChargingNeeds".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn negotiate_ev_charging_rejects_non_positive_evse_id() {
+        // The needs leg's `evse_id > 0` guard fires first, before any CALL is
+        // emitted — the whole negotiation is refused.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        assert!(matches!(
+            cp.negotiate_ev_charging(
+                0,
+                sample_ev_charging_needs(),
+                None,
+                "2022-01-01T10:00:00Z",
+                sample_ev_charging_schedule(),
+            )
+            .await,
+            Err(OcppError::ValidationError { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn negotiate_ev_charging_is_v201_only() {
+        // A 1.6J station has no ISO 15118 negotiation path; the needs leg refuses.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        assert!(matches!(
+            cp.negotiate_ev_charging(
+                1,
+                sample_ev_charging_needs(),
+                None,
+                "2022-01-01T10:00:00Z",
+                sample_ev_charging_schedule(),
             )
             .await,
             Err(OcppError::NotSupported { .. })
