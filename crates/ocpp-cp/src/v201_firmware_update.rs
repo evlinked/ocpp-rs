@@ -39,20 +39,66 @@
 //! can be shared across the charge point's tasks, exactly like the
 //! [`V201LogUploadStore`](crate::v201_log_upload::V201LogUploadStore).
 
+use ocpp_types::v201::FirmwareStatusEnumType;
 use tokio::sync::RwLock;
 
-/// Tracks the single `UpdateFirmware` rollout a station is currently serving, by
-/// its `requestId`.
+/// The most recent firmware status the station reported, retained so a
+/// `TriggerMessage(FirmwareStatusNotification)` can re-report it on demand
+/// (Issue #583) — the OCPP 2.0.1 twin of the 1.6J `firmware_status` field.
 ///
-/// `None` means idle (no update in flight); `Some(request_id)` names the request
-/// whose update is underway. The `requestId` is CSMS-supplied and stored as an
-/// opaque `i32` — never parsed or indexed — so no wire value (including
-/// `i32::MIN`/`MAX`) can panic here.
+/// A station reports firmware progress asynchronously
+/// (`FirmwareStatusNotification(Downloading → … → Installed)`), but a CSMS may
+/// ask for the *current* status at any point via `TriggerMessage`. This snapshot
+/// is the answer: [`Idle`](FirmwareStatusEnumType::Idle) with no `request_id`
+/// until the first `UpdateFirmware` progress step is emitted, then the latest
+/// `(status, requestId)` thereafter — retained even after the in-flight slot is
+/// cleared, so a settled `Installed` (or a terminal failure) is still reportable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V201FirmwareStatusReport {
+    /// The latest reported stage of the firmware download/install lifecycle.
+    pub status: FirmwareStatusEnumType,
+    /// The `requestId` of the `UpdateFirmware` that stage belongs to, or `None`
+    /// for the initial [`Idle`](FirmwareStatusEnumType::Idle) (no update has run,
+    /// so the status is not tied to a specific request — the 2.0.1 schema omits
+    /// `requestId` in that case).
+    pub request_id: Option<i32>,
+}
+
+impl Default for V201FirmwareStatusReport {
+    /// A station that has never run an update: [`Idle`](FirmwareStatusEnumType::Idle),
+    /// no correlating `requestId`.
+    fn default() -> Self {
+        Self {
+            status: FirmwareStatusEnumType::Idle,
+            request_id: None,
+        }
+    }
+}
+
+/// Tracks the single `UpdateFirmware` rollout a station is currently serving, by
+/// its `requestId`, plus the latest firmware status it has reported.
+///
+/// For the in-flight slot: `None` means idle (no update in flight);
+/// `Some(request_id)` names the request whose update is underway. The `requestId`
+/// is CSMS-supplied and stored as an opaque `i32` — never parsed or indexed — so
+/// no wire value (including `i32::MIN`/`MAX`) can panic here.
+///
+/// Separately, [`last_reported`](Self::last_reported) retains the most recent
+/// [`V201FirmwareStatusReport`] the station emitted (via
+/// [`record_reported`](Self::record_reported)), so a
+/// `TriggerMessage(FirmwareStatusNotification)` can re-report the current status
+/// without re-running the update. It is deliberately *not* cleared when the
+/// in-flight slot is ([`complete`](Self::complete) / [`clear`](Self::clear)): a
+/// finished rollout leaves the station idle but its last status (`Installed`, or a
+/// terminal failure) remains the truthful thing to report.
 #[derive(Debug, Default)]
 pub struct V201FirmwareUpdateStore {
     /// The `requestId` of the firmware update currently in flight, or `None` when
     /// idle.
     in_flight: RwLock<Option<i32>>,
+    /// The most recent firmware status the station reported. `Idle`/`None` until
+    /// the first progress step; see [`V201FirmwareStatusReport`].
+    last_reported: RwLock<V201FirmwareStatusReport>,
 }
 
 impl V201FirmwareUpdateStore {
@@ -133,6 +179,34 @@ impl V201FirmwareUpdateStore {
         } else {
             false
         }
+    }
+
+    /// Record `status` (from `UpdateFirmware` request `request_id`) as the latest
+    /// firmware status the station has reported.
+    ///
+    /// Called at the single emit choke point
+    /// (`ChargePoint::send_v201_firmware_status`) for every progress step, so the
+    /// snapshot tracks the full lifecycle — interim (`Downloading` … `Installing`)
+    /// and terminal (`Installed` / `DownloadFailed` / `InstallationFailed`). It is
+    /// independent of the in-flight slot: a completed rollout clears
+    /// [`in_flight`](Self::in_flight) but this retains the terminal status so a
+    /// later `TriggerMessage(FirmwareStatusNotification)` still re-reports it.
+    /// `request_id` is only stored, never parsed or indexed.
+    pub async fn record_reported(&self, status: FirmwareStatusEnumType, request_id: i32) {
+        *self.last_reported.write().await = V201FirmwareStatusReport {
+            status,
+            request_id: Some(request_id),
+        };
+    }
+
+    /// The most recent [`V201FirmwareStatusReport`] the station has reported.
+    ///
+    /// The snapshot a `TriggerMessage(FirmwareStatusNotification)` re-reports on
+    /// demand. Defaults to [`Idle`](FirmwareStatusEnumType::Idle) with no
+    /// `requestId` on a station that has never run an update. Returns a copy, so
+    /// the caller decides without holding the store lock.
+    pub async fn last_reported(&self) -> V201FirmwareStatusReport {
+        *self.last_reported.read().await
     }
 }
 
@@ -237,5 +311,78 @@ mod tests {
         // Extreme ids compare, never index — no panic.
         assert!(!store.complete(i32::MIN).await);
         assert!(!store.complete(i32::MAX).await);
+    }
+
+    #[tokio::test]
+    async fn a_new_store_reports_idle_with_no_request_id() {
+        let store = V201FirmwareUpdateStore::new();
+        assert_eq!(
+            store.last_reported().await,
+            V201FirmwareStatusReport {
+                status: FirmwareStatusEnumType::Idle,
+                request_id: None,
+            },
+            "a station that has never run an update reports Idle, no requestId"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_reported_tracks_the_latest_status_and_request_id() {
+        let store = V201FirmwareUpdateStore::new();
+        store
+            .record_reported(FirmwareStatusEnumType::Downloading, 42)
+            .await;
+        assert_eq!(
+            store.last_reported().await,
+            V201FirmwareStatusReport {
+                status: FirmwareStatusEnumType::Downloading,
+                request_id: Some(42),
+            }
+        );
+        // The latest wins — a later step overwrites the earlier one.
+        store
+            .record_reported(FirmwareStatusEnumType::Installed, 42)
+            .await;
+        assert_eq!(
+            store.last_reported().await,
+            V201FirmwareStatusReport {
+                status: FirmwareStatusEnumType::Installed,
+                request_id: Some(42),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn completing_the_rollout_retains_the_last_reported_status() {
+        // A settled rollout returns the in-flight slot to idle, but the terminal
+        // status must remain reportable for a later TriggerMessage.
+        let store = V201FirmwareUpdateStore::new();
+        store.begin(9).await;
+        store
+            .record_reported(FirmwareStatusEnumType::Installed, 9)
+            .await;
+        assert!(store.complete(9).await);
+        assert!(store.is_idle().await, "in-flight slot cleared");
+        assert_eq!(
+            store.last_reported().await,
+            V201FirmwareStatusReport {
+                status: FirmwareStatusEnumType::Installed,
+                request_id: Some(9),
+            },
+            "the terminal status survives the in-flight clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_reported_accepts_extreme_request_ids() {
+        let store = V201FirmwareUpdateStore::new();
+        store
+            .record_reported(FirmwareStatusEnumType::DownloadFailed, i32::MIN)
+            .await;
+        assert_eq!(store.last_reported().await.request_id, Some(i32::MIN));
+        store
+            .record_reported(FirmwareStatusEnumType::InstallationFailed, i32::MAX)
+            .await;
+        assert_eq!(store.last_reported().await.request_id, Some(i32::MAX));
     }
 }

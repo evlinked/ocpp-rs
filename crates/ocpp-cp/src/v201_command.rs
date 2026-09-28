@@ -317,11 +317,14 @@ pub fn v201_reset_response(
 /// [`BootNotification`](MessageTriggerEnumType::BootNotification),
 /// [`Heartbeat`](MessageTriggerEnumType::Heartbeat),
 /// [`StatusNotification`](MessageTriggerEnumType::StatusNotification),
-/// [`MeterValues`](MessageTriggerEnumType::MeterValues), and
-/// [`TransactionEvent`](MessageTriggerEnumType::TransactionEvent) — and to
+/// [`MeterValues`](MessageTriggerEnumType::MeterValues),
+/// [`TransactionEvent`](MessageTriggerEnumType::TransactionEvent), and
+/// [`FirmwareStatusNotification`](MessageTriggerEnumType::FirmwareStatusNotification)
+/// (the CP models `UpdateFirmware` and re-reports its latest firmware status on
+/// demand, Issue #583) — and to
 /// [`NotImplemented`](TriggerMessageStatusEnumType::NotImplemented) for the
-/// firmware-, log-, and certificate-signing triggers the simulator has no
-/// support for.
+/// diagnostics-log-, publish-firmware-, and certificate-signing triggers the
+/// simulator does not yet trigger.
 ///
 /// `MeterValues` is `Accepted` at the policy level because the CP produces meter
 /// readings; in 2.0.1 those ride inside `TransactionEvent`, so the slice-5b
@@ -346,13 +349,21 @@ pub fn v201_trigger_message_status(
     };
     match requested {
         // Messages this CP already builds and sends on the live V201 path.
-        BootNotification | Heartbeat | StatusNotification | MeterValues | TransactionEvent => {
-            TriggerMessageStatusEnumType::Accepted
-        }
-        // Firmware-, diagnostics-log-, and certificate-signing flows the
-        // simulator does not implement: recognized but not triggerable.
+        // `FirmwareStatusNotification` re-reports the station's latest firmware
+        // status on demand — the CP models `UpdateFirmware` and retains that
+        // status, so the trigger is honored (Issue #583), the direct twin of the
+        // 1.6J `TriggerMessage(FirmwareStatusNotification)` re-report.
+        BootNotification
+        | Heartbeat
+        | StatusNotification
+        | MeterValues
+        | TransactionEvent
+        | FirmwareStatusNotification => TriggerMessageStatusEnumType::Accepted,
+        // Diagnostics-log-, publish-firmware-, and certificate-signing flows the
+        // simulator does not yet trigger: recognized but not triggerable.
+        // (LogStatusNotification → #584, PublishFirmwareStatusNotification → #585
+        // will re-report their latest status the same way #583 does.)
         LogStatusNotification
-        | FirmwareStatusNotification
         | SignChargingStationCertificate
         | SignV2GCertificate
         | SignCombinedCertificate
@@ -2427,17 +2438,37 @@ pub fn v201_log_status_notification(
 /// The `requestId` is always carried here (it correlates the async progress
 /// report back to the triggering `UpdateFirmwareRequest`); it is only absent
 /// when a `TriggerMessage` asks for a `FirmwareStatusNotification` with no update
-/// ongoing, which this `UpdateFirmware`-driven flow never is. The firmware twin
-/// of [`v201_log_status_notification`]. Ports
+/// ongoing (the [`Idle`](FirmwareStatusEnumType::Idle) re-report built by
+/// [`v201_firmware_status_report`]), which this `UpdateFirmware`-driven flow never
+/// is. The firmware twin of [`v201_log_status_notification`]. Ports
 /// `ocpp.v201.call.FirmwareStatusNotification`.
 #[must_use]
 pub fn v201_firmware_status_notification(
     status: FirmwareStatusEnumType,
     request_id: i32,
 ) -> FirmwareStatusNotificationRequest {
+    v201_firmware_status_report(status, Some(request_id))
+}
+
+/// Build a schema-valid `FirmwareStatusNotification.req`
+/// ([`FirmwareStatusNotificationRequest`]) with an *optional* `request_id`.
+///
+/// The re-report constructor a `TriggerMessage(FirmwareStatusNotification)` uses
+/// to answer with the station's latest firmware status (Issue #583). Unlike the
+/// async-progress [`v201_firmware_status_notification`], `request_id` may be
+/// `None`: an [`Idle`](FirmwareStatusEnumType::Idle) status on a station that has
+/// never run an `UpdateFirmware` is not tied to a specific request, and the 2.0.1
+/// schema omits `requestId` (`skip_serializing_if = "Option::is_none"`) in that
+/// case; a status carried over from a real rollout re-reports its `Some(requestId)`.
+/// Ports `ocpp.v201.call.FirmwareStatusNotification`.
+#[must_use]
+pub fn v201_firmware_status_report(
+    status: FirmwareStatusEnumType,
+    request_id: Option<i32>,
+) -> FirmwareStatusNotificationRequest {
     FirmwareStatusNotificationRequest {
         status,
-        request_id: Some(request_id),
+        request_id,
         custom_data: None,
     }
 }
@@ -3693,6 +3724,9 @@ mod tests {
             MessageTriggerEnumType::StatusNotification,
             MessageTriggerEnumType::MeterValues,
             MessageTriggerEnumType::TransactionEvent,
+            // The CP models UpdateFirmware and retains its latest firmware status,
+            // so a FirmwareStatusNotification trigger is honored by re-report (#583).
+            MessageTriggerEnumType::FirmwareStatusNotification,
         ] {
             assert_eq!(
                 v201_trigger_message_status(requested),
@@ -3702,13 +3736,13 @@ mod tests {
         }
     }
 
-    /// The firmware-, log-, and certificate-signing triggers the simulator has
-    /// no way to emit resolve to `NotImplemented` (recognized, not triggerable).
+    /// The diagnostics-log-, publish-firmware-, and certificate-signing triggers
+    /// the simulator does not yet originate resolve to `NotImplemented`
+    /// (recognized, not triggerable).
     #[test]
     fn unsupported_triggers_are_not_implemented() {
         for requested in [
             MessageTriggerEnumType::LogStatusNotification,
-            MessageTriggerEnumType::FirmwareStatusNotification,
             MessageTriggerEnumType::SignChargingStationCertificate,
             MessageTriggerEnumType::SignV2GCertificate,
             MessageTriggerEnumType::SignCombinedCertificate,
@@ -3751,10 +3785,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(accepted, 5, "expected exactly 5 producible triggers");
+        assert_eq!(accepted, 6, "expected exactly 6 producible triggers");
         assert_eq!(
-            not_implemented, 6,
-            "expected exactly 6 unsupported triggers"
+            not_implemented, 5,
+            "expected exactly 5 unsupported triggers"
         );
     }
 
@@ -8368,6 +8402,62 @@ mod tests {
                         .validate_call("FirmwareStatusNotification", &payload)
                         .is_ok(),
                     "built {status:?} FirmwareStatusNotification.req (requestId {request_id}) \
+                     should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn firmware_status_report_omits_request_id_when_none() {
+        // The Idle re-report a TriggerMessage(FirmwareStatusNotification) answers
+        // with on a station that has never run an update (#583): Idle, no requestId.
+        let req = v201_firmware_status_report(FirmwareStatusEnumType::Idle, None);
+        assert_eq!(req.status, FirmwareStatusEnumType::Idle);
+        assert_eq!(req.request_id, None);
+        assert!(req.custom_data.is_none());
+        // `requestId` must be *absent* from the wire, not `null` — the schema has
+        // no `null` for it (skip_serializing_if = "Option::is_none").
+        let payload = serde_json::to_value(&req).unwrap();
+        assert!(
+            payload.get("requestId").is_none(),
+            "an Idle re-report omits requestId entirely, got: {payload}"
+        );
+    }
+
+    #[test]
+    fn firmware_status_report_carries_request_id_when_some() {
+        // A status re-reported from a real rollout keeps its correlating requestId.
+        let req = v201_firmware_status_report(FirmwareStatusEnumType::Installed, Some(7));
+        assert_eq!(req.status, FirmwareStatusEnumType::Installed);
+        assert_eq!(req.request_id, Some(7));
+        // The convenience wrapper produces the same shape as the explicit Some.
+        assert_eq!(
+            req,
+            v201_firmware_status_notification(FirmwareStatusEnumType::Installed, 7)
+        );
+    }
+
+    #[test]
+    fn built_firmware_status_reports_are_schema_valid() {
+        // The trigger re-report path (optional requestId) is schema-valid both as
+        // an Idle/None snapshot and carrying a status + requestId from a rollout.
+        let validator = SchemaValidator::v201();
+        for status in [
+            FirmwareStatusEnumType::Idle,
+            FirmwareStatusEnumType::Downloading,
+            FirmwareStatusEnumType::Installed,
+            FirmwareStatusEnumType::DownloadFailed,
+            FirmwareStatusEnumType::InstallationFailed,
+        ] {
+            for request_id in [None, Some(0), Some(-1), Some(i32::MIN), Some(i32::MAX)] {
+                let req = v201_firmware_status_report(status, request_id);
+                let payload = serde_json::to_value(&req).unwrap();
+                assert!(
+                    validator
+                        .validate_call("FirmwareStatusNotification", &payload)
+                        .is_ok(),
+                    "built {status:?} FirmwareStatusNotification.req (requestId {request_id:?}) \
                      should be schema-valid, got: {payload}"
                 );
             }
