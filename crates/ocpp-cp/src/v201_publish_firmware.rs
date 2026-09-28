@@ -37,19 +37,81 @@
 //!
 //! [`V201CustomerInformationStore`]: crate::v201_customer_information::V201CustomerInformationStore
 
+use ocpp_types::v201::PublishFirmwareStatusEnumType;
 use std::collections::HashSet;
 use tokio::sync::RwLock;
 
-/// Tracks the set of `PublishFirmware` progress streams currently in flight, by
-/// their `requestId`.
+/// The most recent publish-firmware status the station reported, retained so a
+/// `TriggerMessage(PublishFirmwareStatusNotification)` can re-report it on demand
+/// (Issue #585) — the publish-to-local-cache twin of
+/// [`V201FirmwareStatusReport`](crate::v201_firmware_update::V201FirmwareStatusReport).
 ///
-/// Each `requestId` is CSMS-supplied and stored as an opaque `i32` — only ever
-/// inserted, compared, and removed, never parsed or indexed — so no wire value
-/// (including `i32::MIN`/`MAX`) can panic here.
+/// A station reports publish progress asynchronously
+/// (`PublishFirmwareStatusNotification(Idle → … → Published)`), but a CSMS may
+/// ask for the *current* status at any point via `TriggerMessage`. This snapshot
+/// is the answer: [`Idle`](PublishFirmwareStatusEnumType::Idle) with no
+/// `request_id` and no `location` until the first `PublishFirmware` progress step
+/// is emitted, then the latest `(status, location, requestId)` thereafter —
+/// retained even after the in-flight marker is cleared, so a settled `Published`
+/// (or a terminal failure) is still reportable.
+///
+/// Unlike the single-slot firmware-update snapshot this carries `location`: the
+/// terminal [`Published`](PublishFirmwareStatusEnumType::Published) advertises the
+/// cached image's download URIs, so a faithful re-report must reproduce them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct V201PublishFirmwareStatusReport {
+    /// The latest reported stage of the firmware-publish lifecycle.
+    pub status: PublishFirmwareStatusEnumType,
+    /// The URIs the published image can be downloaded from — `Some` only when the
+    /// latest reported `status` was [`Published`](PublishFirmwareStatusEnumType::Published),
+    /// `None` for every intermediate state and the initial `Idle` (mirroring what
+    /// the async progress stream itself carries per state).
+    pub location: Option<Vec<String>>,
+    /// The `requestId` of the `PublishFirmware` that stage belongs to, or `None`
+    /// for the initial [`Idle`](PublishFirmwareStatusEnumType::Idle) (no publish
+    /// has run, so the status is not tied to a specific request — the 2.0.1 schema
+    /// omits `requestId` in that case).
+    pub request_id: Option<i32>,
+}
+
+impl Default for V201PublishFirmwareStatusReport {
+    /// A station that has never run a publish:
+    /// [`Idle`](PublishFirmwareStatusEnumType::Idle), no `location`, no
+    /// correlating `requestId`.
+    fn default() -> Self {
+        Self {
+            status: PublishFirmwareStatusEnumType::Idle,
+            location: None,
+            request_id: None,
+        }
+    }
+}
+
+/// Tracks the set of `PublishFirmware` progress streams currently in flight, by
+/// their `requestId`, plus the latest publish-firmware status the station has
+/// reported.
+///
+/// For the in-flight set: each `requestId` is CSMS-supplied and stored as an
+/// opaque `i32` — only ever inserted, compared, and removed, never parsed or
+/// indexed — so no wire value (including `i32::MIN`/`MAX`) can panic here.
+///
+/// Separately, [`last_reported`](Self::last_reported) retains the most recent
+/// [`V201PublishFirmwareStatusReport`] the station emitted (via
+/// [`record_reported`](Self::record_reported)), so a
+/// `TriggerMessage(PublishFirmwareStatusNotification)` can re-report the current
+/// status without re-running a publish. It is deliberately *not* cleared when an
+/// in-flight id settles ([`complete`](Self::complete)): a finished publish leaves
+/// the station's last status (`Published`, or a terminal failure) as the truthful
+/// thing to report. With independent per-id streams the "latest" is simply the
+/// most recent emit across all of them — the station's current publish status.
 #[derive(Debug, Default)]
 pub struct V201PublishFirmwareStore {
     /// The `requestId`s whose progress streams are currently in flight.
     in_flight: RwLock<HashSet<i32>>,
+    /// The most recent publish-firmware status the station reported. `Idle` (no
+    /// `location`/`requestId`) until the first progress step; see
+    /// [`V201PublishFirmwareStatusReport`].
+    last_reported: RwLock<V201PublishFirmwareStatusReport>,
 }
 
 impl V201PublishFirmwareStore {
@@ -98,6 +160,44 @@ impl V201PublishFirmwareStore {
     /// wire value can panic.
     pub async fn complete(&self, request_id: i32) -> bool {
         self.in_flight.write().await.remove(&request_id)
+    }
+
+    /// Record `status` (from `PublishFirmware` request `request_id`, carrying
+    /// `location` only on the terminal `Published` state) as the latest
+    /// publish-firmware status the station has reported.
+    ///
+    /// Called at the single emit choke point
+    /// (`ChargePoint::send_v201_publish_firmware_status`) for every progress step,
+    /// so the snapshot tracks the full lifecycle — interim (`DownloadScheduled` …
+    /// `Downloaded`) and terminal (`Published` / a failure state). It is
+    /// independent of the in-flight set: a completed publish clears its id but this
+    /// retains the terminal status so a later
+    /// `TriggerMessage(PublishFirmwareStatusNotification)` still re-reports it. With
+    /// independent per-id streams the newest emit wins, which is the station's
+    /// current publish status. `request_id` is only stored, never parsed or
+    /// indexed, so no wire value can panic.
+    pub async fn record_reported(
+        &self,
+        status: PublishFirmwareStatusEnumType,
+        location: Option<Vec<String>>,
+        request_id: i32,
+    ) {
+        *self.last_reported.write().await = V201PublishFirmwareStatusReport {
+            status,
+            location,
+            request_id: Some(request_id),
+        };
+    }
+
+    /// The most recent [`V201PublishFirmwareStatusReport`] the station has
+    /// reported.
+    ///
+    /// The snapshot a `TriggerMessage(PublishFirmwareStatusNotification)`
+    /// re-reports on demand. Defaults to [`Idle`](PublishFirmwareStatusEnumType::Idle)
+    /// with no `location`/`requestId` on a station that has never run a publish.
+    /// Returns a clone, so the caller decides without holding the store lock.
+    pub async fn last_reported(&self) -> V201PublishFirmwareStatusReport {
+        self.last_reported.read().await.clone()
     }
 }
 
@@ -179,5 +279,98 @@ mod tests {
         assert!(store.complete(i32::MIN).await);
         assert!(store.complete(i32::MAX).await);
         assert_eq!(store.in_flight_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_new_store_reports_idle_with_no_location_or_request_id() {
+        let store = V201PublishFirmwareStore::new();
+        assert_eq!(
+            store.last_reported().await,
+            V201PublishFirmwareStatusReport {
+                status: PublishFirmwareStatusEnumType::Idle,
+                location: None,
+                request_id: None,
+            },
+            "a station that has never run a publish reports Idle, no location/requestId"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_reported_tracks_the_latest_status_and_request_id() {
+        let store = V201PublishFirmwareStore::new();
+        store
+            .record_reported(PublishFirmwareStatusEnumType::Downloading, None, 42)
+            .await;
+        assert_eq!(
+            store.last_reported().await,
+            V201PublishFirmwareStatusReport {
+                status: PublishFirmwareStatusEnumType::Downloading,
+                location: None,
+                request_id: Some(42),
+            }
+        );
+        // The latest wins — the terminal Published step overwrites the earlier one
+        // and carries the cached-image download URIs.
+        let uris = vec!["http://lc.lan/fw.bin".to_string()];
+        store
+            .record_reported(
+                PublishFirmwareStatusEnumType::Published,
+                Some(uris.clone()),
+                42,
+            )
+            .await;
+        assert_eq!(
+            store.last_reported().await,
+            V201PublishFirmwareStatusReport {
+                status: PublishFirmwareStatusEnumType::Published,
+                location: Some(uris),
+                request_id: Some(42),
+            },
+            "the terminal Published re-report retains its location URIs"
+        );
+    }
+
+    #[tokio::test]
+    async fn completing_the_stream_retains_the_last_reported_status() {
+        // A settled publish clears the id from the in-flight set, but the terminal
+        // status (with its location) must remain reportable for a later trigger.
+        let store = V201PublishFirmwareStore::new();
+        store.begin(9).await;
+        let uris = vec!["ftp://lc.lan/fw.bin".to_string()];
+        store
+            .record_reported(
+                PublishFirmwareStatusEnumType::Published,
+                Some(uris.clone()),
+                9,
+            )
+            .await;
+        assert!(store.complete(9).await);
+        assert_eq!(store.in_flight_count().await, 0, "in-flight marker cleared");
+        assert_eq!(
+            store.last_reported().await,
+            V201PublishFirmwareStatusReport {
+                status: PublishFirmwareStatusEnumType::Published,
+                location: Some(uris),
+                request_id: Some(9),
+            },
+            "the terminal status survives the in-flight clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_reported_accepts_extreme_request_ids() {
+        let store = V201PublishFirmwareStore::new();
+        store
+            .record_reported(
+                PublishFirmwareStatusEnumType::DownloadFailed,
+                None,
+                i32::MIN,
+            )
+            .await;
+        assert_eq!(store.last_reported().await.request_id, Some(i32::MIN));
+        store
+            .record_reported(PublishFirmwareStatusEnumType::PublishFailed, None, i32::MAX)
+            .await;
+        assert_eq!(store.last_reported().await.request_id, Some(i32::MAX));
     }
 }
