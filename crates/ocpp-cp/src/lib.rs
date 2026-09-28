@@ -165,7 +165,7 @@ use ocpp_types::v201::{
     RegistrationStatusEnumType, ReportDataType, RequestStartStopStatusEnumType,
     ReservationUpdateStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
     SetNetworkProfileStatusEnumType, SetVariableResultType, SetVariableStatusEnumType,
-    StatusInfoType, TriggerMessageStatusEnumType, UnlockStatusEnumType,
+    StatusInfoType, TriggerMessageStatusEnumType, TriggerReasonEnumType, UnlockStatusEnumType,
     UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
@@ -251,10 +251,12 @@ pub enum MonitorTripOutcome {
 }
 
 /// The result of driving a live 2.0.1 transaction across a charging-state
-/// transition via [`ChargePoint::transition_charging_state`] (Issue #577).
+/// transition — via [`ChargePoint::transition_charging_state`] (the interim
+/// suspend/resume states, Issue #577) or [`ChargePoint::plug_in_cable`] (the
+/// pre-authorization `EVConnected` plug-in phase, Issue #579).
 ///
-/// A transition either advanced a real change — emitting one
-/// `TransactionEvent(Updated, triggerReason = ChargingStateChanged)` — or was a
+/// A transition either advanced a real change — emitting one interim
+/// `TransactionEvent(Updated)` under the relevant `triggerReason` — or was a
 /// benign no-op (the connector was already in the target state, or no
 /// transaction is running on the EVSE). The outcome is returned (never
 /// panicked) so a caller or test can assert exactly what the injection did
@@ -7292,6 +7294,93 @@ impl ChargePoint {
             }
         }
 
+        self.emit_transaction_state_change(
+            evse_id,
+            new_state,
+            TriggerReasonEnumType::ChargingStateChanged,
+        )
+        .await
+    }
+
+    /// Drive a live 2.0.1 transaction into the **cable-plugged, pre-authorization**
+    /// [`EVConnected`](ChargingStateEnumType::EVConnected) phase, originating one
+    /// `TransactionEvent(triggerReason = CablePluggedIn, chargingState =
+    /// EVConnected)` (Issue #579).
+    ///
+    /// The companion to [`transition_charging_state`](Self::transition_charging_state):
+    /// where that hook drives the interim `Charging ↔ SuspendedEV ↔ SuspendedEVSE`
+    /// suspend/resume transitions, this one models plugging the cable on a station
+    /// whose `TxStartPoint` includes `EVConnected` — the "cable in, not yet
+    /// authorized/charging" phase plug-and-charge and delayed-authorization
+    /// conformance exercises. Both share the same behavior-injection contract and
+    /// the same `emit_transaction_state_change`
+    /// core, differing only in the trigger reason and target state.
+    ///
+    /// # Outcome
+    ///
+    /// - **No transaction on `evse_id`** → [`ChargingStateChangeOutcome::NoTransaction`],
+    ///   inert — no CALL, no `seqNo` burned. A non-positive / out-of-range
+    ///   `evse_id` matches nothing and lands here.
+    /// - **Already `EVConnected`** → [`ChargingStateChangeOutcome::Redundant`], a
+    ///   silent no-op — no CALL, no `seqNo` burned (the hysteresis guarantee).
+    /// - **A real transition** → one `TransactionEvent(CablePluggedIn)` is emitted
+    ///   and, on the CSMS's ack, [`ChargingStateChangeOutcome::Emitted`] reports
+    ///   the `seqNo` used, drawn from the transaction's monotonic stream so it
+    ///   interleaves cleanly with the other events and stays strictly between
+    ///   `Started` and `Ended`.
+    ///
+    /// # Scope
+    ///
+    /// This drives the `EVConnected` / `CablePluggedIn` plug-in phase against an
+    /// already-open transaction context, reusing #577's state-transition
+    /// plumbing. Reconciling the full `TxStartPoint` variants (Authorized /
+    /// PowerPathClosed / EnergyTransfer) — i.e. having the plug-in genuinely
+    /// *open* the transaction before authorization — is a deliberate follow-up,
+    /// out of this slice's scope.
+    ///
+    /// V201-only: `TransactionEvent` and its `chargingState` are 2.0.1
+    /// constructs, so a call on a `V16J` station is refused with
+    /// [`OcppError::NotSupported`].
+    pub async fn plug_in_cable(&self, evse_id: i32) -> OcppResult<ChargingStateChangeOutcome> {
+        if self.config.protocol_version != OcppVersion::V201 {
+            return Err(OcppError::NotSupported {
+                feature:
+                    "TransactionEvent(CablePluggedIn) is an OCPP 2.0.1 message; not available on a 1.6J station"
+                        .to_string(),
+            });
+        }
+
+        self.emit_transaction_state_change(
+            evse_id,
+            ChargingStateEnumType::EVConnected,
+            TriggerReasonEnumType::CablePluggedIn,
+        )
+        .await
+    }
+
+    /// Shared core behind [`transition_charging_state`](Self::transition_charging_state)
+    /// (#577) and [`plug_in_cable`](Self::plug_in_cable) (#579): resolve the live
+    /// transaction on `evse_id`, compare-and-set its `chargingState`, and — only
+    /// on a *real* change — emit one interim `TransactionEvent(Updated)` under
+    /// `trigger_reason` carrying `new_state`.
+    ///
+    /// The caller is responsible for the version guard and (where applicable)
+    /// validating `new_state` against the hook's allowed set; this core assumes a
+    /// 2.0.1 station and a caller-approved target state.
+    ///
+    /// The compare-and-emit runs under the session's own `charging_state`
+    /// [`Mutex`], not the `v201_sessions` map lock, so a redundant transition is
+    /// a true no-op and two concurrent transitions can't both emit; holding it
+    /// across the send serializes only this connector's state changes (inherently
+    /// sequential), never the whole station. On a transport/timeout/CALLERROR
+    /// failure the modeled state is left unchanged (the `seqNo` is spent, as on
+    /// any emitted event) and the error propagates as an [`OcppError`].
+    async fn emit_transaction_state_change(
+        &self,
+        evse_id: i32,
+        new_state: ChargingStateEnumType,
+        trigger_reason: TriggerReasonEnumType,
+    ) -> OcppResult<ChargingStateChangeOutcome> {
         // Resolve the live transaction on this EVSE. `active_transactions` maps
         // transactionId → ConnectorId, and the v201 store keys by EVSE id
         // (= connector value) in the simulator's flat topology, so the EVSE is
@@ -7339,9 +7428,10 @@ impl ChargePoint {
             evse_id,
             connector_id: 1,
         };
-        let request = v201_transaction::transaction_event_charging_state_changed(
+        let request = v201_transaction::transaction_event_state_transition(
             &session_ref,
             seq_no,
+            trigger_reason,
             new_state,
             &v201_now(),
         );
@@ -7355,8 +7445,9 @@ impl ChargePoint {
         info!(
             evse_id,
             state = ?new_state,
+            trigger = ?trigger_reason,
             seq_no,
-            "originated TransactionEvent(ChargingStateChanged); CSMS acknowledged the charging-state transition"
+            "originated TransactionEvent charging-state transition; CSMS acknowledged"
         );
 
         Ok(ChargingStateChangeOutcome::Emitted { seq_no })
@@ -13582,6 +13673,17 @@ mod tests {
     /// the session opens `Charging`, both matching `open_transaction`. Returns the
     /// transaction id.
     async fn insert_live_v201_session(cp: &ChargePoint, evse_id: i32) -> i32 {
+        insert_live_v201_session_in_state(cp, evse_id, ChargingStateEnumType::Charging).await
+    }
+
+    /// As [`insert_live_v201_session`], but seeds the session's `chargingState`
+    /// so a test can exercise a transition *into* a target state (e.g. seed
+    /// `EVConnected` to assert the plug-in hook's redundant no-op).
+    async fn insert_live_v201_session_in_state(
+        cp: &ChargePoint,
+        evse_id: i32,
+        initial_state: ChargingStateEnumType,
+    ) -> i32 {
         let transaction_id = 700 + evse_id;
         let connector_id = ConnectorId::new(evse_id as u32).unwrap();
         cp.active_transactions
@@ -13595,7 +13697,7 @@ mod tests {
                 next_seq_no: Arc::new(AtomicI32::new(1)),
                 authorized: Arc::new(AtomicBool::new(true)),
                 group_id_token: None,
-                charging_state: Arc::new(Mutex::new(ChargingStateEnumType::Charging)),
+                charging_state: Arc::new(Mutex::new(initial_state)),
             },
         );
         transaction_id
@@ -13771,6 +13873,96 @@ mod tests {
         assert!(matches!(
             cp.transition_charging_state(1, ChargingStateEnumType::SuspendedEV)
                 .await,
+            Err(OcppError::NotSupported { .. })
+        ));
+    }
+
+    // --- plug_in_cable() → TransactionEvent(CablePluggedIn / EVConnected) (#579) -
+    //
+    // The station drives a live transaction into the pre-authorization
+    // EVConnected plug-in phase, emitting one Updated event with
+    // triggerReason = CablePluggedIn. Redundant / no-transaction cases are inert;
+    // V201-only. Reuses #577's driver-hook plumbing via the shared core.
+
+    #[tokio::test]
+    async fn plug_in_cable_emits_one_ev_connected_event() {
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+        insert_live_v201_session(&cp, 1).await;
+
+        // → EVConnected: one Updated event at the next seqNo (1).
+        let outcome = cp.plug_in_cable(1).await.unwrap();
+        assert_eq!(outcome, ChargingStateChangeOutcome::Emitted { seq_no: 1 });
+
+        let payload = recv_transaction_event(&mut rx).await;
+        assert_eq!(payload["eventType"], "Updated");
+        assert_eq!(payload["triggerReason"], "CablePluggedIn");
+        assert_eq!(payload["seqNo"], 1);
+        assert_eq!(payload["transactionInfo"]["chargingState"], "EVConnected");
+        // The plug-in event carries no meter reading and performs no auth.
+        assert!(
+            payload.get("meterValue").is_none(),
+            "a CablePluggedIn event carries no meterValue"
+        );
+        assert!(payload.get("idToken").is_none());
+    }
+
+    #[tokio::test]
+    async fn plug_in_cable_redundant_transition_is_a_noop() {
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+        // Already in EVConnected: a plug-in emits nothing and burns no seqNo.
+        insert_live_v201_session_in_state(&cp, 1, ChargingStateEnumType::EVConnected).await;
+
+        assert_eq!(
+            cp.plug_in_cable(1).await.unwrap(),
+            ChargingStateChangeOutcome::Redundant
+        );
+
+        // A real transition afterwards still uses seqNo 1 (none was burned by the
+        // redundant call), and reaches the wire as the only event.
+        assert_eq!(
+            cp.transition_charging_state(1, ChargingStateEnumType::Charging)
+                .await
+                .unwrap(),
+            ChargingStateChangeOutcome::Emitted { seq_no: 1 }
+        );
+        let payload = recv_transaction_event(&mut rx).await;
+        assert_eq!(payload["seqNo"], 1);
+        assert_eq!(payload["transactionInfo"]["chargingState"], "Charging");
+    }
+
+    #[tokio::test]
+    async fn plug_in_cable_with_no_active_transaction_is_inert() {
+        // No session on the EVSE (and an out-of-range evse_id) both land on the
+        // inert NoTransaction outcome — no panic, no CALL.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        assert_eq!(
+            cp.plug_in_cable(1).await.unwrap(),
+            ChargingStateChangeOutcome::NoTransaction
+        );
+        assert_eq!(
+            cp.plug_in_cable(0).await.unwrap(),
+            ChargingStateChangeOutcome::NoTransaction
+        );
+    }
+
+    #[tokio::test]
+    async fn plug_in_cable_is_v201_only() {
+        // A 1.6J station has no TransactionEvent / chargingState path.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        assert!(matches!(
+            cp.plug_in_cable(1).await,
             Err(OcppError::NotSupported { .. })
         ));
     }

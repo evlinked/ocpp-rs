@@ -359,10 +359,79 @@ pub fn transaction_event_charging_state_changed(
     new_state: ChargingStateEnumType,
     timestamp: &str,
 ) -> TransactionEventRequest {
+    transaction_event_state_transition(
+        session,
+        seq_no,
+        TriggerReasonEnumType::ChargingStateChanged,
+        new_state,
+        timestamp,
+    )
+}
+
+/// Build a `TransactionEvent(Updated)` for the **cable-plugged, pre-authorization**
+/// phase — `triggerReason = CablePluggedIn` and `transactionInfo.chargingState =
+/// EVConnected` (Issue #579).
+///
+/// On a station whose `TxStartPoint` includes `EVConnected`, plugging the cable
+/// drives the connector into the "cable in, not yet authorized/charging" phase
+/// before the `Charging` state today's `Started`/`Updated` path reports — the
+/// phase plug-and-charge and delayed-authorization conformance exercises. This
+/// is the exact companion #577 deferred; it shares #577's state-transition
+/// machinery (`transaction_event_state_transition`) rather than adding a
+/// parallel builder, differing only in the trigger reason and target state.
+///
+/// Like the suspend/resume transitions it carries **no** `meterValue` (a pure
+/// state change, not a `Sample.Periodic` reading) and **no** `idToken` (the
+/// event predates — and does not perform — authorization), and `seq_no`
+/// continues the transaction's monotonic stream.
+///
+/// The wire tokens are pinned by the ported
+/// [`ChargingStateEnumType::EVConnected`] (`"EVConnected"`) /
+/// [`TriggerReasonEnumType::CablePluggedIn`] (`"CablePluggedIn"`)
+/// ([`ocpp/v201/enums.py`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/enums.py))
+/// and the [`TransactionEvent`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py)
+/// payload; mobilityhouse/ocpp is protocol-only, so emitting the plug-in phase
+/// is the simulator's own responsibility.
+#[must_use]
+pub fn transaction_event_cable_plugged_in(
+    session: &SessionRef,
+    seq_no: i32,
+    timestamp: &str,
+) -> TransactionEventRequest {
+    transaction_event_state_transition(
+        session,
+        seq_no,
+        TriggerReasonEnumType::CablePluggedIn,
+        ChargingStateEnumType::EVConnected,
+        timestamp,
+    )
+}
+
+/// The shared core behind [`transaction_event_charging_state_changed`] (#577)
+/// and [`transaction_event_cable_plugged_in`] (#579): an interim
+/// `TransactionEvent(Updated)` that reports a charging-state transition and
+/// nothing else.
+///
+/// Both callers emit the same shape — an `Updated` event carrying the new
+/// `transactionInfo.chargingState` under a state-change `triggerReason`, with
+/// no `meterValue` (the energy reading rides the `MeterValuePeriodic` path) and
+/// no `idToken` (not an authorization event). They differ only in the
+/// `trigger_reason` / `new_state` pair, so the body lives here once.
+///
+/// `pub(crate)` so the simulator's driver hooks can build the request directly
+/// with the right trigger without routing through a public wrapper.
+#[must_use]
+pub(crate) fn transaction_event_state_transition(
+    session: &SessionRef,
+    seq_no: i32,
+    trigger_reason: TriggerReasonEnumType,
+    new_state: ChargingStateEnumType,
+    timestamp: &str,
+) -> TransactionEventRequest {
     TransactionEventRequest {
         event_type: TransactionEventEnumType::Updated,
         timestamp: timestamp.to_string(),
-        trigger_reason: TriggerReasonEnumType::ChargingStateChanged,
+        trigger_reason,
         seq_no,
         transaction_info: TransactionType {
             transaction_id: session.transaction_id.to_string(),
@@ -794,6 +863,9 @@ mod tests {
                 TS,
             ),
             transaction_event_charging_state_changed(&s, 7, ChargingStateEnumType::Charging, TS),
+            // The pre-authorization cable-plugged (EVConnected/CablePluggedIn)
+            // transition must also satisfy the schema (#579).
+            transaction_event_cable_plugged_in(&s, 8, TS),
         ] {
             let payload = serde_json::to_value(&req).unwrap();
             assert!(
@@ -804,5 +876,45 @@ mod tests {
                 req.event_type
             );
         }
+    }
+
+    #[test]
+    fn cable_plugged_in_event_carries_ev_connected_shape() {
+        let s = session();
+        // Cable plugged before authorization: EVConnected, CablePluggedIn.
+        let req = transaction_event_cable_plugged_in(&s, 3, TS);
+
+        // An interim Updated flagged as a state change, not a periodic sample.
+        assert_eq!(req.event_type, TransactionEventEnumType::Updated);
+        assert_eq!(req.trigger_reason, TriggerReasonEnumType::CablePluggedIn);
+        assert_eq!(req.seq_no, 3);
+        assert_eq!(
+            req.transaction_info.charging_state,
+            Some(ChargingStateEnumType::EVConnected)
+        );
+        assert!(req.transaction_info.stopped_reason.is_none());
+        // Predates authorization and carries no reading — no idToken, no meterValue.
+        assert!(
+            req.id_token.is_none(),
+            "the plug-in event does not perform authorization"
+        );
+        assert!(
+            req.meter_value.is_none(),
+            "a state-change event carries no Sample.Periodic reading"
+        );
+        // The evse binding is still present so the CSMS knows which EVSE changed.
+        let evse = req.evse.as_ref().expect("state change carries evse");
+        assert_eq!(evse.id, 1);
+    }
+
+    #[test]
+    fn cable_plugged_in_round_trips_the_exact_wire_tokens() {
+        // `EVConnected` / `CablePluggedIn` serialize as their exact PascalCase
+        // wire tokens (not snake/camel-cased), so a CSMS reads them faithfully.
+        let s = session();
+        let req = transaction_event_cable_plugged_in(&s, 1, TS);
+        let payload = serde_json::to_value(&req).unwrap();
+        assert_eq!(payload["triggerReason"], "CablePluggedIn");
+        assert_eq!(payload["transactionInfo"]["chargingState"], "EVConnected");
     }
 }
