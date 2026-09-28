@@ -9297,8 +9297,9 @@ impl ChargePoint {
     /// Re-report the station's latest log-upload status for a `TriggerMessage`
     /// (`requestedMessage = LogStatusNotification`, Issue #584).
     ///
-    /// The log-upload twin of [`trigger_v201_firmware_status_notification`] and
-    /// the 2.0.1 analog of the 1.6J `TriggerMessage(DiagnosticsStatusNotification)`
+    /// The log-upload twin of
+    /// [`trigger_v201_firmware_status_notification`](Self::trigger_v201_firmware_status_notification)
+    /// and the 2.0.1 analog of the 1.6J `TriggerMessage(DiagnosticsStatusNotification)`
     /// re-report: a CSMS asks for the *current* log-upload status, and the station
     /// answers with a single `LogStatusNotification` carrying the latest status it
     /// has reported — without re-running the upload. The snapshot comes from
