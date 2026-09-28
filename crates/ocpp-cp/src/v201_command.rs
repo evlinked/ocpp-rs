@@ -321,10 +321,13 @@ pub fn v201_reset_response(
 /// [`TransactionEvent`](MessageTriggerEnumType::TransactionEvent), and
 /// [`FirmwareStatusNotification`](MessageTriggerEnumType::FirmwareStatusNotification)
 /// (the CP models `UpdateFirmware` and re-reports its latest firmware status on
-/// demand, Issue #583) — and to
+/// demand, Issue #583), and
+/// [`PublishFirmwareStatusNotification`](MessageTriggerEnumType::PublishFirmwareStatusNotification)
+/// (the CP models `PublishFirmware` and re-reports its latest publish status on
+/// demand, Issue #585) — and to
 /// [`NotImplemented`](TriggerMessageStatusEnumType::NotImplemented) for the
-/// diagnostics-log-, publish-firmware-, and certificate-signing triggers the
-/// simulator does not yet trigger.
+/// diagnostics-log- and certificate-signing triggers the simulator does not yet
+/// trigger.
 ///
 /// `MeterValues` is `Accepted` at the policy level because the CP produces meter
 /// readings; in 2.0.1 those ride inside `TransactionEvent`, so the slice-5b
@@ -349,25 +352,27 @@ pub fn v201_trigger_message_status(
     };
     match requested {
         // Messages this CP already builds and sends on the live V201 path.
-        // `FirmwareStatusNotification` re-reports the station's latest firmware
-        // status on demand — the CP models `UpdateFirmware` and retains that
-        // status, so the trigger is honored (Issue #583), the direct twin of the
-        // 1.6J `TriggerMessage(FirmwareStatusNotification)` re-report.
+        // `FirmwareStatusNotification` / `PublishFirmwareStatusNotification`
+        // re-report the station's latest firmware / publish-firmware status on
+        // demand — the CP models `UpdateFirmware` (#583) and `PublishFirmware`
+        // (#585) and retains each latest status, so the triggers are honored, the
+        // direct twins of the 1.6J `TriggerMessage(FirmwareStatusNotification)`
+        // re-report.
         BootNotification
         | Heartbeat
         | StatusNotification
         | MeterValues
         | TransactionEvent
-        | FirmwareStatusNotification => TriggerMessageStatusEnumType::Accepted,
-        // Diagnostics-log-, publish-firmware-, and certificate-signing flows the
-        // simulator does not yet trigger: recognized but not triggerable.
-        // (LogStatusNotification → #584, PublishFirmwareStatusNotification → #585
-        // will re-report their latest status the same way #583 does.)
+        | FirmwareStatusNotification
+        | PublishFirmwareStatusNotification => TriggerMessageStatusEnumType::Accepted,
+        // Diagnostics-log- and certificate-signing flows the simulator does not
+        // yet trigger: recognized but not triggerable. (LogStatusNotification →
+        // #584 will re-report its latest status the same way #583/#585 do; the
+        // Sign* certificate triggers are a separate, heavier slice.)
         LogStatusNotification
         | SignChargingStationCertificate
         | SignV2GCertificate
-        | SignCombinedCertificate
-        | PublishFirmwareStatusNotification => TriggerMessageStatusEnumType::NotImplemented,
+        | SignCombinedCertificate => TriggerMessageStatusEnumType::NotImplemented,
     }
 }
 
@@ -2498,12 +2503,17 @@ pub const V201_SIMULATED_PUBLISH_FIRMWARE_LOCATIONS: &[&str] = &[
 /// Ports the progress carrier of
 /// [`ocpp.v201.call.PublishFirmwareStatusNotification`](https://github.com/mobilityhouse/ocpp/blob/master/ocpp/v201/call.py):
 /// the single [`PublishFirmwareStatusEnumType`], the correlating `requestId`
-/// (always present here — a simulator only emits these while driving a publish it
-/// accepted, never off a bare `TriggerMessage`), and the optional `location` URI
-/// list. Per the spec `location` is required only on the terminal
+/// (always present here — the async-progress path only emits these while driving a
+/// publish it accepted), and the optional `location` URI list. Per the spec
+/// `location` is required only on the terminal
 /// [`Published`](PublishFirmwareStatusEnumType::Published) state and absent on the
 /// intermediate lifecycle states; the caller passes `Some(list)` only there, so
 /// this builder simply forwards whatever it is given.
+///
+/// A thin wrapper over [`v201_publish_firmware_status_report`] fixing
+/// `request_id` to `Some` — the shape every async progress step carries; the
+/// re-report path a `TriggerMessage` drives uses the report constructor directly
+/// because its `Idle` snapshot has no `requestId`.
 ///
 /// `request_id` is copied into the message and never parsed or indexed, so an
 /// extreme value (`i32::MIN`/`MAX`) cannot panic; `location` is simulator-supplied
@@ -2514,10 +2524,33 @@ pub fn v201_publish_firmware_status_notification(
     location: Option<Vec<String>>,
     request_id: i32,
 ) -> PublishFirmwareStatusNotificationRequest {
+    v201_publish_firmware_status_report(status, location, Some(request_id))
+}
+
+/// Build a `PublishFirmwareStatusNotification.req`
+/// ([`PublishFirmwareStatusNotificationRequest`]) with an *optional* `request_id`.
+///
+/// The re-report constructor a `TriggerMessage(PublishFirmwareStatusNotification)`
+/// uses to answer with the station's latest publish-firmware status (Issue #585) —
+/// the publish-to-local-cache twin of [`v201_firmware_status_report`]. Unlike the
+/// async-progress [`v201_publish_firmware_status_notification`], `request_id` may
+/// be `None`: an [`Idle`](PublishFirmwareStatusEnumType::Idle) status on a station
+/// that has never run a `PublishFirmware` is not tied to a specific request, and
+/// the 2.0.1 schema omits `requestId` (`skip_serializing_if = "Option::is_none"`)
+/// in that case; a status carried over from a real publish re-reports its
+/// `Some(requestId)`. `location` is forwarded as given — `Some` only on the
+/// terminal [`Published`](PublishFirmwareStatusEnumType::Published) re-report.
+/// Ports `ocpp.v201.call.PublishFirmwareStatusNotification`.
+#[must_use]
+pub fn v201_publish_firmware_status_report(
+    status: PublishFirmwareStatusEnumType,
+    location: Option<Vec<String>>,
+    request_id: Option<i32>,
+) -> PublishFirmwareStatusNotificationRequest {
     PublishFirmwareStatusNotificationRequest {
         status,
         location,
-        request_id: Some(request_id),
+        request_id,
         custom_data: None,
     }
 }
@@ -3727,6 +3760,9 @@ mod tests {
             // The CP models UpdateFirmware and retains its latest firmware status,
             // so a FirmwareStatusNotification trigger is honored by re-report (#583).
             MessageTriggerEnumType::FirmwareStatusNotification,
+            // Likewise the CP models PublishFirmware and retains its latest publish
+            // status, so a PublishFirmwareStatusNotification trigger is honored (#585).
+            MessageTriggerEnumType::PublishFirmwareStatusNotification,
         ] {
             assert_eq!(
                 v201_trigger_message_status(requested),
@@ -3736,9 +3772,8 @@ mod tests {
         }
     }
 
-    /// The diagnostics-log-, publish-firmware-, and certificate-signing triggers
-    /// the simulator does not yet originate resolve to `NotImplemented`
-    /// (recognized, not triggerable).
+    /// The diagnostics-log- and certificate-signing triggers the simulator does
+    /// not yet originate resolve to `NotImplemented` (recognized, not triggerable).
     #[test]
     fn unsupported_triggers_are_not_implemented() {
         for requested in [
@@ -3746,7 +3781,6 @@ mod tests {
             MessageTriggerEnumType::SignChargingStationCertificate,
             MessageTriggerEnumType::SignV2GCertificate,
             MessageTriggerEnumType::SignCombinedCertificate,
-            MessageTriggerEnumType::PublishFirmwareStatusNotification,
         ] {
             assert_eq!(
                 v201_trigger_message_status(requested),
@@ -3785,10 +3819,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(accepted, 6, "expected exactly 6 producible triggers");
+        assert_eq!(accepted, 7, "expected exactly 7 producible triggers");
         assert_eq!(
-            not_implemented, 5,
-            "expected exactly 5 unsupported triggers"
+            not_implemented, 4,
+            "expected exactly 4 unsupported triggers"
         );
     }
 
@@ -6908,6 +6942,91 @@ mod tests {
                     &serde_json::to_value(note).unwrap(),
                 )
                 .expect("PublishFirmwareStatusNotification CALL is schema-valid");
+        }
+    }
+
+    #[test]
+    fn publish_firmware_status_report_omits_request_id_when_none() {
+        // The Idle re-report a TriggerMessage(PublishFirmwareStatusNotification)
+        // answers with on a station that has never run a publish (#585): Idle, no
+        // location, no requestId.
+        let req =
+            v201_publish_firmware_status_report(PublishFirmwareStatusEnumType::Idle, None, None);
+        assert_eq!(req.status, PublishFirmwareStatusEnumType::Idle);
+        assert_eq!(req.request_id, None);
+        assert!(req.location.is_none());
+        assert!(req.custom_data.is_none());
+        // `requestId` (and `location`) must be *absent* from the wire, not `null` —
+        // the schema has no `null` for them (skip_serializing_if = "Option::is_none").
+        let payload = serde_json::to_value(&req).unwrap();
+        assert!(
+            payload.get("requestId").is_none(),
+            "an Idle re-report omits requestId entirely, got: {payload}"
+        );
+        assert!(
+            payload.get("location").is_none(),
+            "an Idle re-report omits location entirely, got: {payload}"
+        );
+    }
+
+    #[test]
+    fn publish_firmware_status_report_carries_request_id_and_location_when_some() {
+        // A Published status re-reported from a real publish keeps its correlating
+        // requestId and the cached-image location list.
+        let locations: Vec<String> = V201_SIMULATED_PUBLISH_FIRMWARE_LOCATIONS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let req = v201_publish_firmware_status_report(
+            PublishFirmwareStatusEnumType::Published,
+            Some(locations.clone()),
+            Some(7),
+        );
+        assert_eq!(req.status, PublishFirmwareStatusEnumType::Published);
+        assert_eq!(req.location, Some(locations.clone()));
+        assert_eq!(req.request_id, Some(7));
+        // The async-progress wrapper produces the same shape as the explicit Some.
+        assert_eq!(
+            req,
+            v201_publish_firmware_status_notification(
+                PublishFirmwareStatusEnumType::Published,
+                Some(locations),
+                7,
+            )
+        );
+    }
+
+    #[test]
+    fn built_publish_firmware_status_reports_are_schema_valid() {
+        // The trigger re-report path (optional requestId) is schema-valid both as
+        // an Idle/None snapshot and carrying a status + requestId (+ location on
+        // Published) from a real publish.
+        let validator = SchemaValidator::v201();
+        let locations: Vec<String> = V201_SIMULATED_PUBLISH_FIRMWARE_LOCATIONS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        for status in [
+            PublishFirmwareStatusEnumType::Idle,
+            PublishFirmwareStatusEnumType::Downloading,
+            PublishFirmwareStatusEnumType::Published,
+            PublishFirmwareStatusEnumType::DownloadFailed,
+            PublishFirmwareStatusEnumType::PublishFailed,
+        ] {
+            // Published carries the location list; every other state omits it.
+            let location =
+                (status == PublishFirmwareStatusEnumType::Published).then(|| locations.clone());
+            for request_id in [None, Some(0), Some(-1), Some(i32::MIN), Some(i32::MAX)] {
+                let req = v201_publish_firmware_status_report(status, location.clone(), request_id);
+                let payload = serde_json::to_value(&req).unwrap();
+                assert!(
+                    validator
+                        .validate_call("PublishFirmwareStatusNotification", &payload)
+                        .is_ok(),
+                    "built {status:?} PublishFirmwareStatusNotification.req (requestId \
+                     {request_id:?}) should be schema-valid, got: {payload}"
+                );
+            }
         }
     }
 

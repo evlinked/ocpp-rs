@@ -8740,18 +8740,20 @@ impl ChargePoint {
             MeterValues => self.trigger_v201_meter_values(evse_id).await,
             TransactionEvent => self.trigger_v201_transaction_event(evse_id).await,
             FirmwareStatusNotification => self.trigger_v201_firmware_status_notification().await,
-            // Diagnostics-log-, publish-firmware-, and certificate-signing triggers
-            // the simulator does not yet originate. `v201_trigger_message_status`
-            // reports these `NotImplemented`, so the handler never enqueues them;
-            // this arm keeps the match exhaustive and aligned with that policy.
-            // (LogStatusNotification → #584, PublishFirmwareStatusNotification →
-            // #585 will re-report their latest status as FirmwareStatusNotification
-            // does; the Sign* certificate triggers are a separate, heavier slice.)
+            PublishFirmwareStatusNotification => {
+                self.trigger_v201_publish_firmware_status_notification()
+                    .await
+            }
+            // Diagnostics-log- and certificate-signing triggers the simulator does
+            // not yet originate. `v201_trigger_message_status` reports these
+            // `NotImplemented`, so the handler never enqueues them; this arm keeps
+            // the match exhaustive and aligned with that policy. (LogStatusNotification
+            // → #584 will re-report its latest status as the firmware triggers do;
+            // the Sign* certificate triggers are a separate, heavier slice.)
             other @ (LogStatusNotification
             | SignChargingStationCertificate
             | SignV2GCertificate
-            | SignCombinedCertificate
-            | PublishFirmwareStatusNotification) => {
+            | SignCombinedCertificate) => {
                 warn!("v201 TriggerMessage({other:?}): not implemented by the simulator");
             }
         }
@@ -9202,6 +9204,16 @@ impl ChargePoint {
         location: Option<Vec<String>>,
         request_id: i32,
     ) {
+        // Retain this as the station's latest publish status *before* sending, so
+        // a later `TriggerMessage(PublishFirmwareStatusNotification)` re-reports
+        // the current status even if this progress CALL failed to transmit — the
+        // station's notion of "where the publish is" has advanced regardless. Kept
+        // across the in-flight marker's clear (see
+        // `V201PublishFirmwareStore::record_reported`), so a settled `Published`
+        // (with its cached-image `location`) stays reportable.
+        self.v201_publish_firmwares
+            .record_reported(status, location.clone(), request_id)
+            .await;
         if let Err(e) = self
             .call(v201_command::v201_publish_firmware_status_notification(
                 status, location, request_id,
@@ -9279,6 +9291,53 @@ impl ChargePoint {
         {
             warn!(
                 "v201 TriggerMessage(FirmwareStatusNotification): re-report of \
+                 {:?} (request {:?}) failed: {e}",
+                report.status, report.request_id
+            );
+        }
+    }
+
+    /// Re-report the station's latest publish-firmware status for a
+    /// `TriggerMessage` (`requestedMessage = PublishFirmwareStatusNotification`,
+    /// Issue #585).
+    ///
+    /// The publish-to-local-cache twin of
+    /// [`trigger_v201_firmware_status_notification`](Self::trigger_v201_firmware_status_notification):
+    /// a CSMS asks for the *current* publish status, and the station answers with a
+    /// single `PublishFirmwareStatusNotification` carrying the latest status it has
+    /// reported — without re-running a publish. The snapshot comes from
+    /// [`V201PublishFirmwareStore::last_reported`](crate::v201_publish_firmware::V201PublishFirmwareStore::last_reported),
+    /// which every `send_v201_publish_firmware_status` step records:
+    ///
+    /// - a station that has never run a `PublishFirmware` reports
+    ///   [`Idle`](PublishFirmwareStatusEnumType::Idle) with `requestId` and
+    ///   `location` omitted;
+    /// - a publish in progress reports its most recent interim step
+    ///   (`DownloadScheduled` / `Downloading` / `Downloaded`) with the correlating
+    ///   `requestId` and no `location`;
+    /// - a settled publish reports its terminal
+    ///   [`Published`](PublishFirmwareStatusEnumType::Published) with that
+    ///   `requestId` *and the cached-image `location` URIs* (or a terminal failure)
+    ///   — retained past the in-flight marker's clear.
+    ///
+    /// This is a pure snapshot re-report: it starts no publish and leaves the
+    /// in-flight set untouched. `TriggerMessage` carries no EVSE scope for this
+    /// station-wide message, so `evse_id` is not a parameter (mirroring the
+    /// `BootNotification` / firmware arms). Runs on the command-consumer task (off
+    /// the inbound-CALL path), so the `TriggerMessage` CALLRESULT is flushed before
+    /// this CALL and the receive loop never re-enters itself.
+    async fn trigger_v201_publish_firmware_status_notification(&self) {
+        let report = self.v201_publish_firmwares.last_reported().await;
+        if let Err(e) = self
+            .call(v201_command::v201_publish_firmware_status_report(
+                report.status,
+                report.location,
+                report.request_id,
+            ))
+            .await
+        {
+            warn!(
+                "v201 TriggerMessage(PublishFirmwareStatusNotification): re-report of \
                  {:?} (request {:?}) failed: {e}",
                 report.status, report.request_id
             );
@@ -16433,6 +16492,160 @@ mod tests {
                 request_id: Some(56),
             },
             "a failed rollout leaves its failure terminal as the re-reportable status"
+        );
+    }
+
+    // --- OCPP 2.0.1 TriggerMessage(PublishFirmwareStatusNotification) (M7, Issue #585) ---
+    // A CSMS asking `TriggerMessage(requestedMessage = PublishFirmwareStatusNotification)`
+    // gets the station's latest publish-firmware status re-reported as one
+    // PublishFirmwareStatusNotification — the publish-to-local-cache twin of #583.
+    // The status is recorded at the `send_v201_publish_firmware_status` choke point
+    // across the whole publish lifecycle, and retained past the in-flight marker's
+    // clear (with the cached-image `location` on the terminal `Published`).
+
+    fn publish_firmware_status_notification_routes(
+    ) -> std::collections::HashMap<String, serde_json::Value> {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        // PublishFirmwareStatusNotification.conf is an empty ack.
+        routes.insert(
+            "PublishFirmwareStatusNotification".to_string(),
+            serde_json::json!({}),
+        );
+        routes
+    }
+
+    /// Drain the capturing channel for the next `PublishFirmwareStatusNotification`
+    /// CALL, deserialized into the typed 2.0.1 request. Skips the boot/status
+    /// chatter a freshly-connected CP emits; bounded by a timeout so a missing CALL
+    /// fails fast.
+    async fn recv_one_publish_firmware_status(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    ) -> ocpp_messages::v201::PublishFirmwareStatusNotificationRequest {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+                Ok(Some((action, payload))) if action == "PublishFirmwareStatusNotification" => {
+                    return serde_json::from_value(payload)
+                        .expect("captured PublishFirmwareStatusNotification is typed");
+                }
+                Ok(Some(_)) => continue, // BootNotification / StatusNotification, etc.
+                Ok(None) | Err(_) => panic!("expected a PublishFirmwareStatusNotification CALL"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_trigger_publish_firmware_status_reports_idle_when_no_publish_ran() {
+        // A station that has never run a PublishFirmware answers the trigger with
+        // PublishFirmwareStatusNotification(Idle), requestId and location omitted.
+        let (addr, mut rx) =
+            spawn_mock_csms_capturing(publish_firmware_status_notification_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        cp.send_v201_triggered_message(
+            MessageTriggerEnumType::PublishFirmwareStatusNotification,
+            None,
+        )
+        .await;
+
+        let report = recv_one_publish_firmware_status(&mut rx).await;
+        assert_eq!(report.status, PublishFirmwareStatusEnumType::Idle);
+        assert_eq!(
+            report.request_id, None,
+            "an Idle re-report carries no requestId"
+        );
+        assert!(
+            report.location.is_none(),
+            "an Idle re-report carries no location"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_trigger_publish_firmware_status_reports_the_latest_recorded_status() {
+        // With a terminal Published status recorded (as the publish emit path does),
+        // the trigger re-reports exactly that status + its correlating requestId AND
+        // the cached-image location list — a pure snapshot that starts no publish and
+        // leaves the in-flight set untouched.
+        let (addr, mut rx) =
+            spawn_mock_csms_capturing(publish_firmware_status_notification_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let locations: Vec<String> = v201_command::V201_SIMULATED_PUBLISH_FIRMWARE_LOCATIONS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        cp.v201_publish_firmwares
+            .record_reported(
+                PublishFirmwareStatusEnumType::Published,
+                Some(locations.clone()),
+                55,
+            )
+            .await;
+
+        cp.send_v201_triggered_message(
+            MessageTriggerEnumType::PublishFirmwareStatusNotification,
+            None,
+        )
+        .await;
+
+        let report = recv_one_publish_firmware_status(&mut rx).await;
+        assert_eq!(report.status, PublishFirmwareStatusEnumType::Published);
+        assert_eq!(report.request_id, Some(55));
+        assert_eq!(
+            report.location,
+            Some(locations),
+            "the Published re-report reproduces the cached-image location URIs"
+        );
+        // The re-report is a snapshot: no publish started, in-flight set untouched.
+        assert_eq!(
+            cp.v201_publish_firmwares.in_flight_count().await,
+            0,
+            "re-report must not open a publish stream"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_publish_firmware_stream_records_its_terminal_status_for_re_report() {
+        // The recording is wired through the real state machine (unconnected, so the
+        // progress CALLs fail-and-warn — record_reported runs before the send). The
+        // happy path leaves the latest status at the Published terminal, carrying the
+        // simulated cached-image locations, correlated by requestId.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.v201_publish_firmwares.begin(55).await;
+        cp.run_v201_publish_firmware_status(55).await;
+
+        let expected_locations: Vec<String> =
+            v201_command::V201_SIMULATED_PUBLISH_FIRMWARE_LOCATIONS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+        assert_eq!(
+            cp.v201_publish_firmwares.last_reported().await,
+            crate::v201_publish_firmware::V201PublishFirmwareStatusReport {
+                status: PublishFirmwareStatusEnumType::Published,
+                location: Some(expected_locations),
+                request_id: Some(55),
+            },
+            "a completed publish leaves Published (with its locations) re-reportable"
+        );
+        // Settling the stream cleared the in-flight marker but retained the status.
+        assert_eq!(
+            cp.v201_publish_firmwares.in_flight_count().await,
+            0,
+            "the settled stream clears the in-flight marker"
         );
     }
 
