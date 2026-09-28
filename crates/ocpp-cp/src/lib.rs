@@ -8740,15 +8740,15 @@ impl ChargePoint {
             MeterValues => self.trigger_v201_meter_values(evse_id).await,
             TransactionEvent => self.trigger_v201_transaction_event(evse_id).await,
             FirmwareStatusNotification => self.trigger_v201_firmware_status_notification().await,
-            // Diagnostics-log-, publish-firmware-, and certificate-signing triggers
-            // the simulator does not yet originate. `v201_trigger_message_status`
-            // reports these `NotImplemented`, so the handler never enqueues them;
-            // this arm keeps the match exhaustive and aligned with that policy.
-            // (LogStatusNotification → #584, PublishFirmwareStatusNotification →
-            // #585 will re-report their latest status as FirmwareStatusNotification
-            // does; the Sign* certificate triggers are a separate, heavier slice.)
-            other @ (LogStatusNotification
-            | SignChargingStationCertificate
+            LogStatusNotification => self.trigger_v201_log_status_notification().await,
+            // Publish-firmware- and certificate-signing triggers the simulator does
+            // not yet originate. `v201_trigger_message_status` reports these
+            // `NotImplemented`, so the handler never enqueues them; this arm keeps
+            // the match exhaustive and aligned with that policy.
+            // (PublishFirmwareStatusNotification → #585 will re-report its latest
+            // status as FirmwareStatusNotification / LogStatusNotification do; the
+            // Sign* certificate triggers are a separate, heavier slice.)
+            other @ (SignChargingStationCertificate
             | SignV2GCertificate
             | SignCombinedCertificate
             | PublishFirmwareStatusNotification) => {
@@ -8952,6 +8952,15 @@ impl ChargePoint {
     /// `request_id` (OCPP 2.0.1 Part 2). A best-effort progress report: a send
     /// failure is logged, not propagated (the upload state machine continues).
     async fn send_v201_log_status(&self, status: UploadLogStatusEnumType, request_id: i32) {
+        // Retain this as the station's latest log-upload status *before* sending,
+        // so a later `TriggerMessage(LogStatusNotification)` re-reports the current
+        // status even if this progress CALL failed to transmit — the CP's notion of
+        // "where the upload is" has advanced regardless. Kept across the in-flight
+        // slot's clear (see `V201LogUploadStore::record_reported`), so a settled
+        // `Uploaded` (or terminal failure) stays reportable.
+        self.v201_log_uploads
+            .record_reported(status, request_id)
+            .await;
         if let Err(e) = self
             .call(v201_command::v201_log_status_notification(
                 status, request_id,
@@ -9279,6 +9288,48 @@ impl ChargePoint {
         {
             warn!(
                 "v201 TriggerMessage(FirmwareStatusNotification): re-report of \
+                 {:?} (request {:?}) failed: {e}",
+                report.status, report.request_id
+            );
+        }
+    }
+
+    /// Re-report the station's latest log-upload status for a `TriggerMessage`
+    /// (`requestedMessage = LogStatusNotification`, Issue #584).
+    ///
+    /// The log-upload twin of [`trigger_v201_firmware_status_notification`] and
+    /// the 2.0.1 analog of the 1.6J `TriggerMessage(DiagnosticsStatusNotification)`
+    /// re-report: a CSMS asks for the *current* log-upload status, and the station
+    /// answers with a single `LogStatusNotification` carrying the latest status it
+    /// has reported — without re-running the upload. The snapshot comes from
+    /// [`V201LogUploadStore::last_reported`](crate::v201_log_upload::V201LogUploadStore::last_reported),
+    /// which every `send_v201_log_status` step records:
+    ///
+    /// - a station that has never run a `GetLog` reports
+    ///   [`Idle`](UploadLogStatusEnumType::Idle) with `requestId` omitted;
+    /// - an upload in progress reports its most recent interim step (`Uploading`)
+    ///   with the correlating `requestId`;
+    /// - a settled upload reports its terminal `Uploaded` (or an `UploadFailure` /
+    ///   `AcceptedCanceled`) with that `requestId` — retained past the in-flight
+    ///   slot's clear.
+    ///
+    /// This is a pure snapshot re-report: it starts no upload and leaves the
+    /// in-flight store untouched. `TriggerMessage` carries no EVSE scope for this
+    /// station-wide message, so `evse_id` is not a parameter (mirroring the
+    /// `BootNotification` / `Heartbeat` arms). Runs on the command-consumer task
+    /// (off the inbound-CALL path), so the `TriggerMessage` CALLRESULT is flushed
+    /// before this CALL and the receive loop never re-enters itself.
+    async fn trigger_v201_log_status_notification(&self) {
+        let report = self.v201_log_uploads.last_reported().await;
+        if let Err(e) = self
+            .call(v201_command::v201_log_status_report(
+                report.status,
+                report.request_id,
+            ))
+            .await
+        {
+            warn!(
+                "v201 TriggerMessage(LogStatusNotification): re-report of \
                  {:?} (request {:?}) failed: {e}",
                 report.status, report.request_id
             );
@@ -16433,6 +16484,130 @@ mod tests {
                 request_id: Some(56),
             },
             "a failed rollout leaves its failure terminal as the re-reportable status"
+        );
+    }
+
+    // --- OCPP 2.0.1 TriggerMessage(LogStatusNotification) (M7, Issue #584) ---
+    // A CSMS asking `TriggerMessage(requestedMessage = LogStatusNotification)`
+    // gets the station's latest log-upload status re-reported as one
+    // LogStatusNotification — the log-upload twin of #583. The status is recorded
+    // at the `send_v201_log_status` choke point across the whole upload lifecycle,
+    // and retained past the in-flight slot's clear.
+
+    fn log_status_notification_routes() -> std::collections::HashMap<String, serde_json::Value> {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        // LogStatusNotification.conf is an empty ack.
+        routes.insert("LogStatusNotification".to_string(), serde_json::json!({}));
+        routes
+    }
+
+    /// Drain the capturing channel for the next `LogStatusNotification` CALL,
+    /// deserialized into the typed 2.0.1 request. Skips the boot/status chatter a
+    /// freshly-connected CP emits; bounded by a timeout so a missing CALL fails fast.
+    async fn recv_one_log_status(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    ) -> ocpp_messages::v201::LogStatusNotificationRequest {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+                Ok(Some((action, payload))) if action == "LogStatusNotification" => {
+                    return serde_json::from_value(payload)
+                        .expect("captured LogStatusNotification is typed");
+                }
+                Ok(Some(_)) => continue, // BootNotification / StatusNotification, etc.
+                Ok(None) | Err(_) => panic!("expected a LogStatusNotification CALL"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_trigger_log_status_reports_idle_when_no_upload_ran() {
+        // A station that has never run a GetLog answers the trigger with
+        // LogStatusNotification(Idle), requestId omitted.
+        let (addr, mut rx) = spawn_mock_csms_capturing(log_status_notification_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        cp.send_v201_triggered_message(MessageTriggerEnumType::LogStatusNotification, None)
+            .await;
+
+        let report = recv_one_log_status(&mut rx).await;
+        assert_eq!(report.status, UploadLogStatusEnumType::Idle);
+        assert_eq!(
+            report.request_id, None,
+            "an Idle re-report carries no requestId"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_trigger_log_status_reports_the_latest_recorded_status() {
+        // With a status recorded (as the upload's emit path does), the trigger
+        // re-reports exactly that status + its correlating requestId — a pure
+        // snapshot that starts no upload and leaves the in-flight store untouched.
+        let (addr, mut rx) = spawn_mock_csms_capturing(log_status_notification_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        cp.v201_log_uploads
+            .record_reported(UploadLogStatusEnumType::Uploaded, 55)
+            .await;
+
+        cp.send_v201_triggered_message(MessageTriggerEnumType::LogStatusNotification, None)
+            .await;
+
+        let report = recv_one_log_status(&mut rx).await;
+        assert_eq!(report.status, UploadLogStatusEnumType::Uploaded);
+        assert_eq!(report.request_id, Some(55));
+        // The re-report is a snapshot: no upload started, in-flight slot untouched.
+        assert!(
+            cp.in_flight_log_upload().await.is_none(),
+            "re-report must not open an upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_log_upload_records_its_terminal_status_for_re_report() {
+        // The recording is wired through the real upload flow (unconnected, so the
+        // progress CALLs fail-and-warn — record_reported runs before the send).
+        // The happy path leaves the latest status at the Uploaded terminal.
+        let cp = ChargePoint::new(ChargePointConfig::for_version(OcppVersion::V201)).unwrap();
+        cp.v201_log_uploads.begin(55).await;
+        cp.run_v201_log_upload(55).await;
+        assert_eq!(
+            cp.v201_log_uploads.last_reported().await,
+            crate::v201_log_upload::V201LogStatusReport {
+                status: UploadLogStatusEnumType::Uploaded,
+                request_id: Some(55),
+            },
+            "a completed upload leaves Uploaded as the re-reportable status"
+        );
+
+        // A fault-injected upload records its failure terminal instead.
+        let cp = ChargePoint::new(ChargePointConfig {
+            log_upload_should_fail: true,
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.v201_log_uploads.begin(56).await;
+        cp.run_v201_log_upload(56).await;
+        assert_eq!(
+            cp.v201_log_uploads.last_reported().await,
+            crate::v201_log_upload::V201LogStatusReport {
+                status: UploadLogStatusEnumType::UploadFailure,
+                request_id: Some(56),
+            },
+            "a failed upload leaves its failure terminal as the re-reportable status"
         );
     }
 
