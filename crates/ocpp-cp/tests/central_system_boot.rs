@@ -941,17 +941,18 @@ async fn v201_trigger_unsupported_message_is_not_implemented_and_emits_nothing()
     cp.connect().await.expect("v201 connect + boot sequence");
     assert_eq!(boots.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-    // CSMS -> CP: TriggerMessage(LogStatusNotification). The simulator does not yet
-    // originate a standalone LogStatusNotification on the v201 path (the trigger for
-    // it is tracked by #584), so the policy classifies it NotImplemented and the
-    // wiring enqueues nothing. (FirmwareStatusNotification is now Accepted — it
-    // re-reports the latest firmware status, #583 — so it is no longer the
-    // NotImplemented example here.)
+    // CSMS -> CP: TriggerMessage(PublishFirmwareStatusNotification). The simulator
+    // does not yet originate a standalone PublishFirmwareStatusNotification on the
+    // v201 path (the trigger for it is tracked by #585), so the policy classifies
+    // it NotImplemented and the wiring enqueues nothing. (FirmwareStatusNotification
+    // and LogStatusNotification are now Accepted — they re-report the latest
+    // firmware / log-upload status, #583 / #584 — so neither is the NotImplemented
+    // example here.)
     let resp = server
         .call::<V201TriggerMessageRequest>(
             "CP201_TRIG_NIMP",
             V201TriggerMessageRequest {
-                requested_message: MessageTriggerEnumType::LogStatusNotification,
+                requested_message: MessageTriggerEnumType::PublishFirmwareStatusNotification,
                 evse: None,
                 custom_data: None,
             },
