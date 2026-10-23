@@ -11,6 +11,9 @@ description = "OCPP ocpp-conformance implementation"
 keywords.workspace = true
 categories.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 ocpp-types = { path = "../ocpp-types" }
 ocpp-messages = { path = "../ocpp-messages" }

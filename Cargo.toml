@@ -20,6 +20,18 @@ description = "A modern, production-grade OCPP implementation in Rust"
 keywords = ["ocpp", "ev", "charging", "websocket", "electric-vehicle"]
 categories = ["network-programming", "simulation", "web-programming::websocket"]
 
+# Workspace-wide lint configuration. Applied to each crate via `[lints]
+# workspace = true`. See issue #591: clippy 1.99.0 tightened
+# `clippy::double_must_use` so that it now fires on the `Pin<Box<dyn Future>>`
+# that `#[async_trait]` desugars to (the attribute macro attaches a bare
+# `#[must_use]`, and the boxed future is itself already `#[must_use]`). The
+# warning is entirely macro-generated — the source never writes `#[must_use]` —
+# and `-D warnings` in CI turns it into a hard error on every `#[async_trait]`
+# trait in the workspace. Allowing it in one place keeps CI green on current
+# and future stable clippy without scattering `#[allow]` on each trait.
+[workspace.lints.clippy]
+double_must_use = "allow"
+
 [workspace.dependencies]
 # Core async runtime
 tokio = { version = "1.35", features = ["full"] }

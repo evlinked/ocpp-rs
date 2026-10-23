@@ -25,8 +25,13 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    # Pinned (not @stable) so a future stable release can't silently turn
+    # `main` red by tightening or adding a clippy/rustfmt lint under
+    # `-D warnings`. clippy 1.99.0 did exactly that (see #591); toolchain
+    # bumps here are now a deliberate, reviewable change. Bump this pin to
+    # adopt newer lints on purpose.
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@1.99.0
       with:
         components: rustfmt, clippy
 

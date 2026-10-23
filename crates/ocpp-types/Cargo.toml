@@ -11,6 +11,9 @@ description = "Core types and data structures for OCPP protocol implementation"
 keywords.workspace = true
 categories.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
