@@ -11,6 +11,9 @@ description = "Transport layer implementation for OCPP protocol over WebSocket"
 keywords.workspace = true
 categories.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 ocpp-types = { path = "../ocpp-types" }
 ocpp-messages = { path = "../ocpp-messages" }
