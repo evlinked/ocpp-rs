@@ -30,19 +30,68 @@
 //! can be shared across the charge point's tasks, exactly like the v201
 //! [`V201DisplayMessageStore`](crate::v201_display_message::V201DisplayMessageStore).
 
+use ocpp_types::v201::UploadLogStatusEnumType;
 use tokio::sync::RwLock;
 
-/// Tracks the single `GetLog` upload a station is currently serving, by its
-/// `requestId`.
+/// The most recent log-upload status the station reported, retained so a
+/// `TriggerMessage(LogStatusNotification)` can re-report it on demand (Issue
+/// #584) — the OCPP 2.0.1 twin of the firmware
+/// [`V201FirmwareStatusReport`](crate::v201_firmware_update::V201FirmwareStatusReport)
+/// and of the 1.6J `TriggerMessage(DiagnosticsStatusNotification)` re-report.
 ///
-/// `None` means idle (no upload in flight); `Some(request_id)` names the request
-/// whose upload is underway. The `requestId` is CSMS-supplied and stored as an
-/// opaque `i32` — never parsed or indexed — so no wire value (including
-/// `i32::MIN`/`MAX`) can panic here.
+/// A station reports upload progress asynchronously
+/// (`LogStatusNotification(Uploading → Uploaded)`), but a CSMS may ask for the
+/// *current* status at any point via `TriggerMessage`. This snapshot is the
+/// answer: [`Idle`](UploadLogStatusEnumType::Idle) with no `request_id` until the
+/// first `GetLog` progress step is emitted, then the latest `(status, requestId)`
+/// thereafter — retained even after the in-flight slot is cleared, so a settled
+/// `Uploaded` (or a terminal `UploadFailure` / `AcceptedCanceled`) stays
+/// reportable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct V201LogStatusReport {
+    /// The latest reported stage of the log-upload lifecycle.
+    pub status: UploadLogStatusEnumType,
+    /// The `requestId` of the `GetLog` that stage belongs to, or `None` for the
+    /// initial [`Idle`](UploadLogStatusEnumType::Idle) (no upload has run, so the
+    /// status is not tied to a specific request — the 2.0.1 schema omits
+    /// `requestId` in that case).
+    pub request_id: Option<i32>,
+}
+
+impl Default for V201LogStatusReport {
+    /// A station that has never run an upload:
+    /// [`Idle`](UploadLogStatusEnumType::Idle), no correlating `requestId`.
+    fn default() -> Self {
+        Self {
+            status: UploadLogStatusEnumType::Idle,
+            request_id: None,
+        }
+    }
+}
+
+/// Tracks the single `GetLog` upload a station is currently serving, by its
+/// `requestId`, plus the latest log-upload status it has reported.
+///
+/// For the in-flight slot: `None` means idle (no upload in flight);
+/// `Some(request_id)` names the request whose upload is underway. The `requestId`
+/// is CSMS-supplied and stored as an opaque `i32` — never parsed or indexed — so
+/// no wire value (including `i32::MIN`/`MAX`) can panic here.
+///
+/// Separately, [`last_reported`](Self::last_reported) retains the most recent
+/// [`V201LogStatusReport`] the station emitted (via
+/// [`record_reported`](Self::record_reported)), so a
+/// `TriggerMessage(LogStatusNotification)` can re-report the current status
+/// without re-running the upload. It is deliberately *not* cleared when the
+/// in-flight slot is ([`complete`](Self::complete) / [`clear`](Self::clear)): a
+/// finished upload leaves the station idle but its last status (`Uploaded`, or a
+/// terminal failure) remains the truthful thing to report.
 #[derive(Debug, Default)]
 pub struct V201LogUploadStore {
     /// The `requestId` of the upload currently in flight, or `None` when idle.
     in_flight: RwLock<Option<i32>>,
+    /// The most recent log-upload status the station reported. `Idle`/`None`
+    /// until the first progress step; see [`V201LogStatusReport`].
+    last_reported: RwLock<V201LogStatusReport>,
 }
 
 impl V201LogUploadStore {
@@ -121,6 +170,34 @@ impl V201LogUploadStore {
         } else {
             false
         }
+    }
+
+    /// Record `status` (from `GetLog` request `request_id`) as the latest
+    /// log-upload status the station has reported.
+    ///
+    /// Called at the single emit choke point
+    /// (`ChargePoint::send_v201_log_status`) for every progress step, so the
+    /// snapshot tracks the full lifecycle — the interim `Uploading` and the
+    /// terminal `Uploaded` / `UploadFailure` / `AcceptedCanceled`. It is
+    /// independent of the in-flight slot: a completed upload clears
+    /// [`in_flight`](Self::in_flight) but this retains the terminal status so a
+    /// later `TriggerMessage(LogStatusNotification)` still re-reports it.
+    /// `request_id` is only stored, never parsed or indexed.
+    pub async fn record_reported(&self, status: UploadLogStatusEnumType, request_id: i32) {
+        *self.last_reported.write().await = V201LogStatusReport {
+            status,
+            request_id: Some(request_id),
+        };
+    }
+
+    /// The most recent [`V201LogStatusReport`] the station has reported.
+    ///
+    /// The snapshot a `TriggerMessage(LogStatusNotification)` re-reports on
+    /// demand. Defaults to [`Idle`](UploadLogStatusEnumType::Idle) with no
+    /// `requestId` on a station that has never run an upload. Returns a copy, so
+    /// the caller decides without holding the store lock.
+    pub async fn last_reported(&self) -> V201LogStatusReport {
+        *self.last_reported.read().await
     }
 }
 
@@ -225,5 +302,78 @@ mod tests {
         // Extreme ids compare, never index — no panic.
         assert!(!store.complete(i32::MIN).await);
         assert!(!store.complete(i32::MAX).await);
+    }
+
+    #[tokio::test]
+    async fn a_new_store_reports_idle_with_no_request_id() {
+        let store = V201LogUploadStore::new();
+        assert_eq!(
+            store.last_reported().await,
+            V201LogStatusReport {
+                status: UploadLogStatusEnumType::Idle,
+                request_id: None,
+            },
+            "a station that has never run an upload reports Idle, no requestId"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_reported_tracks_the_latest_status_and_request_id() {
+        let store = V201LogUploadStore::new();
+        store
+            .record_reported(UploadLogStatusEnumType::Uploading, 42)
+            .await;
+        assert_eq!(
+            store.last_reported().await,
+            V201LogStatusReport {
+                status: UploadLogStatusEnumType::Uploading,
+                request_id: Some(42),
+            }
+        );
+        // The latest wins — a later step overwrites the earlier one.
+        store
+            .record_reported(UploadLogStatusEnumType::Uploaded, 42)
+            .await;
+        assert_eq!(
+            store.last_reported().await,
+            V201LogStatusReport {
+                status: UploadLogStatusEnumType::Uploaded,
+                request_id: Some(42),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn completing_the_upload_retains_the_last_reported_status() {
+        // A settled upload returns the in-flight slot to idle, but the terminal
+        // status must remain reportable for a later TriggerMessage.
+        let store = V201LogUploadStore::new();
+        store.begin(9).await;
+        store
+            .record_reported(UploadLogStatusEnumType::Uploaded, 9)
+            .await;
+        assert!(store.complete(9).await);
+        assert!(store.is_idle().await, "in-flight slot cleared");
+        assert_eq!(
+            store.last_reported().await,
+            V201LogStatusReport {
+                status: UploadLogStatusEnumType::Uploaded,
+                request_id: Some(9),
+            },
+            "the terminal status survives the in-flight clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_reported_accepts_extreme_request_ids() {
+        let store = V201LogUploadStore::new();
+        store
+            .record_reported(UploadLogStatusEnumType::UploadFailure, i32::MIN)
+            .await;
+        assert_eq!(store.last_reported().await.request_id, Some(i32::MIN));
+        store
+            .record_reported(UploadLogStatusEnumType::AcceptedCanceled, i32::MAX)
+            .await;
+        assert_eq!(store.last_reported().await.request_id, Some(i32::MAX));
     }
 }

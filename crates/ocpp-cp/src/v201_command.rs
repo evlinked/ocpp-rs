@@ -318,15 +318,18 @@ pub fn v201_reset_response(
 /// [`Heartbeat`](MessageTriggerEnumType::Heartbeat),
 /// [`StatusNotification`](MessageTriggerEnumType::StatusNotification),
 /// [`MeterValues`](MessageTriggerEnumType::MeterValues),
-/// [`TransactionEvent`](MessageTriggerEnumType::TransactionEvent), and
+/// [`TransactionEvent`](MessageTriggerEnumType::TransactionEvent),
 /// [`FirmwareStatusNotification`](MessageTriggerEnumType::FirmwareStatusNotification)
 /// (the CP models `UpdateFirmware` and re-reports its latest firmware status on
-/// demand, Issue #583), and
+/// demand, Issue #583),
+/// [`LogStatusNotification`](MessageTriggerEnumType::LogStatusNotification) (the CP
+/// models `GetLog` and re-reports its latest log-upload status on demand, Issue
+/// #584), and
 /// [`PublishFirmwareStatusNotification`](MessageTriggerEnumType::PublishFirmwareStatusNotification)
 /// (the CP models `PublishFirmware` and re-reports its latest publish status on
 /// demand, Issue #585) — and to
 /// [`NotImplemented`](TriggerMessageStatusEnumType::NotImplemented) for the
-/// diagnostics-log- and certificate-signing triggers the simulator does not yet
+/// certificate-signing triggers the simulator does not yet
 /// trigger.
 ///
 /// `MeterValues` is `Accepted` at the policy level because the CP produces meter
@@ -352,27 +355,27 @@ pub fn v201_trigger_message_status(
     };
     match requested {
         // Messages this CP already builds and sends on the live V201 path.
-        // `FirmwareStatusNotification` / `PublishFirmwareStatusNotification`
-        // re-report the station's latest firmware / publish-firmware status on
-        // demand — the CP models `UpdateFirmware` (#583) and `PublishFirmware`
-        // (#585) and retains each latest status, so the triggers are honored, the
-        // direct twins of the 1.6J `TriggerMessage(FirmwareStatusNotification)`
-        // re-report.
+        // `FirmwareStatusNotification` (#583), `LogStatusNotification` (#584), and
+        // `PublishFirmwareStatusNotification` (#585) re-report the station's latest
+        // firmware / log-upload / publish-firmware status on demand — the CP models
+        // `UpdateFirmware` / `GetLog` / `PublishFirmware` and retains each latest
+        // status, so the triggers are honored, the direct 2.0.1 twins of the 1.6J
+        // `TriggerMessage(FirmwareStatusNotification / DiagnosticsStatusNotification)`
+        // re-reports.
         BootNotification
         | Heartbeat
         | StatusNotification
         | MeterValues
         | TransactionEvent
         | FirmwareStatusNotification
+        | LogStatusNotification
         | PublishFirmwareStatusNotification => TriggerMessageStatusEnumType::Accepted,
-        // Diagnostics-log- and certificate-signing flows the simulator does not
-        // yet trigger: recognized but not triggerable. (LogStatusNotification →
-        // #584 will re-report its latest status the same way #583/#585 do; the
-        // Sign* certificate triggers are a separate, heavier slice.)
-        LogStatusNotification
-        | SignChargingStationCertificate
-        | SignV2GCertificate
-        | SignCombinedCertificate => TriggerMessageStatusEnumType::NotImplemented,
+        // Certificate-signing flows the simulator does not yet trigger: recognized
+        // but not triggerable. The Sign* certificate triggers are a separate,
+        // heavier slice that must originate a fresh SignCertificate CSR.
+        SignChargingStationCertificate | SignV2GCertificate | SignCombinedCertificate => {
+            TriggerMessageStatusEnumType::NotImplemented
+        }
     }
 }
 
@@ -2420,17 +2423,39 @@ pub fn v201_log_upload_terminal_status(
 ///
 /// The `requestId` is always carried here (it correlates the async progress
 /// report back to the triggering `GetLogRequest`); it is only absent when a
-/// `TriggerMessage` asks for a `LogStatusNotification` with no upload ongoing,
-/// which this `GetLog`-driven flow never is. Pure constructor mirroring
-/// [`v201_get_log_response`]. Ports `ocpp.v201.call.LogStatusNotification`.
+/// `TriggerMessage` asks for a `LogStatusNotification` with no upload ongoing
+/// (the [`Idle`](UploadLogStatusEnumType::Idle) re-report built by
+/// [`v201_log_status_report`]), which this `GetLog`-driven flow never is. Pure
+/// constructor mirroring [`v201_get_log_response`]. Ports
+/// `ocpp.v201.call.LogStatusNotification`.
 #[must_use]
 pub fn v201_log_status_notification(
     status: UploadLogStatusEnumType,
     request_id: i32,
 ) -> LogStatusNotificationRequest {
+    v201_log_status_report(status, Some(request_id))
+}
+
+/// Build a schema-valid `LogStatusNotification.req`
+/// ([`LogStatusNotificationRequest`]) with an *optional* `request_id`.
+///
+/// The re-report constructor a `TriggerMessage(LogStatusNotification)` uses to
+/// answer with the station's latest log-upload status (Issue #584). Unlike the
+/// async-progress [`v201_log_status_notification`], `request_id` may be `None`: an
+/// [`Idle`](UploadLogStatusEnumType::Idle) status on a station that has never run
+/// a `GetLog` is not tied to a specific request, and the 2.0.1 schema omits
+/// `requestId` (`skip_serializing_if = "Option::is_none"`) in that case; a status
+/// carried over from a real upload re-reports its `Some(requestId)`. The
+/// log-upload twin of [`v201_firmware_status_report`]. Ports
+/// `ocpp.v201.call.LogStatusNotification`.
+#[must_use]
+pub fn v201_log_status_report(
+    status: UploadLogStatusEnumType,
+    request_id: Option<i32>,
+) -> LogStatusNotificationRequest {
     LogStatusNotificationRequest {
         status,
-        request_id: Some(request_id),
+        request_id,
         custom_data: None,
     }
 }
@@ -3760,6 +3785,9 @@ mod tests {
             // The CP models UpdateFirmware and retains its latest firmware status,
             // so a FirmwareStatusNotification trigger is honored by re-report (#583).
             MessageTriggerEnumType::FirmwareStatusNotification,
+            // The CP models GetLog and retains its latest log-upload status, so a
+            // LogStatusNotification trigger is honored by re-report (#584).
+            MessageTriggerEnumType::LogStatusNotification,
             // Likewise the CP models PublishFirmware and retains its latest publish
             // status, so a PublishFirmwareStatusNotification trigger is honored (#585).
             MessageTriggerEnumType::PublishFirmwareStatusNotification,
@@ -3772,12 +3800,11 @@ mod tests {
         }
     }
 
-    /// The diagnostics-log- and certificate-signing triggers the simulator does
+    /// The certificate-signing triggers the simulator does
     /// not yet originate resolve to `NotImplemented` (recognized, not triggerable).
     #[test]
     fn unsupported_triggers_are_not_implemented() {
         for requested in [
-            MessageTriggerEnumType::LogStatusNotification,
             MessageTriggerEnumType::SignChargingStationCertificate,
             MessageTriggerEnumType::SignV2GCertificate,
             MessageTriggerEnumType::SignCombinedCertificate,
@@ -3819,10 +3846,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(accepted, 7, "expected exactly 7 producible triggers");
+        assert_eq!(accepted, 8, "expected exactly 8 producible triggers");
         assert_eq!(
-            not_implemented, 4,
-            "expected exactly 4 unsupported triggers"
+            not_implemented, 3,
+            "expected exactly 3 unsupported triggers"
         );
     }
 
@@ -8469,6 +8496,62 @@ mod tests {
                         .validate_call("LogStatusNotification", &payload)
                         .is_ok(),
                     "built {status:?} LogStatusNotification.req (requestId {request_id}) \
+                     should be schema-valid, got: {payload}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn log_status_report_omits_request_id_when_none() {
+        // The Idle re-report a TriggerMessage(LogStatusNotification) answers with
+        // on a station that has never run a GetLog (#584): Idle, no requestId.
+        let req = v201_log_status_report(UploadLogStatusEnumType::Idle, None);
+        assert_eq!(req.status, UploadLogStatusEnumType::Idle);
+        assert_eq!(req.request_id, None);
+        assert!(req.custom_data.is_none());
+        // `requestId` must be *absent* from the wire, not `null` — the schema has
+        // no `null` for it (skip_serializing_if = "Option::is_none").
+        let payload = serde_json::to_value(&req).unwrap();
+        assert!(
+            payload.get("requestId").is_none(),
+            "an Idle re-report omits requestId entirely, got: {payload}"
+        );
+    }
+
+    #[test]
+    fn log_status_report_carries_request_id_when_some() {
+        // A status re-reported from a real upload keeps its correlating requestId.
+        let req = v201_log_status_report(UploadLogStatusEnumType::Uploaded, Some(7));
+        assert_eq!(req.status, UploadLogStatusEnumType::Uploaded);
+        assert_eq!(req.request_id, Some(7));
+        // The convenience wrapper produces the same shape as the explicit Some.
+        assert_eq!(
+            req,
+            v201_log_status_notification(UploadLogStatusEnumType::Uploaded, 7)
+        );
+    }
+
+    #[test]
+    fn built_log_status_reports_are_schema_valid() {
+        // The trigger re-report path (optional requestId) is schema-valid both as
+        // an Idle/None snapshot and carrying a status + requestId from an upload.
+        let validator = SchemaValidator::v201();
+        for status in [
+            UploadLogStatusEnumType::Idle,
+            UploadLogStatusEnumType::Uploading,
+            UploadLogStatusEnumType::Uploaded,
+            UploadLogStatusEnumType::UploadFailure,
+            UploadLogStatusEnumType::AcceptedCanceled,
+        ] {
+            for request_id in [None, Some(0), Some(-1), Some(i32::MIN), Some(i32::MAX)] {
+                let req = v201_log_status_report(status, request_id);
+                let payload = serde_json::to_value(&req).unwrap();
+                assert!(
+                    validator
+                        .validate_call("LogStatusNotification", &payload)
+                        .is_ok(),
+                    "built {status:?} LogStatusNotification.req (requestId {request_id:?}) \
                      should be schema-valid, got: {payload}"
                 );
             }
