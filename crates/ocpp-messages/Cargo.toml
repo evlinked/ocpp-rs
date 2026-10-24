@@ -11,6 +11,9 @@ description = "OCPP message definitions and serialization for all protocol versi
 keywords.workspace = true
 categories.workspace = true
 
+[lints]
+workspace = true
+
 [dependencies]
 ocpp-types = { path = "../ocpp-types" }
 serde = { workspace = true }
