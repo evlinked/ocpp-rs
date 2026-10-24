@@ -327,10 +327,18 @@ pub fn v201_reset_response(
 /// #584), and
 /// [`PublishFirmwareStatusNotification`](MessageTriggerEnumType::PublishFirmwareStatusNotification)
 /// (the CP models `PublishFirmware` and re-reports its latest publish status on
-/// demand, Issue #585) — and to
-/// [`NotImplemented`](TriggerMessageStatusEnumType::NotImplemented) for the
-/// certificate-signing triggers the simulator does not yet
-/// trigger.
+/// demand, Issue #585) — and the three certificate-signing triggers
+/// [`SignChargingStationCertificate`](MessageTriggerEnumType::SignChargingStationCertificate),
+/// [`SignV2GCertificate`](MessageTriggerEnumType::SignV2GCertificate), and
+/// [`SignCombinedCertificate`](MessageTriggerEnumType::SignCombinedCertificate),
+/// which — unlike the re-report triggers — the CP honors by *originating* a fresh
+/// [`SignCertificate`](crate::ChargePoint::request_sign_certificate) CSR for the
+/// requested certificate type rather than re-reporting cached state (Issue #589).
+///
+/// Every [`MessageTriggerEnumType`] variant is now producible, so no trigger
+/// resolves to [`NotImplemented`](TriggerMessageStatusEnumType::NotImplemented)
+/// today; the status is retained in the return type for protocol completeness and
+/// for any future spec-added trigger the simulator cannot yet originate.
 ///
 /// `MeterValues` is `Accepted` at the policy level because the CP produces meter
 /// readings; in 2.0.1 those ride inside `TransactionEvent`, so the slice-5b
@@ -362,6 +370,14 @@ pub fn v201_trigger_message_status(
         // status, so the triggers are honored, the direct 2.0.1 twins of the 1.6J
         // `TriggerMessage(FirmwareStatusNotification / DiagnosticsStatusNotification)`
         // re-reports.
+        //
+        // The three certificate-signing triggers (#589) are honored differently:
+        // not a snapshot of tracked state but a fresh CP-initiated `SignCertificate`
+        // CSR the station originates for the requested certificate type (the signed
+        // chain returns later via the paired `CertificateSigned`). They are
+        // `Accepted` because that origination path is wired
+        // (`ChargePoint::request_sign_certificate`, dispatched from
+        // `send_v201_triggered_message`) — not accepted-without-emit.
         BootNotification
         | Heartbeat
         | StatusNotification
@@ -369,13 +385,10 @@ pub fn v201_trigger_message_status(
         | TransactionEvent
         | FirmwareStatusNotification
         | LogStatusNotification
-        | PublishFirmwareStatusNotification => TriggerMessageStatusEnumType::Accepted,
-        // Certificate-signing flows the simulator does not yet trigger: recognized
-        // but not triggerable. The Sign* certificate triggers are a separate,
-        // heavier slice that must originate a fresh SignCertificate CSR.
-        SignChargingStationCertificate | SignV2GCertificate | SignCombinedCertificate => {
-            TriggerMessageStatusEnumType::NotImplemented
-        }
+        | PublishFirmwareStatusNotification
+        | SignChargingStationCertificate
+        | SignV2GCertificate
+        | SignCombinedCertificate => TriggerMessageStatusEnumType::Accepted,
     }
 }
 
@@ -3791,6 +3804,12 @@ mod tests {
             // Likewise the CP models PublishFirmware and retains its latest publish
             // status, so a PublishFirmwareStatusNotification trigger is honored (#585).
             MessageTriggerEnumType::PublishFirmwareStatusNotification,
+            // The three certificate-signing triggers are honored by originating a
+            // fresh SignCertificate CSR (not a status re-report), so they too are
+            // Accepted (#589).
+            MessageTriggerEnumType::SignChargingStationCertificate,
+            MessageTriggerEnumType::SignV2GCertificate,
+            MessageTriggerEnumType::SignCombinedCertificate,
         ] {
             assert_eq!(
                 v201_trigger_message_status(requested),
@@ -3800,10 +3819,14 @@ mod tests {
         }
     }
 
-    /// The certificate-signing triggers the simulator does
-    /// not yet originate resolve to `NotImplemented` (recognized, not triggerable).
+    /// The three certificate-signing triggers are `Accepted` — but on a different
+    /// basis than the re-report triggers: the CP honors them by *originating* a
+    /// fresh `SignCertificate` CSR for the requested certificate type, not by
+    /// re-reporting cached state (#589). This is the successor to the former
+    /// `unsupported_triggers_are_not_implemented` expectation, now that the CSR
+    /// origination path is wired.
     #[test]
-    fn unsupported_triggers_are_not_implemented() {
+    fn certificate_signing_triggers_are_accepted() {
         for requested in [
             MessageTriggerEnumType::SignChargingStationCertificate,
             MessageTriggerEnumType::SignV2GCertificate,
@@ -3811,15 +3834,18 @@ mod tests {
         ] {
             assert_eq!(
                 v201_trigger_message_status(requested),
-                TriggerMessageStatusEnumType::NotImplemented,
-                "{requested:?} should be NotImplemented"
+                TriggerMessageStatusEnumType::Accepted,
+                "{requested:?} should be Accepted (honored by originating a SignCertificate CSR)"
             );
         }
     }
 
-    /// The status decision is total: the `Accepted` and `NotImplemented` groups
-    /// together cover every `MessageTriggerEnumType` variant, and `Rejected`
-    /// (a runtime capability outcome) is never a policy result.
+    /// The status decision is total: every `MessageTriggerEnumType` variant is
+    /// classified (all `Accepted` today), and `Rejected` (a runtime capability
+    /// outcome) is never a policy result. With the certificate-signing triggers
+    /// now wired to originate a CSR (#589), no variant resolves to
+    /// `NotImplemented` — the group is empty but the status is retained for any
+    /// future spec-added trigger.
     #[test]
     fn trigger_status_decision_is_total_and_never_rejected() {
         let all = [
@@ -3846,10 +3872,10 @@ mod tests {
                 }
             }
         }
-        assert_eq!(accepted, 8, "expected exactly 8 producible triggers");
+        assert_eq!(accepted, 11, "expected all 11 triggers to be producible");
         assert_eq!(
-            not_implemented, 3,
-            "expected exactly 3 unsupported triggers"
+            not_implemented, 0,
+            "every trigger is now honored; none should be NotImplemented"
         );
     }
 

@@ -8745,16 +8745,26 @@ impl ChargePoint {
                 self.trigger_v201_publish_firmware_status_notification()
                     .await
             }
-            // Certificate-signing triggers the simulator does not yet originate.
-            // `v201_trigger_message_status` reports these `NotImplemented`, so the
-            // handler never enqueues them; this arm keeps the match exhaustive and
-            // aligned with that policy. The Sign* certificate triggers are a
-            // separate, heavier slice.
-            other @ (SignChargingStationCertificate
-            | SignV2GCertificate
-            | SignCombinedCertificate) => {
-                warn!("v201 TriggerMessage({other:?}): not implemented by the simulator");
+            // Certificate-signing triggers (#589): unlike the re-report triggers,
+            // these tell the station to *originate* a fresh SignCertificate CSR for
+            // the named certificate type. The trigger → certificateType mapping is
+            // deterministic and exhaustive (no wildcard, so a future spec-added
+            // Sign* trigger is a compile error here): a combined certificate serves
+            // both the ISO 15118 and the Charging-Station-to-CSMS connections, which
+            // OCPP 2.0.1 expresses by *omitting* certificateType — hence `None`.
+            SignChargingStationCertificate => {
+                self.trigger_v201_sign_certificate(Some(
+                    CertificateSigningUseEnumType::ChargingStationCertificate,
+                ))
+                .await;
             }
+            SignV2GCertificate => {
+                self.trigger_v201_sign_certificate(Some(
+                    CertificateSigningUseEnumType::V2GCertificate,
+                ))
+                .await;
+            }
+            SignCombinedCertificate => self.trigger_v201_sign_certificate(None).await,
         }
     }
 
@@ -9391,6 +9401,52 @@ impl ChargePoint {
                 "v201 TriggerMessage(PublishFirmwareStatusNotification): re-report of \
                  {:?} (request {:?}) failed: {e}",
                 report.status, report.request_id
+            );
+        }
+    }
+
+    /// Originate an OCPP 2.0.1 `SignCertificate` CSR for a certificate-signing
+    /// `TriggerMessage` — `requestedMessage` one of `SignChargingStationCertificate`,
+    /// `SignV2GCertificate`, or `SignCombinedCertificate` (Issue #589).
+    ///
+    /// Unlike the status-re-report triggers (firmware / log / publish-firmware),
+    /// which answer with a snapshot of a status the station already tracks, the
+    /// `Sign*` triggers tell the station to *originate* fresh certificate
+    /// provisioning: it builds a CSR and sends a `SignCertificate.req`, which the
+    /// CSMS forwards to a CA; the signed chain returns later, out-of-band, via the
+    /// paired `CertificateSigned` CALL the CP already correlates (#553).
+    ///
+    /// `certificate_type` is resolved by the caller from the specific trigger
+    /// (`SignChargingStationCertificate` →
+    /// [`ChargingStationCertificate`](CertificateSigningUseEnumType::ChargingStationCertificate),
+    /// `SignV2GCertificate` →
+    /// [`V2GCertificate`](CertificateSigningUseEnumType::V2GCertificate),
+    /// `SignCombinedCertificate` → `None` — the spec reads an omitted
+    /// `certificateType` as a single certificate for *both* the ISO 15118 and the
+    /// Charging-Station-to-CSMS connections).
+    ///
+    /// Delegates to [`request_sign_certificate`](Self::request_sign_certificate),
+    /// which builds the opaque placeholder CSR (the simulator's documented "no PKI"
+    /// boundary), emits the CALL inline, and — when the CSMS accepts — records the
+    /// pending-CSR marker the paired `CertificateSigned` later clears. This is a
+    /// pure origination: it touches only the certificate-provisioning state, never
+    /// the re-report stores. `TriggerMessage` carries no EVSE scope for this
+    /// station-wide message, so `evse_id` is not a parameter (mirroring the
+    /// `BootNotification` / status-re-report arms). Runs on the command-consumer
+    /// task (off the inbound-CALL path), so the `TriggerMessage` CALLRESULT is
+    /// flushed before this CALL and the receive loop never re-enters itself. A
+    /// transport failure is surfaced best-effort in the log and never propagated,
+    /// exactly like the re-report triggers; the accept/reject ack is logged by
+    /// `request_sign_certificate` (a `Rejected` ack is a valid protocol outcome, not
+    /// an error).
+    async fn trigger_v201_sign_certificate(
+        &self,
+        certificate_type: Option<CertificateSigningUseEnumType>,
+    ) {
+        if let Err(e) = self.request_sign_certificate(certificate_type).await {
+            warn!(
+                "v201 TriggerMessage(Sign*Certificate) for {certificate_type:?}: \
+                 SignCertificate CSR origination failed: {e}"
             );
         }
     }
@@ -16821,6 +16877,167 @@ mod tests {
             cp.v201_publish_firmwares.in_flight_count().await,
             0,
             "the settled stream clears the in-flight marker"
+        );
+    }
+
+    // --- OCPP 2.0.1 TriggerMessage(Sign*Certificate) (M7, Issue #589) ----------
+    // The three certificate-signing triggers are honored by *originating* a fresh
+    // SignCertificate CSR for the requested certificate type (not a status
+    // re-report): SignChargingStationCertificate → ChargingStationCertificate,
+    // SignV2GCertificate → V2GCertificate, SignCombinedCertificate → omitted
+    // certificateType (the spec's single-certificate-for-both-connections case). An
+    // accepted ack records the pending-CSR marker the paired CertificateSigned later
+    // clears; a rejected ack records nothing. The outgoing CALL is schema-validated
+    // by `call()` on the way out.
+
+    fn sign_certificate_routes() -> std::collections::HashMap<String, serde_json::Value> {
+        let mut routes = std::collections::HashMap::new();
+        routes.insert(
+            "BootNotification".to_string(),
+            boot_response("Accepted", 3600),
+        );
+        // SignCertificate.conf is a GenericStatus ack.
+        routes.insert(
+            "SignCertificate".to_string(),
+            serde_json::json!({"status": "Accepted"}),
+        );
+        routes
+    }
+
+    /// Drain the capturing channel for the next `SignCertificate` CALL,
+    /// deserialized into the typed 2.0.1 request. Skips the boot/status chatter a
+    /// freshly-connected CP emits; bounded by a timeout so a missing CALL fails fast.
+    async fn recv_one_sign_certificate(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<(String, serde_json::Value)>,
+    ) -> ocpp_messages::v201::SignCertificateRequest {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await {
+                Ok(Some((action, payload))) if action == "SignCertificate" => {
+                    return serde_json::from_value(payload)
+                        .expect("captured SignCertificate is typed");
+                }
+                Ok(Some(_)) => continue, // BootNotification / StatusNotification, etc.
+                Ok(None) | Err(_) => panic!("expected a SignCertificate CALL"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn v201_trigger_sign_charging_station_certificate_originates_a_csr() {
+        use ocpp_types::v201::CertificateSigningUseEnumType;
+        let (addr, mut rx) = spawn_mock_csms_capturing(sign_certificate_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        cp.send_v201_triggered_message(
+            MessageTriggerEnumType::SignChargingStationCertificate,
+            None,
+        )
+        .await;
+
+        let req = recv_one_sign_certificate(&mut rx).await;
+        assert_eq!(
+            req.certificate_type,
+            Some(CertificateSigningUseEnumType::ChargingStationCertificate),
+            "the ChargingStation trigger requests a ChargingStationCertificate"
+        );
+        assert!(!req.csr.is_empty(), "the originated CSR PEM is populated");
+        // An accepted ack records the pending-CSR marker the CertificateSigned clears.
+        let pending = cp
+            .pending_csr()
+            .await
+            .expect("an accepted origination records a pending CSR");
+        assert_eq!(
+            pending.certificate_type,
+            Some(CertificateSigningUseEnumType::ChargingStationCertificate),
+            "the marker remembers the originated certificate type"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_trigger_sign_v2g_certificate_originates_a_csr() {
+        use ocpp_types::v201::CertificateSigningUseEnumType;
+        let (addr, mut rx) = spawn_mock_csms_capturing(sign_certificate_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        cp.send_v201_triggered_message(MessageTriggerEnumType::SignV2GCertificate, None)
+            .await;
+
+        let req = recv_one_sign_certificate(&mut rx).await;
+        assert_eq!(
+            req.certificate_type,
+            Some(CertificateSigningUseEnumType::V2GCertificate),
+            "the V2G trigger requests a V2GCertificate"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_trigger_sign_combined_certificate_omits_the_certificate_type() {
+        let (addr, mut rx) = spawn_mock_csms_capturing(sign_certificate_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        cp.send_v201_triggered_message(MessageTriggerEnumType::SignCombinedCertificate, None)
+            .await;
+
+        let req = recv_one_sign_certificate(&mut rx).await;
+        assert_eq!(
+            req.certificate_type, None,
+            "a combined certificate omits certificateType (serves both connections)"
+        );
+        // The marker still records the (None) type for the paired CertificateSigned.
+        let pending = cp
+            .pending_csr()
+            .await
+            .expect("an accepted origination records a pending CSR");
+        assert_eq!(
+            pending.certificate_type, None,
+            "the combined marker carries no specific certificate type"
+        );
+    }
+
+    #[tokio::test]
+    async fn v201_trigger_sign_certificate_rejected_ack_records_no_pending_csr() {
+        // A Rejected ack is a valid protocol outcome: the CSR is still emitted on the
+        // wire, but nothing is left awaiting a CertificateSigned delivery.
+        let mut routes = sign_certificate_routes();
+        routes.insert(
+            "SignCertificate".to_string(),
+            serde_json::json!({"status": "Rejected"}),
+        );
+        let (addr, mut rx) = spawn_mock_csms_capturing(routes).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        cp.send_v201_triggered_message(
+            MessageTriggerEnumType::SignChargingStationCertificate,
+            None,
+        )
+        .await;
+
+        // The CSR was emitted on the wire...
+        let _req = recv_one_sign_certificate(&mut rx).await;
+        // ...but a Rejected ack records no pending-CSR marker.
+        assert!(
+            cp.pending_csr().await.is_none(),
+            "a Rejected origination starts no CertificateSigned wait"
         );
     }
 
