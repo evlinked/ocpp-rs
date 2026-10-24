@@ -933,25 +933,63 @@ async fn v201_trigger_meter_values_is_accepted_and_emits_meter_values() {
 }
 
 #[tokio::test]
-async fn v201_trigger_unsupported_message_is_not_implemented_and_emits_nothing() {
-    let (mut server, addr, boots, meter_values) = start_v201_csms_recording_triggers().await;
+async fn v201_trigger_sign_certificate_is_accepted_and_originates_a_csr() {
+    // The three certificate-signing triggers were the last v201 TriggerMessage
+    // family classified NotImplemented. Unlike the status-re-report triggers, the
+    // simulator now honors them by *originating* a fresh SignCertificate CSR for
+    // the requested certificate type (#589), so the policy classifies them Accepted
+    // and the wiring emits one CSR on the command-consumer task. This exercises
+    // that end to end: a self-contained CSMS records the originated CSR AND answers
+    // it Accepted (so the command-consumer task doesn't stall behind an unanswered
+    // CALL), plus counts boots to confirm the trigger reboots nothing.
+    let boots: BootCount = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let csrs: Arc<Mutex<Vec<V201SignCertificateRequest>>> = Arc::new(Mutex::new(Vec::new()));
+    let boots_for_handler = boots.clone();
+    let csrs_for_handler = csrs.clone();
+    let (mut server, addr) = start_v201_csms(move |dispatcher| {
+        let boots = boots_for_handler;
+        dispatcher.on(move |_req: V201BootNotificationRequest| {
+            let boots = boots.clone();
+            async move {
+                boots.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(V201BootNotificationResponse {
+                    current_time: chrono::Utc::now()
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    interval: 300,
+                    status: RegistrationStatusEnumType::Accepted,
+                    status_info: None,
+                    custom_data: None,
+                })
+            }
+        });
+        let csrs = csrs_for_handler;
+        dispatcher.on(move |req: V201SignCertificateRequest| {
+            let csrs = csrs.clone();
+            async move {
+                csrs.lock()
+                    .expect("sign-certificate capture mutex not poisoned")
+                    .push(req);
+                Ok(V201SignCertificateResponse {
+                    status: GenericStatusEnumType::Accepted,
+                    status_info: None,
+                    custom_data: None,
+                })
+            }
+        });
+    })
+    .await;
 
     let cp =
-        ChargePoint::new(v201_cp_config(addr, "CP201_TRIG_NIMP")).expect("build v201 charge point");
+        ChargePoint::new(v201_cp_config(addr, "CP201_TRIG_SIGN")).expect("build v201 charge point");
     cp.connect().await.expect("v201 connect + boot sequence");
     assert_eq!(boots.load(std::sync::atomic::Ordering::SeqCst), 1);
 
-    // CSMS -> CP: TriggerMessage(SignChargingStationCertificate). The simulator
-    // does not yet originate a standalone SignCertificate CSR on the v201 path
-    // (that certificate-signing slice is a distinct, heavier follow-up), so the
-    // policy classifies it NotImplemented and the wiring enqueues nothing.
-    // (FirmwareStatusNotification, LogStatusNotification, and
-    // PublishFirmwareStatusNotification are now Accepted — they re-report the
-    // latest firmware / log-upload / publish-firmware status, #583 / #584 / #585 —
-    // so none of them is the NotImplemented example here.)
+    // CSMS -> CP: TriggerMessage(SignChargingStationCertificate). Now Accepted
+    // (was NotImplemented): honored by originating a SignCertificate CSR for the
+    // ChargingStation certificate rather than re-reporting cached state.
     let resp = server
         .call::<V201TriggerMessageRequest>(
-            "CP201_TRIG_NIMP",
+            "CP201_TRIG_SIGN",
             V201TriggerMessageRequest {
                 requested_message: MessageTriggerEnumType::SignChargingStationCertificate,
                 evse: None,
@@ -962,46 +1000,44 @@ async fn v201_trigger_unsupported_message_is_not_implemented_and_emits_nothing()
         .expect("CSMS TriggerMessage call round-trips");
     assert_eq!(
         resp.status,
-        TriggerMessageStatusEnumType::NotImplemented,
-        "a message the simulator can't produce is NotImplemented"
+        TriggerMessageStatusEnumType::Accepted,
+        "a certificate-signing trigger is Accepted — honored by originating a CSR"
     );
 
-    // Absence is hard to assert directly, so drive a *supported* trigger after it
-    // as a deterministic happens-after barrier: once the MeterValues emitted by
-    // the second trigger arrives, the first (NotImplemented) trigger has fully
-    // run and must have emitted nothing — the meter-values log holds exactly the
-    // one MeterValues and no extra BootNotification slipped in. Scope to EVSE 1 so
-    // the barrier emits exactly one MeterValues.
-    let resp = server
-        .call::<V201TriggerMessageRequest>(
-            "CP201_TRIG_NIMP",
-            V201TriggerMessageRequest {
-                requested_message: MessageTriggerEnumType::MeterValues,
-                evse: Some(EvseType {
-                    id: 1,
-                    connector_id: None,
-                    custom_data: None,
-                }),
-                custom_data: None,
-            },
-        )
-        .await
-        .expect("CSMS TriggerMessage call round-trips");
-    assert_eq!(resp.status, TriggerMessageStatusEnumType::Accepted);
-    wait_for_meter_values(&meter_values, 1).await;
-
-    assert_eq!(
-        meter_values
+    // The CSR is emitted after the CALLRESULT is flushed, on the command-consumer
+    // task; wait (no fixed sleep) for the CSMS to receive exactly one.
+    for _ in 0..250 {
+        if !csrs
             .lock()
-            .expect("meter values log mutex not poisoned")
-            .len(),
+            .expect("sign-certificate capture mutex not poisoned")
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let calls = csrs
+        .lock()
+        .expect("sign-certificate capture mutex not poisoned")
+        .clone();
+    assert_eq!(
+        calls.len(),
         1,
-        "the NotImplemented trigger emitted no MeterValues; only the supported one did"
+        "the SignChargingStationCertificate trigger originates exactly one SignCertificate CSR"
+    );
+    assert_eq!(
+        calls[0].certificate_type,
+        Some(CertificateSigningUseEnumType::ChargingStationCertificate),
+        "the originated CSR names the ChargingStation certificate type"
+    );
+    assert!(
+        !calls[0].csr.is_empty(),
+        "the originated CSR carries a (placeholder) PEM"
     );
     assert_eq!(
         boots.load(std::sync::atomic::Ordering::SeqCst),
         1,
-        "the NotImplemented trigger emitted no BootNotification"
+        "the trigger originated a CSR, not a reboot"
     );
 
     cp.disconnect().await.expect("disconnect");
