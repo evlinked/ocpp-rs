@@ -7391,8 +7391,7 @@ impl ChargePoint {
     ///   reported as [`Opened`](ChargingStateChangeOutcome::Opened) with the
     ///   station-chosen `transactionId`. The subsequent `start_transaction`
     ///   folds the authorization onto it, advancing `EVConnected → Charging`
-    ///   (Issue #595; see
-    ///   [`fold_authorization_onto_plug_open`](Self::fold_authorization_onto_plug_open)).
+    ///   (Issue #595; see `fold_authorization_onto_plug_open`).
     /// - **No transaction open and the `TxStartPoint` does *not* include
     ///   `EVConnected`** (the default `[Authorized]`) → the plug precedes the
     ///   authorization-opened transaction and there is nothing to report yet:
@@ -7407,7 +7406,7 @@ impl ChargePoint {
     /// step into [`start_transaction`](Self::start_transaction) — so a single
     /// `start_transaction` call on a plug-opened session advances it to `Charging`
     /// instead of opening a second transaction — is done in
-    /// [`fold_authorization_onto_plug_open`](Self::fold_authorization_onto_plug_open)
+    /// `fold_authorization_onto_plug_open`
     /// (Issue #595). Start-point variants beyond `EVConnected` (`PowerPathClosed`,
     /// `EnergyTransfer`, …) are modeled in the config but not yet acted on.
     ///
@@ -8302,7 +8301,8 @@ impl ChargePoint {
     ///
     /// On a station whose `TxStartPoint` includes `EVConnected`, the cable-plug
     /// has already *opened* the transaction (`TransactionEvent(Started,
-    /// CablePluggedIn, EVConnected)`, seqNo 0; [`open_transaction_on_cable_plug`]).
+    /// CablePluggedIn, EVConnected)`, seqNo 0;
+    /// [`open_transaction_on_cable_plug`](Self::open_transaction_on_cable_plug)).
     /// A subsequent `start_transaction` must **advance** that same transaction
     /// rather than open a second one. Resolving the live transaction on
     /// `connector_id`:
