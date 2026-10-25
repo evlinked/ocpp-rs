@@ -1171,6 +1171,18 @@ struct V201Session {
     /// — not the volatile auth cache — because a remotely-started transaction
     /// may hold no cache entry and cache *expiry* is not *deauthorization*.
     authorized: Arc<AtomicBool>,
+    /// Whether this transaction was **opened by plugging the cable in** under an
+    /// `EVConnected` `TxStartPoint` (Issue #582) rather than by authorization.
+    ///
+    /// Marks the plug-initiated lineage so the authorization step can be *folded*
+    /// onto it (Issue #595): `start_transaction` on a connector hosting a
+    /// plug-initiated session **advances** it (`EVConnected → Charging`, one
+    /// interim `TransactionEvent(Updated, triggerReason = Authorized)`) instead of
+    /// minting a second transaction, and a redundant authorization on an
+    /// already-advanced plug-initiated session is a silent no-op. `false` for a
+    /// transaction opened the long-standing way (authorization mints it), so that
+    /// path is left exactly as it was.
+    plug_initiated: bool,
     /// The optional `groupIdToken` a `RequestStartTransaction` carried — the
     /// parent/group token the driver `idToken` belongs to (a fleet card, a
     /// household account) that a CSMS may use to group or co-authorize sessions
@@ -7377,9 +7389,10 @@ impl ChargePoint {
     ///   the cable-plug *opens* the transaction (Issue #582): one
     ///   `TransactionEvent(Started, CablePluggedIn, EVConnected)` at `seqNo 0`,
     ///   reported as [`Opened`](ChargingStateChangeOutcome::Opened) with the
-    ///   station-chosen `transactionId`. The subsequent authorization advances
-    ///   the transaction `EVConnected → Charging` (driven today via
-    ///   [`transition_charging_state`](Self::transition_charging_state)).
+    ///   station-chosen `transactionId`. The subsequent `start_transaction`
+    ///   folds the authorization onto it, advancing `EVConnected → Charging`
+    ///   (Issue #595; see
+    ///   [`fold_authorization_onto_plug_open`](Self::fold_authorization_onto_plug_open)).
     /// - **No transaction open and the `TxStartPoint` does *not* include
     ///   `EVConnected`** (the default `[Authorized]`) → the plug precedes the
     ///   authorization-opened transaction and there is nothing to report yet:
@@ -7392,12 +7405,11 @@ impl ChargePoint {
     /// Reconciling the plug-in with the `TxStartPoint` so it *opens* the
     /// transaction is this method's job (Issue #582). Folding the *authorization*
     /// step into [`start_transaction`](Self::start_transaction) — so a single
-    /// `start_transaction` call on a plug-opened session advances it to
-    /// `Charging` instead of opening a second transaction — is a deliberate
-    /// follow-up; until then the driver advances a plug-opened session with
-    /// [`transition_charging_state`](Self::transition_charging_state). Start-point
-    /// variants beyond `EVConnected` (`PowerPathClosed`, `EnergyTransfer`, …) are
-    /// modeled in the config but not yet acted on.
+    /// `start_transaction` call on a plug-opened session advances it to `Charging`
+    /// instead of opening a second transaction — is done in
+    /// [`fold_authorization_onto_plug_open`](Self::fold_authorization_onto_plug_open)
+    /// (Issue #595). Start-point variants beyond `EVConnected` (`PowerPathClosed`,
+    /// `EnergyTransfer`, …) are modeled in the config but not yet acted on.
     ///
     /// V201-only: `TransactionEvent` and its `chargingState` are 2.0.1
     /// constructs, so a call on a `V16J` station is refused with
@@ -7508,6 +7520,9 @@ impl ChargePoint {
                 next_seq_no: Arc::new(AtomicI32::new(1)),
                 // The cable is latched but unauthorized (pre-authorization open).
                 authorized: Arc::new(AtomicBool::new(false)),
+                // Plug-initiated: the subsequent authorization folds onto this
+                // transaction (advances it) rather than opening a second (#595).
+                plug_initiated: true,
                 group_id_token: None,
                 // Opens `EVConnected` — the `Started` event just reported it.
                 charging_state: Arc::new(Mutex::new(ChargingStateEnumType::EVConnected)),
@@ -7917,6 +7932,9 @@ impl ChargePoint {
                         id_tag: id_tag.to_string(),
                         next_seq_no: Arc::new(AtomicI32::new(1)),
                         authorized: Arc::new(AtomicBool::new(true)),
+                        // Authorization opened it the long-standing way — not a
+                        // plug-initiated transaction, so nothing folds onto it.
+                        plug_initiated: false,
                         group_id_token,
                         // A transaction opens Charging — the `Started` event just
                         // reported `chargingState = Charging` (Issue #577).
@@ -8221,6 +8239,26 @@ impl ChargePoint {
         charging_profile: Option<ChargingProfileType>,
         group_id_token: Option<V201IdTokenType>,
     ) -> OcppResult<i32> {
+        // #595: a 2.0.1 station whose `TxStartPoint` includes `EVConnected` opens
+        // the transaction when the cable is plugged in (#582), so by the time the
+        // driver authorizes, a plug-initiated session may already be live on this
+        // connector. Fold the authorization onto it — advancing `EVConnected →
+        // Charging` as one interim `Updated` — instead of minting a second
+        // transaction. `None` (no plug-initiated session, a non-`EVConnected`
+        // start point, or the 1.6J path) falls through to the long-standing
+        // authorization-opens-the-transaction path below, unchanged.
+        if let Some(transaction_id) = self
+            .fold_authorization_onto_plug_open(
+                connector_id,
+                id_tag,
+                &charging_profile,
+                &group_id_token,
+            )
+            .await?
+        {
+            return Ok(transaction_id);
+        }
+
         // Connector is now preparing for a transaction (Available -> Preparing).
         self.send_status_notification(
             connector_id.value(),
@@ -8246,6 +8284,200 @@ impl ChargePoint {
             .await
             .insert(transaction_id, connector_id);
 
+        // Consume any reservation, drive the connector to Charging, and start the
+        // periodic sampler — the tail shared with the plug-open fold path.
+        self.energize_connector(connector_id, transaction_id)
+            .await?;
+
+        info!(
+            "Transaction {} started on connector {}",
+            transaction_id,
+            connector_id.value()
+        );
+
+        Ok(transaction_id)
+    }
+
+    /// Fold the authorization step onto a plug-opened 2.0.1 transaction (#595).
+    ///
+    /// On a station whose `TxStartPoint` includes `EVConnected`, the cable-plug
+    /// has already *opened* the transaction (`TransactionEvent(Started,
+    /// CablePluggedIn, EVConnected)`, seqNo 0; [`open_transaction_on_cable_plug`]).
+    /// A subsequent `start_transaction` must **advance** that same transaction
+    /// rather than open a second one. Resolving the live transaction on
+    /// `connector_id`:
+    ///
+    /// - **A plug-initiated session still at `EVConnected`** → advance it: emit
+    ///   one interim `TransactionEvent(Updated, chargingState = Charging,
+    ///   triggerReason = Authorized)` (contrast
+    ///   [`transition_charging_state`](Self::transition_charging_state)'s
+    ///   `ChargingStateChanged`), capture the authorizing `idToken` /
+    ///   `groupIdToken` onto the session, flip `authorized = true`, install any
+    ///   `charging_profile` against the EVSE, and run the shared
+    ///   [`energize_connector`](Self::energize_connector) tail. Returns
+    ///   `Some(transaction_id)` — the existing id, no new one minted, no second
+    ///   `Started`.
+    /// - **A plug-initiated session already past `EVConnected`** (a redundant
+    ///   second authorization) → a silent no-op: no event, no `seqNo`, returns the
+    ///   existing `Some(transaction_id)`.
+    /// - **No plug-initiated session on the connector** (no plug-open, a
+    ///   non-`EVConnected` start point so the plug opened nothing, a 1.6J station
+    ///   with no `V201Session`, or a normally-opened transaction) → returns `None`
+    ///   so the caller runs today's authorization-opens-the-transaction path.
+    ///
+    /// The `remoteStartId` of a remote start arriving *after* a plug-open cannot
+    /// be echoed: it would have had to ride the `Started` already sent at plug
+    /// time. Such a remote start advances the plug-opened transaction (it is not
+    /// rejected) but the `remoteStartId` is not attached — the advance is an
+    /// `Updated`, which carries no `remoteStartId` field.
+    ///
+    /// The compare-and-advance runs under the session's own `charging_state`
+    /// [`Mutex`] (mirroring [`emit_transaction_state_change`](Self::emit_transaction_state_change)),
+    /// so two authorizations racing a single plug-opened session advance it at
+    /// most once and the loser is the no-op.
+    async fn fold_authorization_onto_plug_open(
+        &self,
+        connector_id: ConnectorId,
+        id_tag: &str,
+        charging_profile: &Option<ChargingProfileType>,
+        group_id_token: &Option<V201IdTokenType>,
+    ) -> OcppResult<Option<i32>> {
+        // Resolve the live transaction on this connector, if any. `active_transactions`
+        // maps transactionId → ConnectorId; an idle connector matches nothing.
+        let transaction_id = {
+            let active = self.active_transactions.read().await;
+            active
+                .iter()
+                .find_map(|(tid, cid)| (*cid == connector_id).then_some(*tid))
+        };
+        let transaction_id = match transaction_id {
+            Some(id) => id,
+            None => return Ok(None),
+        };
+
+        // Only a plug-initiated 2.0.1 session folds authorization onto it. A 1.6J
+        // transaction (no `V201Session`) or a normally-opened 2.0.1 transaction
+        // (`plug_initiated = false`) has no plug-opened lineage, so the caller
+        // opens the long-standing way. Snapshot the shared handles, then drop the
+        // map read lock so it is never held across the outbound send.
+        let (charging_state, next_seq_no, authorized) = {
+            let sessions = self.v201_sessions.read().await;
+            match sessions.get(&transaction_id) {
+                Some(session) if session.plug_initiated => (
+                    session.charging_state.clone(),
+                    session.next_seq_no.clone(),
+                    session.authorized.clone(),
+                ),
+                _ => return Ok(None),
+            }
+        };
+
+        // Compare-and-advance under the per-session state lock: only the
+        // `EVConnected → Charging` edge emits; a plug-opened session already past
+        // `EVConnected` is a redundant second authorization — a silent no-op.
+        {
+            let mut state = charging_state.lock().await;
+            if *state != ChargingStateEnumType::EVConnected {
+                info!(
+                    connector_id = connector_id.value(),
+                    transaction_id,
+                    state = ?*state,
+                    "authorization folds onto an already-advanced plug-opened \
+                     transaction; silent no-op (no second advance)"
+                );
+                return Ok(Some(transaction_id));
+            }
+
+            // Connector is now preparing to energise (Available -> Preparing), the
+            // same opening notification the authorization-opens path sends.
+            self.send_status_notification(
+                connector_id.value(),
+                ChargePointStatus::Preparing,
+                ChargePointErrorCode::NoError,
+            )
+            .await?;
+
+            // Emit the interim advance: `Updated`, `chargingState = Charging`,
+            // `triggerReason = Authorized`. `call()` schema-validates the request
+            // and the `.conf`; a transport/timeout/CALLERROR failure propagates and
+            // leaves the modeled state at `EVConnected` (the `seqNo` is spent, as on
+            // any emitted event), so the authorization can be retried.
+            let seq_no = next_seq_no.fetch_add(1, Ordering::SeqCst);
+            let txid_str = transaction_id.to_string();
+            let request = v201_transaction::transaction_event_state_transition(
+                &v201_transaction::SessionRef {
+                    transaction_id: &txid_str,
+                    evse_id: connector_id.value() as i32,
+                    connector_id: 1,
+                },
+                seq_no,
+                TriggerReasonEnumType::Authorized,
+                ChargingStateEnumType::Charging,
+                &v201_now(),
+            );
+            let _ack = self.call(request).await?;
+            *state = ChargingStateEnumType::Charging;
+            // The session is now authorized: the cable may no longer be released
+            // without first stopping the transaction (`OngoingAuthorizedTransaction`).
+            authorized.store(true, Ordering::SeqCst);
+
+            info!(
+                connector_id = connector_id.value(),
+                transaction_id,
+                seq_no,
+                "folded authorization onto plug-opened transaction; advanced \
+                 EVConnected -> Charging (Updated, Authorized)"
+            );
+        }
+
+        // Capture the authorizing idToken / groupIdToken onto the existing session
+        // so they travel with the live transaction (the `Ended` event echoes the
+        // idToken; `transaction_group_id_token` reads the group). Done after the
+        // emit, under a brief map write — a stop racing us only means the session is
+        // already gone, in which case there is nothing to capture.
+        {
+            let mut sessions = self.v201_sessions.write().await;
+            if let Some(session) = sessions.get_mut(&transaction_id) {
+                session.id_tag = id_tag.to_string();
+                session.group_id_token = group_id_token.clone();
+            }
+        }
+
+        // A `RequestStartTransaction` that advanced a plug-opened session still
+        // installs its `TxProfile` against the EVSE, exactly as `open_transaction`
+        // would have on the authorization-opened path (slice 7d, Issue #450).
+        if let Some(profile) = charging_profile {
+            self.v201_tx_profiles
+                .install(connector_id.value() as i32, profile.clone())
+                .await;
+        }
+
+        // Consume any reservation, drive the connector to Charging, and start the
+        // periodic sampler — the same tail the authorization-opens path runs. The
+        // transactionId → connector mapping is already recorded (from the plug-open).
+        self.energize_connector(connector_id, transaction_id)
+            .await?;
+
+        Ok(Some(transaction_id))
+    }
+
+    /// The shared tail of a transaction start: consume any reservation on
+    /// `connector_id`, drive the connector into `Charging`, and begin periodic
+    /// metering for `transaction_id`.
+    ///
+    /// Runs identically for the authorization-opens path
+    /// ([`start_transaction_with_remote_start_id`](Self::start_transaction_with_remote_start_id))
+    /// and the plug-open fold path
+    /// ([`fold_authorization_onto_plug_open`](Self::fold_authorization_onto_plug_open)),
+    /// so the connector energises and samples exactly once per start regardless of
+    /// how the transaction was opened. The caller is responsible for the preceding
+    /// `Preparing` `StatusNotification` and for recording the transactionId →
+    /// connector mapping.
+    async fn energize_connector(
+        &self,
+        connector_id: ConnectorId,
+        transaction_id: i32,
+    ) -> OcppResult<()> {
         // A start on a reserved connector consumes its reservation (OCPP 1.6J
         // §5.14): drop any reservation held on this connector so a later
         // CancelReservation for it is correctly Rejected, and disarm its
@@ -8294,13 +8526,7 @@ impl ChargePoint {
         // Begin periodic MeterValues sampling for this transaction.
         self.start_meter_sampler(connector_id, transaction_id).await;
 
-        info!(
-            "Transaction {} started on connector {}",
-            transaction_id,
-            connector_id.value()
-        );
-
-        Ok(transaction_id)
+        Ok(())
     }
 
     /// The version-specific half of [`stop_transaction`](Self::stop_transaction):
@@ -14089,6 +14315,7 @@ mod tests {
                 id_tag: "RFID-CAFE".to_string(),
                 next_seq_no: Arc::new(AtomicI32::new(1)),
                 authorized: Arc::new(AtomicBool::new(true)),
+                plug_initiated: false,
                 group_id_token: None,
                 charging_state: Arc::new(Mutex::new(initial_state)),
             },
@@ -14523,9 +14750,10 @@ mod tests {
     async fn plug_in_cable_opened_transaction_full_lifecycle_seq_monotonic() {
         // The reconciled lifecycle: cable-plug opens (Started, EVConnected, seqNo
         // 0) → authorization advances to Charging (Updated, seqNo 1) → stop closes
-        // Idle (Ended, seqNo 2). seqNo is strictly monotonic end to end. The
-        // authorization advance is driven via transition_charging_state (folding
-        // it into start_transaction is the deferred follow-up).
+        // Idle (Ended, seqNo 2). seqNo is strictly monotonic end to end. This
+        // variant drives the advance via the explicit `transition_charging_state`
+        // driver hook; the `start_transaction` fold of the same advance (#595) is
+        // covered by `start_transaction_folds_authorization_onto_plug_open` below.
         let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
         let cp = ChargePoint::new(ev_connected_v201_config(addr)).unwrap();
         cp.connect().await.unwrap();
@@ -14568,6 +14796,171 @@ mod tests {
             .await
             .get(&transaction_id)
             .is_none());
+    }
+
+    // --- start_transaction folds authorization onto a plug-opened transaction
+    //     (#595) ---
+    //
+    // Under an EVConnected TxStartPoint the cable-plug opens the transaction
+    // (Started, EVConnected, seqNo 0). The subsequent start_transaction must
+    // *advance* that same transaction (one Updated, Charging, Authorized, seqNo 1)
+    // rather than mint a second Started — returning the existing id, capturing the
+    // authorizing idToken, flipping authorized, and energising the connector.
+
+    #[tokio::test]
+    async fn start_transaction_folds_authorization_onto_plug_open() {
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(ev_connected_v201_config(addr)).unwrap();
+        cp.connect().await.unwrap();
+
+        // Cable-plug opens the transaction at EVConnected (seqNo 0).
+        let opened = match cp.plug_in_cable(1).await.unwrap() {
+            ChargingStateChangeOutcome::Opened { transaction_id, .. } => transaction_id,
+            other => panic!("expected the plug to open a transaction, got {other:?}"),
+        };
+        let started = recv_transaction_event(&mut rx).await;
+        assert_eq!(started["eventType"], "Started");
+        assert_eq!(started["triggerReason"], "CablePluggedIn");
+        assert_eq!(started["seqNo"], 0);
+        assert_eq!(started["transactionInfo"]["chargingState"], "EVConnected");
+
+        // Authorization folds onto the plug-opened transaction: it advances the
+        // *same* id (no second Started) and returns it.
+        let connector_id = ConnectorId::new(1).unwrap();
+        let advanced = cp
+            .start_transaction(connector_id, "RFID-CAFE", 0)
+            .await
+            .unwrap();
+        assert_eq!(
+            advanced, opened,
+            "start_transaction advances the plug-opened transaction, minting no new id"
+        );
+
+        // Exactly one interim Updated reached the wire: Charging / Authorized at
+        // seqNo 1 — not a second Started.
+        let updated = recv_transaction_event(&mut rx).await;
+        assert_eq!(updated["eventType"], "Updated");
+        assert_eq!(updated["triggerReason"], "Authorized");
+        assert_eq!(updated["seqNo"], 1);
+        assert_eq!(updated["transactionInfo"]["chargingState"], "Charging");
+        assert_eq!(
+            updated["transactionInfo"]["transactionId"],
+            opened.to_string()
+        );
+        // An advance carries no idToken (it is an Updated, not the Started) and no
+        // remoteStartId (a local start, and anyway unattachable after plug time).
+        assert!(updated.get("idToken").is_none());
+        assert!(updated["transactionInfo"].get("remoteStartId").is_none());
+
+        // The session is now authorized, at Charging, and carries the authorizing
+        // idTag — the keys the Ended event and UnlockConnector consult.
+        {
+            let sessions = cp.v201_sessions.read().await;
+            let session = sessions.get(&opened).expect("session still live");
+            assert!(session.authorized.load(Ordering::SeqCst), "now authorized");
+            assert_eq!(session.id_tag, "RFID-CAFE", "authorizing idTag captured");
+            assert_eq!(
+                *session.charging_state.lock().await,
+                ChargingStateEnumType::Charging
+            );
+        }
+        // The connector energised exactly once (Preparing → Charging).
+        assert_eq!(
+            cp.get_connector(connector_id).await.unwrap().status().await,
+            ChargePointStatus::Charging
+        );
+
+        // Closing the transaction draws the next seqNo (2) — strictly monotonic
+        // across plug-open (0) → authorize-advance (1) → Ended (2) — and the Ended
+        // echoes the captured idToken.
+        cp.stop_transaction(opened, 1500, Reason::Local)
+            .await
+            .unwrap();
+        let ended = recv_transaction_event(&mut rx).await;
+        assert_eq!(ended["eventType"], "Ended");
+        assert_eq!(ended["seqNo"], 2);
+        assert_eq!(ended["transactionInfo"]["chargingState"], "Idle");
+        assert_eq!(ended["idToken"]["idToken"], "RFID-CAFE");
+    }
+
+    #[tokio::test]
+    async fn start_transaction_double_authorization_on_plug_open_is_noop() {
+        // A redundant second authorization on an already-advanced plug-opened
+        // transaction is a silent no-op: no second advance, no extra seqNo, same id.
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(ev_connected_v201_config(addr)).unwrap();
+        cp.connect().await.unwrap();
+        let connector_id = ConnectorId::new(1).unwrap();
+
+        let opened = match cp.plug_in_cable(1).await.unwrap() {
+            ChargingStateChangeOutcome::Opened { transaction_id, .. } => transaction_id,
+            other => panic!("expected Opened, got {other:?}"),
+        };
+        assert_eq!(recv_transaction_event(&mut rx).await["seqNo"], 0);
+
+        // First authorization advances EVConnected → Charging (seqNo 1).
+        assert_eq!(
+            cp.start_transaction(connector_id, "RFID-CAFE", 0)
+                .await
+                .unwrap(),
+            opened
+        );
+        assert_eq!(recv_transaction_event(&mut rx).await["seqNo"], 1);
+
+        // Second authorization on the same connector is a no-op — same id, and it
+        // burns no seqNo (proven below: the Ended lands at 2, not 3).
+        assert_eq!(
+            cp.start_transaction(connector_id, "RFID-CAFE", 0)
+                .await
+                .unwrap(),
+            opened,
+            "a redundant authorization returns the existing id without opening a new transaction"
+        );
+
+        cp.stop_transaction(opened, 1500, Reason::Local)
+            .await
+            .unwrap();
+        let ended = recv_transaction_event(&mut rx).await;
+        assert_eq!(ended["eventType"], "Ended");
+        assert_eq!(
+            ended["seqNo"], 2,
+            "the redundant authorization emitted nothing, so Ended is seqNo 2 (0,1,2)"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_transaction_without_plug_open_opens_as_today() {
+        // No regression: even on a station configured with an EVConnected start
+        // point, a start_transaction with *no* prior cable-plug opens the
+        // transaction the long-standing way — Started, Charging, Authorized, seqNo
+        // 0, carrying the idToken — not an interim Updated.
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(ev_connected_v201_config(addr)).unwrap();
+        cp.connect().await.unwrap();
+        let connector_id = ConnectorId::new(1).unwrap();
+
+        let tid = cp
+            .start_transaction(connector_id, "RFID-CAFE", 0)
+            .await
+            .unwrap();
+
+        let started = recv_transaction_event(&mut rx).await;
+        assert_eq!(started["eventType"], "Started");
+        assert_eq!(started["triggerReason"], "Authorized");
+        assert_eq!(started["seqNo"], 0);
+        assert_eq!(started["transactionInfo"]["chargingState"], "Charging");
+        assert_eq!(started["idToken"]["idToken"], "RFID-CAFE");
+
+        // The session opened the normal way: authorized, not plug-initiated.
+        {
+            let sessions = cp.v201_sessions.read().await;
+            let session = sessions.get(&tid).expect("session recorded");
+            assert!(session.authorized.load(Ordering::SeqCst));
+            assert!(
+                !session.plug_initiated,
+                "an authorization-opened transaction is not plug-initiated"
+            );
+        }
     }
 
     #[test]
