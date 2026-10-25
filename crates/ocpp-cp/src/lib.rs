@@ -165,8 +165,8 @@ use ocpp_types::v201::{
     RegistrationStatusEnumType, ReportDataType, RequestStartStopStatusEnumType,
     ReservationUpdateStatusEnumType, ReserveNowStatusEnumType, ResetStatusEnumType,
     SetNetworkProfileStatusEnumType, SetVariableResultType, SetVariableStatusEnumType,
-    StatusInfoType, TriggerMessageStatusEnumType, TriggerReasonEnumType, UnlockStatusEnumType,
-    UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
+    StatusInfoType, TriggerMessageStatusEnumType, TriggerReasonEnumType, TxStartStopPointEnumType,
+    UnlockStatusEnumType, UpdateFirmwareStatusEnumType, UploadLogStatusEnumType,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -258,9 +258,11 @@ pub enum MonitorTripOutcome {
 /// A transition either advanced a real change — emitting one interim
 /// `TransactionEvent(Updated)` under the relevant `triggerReason` — or was a
 /// benign no-op (the connector was already in the target state, or no
-/// transaction is running on the EVSE). The outcome is returned (never
-/// panicked) so a caller or test can assert exactly what the injection did
-/// without inspecting the wire.
+/// transaction is running on the EVSE). A cable-plug on a station whose
+/// `TxStartPoint` includes `EVConnected` is the one case that instead *opens* a
+/// transaction ([`Opened`](Self::Opened); Issue #582). The outcome is returned
+/// (never panicked) so a caller or test can assert exactly what the injection
+/// did without inspecting the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChargingStateChangeOutcome {
     /// No transaction is active on the target EVSE, so the suspend/resume was
@@ -275,6 +277,19 @@ pub enum ChargingStateChangeOutcome {
     /// this `seq_no` (drawn from the transaction's monotonic stream).
     Emitted {
         /// The `seqNo` stamped on the emitted `TransactionEvent`.
+        seq_no: i32,
+    },
+    /// The cable-plug **opened** a fresh transaction — a station whose
+    /// `TxStartPoint` includes `EVConnected` (Issue #582): one
+    /// `TransactionEvent(Started, triggerReason = CablePluggedIn, chargingState =
+    /// EVConnected)` was emitted at `seqNo = 0`, and `transaction_id` is the
+    /// station-chosen id the new transaction is keyed on (so the caller can later
+    /// advance or stop it). Distinct from [`Emitted`](Self::Emitted), which
+    /// advances an *already-open* transaction with an interim `Updated`.
+    Opened {
+        /// The station-chosen `transactionId` of the newly opened transaction.
+        transaction_id: i32,
+        /// The `seqNo` of the opening `Started` event (always `0`).
         seq_no: i32,
     },
 }
@@ -525,9 +540,31 @@ pub struct ChargePointConfig {
     /// `UpdateStatus::Failed`. Defaults to
     /// [`local_list::DEFAULT_LOCAL_AUTH_LIST_MAX_LENGTH`].
     pub local_auth_list_max_length: usize,
+    /// The OCPP 2.0.1 `TxStartPoint` set configured on this station — the events
+    /// that mark a transaction as started (OCPP 2.0.1 Part 2, the
+    /// `TxCtrlr.TxStartPoint` device-model variable). The simulator consults one
+    /// bit of it today: whether `EVConnected` is a start point, which decides
+    /// whether plugging the cable *opens* the transaction (see
+    /// [`ChargePoint::plug_in_cable`]) or merely precedes an
+    /// authorization-opened one.
+    ///
+    /// Defaults to `[Authorized]` — the behavior the simulator has always had:
+    /// the transaction opens on authorization ([`ChargePoint::start_transaction`]),
+    /// and a cable-plug before that opens nothing. 2.0.1-only; unused on the 1.6J
+    /// path. `#[serde(default)]` so a persisted config predating this field still
+    /// deserializes (to `[Authorized]`) rather than failing to load.
+    #[serde(default = "default_tx_start_points")]
+    pub tx_start_points: Vec<TxStartStopPointEnumType>,
     /// Transport configuration (not serialized; uses Default on deserialization)
     #[serde(skip)]
     pub transport_config: TransportConfig,
+}
+
+/// Default [`ChargePointConfig::tx_start_points`]: `[Authorized]`, the behavior
+/// the simulator has always had — a transaction opens on authorization, and a
+/// cable-plug before that opens nothing.
+fn default_tx_start_points() -> Vec<TxStartStopPointEnumType> {
+    vec![TxStartStopPointEnumType::Authorized]
 }
 
 impl Default for ChargePointConfig {
@@ -565,6 +602,7 @@ impl Default for ChargePointConfig {
             firmware_update_outcome: FirmwareUpdateOutcome::Succeed,
             unlock_connector_outcome: UnlockConnectorOutcome::Unlock,
             local_auth_list_max_length: local_list::DEFAULT_LOCAL_AUTH_LIST_MAX_LENGTH,
+            tx_start_points: default_tx_start_points(),
             // Offer exactly the subprotocol matching `protocol_version` rather
             // than the transport default (which lists both `ocpp1.6` and
             // `ocpp2.0.1` for the *server* side) — a CP must only offer a
@@ -596,6 +634,15 @@ impl ChargePointConfig {
         };
         config.transport_config.sub_protocols = subprotocols_for(version);
         config
+    }
+
+    /// Whether the configured [`TxStartPoint`](Self::tx_start_points) set
+    /// includes `EVConnected` — i.e. plugging the cable *opens* the transaction
+    /// (the 2.0.1 plug-and-charge / delayed-authorization lifecycle) rather than
+    /// merely preceding an authorization-opened one (Issue #582).
+    fn tx_opens_on_cable_plug(&self) -> bool {
+        self.tx_start_points
+            .contains(&TxStartStopPointEnumType::EVConnected)
     }
 
     /// Build the OCPP 2.0.1 `BootNotification` request this Charge Point sends
@@ -7302,41 +7349,55 @@ impl ChargePoint {
         .await
     }
 
-    /// Drive a live 2.0.1 transaction into the **cable-plugged, pre-authorization**
-    /// [`EVConnected`](ChargingStateEnumType::EVConnected) phase, originating one
+    /// Model plugging the cable in on a 2.0.1 station, emitting one
     /// `TransactionEvent(triggerReason = CablePluggedIn, chargingState =
-    /// EVConnected)` (Issue #579).
+    /// EVConnected)` — either as the transaction's opening `Started` or as an
+    /// interim `Updated`, depending on the station's configured `TxStartPoint`
+    /// and whether a transaction is already open (Issues #579, #582).
     ///
     /// The companion to [`transition_charging_state`](Self::transition_charging_state):
     /// where that hook drives the interim `Charging ↔ SuspendedEV ↔ SuspendedEVSE`
-    /// suspend/resume transitions, this one models plugging the cable on a station
-    /// whose `TxStartPoint` includes `EVConnected` — the "cable in, not yet
-    /// authorized/charging" phase plug-and-charge and delayed-authorization
-    /// conformance exercises. Both share the same behavior-injection contract and
-    /// the same `emit_transaction_state_change`
-    /// core, differing only in the trigger reason and target state.
+    /// suspend/resume transitions, this one models the physical plug-in — the
+    /// "cable in, not yet authorized/charging" phase plug-and-charge and
+    /// delayed-authorization conformance exercises.
     ///
     /// # Outcome
     ///
-    /// - **No transaction on `evse_id`** → [`ChargingStateChangeOutcome::NoTransaction`],
-    ///   inert — no CALL, no `seqNo` burned. A non-positive / out-of-range
-    ///   `evse_id` matches nothing and lands here.
-    /// - **Already `EVConnected`** → [`ChargingStateChangeOutcome::Redundant`], a
-    ///   silent no-op — no CALL, no `seqNo` burned (the hysteresis guarantee).
-    /// - **A real transition** → one `TransactionEvent(CablePluggedIn)` is emitted
-    ///   and, on the CSMS's ack, [`ChargingStateChangeOutcome::Emitted`] reports
-    ///   the `seqNo` used, drawn from the transaction's monotonic stream so it
-    ///   interleaves cleanly with the other events and stays strictly between
-    ///   `Started` and `Ended`.
+    /// The configured [`TxStartPoint`](ChargePointConfig::tx_start_points) and the
+    /// EVSE's current state decide what the plug-in does:
+    ///
+    /// - **A transaction is already open on `evse_id`** → the plug-in is an
+    ///   interim state change on it (the #579 behavior): a real transition into
+    ///   `EVConnected` emits one `TransactionEvent(Updated, CablePluggedIn)` and
+    ///   reports [`Emitted`](ChargingStateChangeOutcome::Emitted); a redundant
+    ///   plug (already `EVConnected`) is a silent
+    ///   [`Redundant`](ChargingStateChangeOutcome::Redundant) no-op — no CALL, no
+    ///   `seqNo` burned.
+    /// - **No transaction open and the `TxStartPoint` includes `EVConnected`** →
+    ///   the cable-plug *opens* the transaction (Issue #582): one
+    ///   `TransactionEvent(Started, CablePluggedIn, EVConnected)` at `seqNo 0`,
+    ///   reported as [`Opened`](ChargingStateChangeOutcome::Opened) with the
+    ///   station-chosen `transactionId`. The subsequent authorization advances
+    ///   the transaction `EVConnected → Charging` (driven today via
+    ///   [`transition_charging_state`](Self::transition_charging_state)).
+    /// - **No transaction open and the `TxStartPoint` does *not* include
+    ///   `EVConnected`** (the default `[Authorized]`) → the plug precedes the
+    ///   authorization-opened transaction and there is nothing to report yet:
+    ///   inert [`NoTransaction`](ChargingStateChangeOutcome::NoTransaction), no
+    ///   CALL. A non-positive / unconfigured `evse_id` hosts no transaction and
+    ///   lands here too — never a panic.
     ///
     /// # Scope
     ///
-    /// This drives the `EVConnected` / `CablePluggedIn` plug-in phase against an
-    /// already-open transaction context, reusing #577's state-transition
-    /// plumbing. Reconciling the full `TxStartPoint` variants (Authorized /
-    /// PowerPathClosed / EnergyTransfer) — i.e. having the plug-in genuinely
-    /// *open* the transaction before authorization — is a deliberate follow-up,
-    /// out of this slice's scope.
+    /// Reconciling the plug-in with the `TxStartPoint` so it *opens* the
+    /// transaction is this method's job (Issue #582). Folding the *authorization*
+    /// step into [`start_transaction`](Self::start_transaction) — so a single
+    /// `start_transaction` call on a plug-opened session advances it to
+    /// `Charging` instead of opening a second transaction — is a deliberate
+    /// follow-up; until then the driver advances a plug-opened session with
+    /// [`transition_charging_state`](Self::transition_charging_state). Start-point
+    /// variants beyond `EVConnected` (`PowerPathClosed`, `EnergyTransfer`, …) are
+    /// modeled in the config but not yet acted on.
     ///
     /// V201-only: `TransactionEvent` and its `chargingState` are 2.0.1
     /// constructs, so a call on a `V16J` station is refused with
@@ -7350,12 +7411,124 @@ impl ChargePoint {
             });
         }
 
-        self.emit_transaction_state_change(
+        // If a transaction is already open on this EVSE, the plug-in is an
+        // interim state change on it (the #579 behavior): a real transition into
+        // `EVConnected` emits one `Updated`, a redundant plug is a silent no-op.
+        // `emit_transaction_state_change` resolves the live transaction and
+        // reports `NoTransaction` — without emitting or burning a `seqNo` — when
+        // none is open, so a fall-through to the open path below is clean.
+        let outcome = self
+            .emit_transaction_state_change(
+                evse_id,
+                ChargingStateEnumType::EVConnected,
+                TriggerReasonEnumType::CablePluggedIn,
+            )
+            .await?;
+
+        // No transaction yet: under a `TxStartPoint` that includes `EVConnected`
+        // the cable-plug *opens* the transaction (Issue #582); otherwise the plug
+        // precedes the authorization-opened transaction and the inert
+        // `NoTransaction` stands.
+        match outcome {
+            ChargingStateChangeOutcome::NoTransaction if self.config.tx_opens_on_cable_plug() => {
+                self.open_transaction_on_cable_plug(evse_id).await
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Open a fresh 2.0.1 transaction *on a cable-plug*, for a station whose
+    /// `TxStartPoint` includes `EVConnected` (Issue #582): mint a station-chosen
+    /// `transactionId`, emit `TransactionEvent(Started, triggerReason =
+    /// CablePluggedIn, chargingState = EVConnected)` at `seqNo 0`, and record the
+    /// [`active_transactions`](Self::active_transactions) + [`V201Session`]
+    /// (seeded `EVConnected`, `next_seq_no = 1`, **not yet authorized**) the rest
+    /// of the lifecycle keys on.
+    ///
+    /// The pre-authorization twin of [`open_transaction`](Self::open_transaction)'s
+    /// `V201` arm: the opening event is the plug-in, so it carries no `idToken`
+    /// and no `Transaction.Begin` reading (no one has authorized and no energy has
+    /// flowed). The session opens `authorized = false` — the cable is latched but
+    /// unauthorized — so an `UnlockConnector` may still release it, matching a
+    /// real station whose driver has plugged in but not yet presented a token.
+    ///
+    /// Only called from [`plug_in_cable`](Self::plug_in_cable) once it has
+    /// established there is no transaction already open on the EVSE. An `evse_id`
+    /// that maps to no connector on this station (non-positive, or unconfigured)
+    /// can host no transaction, so this is inert
+    /// ([`NoTransaction`](ChargingStateChangeOutcome::NoTransaction)) — never a
+    /// panic. The `Started` is sent *before* any state is recorded, so a failed
+    /// CALL leaves no dangling session (the minted id is simply skipped, as on
+    /// the authorization-opened path).
+    async fn open_transaction_on_cable_plug(
+        &self,
+        evse_id: i32,
+    ) -> OcppResult<ChargingStateChangeOutcome> {
+        // The plug must land on a connector this station actually has. The flat
+        // 1.6J-inherited topology maps `evse_id → connectorId` directly; a
+        // non-positive (`ConnectorId::new` rejects `0`) or unconfigured id hosts
+        // nothing, so the plug-in is inert rather than minting a phantom
+        // transaction.
+        let connector_id = match u32::try_from(evse_id)
+            .ok()
+            .and_then(|id| ConnectorId::new(id).ok())
+        {
+            Some(cid) if self.connectors.read().await.contains_key(&cid) => cid,
+            _ => return Ok(ChargingStateChangeOutcome::NoTransaction),
+        };
+
+        // Mint the station-chosen transactionId from the same allocator as the
+        // authorization-opened path, so ids never collide, and emit the opening
+        // `Started` before recording any state.
+        let transaction_id = self.next_v201_transaction_id.fetch_add(1, Ordering::SeqCst);
+        let txid_str = transaction_id.to_string();
+        let request = v201_transaction::transaction_event_started_on_cable_plug(
+            &v201_transaction::SessionRef {
+                transaction_id: &txid_str,
+                evse_id,
+                connector_id: 1,
+            },
+            &v201_now(),
+        );
+        // `call()` schema-validates both the request and the `.conf`; a transport
+        // / timeout / CALLERROR failure propagates and records no session, so the
+        // open is all-or-nothing.
+        let _ack = self.call(request).await?;
+
+        // Record the session first, then the active-transaction mapping, so a
+        // concurrent resolver never sees the mapping without its session (the
+        // resolver reads `active_transactions` then `v201_sessions`).
+        self.v201_sessions.write().await.insert(
+            transaction_id,
+            V201Session {
+                // No authorizing idTag yet — the cable is in, authorization is
+                // still to come (captured when the session advances to Charging).
+                id_tag: String::new(),
+                // `Started` took 0; the next event (the Charging advance) takes 1.
+                next_seq_no: Arc::new(AtomicI32::new(1)),
+                // The cable is latched but unauthorized (pre-authorization open).
+                authorized: Arc::new(AtomicBool::new(false)),
+                group_id_token: None,
+                // Opens `EVConnected` — the `Started` event just reported it.
+                charging_state: Arc::new(Mutex::new(ChargingStateEnumType::EVConnected)),
+            },
+        );
+        self.active_transactions
+            .write()
+            .await
+            .insert(transaction_id, connector_id);
+
+        info!(
             evse_id,
-            ChargingStateEnumType::EVConnected,
-            TriggerReasonEnumType::CablePluggedIn,
-        )
-        .await
+            transaction_id,
+            "cable plugged in on a station with an EVConnected TxStartPoint; \
+             opened transaction with TransactionEvent(Started, CablePluggedIn, EVConnected)"
+        );
+
+        Ok(ChargingStateChangeOutcome::Opened {
+            transaction_id,
+            seq_no: 0,
+        })
     }
 
     /// Shared core behind [`transition_charging_state`](Self::transition_charging_state)
@@ -14185,6 +14358,229 @@ mod tests {
             cp.plug_in_cable(1).await,
             Err(OcppError::NotSupported { .. })
         ));
+    }
+
+    // --- plug_in_cable() opens the transaction under an EVConnected TxStartPoint
+    //     (#582) ---
+    //
+    // On a station whose configured TxStartPoint includes EVConnected the
+    // cable-plug *opens* the transaction (Started, CablePluggedIn, EVConnected,
+    // seqNo 0) rather than acting on an already-open one. With the default
+    // [Authorized] start point the plug opens nothing. These drive the open path
+    // end-to-end against a capturing mock CSMS, with no pre-inserted session.
+
+    /// A V201 config whose `TxStartPoint` includes `EVConnected`, pointed at
+    /// `addr`, so plugging the cable opens the transaction.
+    fn ev_connected_v201_config(addr: std::net::SocketAddr) -> ChargePointConfig {
+        ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            tx_start_points: vec![
+                TxStartStopPointEnumType::EVConnected,
+                TxStartStopPointEnumType::Authorized,
+            ],
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        }
+    }
+
+    #[tokio::test]
+    async fn plug_in_cable_opens_transaction_under_ev_connected_start_point() {
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(ev_connected_v201_config(addr)).unwrap();
+        cp.connect().await.unwrap();
+
+        // No transaction is open yet: the plug *opens* one as its Started event.
+        let outcome = cp.plug_in_cable(1).await.unwrap();
+        let transaction_id = match outcome {
+            ChargingStateChangeOutcome::Opened {
+                transaction_id,
+                seq_no,
+            } => {
+                assert_eq!(seq_no, 0, "the opening Started takes seqNo 0");
+                transaction_id
+            }
+            other => panic!("expected the cable-plug to open a transaction, got {other:?}"),
+        };
+
+        // The wire carries a Started (not an interim Updated) at EVConnected.
+        let payload = recv_transaction_event(&mut rx).await;
+        assert_eq!(payload["eventType"], "Started");
+        assert_eq!(payload["triggerReason"], "CablePluggedIn");
+        assert_eq!(payload["seqNo"], 0);
+        assert_eq!(payload["transactionInfo"]["chargingState"], "EVConnected");
+        // Pre-authorization, pre-energy: no idToken, no meterValue.
+        assert!(
+            payload.get("idToken").is_none(),
+            "a cable-plug open performs no authorization"
+        );
+        assert!(
+            payload.get("meterValue").is_none(),
+            "a cable-plug open precedes energy flow"
+        );
+
+        // The session + active-transaction records the rest of the lifecycle keys
+        // on are now present, seeded EVConnected / unauthorized / seqNo-from-1.
+        assert_eq!(
+            cp.active_transactions.read().await.get(&transaction_id),
+            Some(&ConnectorId::new(1).unwrap())
+        );
+        let sessions = cp.v201_sessions.read().await;
+        let session = sessions.get(&transaction_id).expect("session recorded");
+        assert_eq!(
+            *session.charging_state.lock().await,
+            ChargingStateEnumType::EVConnected
+        );
+        assert!(
+            !session.authorized.load(Ordering::SeqCst),
+            "the cable is latched but not yet authorized"
+        );
+        assert!(
+            session.id_tag.is_empty(),
+            "no authorizing idTag is captured at plug time"
+        );
+    }
+
+    #[tokio::test]
+    async fn plug_in_cable_default_start_point_does_not_open_transaction() {
+        // Default TxStartPoint is [Authorized]: the plug precedes the
+        // authorization-opened transaction and opens nothing.
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        assert_eq!(
+            cp.plug_in_cable(1).await.unwrap(),
+            ChargingStateChangeOutcome::NoTransaction
+        );
+        // Nothing opened: no session, no active transaction, and no
+        // TransactionEvent reached the wire.
+        assert!(cp.v201_sessions.read().await.is_empty());
+        assert!(cp.active_transactions.read().await.is_empty());
+        let saw_event = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            loop {
+                match rx.recv().await {
+                    Some((action, _)) if action == "TransactionEvent" => break true,
+                    Some(_) => continue,
+                    None => break false,
+                }
+            }
+        })
+        .await;
+        assert!(
+            saw_event.is_err(),
+            "a plug with no EVConnected start point emits no TransactionEvent"
+        );
+    }
+
+    #[tokio::test]
+    async fn plug_in_cable_invalid_evse_is_inert_under_ev_connected_start_point() {
+        // Even with an EVConnected start point, a non-positive / unconfigured
+        // evse_id hosts no transaction, so the open path is inert (no panic).
+        let cp = ChargePoint::new(ChargePointConfig {
+            tx_start_points: vec![TxStartStopPointEnumType::EVConnected],
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        // evse 0 is not a valid connector; evse 99 is not configured (count = 2).
+        assert_eq!(
+            cp.plug_in_cable(0).await.unwrap(),
+            ChargingStateChangeOutcome::NoTransaction
+        );
+        assert_eq!(
+            cp.plug_in_cable(99).await.unwrap(),
+            ChargingStateChangeOutcome::NoTransaction
+        );
+        assert!(cp.v201_sessions.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn plug_in_cable_opened_transaction_double_plug_is_single_started() {
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(ev_connected_v201_config(addr)).unwrap();
+        cp.connect().await.unwrap();
+
+        // First plug opens the transaction (one Started).
+        assert!(matches!(
+            cp.plug_in_cable(1).await.unwrap(),
+            ChargingStateChangeOutcome::Opened { seq_no: 0, .. }
+        ));
+        let first = recv_transaction_event(&mut rx).await;
+        assert_eq!(first["eventType"], "Started");
+        assert_eq!(first["seqNo"], 0);
+
+        // Second plug finds the transaction already EVConnected: a silent no-op,
+        // so no second Started is emitted (the double-plug guarantee).
+        assert_eq!(
+            cp.plug_in_cable(1).await.unwrap(),
+            ChargingStateChangeOutcome::Redundant
+        );
+    }
+
+    #[tokio::test]
+    async fn plug_in_cable_opened_transaction_full_lifecycle_seq_monotonic() {
+        // The reconciled lifecycle: cable-plug opens (Started, EVConnected, seqNo
+        // 0) → authorization advances to Charging (Updated, seqNo 1) → stop closes
+        // Idle (Ended, seqNo 2). seqNo is strictly monotonic end to end. The
+        // authorization advance is driven via transition_charging_state (folding
+        // it into start_transaction is the deferred follow-up).
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(ev_connected_v201_config(addr)).unwrap();
+        cp.connect().await.unwrap();
+
+        let transaction_id = match cp.plug_in_cable(1).await.unwrap() {
+            ChargingStateChangeOutcome::Opened { transaction_id, .. } => transaction_id,
+            other => panic!("expected Opened, got {other:?}"),
+        };
+        let started = recv_transaction_event(&mut rx).await;
+        assert_eq!(started["eventType"], "Started");
+        assert_eq!(started["seqNo"], 0);
+        assert_eq!(started["transactionInfo"]["chargingState"], "EVConnected");
+
+        // Authorization advances EVConnected → Charging as an interim Updated.
+        assert_eq!(
+            cp.transition_charging_state(1, ChargingStateEnumType::Charging)
+                .await
+                .unwrap(),
+            ChargingStateChangeOutcome::Emitted { seq_no: 1 }
+        );
+        let updated = recv_transaction_event(&mut rx).await;
+        assert_eq!(updated["eventType"], "Updated");
+        assert_eq!(updated["seqNo"], 1);
+        assert_eq!(updated["transactionInfo"]["chargingState"], "Charging");
+
+        // Stopping closes the transaction with Ended / Idle at the next seqNo.
+        cp.stop_transaction(transaction_id, 1500, Reason::Local)
+            .await
+            .unwrap();
+        let ended = recv_transaction_event(&mut rx).await;
+        assert_eq!(ended["eventType"], "Ended");
+        assert_eq!(ended["seqNo"], 2);
+        assert_eq!(ended["transactionInfo"]["chargingState"], "Idle");
+
+        // The session and active-transaction records are gone once it closes.
+        assert!(cp.v201_sessions.read().await.get(&transaction_id).is_none());
+        assert!(cp
+            .active_transactions
+            .read()
+            .await
+            .get(&transaction_id)
+            .is_none());
+    }
+
+    #[test]
+    fn tx_start_points_defaults_to_authorized() {
+        // The default start point is [Authorized] — a transaction opens on
+        // authorization, not on cable-plug — so the simulator's long-standing
+        // behavior is unchanged unless EVConnected is configured explicitly.
+        let config = ChargePointConfig::for_version(OcppVersion::V201);
+        assert_eq!(
+            config.tx_start_points,
+            vec![TxStartStopPointEnumType::Authorized]
+        );
+        assert!(!config.tx_opens_on_cable_plug());
     }
 
     // ---- NotifyReport tbc paging over the wire (#574) ----

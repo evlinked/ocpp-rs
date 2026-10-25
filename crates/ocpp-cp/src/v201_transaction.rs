@@ -196,6 +196,57 @@ pub fn transaction_event_started(
     }
 }
 
+/// Build a `TransactionEvent(Started)` for a transaction **opened by plugging
+/// the cable in** — the pre-authorization start a station whose `TxStartPoint`
+/// includes `EVConnected` performs (Issue #582).
+///
+/// Unlike [`transaction_event_started`] (which opens on *authorization*, at
+/// `chargingState = Charging` carrying the authorizing `idToken` and a
+/// `Transaction.Begin` meter reading), this opens the transaction at the
+/// physical plug-in: `triggerReason = CablePluggedIn`, `seqNo = 0`,
+/// `chargingState = EVConnected`, and **no** `idToken` and **no** `meterValue`
+/// — the cable is latched but no one has authorized yet and no energy has
+/// flowed. The subsequent authorization advances the transaction `EVConnected →
+/// Charging` as an interim `Updated`.
+///
+/// This is the "cable plug *is* the `Started` event" case the interim
+/// [`transaction_event_cable_plugged_in`] builder deliberately left to the
+/// `TxStartPoint` reconciliation: there the plug is an `Updated` on an
+/// already-open transaction; here it is the transaction's opening `Started`.
+/// `seqNo` is fixed at `0` — a `Started` is always a transaction's first event.
+#[must_use]
+pub fn transaction_event_started_on_cable_plug(
+    session: &SessionRef,
+    timestamp: &str,
+) -> TransactionEventRequest {
+    TransactionEventRequest {
+        event_type: TransactionEventEnumType::Started,
+        timestamp: timestamp.to_string(),
+        trigger_reason: TriggerReasonEnumType::CablePluggedIn,
+        seq_no: 0,
+        transaction_info: TransactionType {
+            transaction_id: session.transaction_id.to_string(),
+            charging_state: Some(ChargingStateEnumType::EVConnected),
+            time_spent_charging: None,
+            stopped_reason: None,
+            remote_start_id: None,
+            custom_data: None,
+        },
+        offline: None,
+        number_of_phases_used: None,
+        cable_max_current: None,
+        reservation_id: None,
+        evse: Some(evse_of(session)),
+        // The transaction opens before authorization and before energy flows: no
+        // authorizing idToken yet, and no `Transaction.Begin` reading (that rides
+        // the later Charging advance / periodic sampler). Both fields are
+        // optional in the 2.0.1 `TransactionEvent` schema.
+        meter_value: None,
+        id_token: None,
+        custom_data: None,
+    }
+}
+
 /// The periodic `Sample.Periodic` meter value: the active-import energy reading,
 /// plus — when `bounded_power_w` is `Some` — a `Power.Active.Import` reading of
 /// the profile-bounded power the station may draw (slice 7e, Issue #455).
@@ -866,6 +917,9 @@ mod tests {
             // The pre-authorization cable-plugged (EVConnected/CablePluggedIn)
             // transition must also satisfy the schema (#579).
             transaction_event_cable_plugged_in(&s, 8, TS),
+            // The transaction-*opening* cable-plug Started (pre-authorization,
+            // EVConnected, seqNo 0) must also satisfy the schema (#582).
+            transaction_event_started_on_cable_plug(&s, TS),
         ] {
             let payload = serde_json::to_value(&req).unwrap();
             assert!(
@@ -915,6 +969,56 @@ mod tests {
         let req = transaction_event_cable_plugged_in(&s, 1, TS);
         let payload = serde_json::to_value(&req).unwrap();
         assert_eq!(payload["triggerReason"], "CablePluggedIn");
+        assert_eq!(payload["transactionInfo"]["chargingState"], "EVConnected");
+    }
+
+    #[test]
+    fn started_on_cable_plug_carries_preauth_started_shape() {
+        let s = session();
+        // A station whose TxStartPoint includes EVConnected: the cable-plug opens
+        // the transaction as its Started event (#582).
+        let req = transaction_event_started_on_cable_plug(&s, TS);
+
+        // It is a real Started (not an interim Updated), at seqNo 0.
+        assert_eq!(req.event_type, TransactionEventEnumType::Started);
+        assert_eq!(req.trigger_reason, TriggerReasonEnumType::CablePluggedIn);
+        assert_eq!(req.seq_no, 0);
+        assert_eq!(req.transaction_info.transaction_id, "42");
+        // Opens pre-authorization at EVConnected, not Charging.
+        assert_eq!(
+            req.transaction_info.charging_state,
+            Some(ChargingStateEnumType::EVConnected)
+        );
+        assert!(req.transaction_info.stopped_reason.is_none());
+        // No remote-start request to correlate (a plug is a local start).
+        assert!(req.transaction_info.remote_start_id.is_none());
+        // Predates authorization and precedes energy: no idToken, no meterValue —
+        // the authorizing token and the Transaction.Begin reading come later.
+        assert!(
+            req.id_token.is_none(),
+            "the cable-plug open performs no authorization"
+        );
+        assert!(
+            req.meter_value.is_none(),
+            "the cable-plug open precedes energy flow and carries no reading"
+        );
+        // The evse binding is present so the CSMS knows which EVSE opened.
+        let evse = req.evse.as_ref().expect("started carries evse");
+        assert_eq!(evse.id, 1);
+        assert_eq!(evse.connector_id, Some(1));
+    }
+
+    #[test]
+    fn started_on_cable_plug_round_trips_the_exact_wire_tokens() {
+        // A transaction-opening cable-plug serializes as eventType = Started with
+        // triggerReason = CablePluggedIn and chargingState = EVConnected — the
+        // exact PascalCase wire tokens a CSMS reads.
+        let s = session();
+        let req = transaction_event_started_on_cable_plug(&s, TS);
+        let payload = serde_json::to_value(&req).unwrap();
+        assert_eq!(payload["eventType"], "Started");
+        assert_eq!(payload["triggerReason"], "CablePluggedIn");
+        assert_eq!(payload["seqNo"], 0);
         assert_eq!(payload["transactionInfo"]["chargingState"], "EVConnected");
     }
 }
