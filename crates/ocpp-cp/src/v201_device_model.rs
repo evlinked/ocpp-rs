@@ -145,6 +145,7 @@ impl MonitorEntry {
         TrippedMonitor {
             id: self.monitor.id,
             kind: self.monitor.kind,
+            severity: self.monitor.severity,
             component: self.component.clone(),
             variable: self.variable.clone(),
         }
@@ -207,6 +208,14 @@ pub struct TrippedMonitor {
     /// The monitor kind (`Delta` / `Periodic` / `UpperThreshold` / …). The
     /// emitter derives the event's `EventTriggerEnumType` from it.
     pub kind: MonitorEnumType,
+    /// The monitor's assigned severity (`0` Danger … `9` Debug; a lower number is
+    /// more severe). The emitter compares it against the station's active
+    /// reporting level ([`active_monitoring_level`]) to decide whether this
+    /// monitor's trip is reported on the wire (OCPP 2.0.1 Part 2, D01): a monitor
+    /// is reported only while `severity <= active_monitoring_level`.
+    ///
+    /// [`active_monitoring_level`]: V201DeviceModel::active_monitoring_level
+    pub severity: i32,
     /// The component in its CSMS-visible casing.
     pub component: ComponentType,
     /// The variable in its CSMS-visible casing.
@@ -264,11 +273,12 @@ pub struct V201DeviceModel {
     /// Defaults to [`DEFAULT_MONITORING_LEVEL`] (`9`, report everything) until a
     /// CSMS narrows it.
     ///
-    /// Recorded but not yet **enforced**: there is no live `NotifyEvent` emitter
-    /// on the simulator to gate, so no installed monitor's reporting changes
-    /// today. The level is stored and readable ([`active_monitoring_level`]) so a
-    /// future emitter can honor it — mirroring how the monitor store landed
-    /// before the report seam that reads it.
+    /// **Enforced** at emit time: the `NotifyEvent` emitter projects each matched
+    /// monitor's `severity` onto [`TrippedMonitor`] and reports only those with
+    /// `severity <= active_monitoring_level` (inclusive; #597), on both trip
+    /// paths. A narrowed level suppresses the more-verbose monitors on the wire;
+    /// the default `9` reports everything. The level is read
+    /// ([`active_monitoring_level`]) at emit time, not at crossing-detection time.
     ///
     /// [`active_monitoring_level`]: V201DeviceModel::active_monitoring_level
     active_monitoring_level: i32,
@@ -2378,6 +2388,52 @@ mod tests {
         assert!(model
             .monitors_for_variable("OCPPCommCtrlr", "NoSuchVariable")
             .is_empty());
+    }
+
+    #[test]
+    fn tripped_monitor_projection_carries_the_stored_severity() {
+        // The emitter gates by severity (#597), so the projection must thread each
+        // monitor's stored severity through unchanged — on both lookup paths.
+        let mut model = V201DeviceModel::with_standard_profile();
+        model.install_monitors(&[
+            monitor_data(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                MonitorEnumType::Delta,
+                50.0,
+                2,
+            ),
+            monitor_data(
+                "OCPPCommCtrlr",
+                "HeartbeatInterval",
+                MonitorEnumType::Periodic,
+                900.0,
+                7,
+            ),
+        ]);
+
+        // Injection-seam lookup: both monitors, id-sorted, each carrying its own
+        // severity (paired with the kind it was installed with).
+        let found = model.monitors_for_variable("OCPPCommCtrlr", "HeartbeatInterval");
+        assert_eq!(found.len(), 2);
+        let delta = found
+            .iter()
+            .find(|m| m.kind == MonitorEnumType::Delta)
+            .unwrap();
+        let periodic = found
+            .iter()
+            .find(|m| m.kind == MonitorEnumType::Periodic)
+            .unwrap();
+        assert_eq!(delta.severity, 2);
+        assert_eq!(periodic.severity, 7);
+
+        // Write-driven lookup projects severity identically (the periodic monitor
+        // is never write-driven, so only the delta — jumping ≥ 50 — is returned).
+        let crossed =
+            model.monitors_tripped_by_write("OCPPCommCtrlr", "HeartbeatInterval", "300", "400");
+        assert_eq!(crossed.len(), 1);
+        assert_eq!(crossed[0].kind, MonitorEnumType::Delta);
+        assert_eq!(crossed[0].severity, 2);
     }
 
     // --- monitors_tripped_by_write: autonomous write-driven trips (#573) ----
