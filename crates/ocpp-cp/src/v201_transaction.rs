@@ -251,8 +251,9 @@ pub fn transaction_event_started_on_cable_plug(
 /// path closes** — the start a station whose `TxStartPoint` includes
 /// `PowerPathClosed` performs (Issue #599).
 ///
-/// `PowerPathClosed` is a [`TxStartStopPointEnumType`] value, not a
-/// [`TriggerReasonEnumType`] one — there is no `PowerPathClosed` trigger. The
+/// `PowerPathClosed` is a [`TxStartStopPointEnumType`](ocpp_types::v201::TxStartStopPointEnumType)
+/// value, not a [`TriggerReasonEnumType`] one — there is no `PowerPathClosed`
+/// trigger. The
 /// contactor closing *is* a charging-state change into
 /// [`Charging`](ChargingStateEnumType::Charging), so the faithful wire tokens are
 /// `triggerReason = ChargingStateChanged`, `chargingState = Charging`, `seqNo =
