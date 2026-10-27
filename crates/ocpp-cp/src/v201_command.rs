@@ -340,10 +340,12 @@ pub fn v201_reset_response(
 /// today; the status is retained in the return type for protocol completeness and
 /// for any future spec-added trigger the simulator cannot yet originate.
 ///
-/// `MeterValues` is `Accepted` at the policy level because the CP produces meter
-/// readings; in 2.0.1 those ride inside `TransactionEvent`, so the slice-5b
-/// wiring must supply the concrete emit path for a standalone `MeterValues`
-/// trigger (tracked with the 5b follow-up) before it can be honored on the wire.
+/// `MeterValues` is `Accepted` because the CP produces meter readings, and a
+/// standalone `MeterValues` trigger is honored on the wire: the station emits one
+/// `MeterValues.req` per in-scope EVSE from each connector's latest reading
+/// (`trigger_v201_meter_values`, dispatched from `send_v201_triggered_message`) —
+/// distinct from the steady-state readings that in 2.0.1 ride inside
+/// `TransactionEvent`.
 ///
 /// Total, exhaustive `match` — every [`MessageTriggerEnumType`] variant is
 /// classified explicitly, with no wildcard arm, so a future spec-added trigger
@@ -3887,7 +3889,7 @@ mod tests {
 
         let info = StatusInfoType {
             reason_code: "NotSupported".to_string(),
-            additional_info: Some("MeterValues trigger not yet wired".to_string()),
+            additional_info: Some("recognized but not triggerable".to_string()),
             custom_data: None,
         };
         let declined =

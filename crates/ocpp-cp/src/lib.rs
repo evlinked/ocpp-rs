@@ -4079,9 +4079,11 @@ impl ChargePoint {
             // OCPP 2.0.1 (Part 2, `TriggerMessage`). Ports
             // `ocpp.v201.call.TriggerMessage`: the `requestedMessage` is a
             // `MessageTriggerEnumType` and the response gains an optional
-            // `statusInfo`. The pure policy decision (`Accepted` for a message the
-            // simulator emits, `NotImplemented` otherwise) lives in `v201_command`
-            // (slice 5a, #434); this is the runtime wiring (slice 5b, #433). The
+            // `statusInfo`. The pure policy decision lives in `v201_command`
+            // (slice 5a, #434) — every current trigger is `Accepted`, with
+            // `NotImplemented` retained for a future spec-added trigger the
+            // simulator cannot originate; this is the runtime wiring (slice 5b,
+            // #433). The
             // request's optional `evse` scope is carried through to the side effect
             // (station-wide when omitted). Same off-CALL-path discipline and
             // `Err(_) => Rejected` capability outcome as the 1.6J handler.
@@ -4093,8 +4095,8 @@ impl ChargePoint {
                         let requested = req.requested_message;
                         let mut status = v201_command::v201_trigger_message_status(requested);
                         // Only an accepted trigger queues a side effect; a
-                        // `NotImplemented` message is recognized but has no emit
-                        // path, so nothing is enqueued. A failed enqueue (the
+                        // `NotImplemented` trigger (none today) is recognized but
+                        // has no emit path, so nothing is enqueued. A failed enqueue (the
                         // consumer has gone away, CP shutting down) downgrades to
                         // `Rejected` — the runtime capability outcome slice 5a
                         // leaves to the wiring layer — rather than accept-and-drop.
