@@ -2281,11 +2281,13 @@ impl ChargePoint {
         // visible to the CALLRESULT), serialized by the model's write lock;
         // nothing is queued.
         //
-        // Threshold is recorded, not yet **enforced**: there is no live
-        // `NotifyEvent` emitter on the simulator to gate, so no installed monitor's
-        // reporting changes today. The active level is stored and readable so a
-        // future emitter can honor it (follow-up on #500) — mirroring how the
-        // monitor store landed before the report seam that reads it. Ports
+        // The threshold is **enforced**: the `NotifyEvent` emitter
+        // (`emit_monitor_notify_event`, #545) reads this stored level at emit time
+        // and reports only monitors whose `severity <= active_monitoring_level`
+        // (inclusive; #597), on both the injection seam and the autonomous
+        // `SetVariables`-crossing path. A narrowed level therefore suppresses the
+        // more-verbose monitors on the wire from the next trip on; the default
+        // `9` (Debug) suppresses nothing. Ports
         // `ocpp.v201.call.SetMonitoringLevel` →
         // `ocpp.v201.call_result.SetMonitoringLevel`.
         if matches!(protocol_version, OcppVersion::V201) {
@@ -7135,13 +7137,19 @@ impl ChargePoint {
     ///
     /// - **No monitor matches** → [`MonitorTripOutcome::NoMonitor`], no CALL is
     ///   emitted (a benign no-op — the value changed but nothing was watching it).
-    /// - **≥ 1 monitor matches** → one `NotifyEvent.req` is emitted and, on the
-    ///   CSMS's empty ack, [`MonitorTripOutcome::Emitted`] reports how many events
-    ///   it carried and the `seqNo` used.
+    /// - **Matches, but all above the active reporting level** → also
+    ///   [`MonitorTripOutcome::NoMonitor`]: `emit_monitor_notify_event` gates the
+    ///   matched set by `severity <= active_monitoring_level` (OCPP 2.0.1 Part 2,
+    ///   D01), so a trip every one of whose monitors is more verbose than the
+    ///   active level reports nothing.
+    /// - **≥ 1 monitor matches and is at or below the active level** → one
+    ///   `NotifyEvent.req` is emitted carrying only those reportable monitors and,
+    ///   on the CSMS's empty ack, [`MonitorTripOutcome::Emitted`] reports how many
+    ///   events it carried and the `seqNo` used.
     ///
-    /// The `seqNo` is claimed **only** when at least one monitor matches, so a
-    /// no-op trip does not burn a sequence position and leave a phantom gap in the
-    /// CSMS's view of the stream.
+    /// The `seqNo` is claimed **only** when at least one monitor is reportable, so
+    /// a no-op or fully-suppressed trip does not burn a sequence position and
+    /// leave a phantom gap in the CSMS's view of the stream.
     ///
     /// # Trust boundary
     ///
@@ -7218,13 +7226,30 @@ impl ChargePoint {
     /// `eventId` streams live in exactly one place (Issue #573; no duplicated trip
     /// logic).
     ///
-    /// An empty `monitors` slice emits nothing and claims **no** `seqNo`
-    /// (returns [`MonitorTripOutcome::NoMonitor`]), so a caller that finds no
+    /// # Reporting-level gate (OCPP 2.0.1 Part 2, D01)
+    ///
+    /// The station reports only monitors whose `severity` is at or below the
+    /// active reporting level
+    /// ([`active_monitoring_level`](crate::v201_device_model::V201DeviceModel::active_monitoring_level),
+    /// set by `SetMonitoringLevel`; lower severity = more severe, the boundary is
+    /// inclusive). The gate lives **here**, at the one point both trip paths
+    /// funnel through, so the injection seam and the autonomous path cannot
+    /// drift. The active level is read once at emit time — reflecting the level
+    /// in force *when the event is reported*, not when a crossing was detected —
+    /// after each caller has already dropped its device-model snapshot lock, so
+    /// this read never re-enters a held lock.
+    ///
+    /// An empty `monitors` slice — or a slice every one of whose monitors is
+    /// above the active level — emits nothing and claims **no** `seqNo` (returns
+    /// [`MonitorTripOutcome::NoMonitor`]), so a trip that finds no *reportable*
     /// match never burns a sequence position and leaves no phantom gap in the
-    /// CSMS's view of the stream. The `actual_value` is opaque, caller-supplied
-    /// text threaded to the wire verbatim; an over-long value surfaces as an
-    /// [`OcppError`] from [`call`](Self::call)'s outbound validation, never a
-    /// panic or a silent truncation.
+    /// CSMS's view of the stream. The default level is `9` (Debug), so until a
+    /// CSMS narrows it every matched monitor still reports exactly as before.
+    ///
+    /// The `actual_value` is opaque, caller-supplied text threaded to the wire
+    /// verbatim; an over-long value surfaces as an [`OcppError`] from
+    /// [`call`](Self::call)'s outbound validation, never a panic or a silent
+    /// truncation.
     async fn emit_monitor_notify_event(
         &self,
         monitors: &[TrippedMonitor],
@@ -7234,8 +7259,28 @@ impl ChargePoint {
             return Ok(MonitorTripOutcome::NoMonitor);
         }
 
+        // Gate by the active reporting level before claiming any `seqNo`/`eventId`
+        // (OCPP 2.0.1 Part 2, D01): report only monitors whose severity is at or
+        // below the active level. A pure comparison of two already-validated,
+        // in-range `i32`s — no wire value is parsed or indexed, so no panic path.
+        let active_level = self
+            .v201_device_model
+            .read()
+            .await
+            .active_monitoring_level();
+        let reportable: Vec<&TrippedMonitor> = monitors
+            .iter()
+            .filter(|m| m.severity <= active_level)
+            .collect();
+        if reportable.is_empty() {
+            // Every matched monitor is more verbose than the active level allows:
+            // collapse into the same no-op a zero-match trip produces — no CALL,
+            // no `seqNo` burned, so the next reportable trip reuses the position.
+            return Ok(MonitorTripOutcome::NoMonitor);
+        }
+
         let generated_at = v201_now();
-        let event_data: Vec<_> = monitors
+        let event_data: Vec<_> = reportable
             .iter()
             .map(|m| {
                 v201_command::v201_monitor_event_data(
@@ -14079,10 +14124,22 @@ mod tests {
     /// which writes to the same device-model store the trip hook reads. Returns
     /// the station-assigned monitor id.
     async fn install_one_monitor(cp: &ChargePoint, kind: ocpp_types::v201::MonitorEnumType) -> i32 {
+        install_one_monitor_with_severity(cp, kind, 3).await
+    }
+
+    /// Install one CSMS monitor on `OCPPCommCtrlr` / `HeartbeatInterval` at a
+    /// chosen `severity` (`0` Danger … `9` Debug) — the reporting-level gate tests
+    /// (#597) need monitors above and below the active level. Returns the
+    /// station-assigned monitor id.
+    async fn install_one_monitor_with_severity(
+        cp: &ChargePoint,
+        kind: ocpp_types::v201::MonitorEnumType,
+        severity: i32,
+    ) -> i32 {
         use ocpp_types::v201::SetMonitoringStatusEnumType;
         let resp = cp
             .handle_message(Message::Call(make_v201_set_variable_monitoring(vec![
-                v201_monitor_data("OCPPCommCtrlr", "HeartbeatInterval", kind, 1.0, 3),
+                v201_monitor_data("OCPPCommCtrlr", "HeartbeatInterval", kind, 1.0, severity),
             ])))
             .await
             .unwrap();
@@ -14095,6 +14152,24 @@ mod tests {
                     SetMonitoringStatusEnumType::Accepted
                 );
                 body.set_monitoring_result[0].id.expect("accepted → id")
+            }
+            other => panic!("expected CallResult, got: {other:?}"),
+        }
+    }
+
+    /// Set the station's active reporting level (`SetMonitoringLevel`) over the
+    /// inbound handler, asserting it is `Accepted`. Used by the level-gate tests
+    /// (#597) to narrow the level before a trip.
+    async fn set_active_monitoring_level(cp: &ChargePoint, severity: i32) {
+        use ocpp_types::v201::GenericStatusEnumType;
+        let resp = cp
+            .handle_message(Message::Call(make_v201_set_monitoring_level(severity)))
+            .await
+            .unwrap();
+        match resp.unwrap() {
+            Message::CallResult(r) => {
+                let body: ocpp_messages::v201::SetMonitoringLevelResponse = r.payload_as().unwrap();
+                assert_eq!(body.status, GenericStatusEnumType::Accepted);
             }
             other => panic!("expected CallResult, got: {other:?}"),
         }
@@ -14264,6 +14339,111 @@ mod tests {
                 .await,
             Err(OcppError::NotSupported { .. })
         ));
+    }
+
+    // --- NotifyEvent reporting-level gate (SetMonitoringLevel, #597) ---
+    // The emitter reports only monitors whose severity is at or below the active
+    // reporting level (OCPP 2.0.1 Part 2 D01; lower severity = more severe, the
+    // boundary is inclusive). The default level is 9 (Debug), so the trip tests
+    // above — all at the default — double as the "nothing suppressed" regression
+    // guard.
+
+    #[tokio::test]
+    async fn trip_reports_only_monitors_at_or_below_the_active_level() {
+        use ocpp_types::v201::MonitorEnumType;
+        // Three monitors on one variable at severities 0 / 3 / 5; the level is
+        // narrowed to 3. A single trip matches all three, but only the severity-0
+        // and severity-3 monitors (≤ 3, inclusive) ride the NotifyEvent page — the
+        // severity-5 monitor is more verbose than the level allows and is dropped.
+        let (addr, mut rx) = spawn_mock_csms_capturing(notify_event_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let danger =
+            install_one_monitor_with_severity(&cp, MonitorEnumType::UpperThreshold, 0).await;
+        let at_level = install_one_monitor_with_severity(&cp, MonitorEnumType::Delta, 3).await;
+        let _verbose = install_one_monitor_with_severity(&cp, MonitorEnumType::Periodic, 5).await;
+        set_active_monitoring_level(&cp, 3).await;
+
+        let outcome = cp
+            .trip_variable_monitor("OCPPCommCtrlr", "HeartbeatInterval", "900")
+            .await
+            .unwrap();
+        // Two of the three monitors are reportable → one page carrying two events.
+        assert_eq!(
+            outcome,
+            MonitorTripOutcome::Emitted {
+                events: 2,
+                seq_no: 0
+            }
+        );
+
+        let payload = recv_notify_event(&mut rx).await;
+        assert_eq!(payload["seqNo"], 0);
+        let events = payload["eventData"].as_array().unwrap();
+        assert_eq!(
+            events.len(),
+            2,
+            "only the severity ≤ 3 subset rides the page"
+        );
+        let reported_ids: Vec<i64> = events
+            .iter()
+            .map(|e| e["variableMonitoringId"].as_i64().unwrap())
+            .collect();
+        assert!(
+            reported_ids.contains(&(danger as i64)) && reported_ids.contains(&(at_level as i64)),
+            "the severity-0 and severity-3 (boundary-inclusive) monitors must report, got {reported_ids:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn trip_all_monitors_above_level_is_noop_and_burns_no_seq_no() {
+        use ocpp_types::v201::MonitorEnumType;
+        // A single monitor at severity 5 with the level narrowed to 3: the trip
+        // matches it but suppresses it, so it collapses to NoMonitor — no CALL, no
+        // seqNo burned. Widening the level back to 9 and re-tripping then emits at
+        // seqNo 0, proving the suppressed trip claimed no sequence position.
+        let (addr, mut rx) = spawn_mock_csms_capturing(notify_event_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        install_one_monitor_with_severity(&cp, MonitorEnumType::Delta, 5).await;
+        set_active_monitoring_level(&cp, 3).await;
+
+        // Matched but entirely above the level → the same no-op a zero-match trip
+        // produces.
+        assert_eq!(
+            cp.trip_variable_monitor("OCPPCommCtrlr", "HeartbeatInterval", "900")
+                .await
+                .unwrap(),
+            MonitorTripOutcome::NoMonitor
+        );
+
+        // Widen the level so the same monitor is now reportable; the first real
+        // emission uses seqNo 0 — the suppressed trip left no phantom gap.
+        set_active_monitoring_level(&cp, 9).await;
+        assert_eq!(
+            cp.trip_variable_monitor("OCPPCommCtrlr", "HeartbeatInterval", "901")
+                .await
+                .unwrap(),
+            MonitorTripOutcome::Emitted {
+                events: 1,
+                seq_no: 0
+            }
+        );
+        let payload = recv_notify_event(&mut rx).await;
+        assert_eq!(
+            payload["seqNo"], 0,
+            "a fully-suppressed trip must not burn a seqNo"
+        );
     }
 
     // --- transition_charging_state() → TransactionEvent(ChargingStateChanged)
@@ -15118,10 +15298,23 @@ mod tests {
         kind: ocpp_types::v201::MonitorEnumType,
         value: f64,
     ) -> i32 {
+        install_valued_monitor_with_severity(cp, variable, kind, value, 3).await
+    }
+
+    /// The valued twin of [`install_one_monitor_with_severity`]: a threshold/delta
+    /// monitor on `OCPPCommCtrlr` / `variable` with a chosen `value` and
+    /// `severity`, for the autonomous-path reporting-level test (#597).
+    async fn install_valued_monitor_with_severity(
+        cp: &ChargePoint,
+        variable: &str,
+        kind: ocpp_types::v201::MonitorEnumType,
+        value: f64,
+        severity: i32,
+    ) -> i32 {
         use ocpp_types::v201::SetMonitoringStatusEnumType;
         let resp = cp
             .handle_message(Message::Call(make_v201_set_variable_monitoring(vec![
-                v201_monitor_data("OCPPCommCtrlr", variable, kind, value, 3),
+                v201_monitor_data("OCPPCommCtrlr", variable, kind, value, severity),
             ])))
             .await
             .unwrap();
@@ -15479,6 +15672,61 @@ mod tests {
         assert_eq!(e["variableMonitoringId"], id);
         assert_eq!(e["component"]["name"], "OCPPCommCtrlr");
         assert_eq!(e["variable"]["name"], "HeartbeatInterval");
+    }
+
+    #[tokio::test]
+    async fn v201_set_variables_crossing_respects_the_active_monitoring_level() {
+        use ocpp_types::v201::MonitorEnumType;
+        // Parity with the injection seam: the autonomous SetVariables-crossing path
+        // honors the reporting level at the same shared emit point. Two monitors on
+        // one variable — a severity-5 UpperThreshold and a severity-1 Delta — are
+        // both crossed by one "300"→"1000" write, but with the level narrowed to 3
+        // only the severity-1 Delta rides the NotifyEvent; the severity-5 monitor is
+        // suppressed.
+        let (addr, mut rx) = spawn_mock_csms_capturing(notify_event_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        let _verbose = install_valued_monitor_with_severity(
+            &cp,
+            "HeartbeatInterval",
+            MonitorEnumType::UpperThreshold,
+            900.0,
+            5,
+        )
+        .await;
+        let reported = install_valued_monitor_with_severity(
+            &cp,
+            "HeartbeatInterval",
+            MonitorEnumType::Delta,
+            50.0,
+            1,
+        )
+        .await;
+        set_active_monitoring_level(&cp, 3).await;
+
+        cp.handle_message(Message::Call(make_v201_set_variables(
+            "OCPPCommCtrlr",
+            "HeartbeatInterval",
+            "1000",
+        )))
+        .await
+        .unwrap();
+
+        let payload = recv_notify_event(&mut rx).await;
+        assert_eq!(payload["seqNo"], 0);
+        let events = payload["eventData"].as_array().unwrap();
+        assert_eq!(
+            events.len(),
+            1,
+            "only the severity-1 monitor is at or below the level"
+        );
+        assert_eq!(events[0]["variableMonitoringId"], reported);
+        assert_eq!(events[0]["trigger"], "Delta");
     }
 
     #[tokio::test]
