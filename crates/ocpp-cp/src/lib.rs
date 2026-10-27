@@ -279,13 +279,16 @@ pub enum ChargingStateChangeOutcome {
         /// The `seqNo` stamped on the emitted `TransactionEvent`.
         seq_no: i32,
     },
-    /// The cable-plug **opened** a fresh transaction — a station whose
-    /// `TxStartPoint` includes `EVConnected` (Issue #582): one
-    /// `TransactionEvent(Started, triggerReason = CablePluggedIn, chargingState =
-    /// EVConnected)` was emitted at `seqNo = 0`, and `transaction_id` is the
-    /// station-chosen id the new transaction is keyed on (so the caller can later
-    /// advance or stop it). Distinct from [`Emitted`](Self::Emitted), which
-    /// advances an *already-open* transaction with an interim `Updated`.
+    /// A physical lifecycle event **opened** a fresh transaction, rather than
+    /// advancing one, so the emitted event was the transaction's `Started`:
+    /// a cable-plug under an `EVConnected` `TxStartPoint` (Issue #582) emits
+    /// `Started(CablePluggedIn, EVConnected)`, and a power-path-close under a
+    /// `PowerPathClosed` `TxStartPoint` (Issue #599) emits
+    /// `Started(ChargingStateChanged, Charging)` — both at `seqNo = 0`.
+    /// `transaction_id` is the station-chosen id the new transaction is keyed on
+    /// (so the caller can later advance or stop it). Distinct from
+    /// [`Emitted`](Self::Emitted), which advances an *already-open* transaction
+    /// with an interim `Updated`.
     Opened {
         /// The station-chosen `transactionId` of the newly opened transaction.
         transaction_id: i32,
@@ -643,6 +646,16 @@ impl ChargePointConfig {
     fn tx_opens_on_cable_plug(&self) -> bool {
         self.tx_start_points
             .contains(&TxStartStopPointEnumType::EVConnected)
+    }
+
+    /// Whether the configured [`TxStartPoint`](Self::tx_start_points) set
+    /// includes `PowerPathClosed` — i.e. the contactor closing / power path
+    /// energising *opens* the transaction (the 2.0.1 `PowerPathClosed`
+    /// lifecycle) rather than merely advancing an already-open one
+    /// (Issue #599; the companion to [`tx_opens_on_cable_plug`](Self::tx_opens_on_cable_plug)).
+    fn tx_opens_on_power_path_closed(&self) -> bool {
+        self.tx_start_points
+            .contains(&TxStartStopPointEnumType::PowerPathClosed)
     }
 
     /// Build the OCPP 2.0.1 `BootNotification` request this Charge Point sends
@@ -1171,17 +1184,20 @@ struct V201Session {
     /// — not the volatile auth cache — because a remotely-started transaction
     /// may hold no cache entry and cache *expiry* is not *deauthorization*.
     authorized: Arc<AtomicBool>,
-    /// Whether this transaction was **opened by plugging the cable in** under an
-    /// `EVConnected` `TxStartPoint` (Issue #582) rather than by authorization.
+    /// Whether this transaction was **opened by a physical lifecycle event before
+    /// authorization** — plugging the cable in under an `EVConnected`
+    /// `TxStartPoint` (Issue #582) or the power path closing under a
+    /// `PowerPathClosed` `TxStartPoint` (Issue #599) — rather than by
+    /// authorization.
     ///
-    /// Marks the plug-initiated lineage so the authorization step can be *folded*
-    /// onto it (Issue #595): `start_transaction` on a connector hosting a
-    /// plug-initiated session **advances** it (`EVConnected → Charging`, one
-    /// interim `TransactionEvent(Updated, triggerReason = Authorized)`) instead of
-    /// minting a second transaction, and a redundant authorization on an
-    /// already-advanced plug-initiated session is a silent no-op. `false` for a
-    /// transaction opened the long-standing way (authorization mints it), so that
-    /// path is left exactly as it was.
+    /// Marks the physically-initiated lineage so the authorization step can be
+    /// *folded* onto it (Issue #595): `start_transaction` on a connector hosting
+    /// such a session **advances** it (`EVConnected → Charging`, one interim
+    /// `TransactionEvent(Updated, triggerReason = Authorized)`) instead of minting
+    /// a second transaction, and a redundant authorization on an already-advanced
+    /// session is a silent no-op. `false` for a transaction opened the
+    /// long-standing way (authorization mints it), so that path is left exactly as
+    /// it was.
     plug_initiated: bool,
     /// The optional `groupIdToken` a `RequestStartTransaction` carried — the
     /// parent/group token the driver `idToken` belongs to (a fleet card, a
@@ -7452,8 +7468,10 @@ impl ChargePoint {
     /// `start_transaction` call on a plug-opened session advances it to `Charging`
     /// instead of opening a second transaction — is done in
     /// `fold_authorization_onto_plug_open`
-    /// (Issue #595). Start-point variants beyond `EVConnected` (`PowerPathClosed`,
-    /// `EnergyTransfer`, …) are modeled in the config but not yet acted on.
+    /// (Issue #595). The `PowerPathClosed` start point has its own driver hook,
+    /// [`power_path_closed`](Self::power_path_closed) (Issue #599); the remaining
+    /// variants (`EnergyTransfer`, `DataSigned`, `ParkingBayOccupancy`) are
+    /// modeled in the config but not yet acted on.
     ///
     /// V201-only: `TransactionEvent` and its `chargingState` are 2.0.1
     /// constructs, so a call on a `V16J` station is refused with
@@ -7582,6 +7600,203 @@ impl ChargePoint {
             transaction_id,
             "cable plugged in on a station with an EVConnected TxStartPoint; \
              opened transaction with TransactionEvent(Started, CablePluggedIn, EVConnected)"
+        );
+
+        Ok(ChargingStateChangeOutcome::Opened {
+            transaction_id,
+            seq_no: 0,
+        })
+    }
+
+    /// Model the **power path closing** (the contactor closing / cable
+    /// energising) on a 2.0.1 station — the `PowerPathClosed` `TxStartPoint`
+    /// (OCPP 2.0.1 Part 2, `TxStartStopPointEnumType`; Issue #599).
+    ///
+    /// The sibling of [`plug_in_cable`](Self::plug_in_cable) (`EVConnected`,
+    /// #582) and [`transition_charging_state`](Self::transition_charging_state)
+    /// (#577): where plugging the cable models the pre-authorization
+    /// `EVConnected` phase, this models the point at which the EV and EVSE have
+    /// closed the power path and energy can flow — `chargingState = Charging`.
+    ///
+    /// # Outcome
+    ///
+    /// The configured [`TxStartPoint`](ChargePointConfig::tx_start_points) and the
+    /// EVSE's current state decide what the power-path-close does:
+    ///
+    /// - **A transaction is already open on `evse_id`** → the power-path-close is
+    ///   an interim advance on it, reusing the shared compare-and-advance core:
+    ///   a session still at `EVConnected` (an unclosed plug-open, #582) advances
+    ///   to `Charging` with one `TransactionEvent(Updated, ChargingStateChanged)`
+    ///   and reports [`Emitted`](ChargingStateChangeOutcome::Emitted); a session
+    ///   already `Charging` (the realistic ordering — authorization closed it
+    ///   first) is a silent [`Redundant`](ChargingStateChangeOutcome::Redundant)
+    ///   no-op — no CALL, no `seqNo` burned.
+    /// - **No transaction open and the `TxStartPoint` includes `PowerPathClosed`**
+    ///   → the power-path-close *opens* the transaction: one
+    ///   `TransactionEvent(Started, ChargingStateChanged, Charging)` at `seqNo 0`,
+    ///   reported as [`Opened`](ChargingStateChangeOutcome::Opened) with the
+    ///   station-chosen `transactionId`.
+    /// - **No transaction open and the `TxStartPoint` does *not* include
+    ///   `PowerPathClosed`** → nothing to report yet: inert
+    ///   [`NoTransaction`](ChargingStateChangeOutcome::NoTransaction), no CALL. A
+    ///   non-positive / unconfigured `evse_id` hosts no transaction and lands here
+    ///   too — never a panic.
+    ///
+    /// # Trigger reason
+    ///
+    /// `PowerPathClosed` is a [`TxStartStopPointEnumType`] value, not a
+    /// [`TriggerReasonEnumType`] one — there is no `PowerPathClosed` trigger. The
+    /// contactor closing *is* a charging-state change into `Charging`, so both the
+    /// opening `Started` and the interim `Updated` carry
+    /// `triggerReason = ChargingStateChanged`, mirroring how the `EVConnected`
+    /// start point names its physical event (`CablePluggedIn`).
+    ///
+    /// # Ordering note
+    ///
+    /// In a real plug-and-charge sequence authorization happens *before* the power
+    /// path closes, so by the time this hook is called the transaction is already
+    /// open and `Charging` (via [`start_transaction`](Self::start_transaction) or
+    /// a folded plug-open) and the power-path-close is a redundant no-op. The
+    /// *open* arm here models a station driven power-path-first (e.g. a
+    /// `PowerPathClosed`-only conformance exercise). A `start_transaction` arriving
+    /// after such an open still folds onto the one transaction (no second
+    /// `Started`), but the authorizing `idToken` rides only the `EVConnected →
+    /// Charging` fold edge, so it is not retroactively attached to a session the
+    /// power path already advanced to `Charging` — the same shape as the
+    /// `remoteStartId`-after-plug limitation #595 documents.
+    ///
+    /// V201-only: `TransactionEvent` and its `chargingState` are 2.0.1
+    /// constructs, so a call on a `V16J` station is refused with
+    /// [`OcppError::NotSupported`].
+    pub async fn power_path_closed(&self, evse_id: i32) -> OcppResult<ChargingStateChangeOutcome> {
+        if self.config.protocol_version != OcppVersion::V201 {
+            return Err(OcppError::NotSupported {
+                feature:
+                    "TransactionEvent(PowerPathClosed) is an OCPP 2.0.1 message; not available on a 1.6J station"
+                        .to_string(),
+            });
+        }
+
+        // If a transaction is already open on this EVSE, the power-path-close is
+        // an interim advance into `Charging` on it — the same per-session
+        // compare-and-advance `transition_charging_state` / `plug_in_cable` use:
+        // a real `EVConnected → Charging` edge emits one `Updated`, an already
+        // `Charging` session is a silent no-op. `emit_transaction_state_change`
+        // resolves the live transaction and reports `NoTransaction` — without
+        // emitting or burning a `seqNo` — when none is open, so a fall-through to
+        // the open path below is clean.
+        let outcome = self
+            .emit_transaction_state_change(
+                evse_id,
+                ChargingStateEnumType::Charging,
+                TriggerReasonEnumType::ChargingStateChanged,
+            )
+            .await?;
+
+        // No transaction yet: under a `TxStartPoint` that includes
+        // `PowerPathClosed` the power-path-close *opens* the transaction;
+        // otherwise there is nothing to report yet and the inert `NoTransaction`
+        // stands.
+        match outcome {
+            ChargingStateChangeOutcome::NoTransaction
+                if self.config.tx_opens_on_power_path_closed() =>
+            {
+                self.open_transaction_on_power_path_close(evse_id).await
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// Open a fresh 2.0.1 transaction *on a power-path-close*, for a station whose
+    /// `TxStartPoint` includes `PowerPathClosed` (Issue #599): mint a
+    /// station-chosen `transactionId`, emit `TransactionEvent(Started,
+    /// triggerReason = ChargingStateChanged, chargingState = Charging)` at
+    /// `seqNo 0`, and record the [`active_transactions`](Self::active_transactions)
+    /// and [`V201Session`] (seeded `Charging`, `next_seq_no = 1`, **not yet
+    /// authorized**) that the rest of the lifecycle keys on.
+    ///
+    /// The power-path twin of
+    /// [`open_transaction_on_cable_plug`](Self::open_transaction_on_cable_plug):
+    /// the opening event is the contactor closing, so it carries no `idToken` and
+    /// no `Transaction.Begin` reading (the driver hook takes only the EVSE id; the
+    /// energy reading rides the periodic sampler once authorization folds). The
+    /// session opens `authorized = false` and `plug_initiated = true` so a later
+    /// [`start_transaction`](Self::start_transaction) folds onto this one
+    /// transaction rather than minting a second (see
+    /// [`fold_authorization_onto_plug_open`](Self::fold_authorization_onto_plug_open)).
+    ///
+    /// Only called from [`power_path_closed`](Self::power_path_closed) once it has
+    /// established there is no transaction already open on the EVSE. An `evse_id`
+    /// that maps to no connector on this station (non-positive, or unconfigured)
+    /// can host no transaction, so this is inert
+    /// ([`NoTransaction`](ChargingStateChangeOutcome::NoTransaction)) — never a
+    /// panic. The `Started` is sent *before* any state is recorded, so a failed
+    /// CALL leaves no dangling session.
+    async fn open_transaction_on_power_path_close(
+        &self,
+        evse_id: i32,
+    ) -> OcppResult<ChargingStateChangeOutcome> {
+        // The power-path-close must land on a connector this station actually has.
+        // The flat 1.6J-inherited topology maps `evse_id → connectorId` directly;
+        // a non-positive (`ConnectorId::new` rejects `0`) or unconfigured id hosts
+        // nothing, so this is inert rather than minting a phantom transaction.
+        let connector_id = match u32::try_from(evse_id)
+            .ok()
+            .and_then(|id| ConnectorId::new(id).ok())
+        {
+            Some(cid) if self.connectors.read().await.contains_key(&cid) => cid,
+            _ => return Ok(ChargingStateChangeOutcome::NoTransaction),
+        };
+
+        // Mint the station-chosen transactionId from the same allocator as the
+        // authorization-opened and cable-plug paths, so ids never collide, and
+        // emit the opening `Started` before recording any state.
+        let transaction_id = self.next_v201_transaction_id.fetch_add(1, Ordering::SeqCst);
+        let txid_str = transaction_id.to_string();
+        let request = v201_transaction::transaction_event_started_on_power_path_close(
+            &v201_transaction::SessionRef {
+                transaction_id: &txid_str,
+                evse_id,
+                connector_id: 1,
+            },
+            &v201_now(),
+        );
+        // `call()` schema-validates both the request and the `.conf`; a transport
+        // / timeout / CALLERROR failure propagates and records no session, so the
+        // open is all-or-nothing.
+        let _ack = self.call(request).await?;
+
+        // Record the session first, then the active-transaction mapping, so a
+        // concurrent resolver never sees the mapping without its session (the
+        // resolver reads `active_transactions` then `v201_sessions`).
+        self.v201_sessions.write().await.insert(
+            transaction_id,
+            V201Session {
+                // No authorizing idTag yet — the power path closed, authorization
+                // (if any) folds on later.
+                id_tag: String::new(),
+                // `Started` took 0; the next event takes 1.
+                next_seq_no: Arc::new(AtomicI32::new(1)),
+                // The power path is closed but no token has been presented.
+                authorized: Arc::new(AtomicBool::new(false)),
+                // Physically initiated: a subsequent authorization folds onto this
+                // transaction rather than opening a second (#595/#599).
+                plug_initiated: true,
+                group_id_token: None,
+                // Opens `Charging` — the `Started` event just reported it.
+                charging_state: Arc::new(Mutex::new(ChargingStateEnumType::Charging)),
+            },
+        );
+        self.active_transactions
+            .write()
+            .await
+            .insert(transaction_id, connector_id);
+
+        info!(
+            evse_id,
+            transaction_id,
+            "power path closed on a station with a PowerPathClosed TxStartPoint; \
+             opened transaction with TransactionEvent(Started, ChargingStateChanged, Charging)"
         );
 
         Ok(ChargingStateChangeOutcome::Opened {
@@ -14976,6 +15191,243 @@ mod tests {
             .await
             .get(&transaction_id)
             .is_none());
+    }
+
+    // --- power_path_closed() acts on the PowerPathClosed TxStartPoint (#599) ---
+    //
+    // On a station whose configured TxStartPoint includes PowerPathClosed the
+    // contactor-close *opens* the transaction (Started, ChargingStateChanged,
+    // Charging, seqNo 0) when none is open, and *advances* an already-open one
+    // (EVConnected -> Charging, Updated, seqNo N) reusing the shared
+    // compare-and-advance core — an already-Charging session is a silent no-op.
+    // With no PowerPathClosed start point the power-path-close opens nothing.
+
+    /// A V201 config whose `TxStartPoint` is `[PowerPathClosed]`, pointed at
+    /// `addr`, so closing the power path opens the transaction.
+    fn power_path_closed_v201_config(addr: std::net::SocketAddr) -> ChargePointConfig {
+        ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            tx_start_points: vec![TxStartStopPointEnumType::PowerPathClosed],
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        }
+    }
+
+    #[tokio::test]
+    async fn power_path_closed_opens_transaction_under_power_path_closed_start_point() {
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(power_path_closed_v201_config(addr)).unwrap();
+        cp.connect().await.unwrap();
+
+        // No transaction is open yet: the power-path-close *opens* one as its
+        // Started event, at Charging.
+        let transaction_id = match cp.power_path_closed(1).await.unwrap() {
+            ChargingStateChangeOutcome::Opened {
+                transaction_id,
+                seq_no,
+            } => {
+                assert_eq!(seq_no, 0, "the opening Started takes seqNo 0");
+                transaction_id
+            }
+            other => panic!("expected the power-path-close to open a transaction, got {other:?}"),
+        };
+
+        // The wire carries a Started (not an interim Updated) at Charging, under
+        // the ChargingStateChanged trigger (there is no PowerPathClosed trigger).
+        let payload = recv_transaction_event(&mut rx).await;
+        assert_eq!(payload["eventType"], "Started");
+        assert_eq!(payload["triggerReason"], "ChargingStateChanged");
+        assert_eq!(payload["seqNo"], 0);
+        assert_eq!(payload["transactionInfo"]["chargingState"], "Charging");
+        // Pre-authorization open: no idToken; the driver hook carries no meter
+        // start, so no Transaction.Begin reading rides the open.
+        assert!(
+            payload.get("idToken").is_none(),
+            "a power-path-close open performs no authorization"
+        );
+        assert!(
+            payload.get("meterValue").is_none(),
+            "the power-path-close driver hook stamps no meter reading"
+        );
+
+        // The session + active-transaction records are seeded Charging /
+        // unauthorized / seqNo-from-1, ready for a later authorization to fold on.
+        assert_eq!(
+            cp.active_transactions.read().await.get(&transaction_id),
+            Some(&ConnectorId::new(1).unwrap())
+        );
+        let sessions = cp.v201_sessions.read().await;
+        let session = sessions.get(&transaction_id).expect("session recorded");
+        assert_eq!(
+            *session.charging_state.lock().await,
+            ChargingStateEnumType::Charging
+        );
+        assert!(
+            !session.authorized.load(Ordering::SeqCst),
+            "the power path is closed but no token has been presented"
+        );
+        assert!(
+            session.id_tag.is_empty(),
+            "no authorizing idTag is captured at power-path-close time"
+        );
+    }
+
+    #[tokio::test]
+    async fn power_path_closed_default_start_point_does_not_open_transaction() {
+        // Default TxStartPoint is [Authorized]: a power-path-close with no open
+        // transaction and no PowerPathClosed start point opens nothing.
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(ChargePointConfig {
+            central_system_url: format!("ws://{addr}"),
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        cp.connect().await.unwrap();
+
+        assert_eq!(
+            cp.power_path_closed(1).await.unwrap(),
+            ChargingStateChangeOutcome::NoTransaction
+        );
+        assert!(cp.v201_sessions.read().await.is_empty());
+        assert!(cp.active_transactions.read().await.is_empty());
+        let saw_event = tokio::time::timeout(std::time::Duration::from_millis(300), async {
+            loop {
+                match rx.recv().await {
+                    Some((action, _)) if action == "TransactionEvent" => break true,
+                    Some(_) => continue,
+                    None => break false,
+                }
+            }
+        })
+        .await;
+        assert!(
+            saw_event.is_err(),
+            "a power-path-close with no PowerPathClosed start point emits no TransactionEvent"
+        );
+    }
+
+    #[tokio::test]
+    async fn power_path_closed_invalid_evse_is_inert_under_power_path_closed_start_point() {
+        // Even with a PowerPathClosed start point, a non-positive / unconfigured
+        // evse_id hosts no transaction, so the open path is inert (no panic).
+        let cp = ChargePoint::new(ChargePointConfig {
+            tx_start_points: vec![TxStartStopPointEnumType::PowerPathClosed],
+            ..ChargePointConfig::for_version(OcppVersion::V201)
+        })
+        .unwrap();
+        // evse 0 is not a valid connector; evse 99 is not configured (count = 2).
+        assert_eq!(
+            cp.power_path_closed(0).await.unwrap(),
+            ChargingStateChangeOutcome::NoTransaction
+        );
+        assert_eq!(
+            cp.power_path_closed(99).await.unwrap(),
+            ChargingStateChangeOutcome::NoTransaction
+        );
+        assert!(cp.v201_sessions.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn power_path_closed_advances_open_ev_connected_transaction() {
+        // A transaction already open at EVConnected (a plug-open awaiting its
+        // power path): the power-path-close advances it to Charging as one interim
+        // Updated (ChargingStateChanged), not a second Started.
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(power_path_closed_v201_config(addr)).unwrap();
+        cp.connect().await.unwrap();
+        let transaction_id =
+            insert_live_v201_session_in_state(&cp, 1, ChargingStateEnumType::EVConnected).await;
+
+        assert_eq!(
+            cp.power_path_closed(1).await.unwrap(),
+            ChargingStateChangeOutcome::Emitted { seq_no: 1 }
+        );
+        let payload = recv_transaction_event(&mut rx).await;
+        assert_eq!(payload["eventType"], "Updated");
+        assert_eq!(payload["triggerReason"], "ChargingStateChanged");
+        assert_eq!(payload["seqNo"], 1);
+        assert_eq!(payload["transactionInfo"]["chargingState"], "Charging");
+
+        // One physical session stays one transaction: no new id was minted.
+        assert_eq!(cp.active_transactions.read().await.len(), 1);
+        let sessions = cp.v201_sessions.read().await;
+        let session = sessions.get(&transaction_id).expect("same transaction");
+        assert_eq!(
+            *session.charging_state.lock().await,
+            ChargingStateEnumType::Charging
+        );
+    }
+
+    #[tokio::test]
+    async fn power_path_closed_when_already_charging_is_a_noop() {
+        // The realistic ordering: authorization has already driven the session to
+        // Charging, so the subsequent power-path-close is a silent no-op — no
+        // event, no seqNo burned.
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(power_path_closed_v201_config(addr)).unwrap();
+        cp.connect().await.unwrap();
+        insert_live_v201_session_in_state(&cp, 1, ChargingStateEnumType::Charging).await;
+
+        assert_eq!(
+            cp.power_path_closed(1).await.unwrap(),
+            ChargingStateChangeOutcome::Redundant
+        );
+
+        // A real suspend afterwards still uses seqNo 1 (none was burned), and is
+        // the only event to reach the wire.
+        assert_eq!(
+            cp.transition_charging_state(1, ChargingStateEnumType::SuspendedEV)
+                .await
+                .unwrap(),
+            ChargingStateChangeOutcome::Emitted { seq_no: 1 }
+        );
+        let payload = recv_transaction_event(&mut rx).await;
+        assert_eq!(payload["seqNo"], 1);
+        assert_eq!(payload["transactionInfo"]["chargingState"], "SuspendedEV");
+    }
+
+    #[tokio::test]
+    async fn power_path_closed_opened_transaction_full_lifecycle_seq_monotonic() {
+        // The power-path-opened lifecycle: power-path-close opens (Started,
+        // Charging, seqNo 0) → stop closes Idle (Ended, seqNo 1). seqNo is strictly
+        // monotonic end to end.
+        let (addr, mut rx) = spawn_mock_csms_capturing(transaction_event_routes()).await;
+        let cp = ChargePoint::new(power_path_closed_v201_config(addr)).unwrap();
+        cp.connect().await.unwrap();
+
+        let transaction_id = match cp.power_path_closed(1).await.unwrap() {
+            ChargingStateChangeOutcome::Opened { transaction_id, .. } => transaction_id,
+            other => panic!("expected Opened, got {other:?}"),
+        };
+        let started = recv_transaction_event(&mut rx).await;
+        assert_eq!(started["eventType"], "Started");
+        assert_eq!(started["seqNo"], 0);
+        assert_eq!(started["transactionInfo"]["chargingState"], "Charging");
+
+        cp.stop_transaction(transaction_id, 1500, Reason::Local)
+            .await
+            .unwrap();
+        let ended = recv_transaction_event(&mut rx).await;
+        assert_eq!(ended["eventType"], "Ended");
+        assert_eq!(ended["seqNo"], 1);
+        assert_eq!(ended["transactionInfo"]["chargingState"], "Idle");
+
+        assert!(cp.v201_sessions.read().await.get(&transaction_id).is_none());
+        assert!(cp
+            .active_transactions
+            .read()
+            .await
+            .get(&transaction_id)
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn power_path_closed_is_v201_only() {
+        // A 1.6J station has no TransactionEvent / chargingState path.
+        let cp = ChargePoint::new(ChargePointConfig::default()).unwrap();
+        assert!(matches!(
+            cp.power_path_closed(1).await,
+            Err(OcppError::NotSupported { .. })
+        ));
     }
 
     // --- start_transaction folds authorization onto a plug-opened transaction

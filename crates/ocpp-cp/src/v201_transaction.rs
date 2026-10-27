@@ -247,6 +247,55 @@ pub fn transaction_event_started_on_cable_plug(
     }
 }
 
+/// Build a `TransactionEvent(Started)` for a transaction **opened when the power
+/// path closes** — the start a station whose `TxStartPoint` includes
+/// `PowerPathClosed` performs (Issue #599).
+///
+/// `PowerPathClosed` is a [`TxStartStopPointEnumType`] value, not a
+/// [`TriggerReasonEnumType`] one — there is no `PowerPathClosed` trigger. The
+/// contactor closing *is* a charging-state change into
+/// [`Charging`](ChargingStateEnumType::Charging), so the faithful wire tokens are
+/// `triggerReason = ChargingStateChanged`, `chargingState = Charging`, `seqNo =
+/// 0`. This mirrors [`transaction_event_started_on_cable_plug`]'s
+/// `CablePluggedIn` / `EVConnected` pairing: each opening `Started` names the
+/// physical event that reached the configured start point.
+///
+/// Like the cable-plug open it carries **no** authorizing `idToken` (the open is
+/// the physical contactor-close, not an authorization) and **no** `meterValue`
+/// (the driver hook [`ChargePoint::power_path_closed`](crate::ChargePoint::power_path_closed)
+/// takes only the EVSE id, so there is no `meter_start` to stamp; the energy
+/// reading rides the periodic sampler once authorization folds onto the
+/// transaction). Both fields are optional in the 2.0.1 `TransactionEvent` schema.
+/// `seqNo` is fixed at `0` — a `Started` is always a transaction's first event.
+#[must_use]
+pub fn transaction_event_started_on_power_path_close(
+    session: &SessionRef,
+    timestamp: &str,
+) -> TransactionEventRequest {
+    TransactionEventRequest {
+        event_type: TransactionEventEnumType::Started,
+        timestamp: timestamp.to_string(),
+        trigger_reason: TriggerReasonEnumType::ChargingStateChanged,
+        seq_no: 0,
+        transaction_info: TransactionType {
+            transaction_id: session.transaction_id.to_string(),
+            charging_state: Some(ChargingStateEnumType::Charging),
+            time_spent_charging: None,
+            stopped_reason: None,
+            remote_start_id: None,
+            custom_data: None,
+        },
+        offline: None,
+        number_of_phases_used: None,
+        cable_max_current: None,
+        reservation_id: None,
+        evse: Some(evse_of(session)),
+        meter_value: None,
+        id_token: None,
+        custom_data: None,
+    }
+}
+
 /// The periodic `Sample.Periodic` meter value: the active-import energy reading,
 /// plus — when `bounded_power_w` is `Some` — a `Power.Active.Import` reading of
 /// the profile-bounded power the station may draw (slice 7e, Issue #455).
@@ -920,6 +969,9 @@ mod tests {
             // The transaction-*opening* cable-plug Started (pre-authorization,
             // EVConnected, seqNo 0) must also satisfy the schema (#582).
             transaction_event_started_on_cable_plug(&s, TS),
+            // The transaction-*opening* power-path-close Started (ChargingStateChanged,
+            // Charging, seqNo 0) must also satisfy the schema (#599).
+            transaction_event_started_on_power_path_close(&s, TS),
         ] {
             let payload = serde_json::to_value(&req).unwrap();
             assert!(
@@ -1020,5 +1072,60 @@ mod tests {
         assert_eq!(payload["triggerReason"], "CablePluggedIn");
         assert_eq!(payload["seqNo"], 0);
         assert_eq!(payload["transactionInfo"]["chargingState"], "EVConnected");
+    }
+
+    #[test]
+    fn started_on_power_path_close_carries_charging_started_shape() {
+        let s = session();
+        // A station whose TxStartPoint includes PowerPathClosed: the contactor
+        // closing opens the transaction as its Started event (#599).
+        let req = transaction_event_started_on_power_path_close(&s, TS);
+
+        // It is a real Started (not an interim Updated), at seqNo 0.
+        assert_eq!(req.event_type, TransactionEventEnumType::Started);
+        // There is no PowerPathClosed trigger: the contactor closing is a
+        // charging-state change into Charging.
+        assert_eq!(
+            req.trigger_reason,
+            TriggerReasonEnumType::ChargingStateChanged
+        );
+        assert_eq!(req.seq_no, 0);
+        assert_eq!(req.transaction_info.transaction_id, "42");
+        // Opens at Charging (the power path is closed), not EVConnected.
+        assert_eq!(
+            req.transaction_info.charging_state,
+            Some(ChargingStateEnumType::Charging)
+        );
+        assert!(req.transaction_info.stopped_reason.is_none());
+        // No remote-start request to correlate (a power-path-close is a local start).
+        assert!(req.transaction_info.remote_start_id.is_none());
+        // Pre-authorization open, and the driver hook carries no meter start: no
+        // idToken, no meterValue — both ride the later authorization fold / sampler.
+        assert!(
+            req.id_token.is_none(),
+            "the power-path-close open performs no authorization"
+        );
+        assert!(
+            req.meter_value.is_none(),
+            "the power-path-close open stamps no Transaction.Begin reading"
+        );
+        // The evse binding is present so the CSMS knows which EVSE opened.
+        let evse = req.evse.as_ref().expect("started carries evse");
+        assert_eq!(evse.id, 1);
+        assert_eq!(evse.connector_id, Some(1));
+    }
+
+    #[test]
+    fn started_on_power_path_close_round_trips_the_exact_wire_tokens() {
+        // A transaction-opening power-path-close serializes as eventType = Started
+        // with triggerReason = ChargingStateChanged and chargingState = Charging —
+        // the exact PascalCase wire tokens a CSMS reads.
+        let s = session();
+        let req = transaction_event_started_on_power_path_close(&s, TS);
+        let payload = serde_json::to_value(&req).unwrap();
+        assert_eq!(payload["eventType"], "Started");
+        assert_eq!(payload["triggerReason"], "ChargingStateChanged");
+        assert_eq!(payload["seqNo"], 0);
+        assert_eq!(payload["transactionInfo"]["chargingState"], "Charging");
     }
 }
